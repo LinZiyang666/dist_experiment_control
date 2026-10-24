@@ -41,7 +41,7 @@ func topoTestAdmin(t *testing.T, opID, target string, deadline time.Time, now *t
 	t.Helper()
 	n, _ := d7SingleNode(t, "ctl-1")
 	admin := NewClusterAdmin(n, nil)
-	admin.now = func() time.Time { return *now }
+	admin.Now = func() time.Time { return *now }
 
 	in := cluster.OpStartInput{
 		OpID: opID, Kind: cluster.OpKindRetire, TargetNode: target,
@@ -60,7 +60,7 @@ func topoTestAdmin(t *testing.T, opID, target string, deadline time.Time, now *t
 	if err != nil || op == nil {
 		t.Fatalf("read back seeded op: %v", err)
 	}
-	if ok, _ := admin.topoConvergedForOp(op, false); ok {
+	if ok, _ := admin.TopoConvergedForOp(op, false); ok {
 		t.Fatal("fixture precondition failed: the topology gate must be NOT converged for these tests to mean anything")
 	}
 	return admin, op
@@ -68,7 +68,7 @@ func topoTestAdmin(t *testing.T, opID, target string, deadline time.Time, now *t
 
 func opState(t *testing.T, a *ClusterAdmin, opID string) (string, bool, string) {
 	t.Helper()
-	o, err := cluster.OperationByID(a.node.RODB(), opID)
+	o, err := cluster.OperationByID(a.Node.RODB(), opID)
 	if err != nil || o == nil {
 		t.Fatalf("read op %s: %v", opID, err)
 	}
@@ -86,7 +86,7 @@ func TestTopoAdvanceN1BoundaryStaysNonterminal(t *testing.T) {
 
 	for i, dt := range []time.Duration{0, time.Minute, time.Hour, 24 * time.Hour, 30 * 24 * time.Hour} {
 		now = now.Add(dt)
-		if admin.topoAdvance(op, substrate{numVoters: 1}, false) {
+		if admin.TopoAdvance(op, substrate{NumVoters: 1}, false) {
 			t.Fatalf("tick %d (t+%s): the N=1 de-cluster boundary ADVANCED past the topology gate — that would declare a "+
 				"retire complete while the survivor is still running a clustered nats.conf", i, dt)
 		}
@@ -117,17 +117,21 @@ func TestTopoAdvanceN1BoundaryStaysNonterminal(t *testing.T) {
 // TestTopoAdvanceBoundsTheUnboundedGate is the other half: for every shape that is NOT the N=1 boundary,
 // the gate must terminate. "It will probably converge eventually" is exactly the answer #45 rejects.
 func TestTopoAdvanceBoundsTheUnboundedGate(t *testing.T) {
+	// origin: hot-update S10 plan §11.1 / TEST-BUDGET
+	if runIsolatedBrokerTest(t) {
+		return
+	}
 	cases := []struct {
 		name    string
 		sub     substrate
 		joining bool
 	}{
-		{"retire with survivors", substrate{numVoters: 3}, false},
-		{"retire from N=2 leaving 2 configured voters", substrate{numVoters: 2}, false},
-		{"join", substrate{numVoters: 3}, true},
+		{"retire with survivors", substrate{NumVoters: 3}, false},
+		{"retire from N=2 leaving 2 configured voters", substrate{NumVoters: 2}, false},
+		{"join", substrate{NumVoters: 3}, true},
 		// A JOIN can never legitimately be at numVoters<=1 (it has just promoted its joiner), but pin it
 		// anyway: the carve-out predicate must be retire-only, or a wedged join inherits an infinite wait.
-		{"join with a single voter is NOT carved out", substrate{numVoters: 1}, true},
+		{"join with a single voter is NOT carved out", substrate{NumVoters: 1}, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -137,7 +141,7 @@ func TestTopoAdvanceBoundsTheUnboundedGate(t *testing.T) {
 
 			// Before the deadline: non-terminal, but NOT blocked — a slow-but-healthy convergence
 			// must not be false-failed.
-			if admin.topoAdvance(op, tc.sub, tc.joining) {
+			if admin.TopoAdvance(op, tc.sub, tc.joining) {
 				t.Fatal("advanced past an unconverged topology gate")
 			}
 			if state, _, _ := opState(t, admin, op.OpID); state != cluster.OpStateNatsRolledOut {
@@ -146,7 +150,7 @@ func TestTopoAdvanceBoundsTheUnboundedGate(t *testing.T) {
 
 			// Past the deadline: it MUST terminate into an operator-actionable state.
 			now = now.Add(opTopoConvergeTimeout + time.Second)
-			if admin.topoAdvance(op, tc.sub, tc.joining) {
+			if admin.TopoAdvance(op, tc.sub, tc.joining) {
 				t.Fatal("advanced past an unconverged topology gate after the deadline")
 			}
 			state, _, lastErr := opState(t, admin, op.OpID)
@@ -170,10 +174,14 @@ func TestTopoAdvanceBoundsTheUnboundedGate(t *testing.T) {
 // already-elapsed deadline would BLOCK the op on its very first topology tick, converting a correct wait
 // into an instant false failure.
 func TestTopoAdvanceDeadlineIsStampedOnEntry(t *testing.T) {
+	// origin: hot-update S10 plan §11.1 / TEST-BUDGET
+	if runIsolatedBrokerTest(t) {
+		return
+	}
 	now := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
 	n, _ := d7SingleNode(t, "ctl-1")
 	admin := NewClusterAdmin(n, nil)
-	admin.now = func() time.Time { return now }
+	admin.Now = func() time.Time { return now }
 
 	// An op arriving at NATS_ROLLED_OUT carrying an ALREADY-EXPIRED catch-up deadline.
 	in := cluster.OpStartInput{
@@ -187,7 +195,7 @@ func TestTopoAdvanceDeadlineIsStampedOnEntry(t *testing.T) {
 	}
 	op, _ := cluster.OperationByID(n.RODB(), "op-stamp")
 
-	admin.toNatsRolledOut(op)
+	admin.ToNatsRolledOut(op)
 
 	after, _ := cluster.OperationByID(n.RODB(), "op-stamp")
 	if after.OpState != cluster.OpStateNatsRolledOut {
@@ -211,13 +219,17 @@ func TestTopoAdvanceDeadlineIsStampedOnEntry(t *testing.T) {
 // error, in bounded time. The two holes were (1) a probe that errors every tick returned before the
 // deadline was ever consulted, and (2) an op with catchup_deadline == 0 had no deadline at all.
 func TestCatchingUpIsAlwaysBounded(t *testing.T) {
+	// origin: hot-update S10 plan §11.1 / TEST-BUDGET
+	if runIsolatedBrokerTest(t) {
+		return
+	}
 	// (1) a probe that fails FOREVER must still hit the deadline.
 	t.Run("a permanently failing probe still terminates", func(t *testing.T) {
 		now := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
 		n, _ := d7SingleNode(t, "ctl-1")
 		admin := NewClusterAdmin(n, nil)
-		admin.now = func() time.Time { return now }
-		admin.caughtUpFn = func(string, uint64) (bool, error) { return false, errNeverReachable }
+		admin.Now = func() time.Time { return now }
+		admin.CaughtUpFn = func(string, uint64) (bool, error) { return false, errNeverReachable }
 
 		in := cluster.OpStartInput{
 			OpID: "op-probe", Kind: cluster.OpKindJoin, TargetNode: "brk-j",
@@ -231,10 +243,10 @@ func TestCatchingUpIsAlwaysBounded(t *testing.T) {
 		op, _ := cluster.OperationByID(n.RODB(), "op-probe")
 
 		// Before the deadline the op stays put — a probe blip is not a failure.
-		if admin.driveCatchingUp(op, substrate{phase: phaseCatchingUp}) {
+		if admin.DriveCatchingUp(op, substrate{Phase: phaseCatchingUp}) {
 			t.Fatal("a failing probe must not count as progress")
 		}
-		admin.boundCatchingUp(op)
+		admin.BoundCatchingUp(op)
 		if s, _, _ := opState(t, admin, "op-probe"); s != cluster.OpStateCatchingUp {
 			t.Fatalf("the op was terminated before its deadline (%s)", s)
 		}
@@ -242,7 +254,7 @@ func TestCatchingUpIsAlwaysBounded(t *testing.T) {
 		// Past it, the op MUST become actionable.
 		now = now.Add(3 * time.Minute)
 		op, _ = cluster.OperationByID(n.RODB(), "op-probe")
-		admin.boundCatchingUp(op)
+		admin.BoundCatchingUp(op)
 		s, _, lastErr := opState(t, admin, "op-probe")
 		if s != cluster.OpStateBlocked {
 			t.Fatalf("a catch-up probe that fails EVERY tick left the op at %s forever — it never reaches the deadline "+
@@ -258,7 +270,7 @@ func TestCatchingUpIsAlwaysBounded(t *testing.T) {
 		now := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
 		n, _ := d7SingleNode(t, "ctl-1")
 		admin := NewClusterAdmin(n, nil)
-		admin.now = func() time.Time { return now }
+		admin.Now = func() time.Time { return now }
 
 		in := cluster.OpStartInput{
 			OpID: "op-nodl", Kind: cluster.OpKindJoin, TargetNode: "brk-j",
@@ -271,7 +283,7 @@ func TestCatchingUpIsAlwaysBounded(t *testing.T) {
 		}
 		op, _ := cluster.OperationByID(n.RODB(), "op-nodl")
 
-		admin.boundCatchingUp(op)
+		admin.BoundCatchingUp(op)
 
 		after, _ := cluster.OperationByID(n.RODB(), "op-nodl")
 		if after.OpState == cluster.OpStateBlocked {
@@ -287,7 +299,7 @@ func TestCatchingUpIsAlwaysBounded(t *testing.T) {
 		// And once stamped, it is bounded like any other op.
 		now = now.Add(opCatchupMaxWindow + time.Hour)
 		op2, _ := cluster.OperationByID(n.RODB(), "op-nodl")
-		admin.boundCatchingUp(op2)
+		admin.BoundCatchingUp(op2)
 		if s, _, _ := opState(t, admin, "op-nodl"); s != cluster.OpStateBlocked {
 			t.Fatalf("the freshly stamped deadline never fired (state %s)", s)
 		}
@@ -299,7 +311,7 @@ func TestCatchingUpIsAlwaysBounded(t *testing.T) {
 		now := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
 		n, _ := d7SingleNode(t, "ctl-1")
 		admin := NewClusterAdmin(n, nil)
-		admin.now = func() time.Time { return now }
+		admin.Now = func() time.Time { return now }
 
 		in := cluster.OpStartInput{
 			OpID: "op-once", Kind: cluster.OpKindJoin, TargetNode: "brk-j",
@@ -310,14 +322,14 @@ func TestCatchingUpIsAlwaysBounded(t *testing.T) {
 			t.Fatal(err)
 		}
 		op, _ := cluster.OperationByID(n.RODB(), "op-once")
-		admin.boundCatchingUp(op)
+		admin.BoundCatchingUp(op)
 		first, _ := cluster.OperationByID(n.RODB(), "op-once")
 
 		// Ten more ticks, clock advancing. The deadline must not move.
 		for i := 0; i < 10; i++ {
 			now = now.Add(10 * time.Second)
 			cur, _ := cluster.OperationByID(n.RODB(), "op-once")
-			admin.boundCatchingUp(cur)
+			admin.BoundCatchingUp(cur)
 		}
 		last, _ := cluster.OperationByID(n.RODB(), "op-once")
 		if last.CatchupDeadline != first.CatchupDeadline {

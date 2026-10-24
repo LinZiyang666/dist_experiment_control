@@ -28,7 +28,7 @@ func TestContestedRegisterReplyMustNotClearPendingExits(t *testing.T) {
 	c := newProcCourier(nil)
 	c.enqueueExit("pid-alpha", 7)
 
-	c.onRegisterSuccess(proto.NodeRegisterResp{
+	c.onRegisterSuccess(c.registerReceipt(), c.pendingExitSnapshot(), proto.NodeRegisterResp{
 		OK:    true,
 		Lease: &proto.NodeLease{AssignedNID: "gpu1-02", Basename: "gpu1"},
 	})

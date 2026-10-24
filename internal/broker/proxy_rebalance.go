@@ -69,6 +69,20 @@ func (b *Broker) rebalanceProxyHomes(dryRun bool) (*adminsock.ProxyRebalanceRepo
 	// 3. Greedy balance plan (pure, so it is adversarially unit-testable without a DB/raft harness).
 	plan := planProxyRebalance(voters, allocs)
 	rep.Planned = len(plan)
+	// Plan over the actual voter set. Filtering a maintained destination silently
+	// changes the operator's plan and churns unrelated proxies during a cut.
+	// origin: hot-update S6 internal review rv-cluster-10
+	for _, move := range plan {
+		for _, home := range []string{move.from, move.to} {
+			if proxyHomeMaintained(b, home) {
+				_, record, err := readHomeMaintenance(b.read().SQL(), home)
+				if err != nil {
+					return rep, err
+				}
+				return rep, &HomeMaintenanceDeferredError{Home: home, CutID: record.CutID}
+			}
+		}
+	}
 
 	// 4. Materialize the report; execute unless dry-run. Per-sid keyset (keys + epoch) is gathered once
 	//    and reused across that sid's moves (the directive carries the keyset epoch, not the home epoch).
@@ -84,7 +98,7 @@ func (b *Broker) rebalanceProxyHomes(dryRun bool) (*adminsock.ProxyRebalanceRepo
 		if !ok {
 			keys, _ = b.activeProxyKeys(m.a.SID)
 			keysCache[m.a.SID] = keys
-			ep, _ := session.GetProxyEpoch(b.cfg.DB, m.a.SID)
+			ep, _ := session.GetProxyEpoch(b.read().SQL(), m.a.SID)
 			epochCache[m.a.SID] = ep
 		}
 		err := b.moveProxyHomeTo(nc, m.a, m.to, keys, epochCache[m.a.SID])
@@ -160,22 +174,16 @@ func planProxyRebalance(voters []string, allocs []*port.Allocation) []plannedMov
 // on the new home. Does NOT touch the reaper's per-port dwell/event marks — a rebalance is one-shot, and
 // the next reaper tick re-arms them cleanly once the new (healthy) home is observed.
 func (b *Broker) moveProxyHomeTo(nc *nats.Conn, existing *port.Allocation, target string, keys []proto.ProxyKey, epoch int64) error {
+	// origin: hot-update S6 plan §7.2 / T41
+	upd, err := committedHomeMove(b, existing, target)
+	if err != nil {
+		return err
+	}
 	b.pubSysEvent(evHomeReassignStarted, map[string]any{
 		"kind": "proxy", "sid": existing.SID, "nid": existing.NID, "port": existing.Port,
 		"from_broker": existing.HomeBroker, "to_broker": target, "epoch": existing.Epoch, "reason": "rebalance",
 	})
-	var newEpoch int64
-	if err := b.cl.node.Propose(func(db *sql.DB) (*cluster.Command, error) {
-		ne, cmd, perr := port.PlanReassignHome(db, existing.Port, target, b.cfg.Now())
-		newEpoch = ne
-		return cmd, perr
-	}); err != nil {
-		b.pubSysEvent(evHomeReassignFailed, map[string]any{
-			"kind": "proxy", "sid": existing.SID, "port": existing.Port,
-			"from_broker": existing.HomeBroker, "to_broker": target, "reason": classifyRehomeErr(err),
-		})
-		return err
-	}
+	newEpoch := upd.Epoch
 	// Parity with rehomeProxy (R3): announce the transient unready before succeeded, so a readiness
 	// consumer sees the same event stream for an operator rebalance as for a failure-driven rehome.
 	b.pubSysEvent("proxy_node_unready", map[string]any{"sid": existing.SID, "nid": existing.NID})
@@ -185,9 +193,7 @@ func (b *Broker) moveProxyHomeTo(nc *nats.Conn, existing *port.Allocation, targe
 	})
 	// Re-push the Home directive immediately (the reaper would also catch this on its next tick, but the
 	// inline push makes the switch prompt — mirrors rehomeProxy). Re-lookup to read the committed home.
-	if upd, err := port.LookupProxyByNode(b.cfg.DB, existing.SID, existing.NID); err == nil && upd != nil {
-		b.pushProxyDirectiveWithHome(nc, existing.SID, existing.NID, upd, keys, epoch)
-	}
+	b.pushProxyDirectiveWithHome(nc, existing.SID, existing.NID, upd, keys, epoch)
 	return nil
 }
 
@@ -199,23 +205,30 @@ func (b *Broker) eligibleProxyHomes() []string {
 	// BEFORE flipping VOTER->DRAINING, so a draining node is still phase=VOTER in this window and must be
 	// excluded as a rebalance target (mirrors the allocatePort guard, clusterwrite.go:550). A read error →
 	// treat as no-draining and proceed unfiltered rather than stall EVERY rehome on a transient error.
-	draining, _ := cluster.DrainingNodes(b.cfg.DB)
+	draining, _ := cluster.DrainingNodes(b.read().SQL())
 	rows, err := b.read().Query(`SELECT node_id FROM cluster_nodes WHERE phase='VOTER' AND cert_fp != '' AND public_host != '' ORDER BY node_id`)
 	if err != nil {
 		return nil
 	}
 	defer func() { _ = rows.Close() }()
-	var out []string
+	var candidates []string
 	for rows.Next() {
 		var id string
 		if err := rows.Scan(&id); err != nil {
-			return out
+			return nil
 		}
+		candidates = append(candidates, id)
+	}
+	if rows.Err() != nil {
+		return nil
+	}
+	_ = rows.Close()
+	var out []string
+	for _, id := range candidates {
 		if slices.Contains(draining, id) {
-			continue // A9: never rebalance a proxy home onto a draining broker
+			continue
 		}
-		// Self (the leader) is always reachable to itself; a remote home must be REACHABLE per §17.
-		if id == b.selfID || b.homeReachable(id) {
+		if id == b.selfID || b.homeReachable(id) || proxyHomeMaintained(b, id) {
 			out = append(out, id)
 		}
 	}
@@ -228,12 +241,16 @@ func (b *Broker) eligibleProxyHomes() []string {
 // tick). Returns minimal Allocations carrying the fields moveProxyHomeTo needs (Port/SID/NID/HomeBroker/
 // Epoch). The skipped not-ready / dead-homed proxies are the reaper's job, not rebalance's.
 func (b *Broker) movableProxyAllocs(voterSet map[string]bool) ([]*port.Allocation, error) {
+	// Read readiness in this same query. A nested lookup while rows owns the
+	// sole connection deadlocks before the maintenance plan can defer.
+	// origin: hot-update S6 internal review rv-cluster-10
 	rows, err := b.read().Query(`
-		SELECT pa.sid, pa.nid, pa.port, pa.home_broker, pa.epoch
+		SELECT pa.sid, pa.nid, pa.port, pa.home_broker, pa.epoch, pa.token_hash, pa.name, pa.state
 		FROM port_allocations pa
 		JOIN sessions s ON s.sid = pa.sid
+ JOIN nodes n ON n.sid=pa.sid AND n.nid=pa.nid
 		WHERE pa.name = '__proxy__' AND pa.state = 'ALLOCATED'
-		  AND s.state = 'ACTIVE' AND s.proxy_enabled = 1
+		  AND s.state = 'ACTIVE' AND s.proxy_enabled = 1 AND n.proxy_ready=1
 		ORDER BY pa.port`)
 	if err != nil {
 		return nil, err
@@ -243,15 +260,12 @@ func (b *Broker) movableProxyAllocs(voterSet map[string]bool) ([]*port.Allocatio
 	for rows.Next() {
 		var a port.Allocation
 		var home sql.NullString
-		if err := rows.Scan(&a.SID, &a.NID, &a.Port, &home, &a.Epoch); err != nil {
+		if err := rows.Scan(&a.SID, &a.NID, &a.Port, &home, &a.Epoch, &a.TokenHash, &a.Name, &a.State); err != nil {
 			return nil, err
 		}
 		a.HomeBroker = home.String
 		if a.HomeBroker == "" || !voterSet[a.HomeBroker] {
 			continue // unhomed / dead-home proxy → the reaper's auto-rehome owns it, not rebalance
-		}
-		if !b.nodeProxyReady(a.SID, a.NID) {
-			continue // mid-establishment / strand → leave it to the reaper (don't churn an unstable proxy)
 		}
 		ac := a
 		out = append(out, &ac)

@@ -74,7 +74,7 @@ func TestWebhookRejectedDeliveryIsLiveButNotDelivered(t *testing.T) {
 	}
 
 	var beats atomic.Int64
-	p.beat = func() { beats.Add(1) }
+	p.Beat = func() { beats.Add(1) }
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -130,13 +130,13 @@ func TestWebhookLoopBeatTracksCompletedIterations(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newWebhookPoster: %v", err)
 	}
-	p.client = &http.Client{Transport: externalReviewRoundTripper(func(*http.Request) (*http.Response, error) {
+	p.Client = &http.Client{Transport: externalReviewRoundTripper(func(*http.Request) (*http.Response, error) {
 		hits.Add(1)
 		return &http.Response{StatusCode: http.StatusUnauthorized, Body: http.NoBody}, nil
 	})}
 
 	var beats atomic.Int64
-	p.beat = func() { beats.Add(1) }
+	p.Beat = func() { beats.Add(1) }
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() { defer close(done); p.Run(ctx) }()

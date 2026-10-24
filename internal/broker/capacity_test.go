@@ -8,6 +8,7 @@ import (
 
 	"github.com/LinZiyang666/tether/internal/jsstream"
 	"github.com/LinZiyang666/tether/internal/proto"
+	"github.com/LinZiyang666/tether/internal/xfertrack"
 )
 
 // capacity_test.go (G6 #21 + smalldisk) — the OBJ_xfer bucket sizing invariants: the computed
@@ -224,18 +225,18 @@ func TestXferSizingSurvivesMissingDependencies(t *testing.T) {
 func TestOneObjectBucketCapRejectsASecondMaxTransferInTheSameSession(t *testing.T) {
 	tracker := newTransferTracker()
 	bucket := proto.XferBucketName("lab")
-	first := &transferEntry{
-		transferID: "first", sid: "lab", tier: "b", bucket: bucket,
-		size: proto.XferMaxBytes,
-	}
-	second := &transferEntry{
-		transferID: "second", sid: "lab", tier: "b", bucket: bucket,
-		size: proto.XferMaxBytes,
-	}
-	if code := tracker.put(first); code != "" {
+	first := xfertrack.NewLegacyEntry(xfertrack.LegacyRecord{
+		TransferID: "first", SID: "lab", Tier: "b", Bucket: bucket,
+		Size: proto.XferMaxBytes,
+	})
+	second := xfertrack.NewLegacyEntry(xfertrack.LegacyRecord{
+		TransferID: "second", SID: "lab", Tier: "b", Bucket: bucket,
+		Size: proto.XferMaxBytes,
+	})
+	if code := putLegacyTransfer(tracker, first); code != "" {
 		t.Fatalf("first transfer unexpectedly refused: %s", code)
 	}
-	if code := tracker.put(second); code == "" {
+	if code := putLegacyTransfer(tracker, second); code == "" {
 		t.Fatalf("tracker admitted two %d-byte objects into one %d-byte bucket; both pass per-request "+
 			"admission but their aggregate cannot fit, so one fails mid-Put", proto.XferMaxBytes, xferBucketCap)
 	}

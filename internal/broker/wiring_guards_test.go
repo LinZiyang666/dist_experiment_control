@@ -33,6 +33,11 @@ type wiredCall struct {
 }
 
 var requiredWirings = []wiredCall{
+	// origin: hot-update S7 plan §5.1 / P13; both sides of the move remain wired.
+	{
+		file: "xfer_inflight.go", fn: "xferInflightDir", call: ".InflightDir()",
+		because: "the broker adapter must use the leaf that owns the single-broker fallback.",
+	},
 	{
 		file: "transfer.go", fn: "handlePushReq", call: "transferRequestBounds(",
 		because: "BT-F5's length bounds. Unwired, one push.req can carry max_payload into the " +
@@ -58,7 +63,7 @@ var requiredWirings = []wiredCall{
 			"failure mode this whole file exists for. origin: increment 2 internal review, six lanes.",
 	},
 	{
-		file: "xfer_inflight.go", fn: "xferInflightDir", call: "xferLedgerSubdir(",
+		file: "../xferledger/disk.go", fn: "InflightDir", call: "LegacySubdir(",
 		because: "#57's single-broker ledger fallback. Unwired, install.sh's commented-out " +
 			"data_dir means the ledger does not exist and the protected set is always empty — " +
 			"which the reaper reads as 'nobody owns any of these objects'.",

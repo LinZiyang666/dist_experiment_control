@@ -140,6 +140,7 @@ func TestRepeatedLeaseAssignmentsDoNotSpinTheSessionLoop(t *testing.T) {
 // which on the unsupervised setsid deployment leaves the node down for good.
 // Every other rebuild path (roster.go's two) sets the flag before calling
 // fin.Do(teardownRebuild).
+// origin: S8 internal review FIX-AGENTRACE-A F2
 func TestLeaseAdoptionTearsDownWithTheRebuildIntent(t *testing.T) {
 	url := testharness.StartNATS(t)
 	oldClose, oldGrace := closeBudget, poisonGrace

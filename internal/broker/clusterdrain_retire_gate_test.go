@@ -107,12 +107,12 @@ func TestDrainWithoutRetireIsNotRefusedByTheRetireGate(t *testing.T) {
 // a deploy-tier drill rather than a unit test. What can be pinned here is the ordering
 // itself, which is the whole of the fix and is exactly what a future edit would undo.
 func TestDrainBumpsThePhaseBeforeWaitingForConvergence(t *testing.T) {
-	src, err := os.ReadFile("clusterdrain.go")
+	src, err := os.ReadFile("../brokercontrol/clusterdrain.go")
 	if err != nil {
 		t.Fatalf("read source: %v", err)
 	}
 	fset := token.NewFileSet()
-	f, perr := parser.ParseFile(fset, "clusterdrain.go", src, 0)
+	f, perr := parser.ParseFile(fset, "../brokercontrol/clusterdrain.go", src, 0)
 	if perr != nil {
 		t.Fatalf("parse: %v", perr)
 	}
@@ -130,11 +130,11 @@ func TestDrainBumpsThePhaseBeforeWaitingForConvergence(t *testing.T) {
 			"is scanning for a function that no longer exists, so it can never report anything")
 	}
 
-	phaseAt := strings.Index(body, "a.setPhase(nodeID, phaseDraining")
-	waitAt := strings.Index(body, "a.awaitHomeConvergence(")
+	phaseAt := strings.Index(body, "a.SetPhase(nodeID, PhaseDraining")
+	waitAt := strings.Index(body, "a.AwaitHomeConvergence(")
 	if phaseAt < 0 || waitAt < 0 {
 		t.Fatalf("SELF-CHECK FAILED: the scanner no longer matches DrainNode's real shape "+
-			"(setPhase found=%v, awaitHomeConvergence found=%v)", phaseAt >= 0, waitAt >= 0)
+			"(SetPhase found=%v, AwaitHomeConvergence found=%v)", phaseAt >= 0, waitAt >= 0)
 	}
 	if phaseAt > waitAt {
 		t.Fatal("DrainNode waits for data-plane convergence BEFORE bumping the phase to DRAINING.\n\n" +

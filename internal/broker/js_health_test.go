@@ -168,7 +168,7 @@ func TestG7JSUnavailableNonDemoteClear(t *testing.T) {
 	if jsFlag {
 		t.Fatal("a non-10008 observe error must CLEAR the JS-503 signal (inv-6 no-stuck-ACTIVE), even while leader")
 	}
-	if !rec.jsDownSince.IsZero() {
+	if !rec.JsDownSince.IsZero() {
 		t.Fatal("the non-10008 clear must also zero jsDownSince so a later real 503 re-accrues the full threshold")
 	}
 	if !f.leader {

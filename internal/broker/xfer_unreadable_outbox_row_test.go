@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/schema"
+	"github.com/LinZiyang666/tether/internal/xfertrack"
 )
 
 // xfer_unreadable_outbox_row_test.go — the ROW-level twin of the R6-F1 census guard.
@@ -51,7 +52,7 @@ func TestUnreadableOutboxRowMustNotLicenseASyntheticTerminal(t *testing.T) {
 	n, _ := d7SingleNode(t, "unreadable-outbox-row")
 	now := time.Now().UTC()
 	root := t.TempDir()
-	b := &Broker{transfers: newTransferTracker()}
+	b := &Broker{transfers: xfertrack.NewLegacyTracker()}
 	b.cfg = Config{ClusterDataDir: root, Logger: silentLogger(), Now: func() time.Time { return now }}
 	b.cl = &clusterRuntime{node: n}
 
@@ -153,7 +154,7 @@ func TestUnfinalizableTransferIsReportedOnEveryPass(t *testing.T) {
 	root := t.TempDir()
 
 	var logBuf lockedBuffer
-	b := &Broker{transfers: newTransferTracker()}
+	b := &Broker{transfers: xfertrack.NewLegacyTracker()}
 	b.cfg = Config{
 		ClusterDataDir: root,
 		Logger:         slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelWarn})),

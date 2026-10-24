@@ -26,6 +26,7 @@ func TestD9BroadcastClusterSubjectClassification(t *testing.T) {
 		p + ".s.*.cmd.by.*.node.*.expose-rm.req",
 		p + ".s.*.cmd.by.*.node.*.run.req",
 		p + ".s.*.cmd.by.*.node.*.exec.req",
+		p + ".s.*.cmd.by.*.node.*.process-resume.req",
 		p + ".s.*.cmd.by.*.node.*.kill.req",
 	}
 	for _, s := range broadcast {

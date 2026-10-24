@@ -43,6 +43,10 @@ func b5SeedPortParent(t *testing.T, n *cluster.Node, port int, homeBroker string
 // not inflate the band. disk_free_pct is filled (StoreDir set, real tmp dir). Both ride
 // ONLY the self row.
 func TestB5CapacityIsSelfRowAndHomeScoped(t *testing.T) {
+	// origin: hot-update S10 plan §11.1 / TEST-BUDGET
+	if runIsolatedBrokerTest(t) {
+		return
+	}
 	n, addr := d7SingleNode(t, "single-1")
 	admin := NewClusterAdmin(n, nil)
 	in := d7JoinInput(t, "single-1", addr)
@@ -114,6 +118,10 @@ func TestB5CapacityAbsentWithoutProbes(t *testing.T) {
 // derived CertValidSecs is positive, and an IN-WINDOW (near-expiry) cert appends the
 // advisory to the banner WITHOUT changing Health/ExitCode vs a fresh cert.
 func TestB5CertRoundTripAndAdvisoryNoHealthChange(t *testing.T) {
+	// origin: hot-update S10 plan §11.1 / TEST-BUDGET
+	if runIsolatedBrokerTest(t) {
+		return
+	}
 	n, addr := d7SingleNode(t, "single-1")
 	admin := NewClusterAdmin(n, nil)
 	in := d7JoinInput(t, "single-1", addr)
@@ -131,7 +139,7 @@ func TestB5CertRoundTripAndAdvisoryNoHealthChange(t *testing.T) {
 	// Rotate with a SHORT window so CertValidSecs lands inside window/8 → advisory.
 	// window/8 of 24h = 3h; pick valid_until = now + 1h (well within), window arg 24h.
 	if err := n.Propose(func(*sql.DB) (*cluster.Command, error) {
-		return cluster.PlanClusterCertRotate("single-1", "sha256:NEW", admin.now().Add(time.Hour), admin.now())
+		return cluster.PlanClusterCertRotate("single-1", "sha256:NEW", admin.Now().Add(time.Hour), admin.Now())
 	}); err != nil {
 		t.Fatalf("cert rotate propose: %v", err)
 	}

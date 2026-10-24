@@ -32,7 +32,7 @@ func retireBoundsAdmin(t *testing.T, opID, state string, now *time.Time) (*Clust
 	t.Helper()
 	n, _ := d7SingleNode(t, "ctl-1")
 	admin := NewClusterAdmin(n, nil)
-	admin.now = func() time.Time { return *now }
+	admin.Now = func() time.Time { return *now }
 
 	in := cluster.OpStartInput{
 		OpID: opID, Kind: cluster.OpKindRetire, TargetNode: "ctl-2",
@@ -69,8 +69,8 @@ func TestARetriedRetireStepEndsInBlocked(t *testing.T) {
 	st, _, lastErr := opState(t, admin, op.OpID)
 	if st != cluster.OpStateBlocked {
 		t.Fatalf("after %d identical failures the op is state=%s.\n\n"+
-			"An unbounded hold fences the entire membership plane (assertNoActiveOp) behind an "+
-			"operation that will never finish, and the only evidence is a last_error field nobody "+
+			"An unbounded hold fences the entire membership plane (AssertNoActiveOp) behind an "+
+			"operation that will never Finish, and the only evidence is a last_error field nobody "+
 			"is watching. BLOCKED is loud and operator-recoverable.", opMaxAttempts, st)
 	}
 	if lastErr == "" {
@@ -85,6 +85,10 @@ func TestARetriedRetireStepEndsInBlocked(t *testing.T) {
 // last_error and delay in front of a human — the controller ticks every 5s, so the cost
 // is seconds rather than the "fifty minutes" this comment once claimed (round 2, G-4).
 func TestADeterministicRetireStepBlocksImmediately(t *testing.T) {
+	// origin: hot-update S10 plan §11.1 / TEST-BUDGET
+	if runIsolatedBrokerTest(t) {
+		return
+	}
 	cases := []struct {
 		name string
 		err  error
@@ -102,7 +106,7 @@ func TestADeterministicRetireStepBlocksImmediately(t *testing.T) {
 			st, _, lastErr := opState(t, admin, op.OpID)
 			if st != cluster.OpStateBlocked {
 				t.Fatalf("a deterministic failure left the op state=%s after ONE attempt.\n\n"+
-					"Retrying %v cannot change its outcome. Every retry is another controller tick "+
+					"Retrying %v cannot change its outcome. Every retry is another controller Tick "+
 					"before the operator is shown a problem only they can fix.", st, tc.err)
 			}
 			if lastErr == "" {
@@ -121,7 +125,7 @@ func TestEveryRetireStepFailureIsRouted(t *testing.T) {
 	// recordOpError inside driveRetire is the shape that holds forever. The convergence
 	// hold is the ONE legitimate one: it has its own crash-safe replicated deadline
 	// (boundRehomeConvergence) and is only reached after that deadline was stamped.
-	body := functionBody(t, src, "driveRetire")
+	body := functionBody(t, src, "DriveRetire")
 
 	// The ALLOW-LIST, with the reason each one earns its place. Anything else that calls
 	// recordOpError inside driveRetire is a step failure that can hold forever, and this
@@ -144,26 +148,26 @@ func TestEveryRetireStepFailureIsRouted(t *testing.T) {
 	// boundRehomeConvergence for an EARLIER state of the same op, so a second user of that
 	// field would inherit a deadline stamped for a different wait.
 	allowed := map[string]string{
-		"a.recordOpError(op, holdErr)": "data-plane convergence — carries boundRehomeConvergence's own replicated deadline",
-		`a.recordOpError(op, errors.New("streams not at target replica count yet"))`:                 "replication catch-up; a condition that can still become true",
-		`a.recordOpError(op, errors.New("streams regressed below target before removal — holding"))`: "same condition, re-checked immediately before the irreversible step",
+		"a.RecordOpError(op, holdErr)": "data-plane convergence — carries BoundRehomeConvergence's own replicated deadline",
+		`a.RecordOpError(op, errors.New("streams not at target replica count yet"))`:                 "replication catch-up; a condition that can still become true",
+		`a.RecordOpError(op, errors.New("streams regressed below target before removal — holding"))`: "same condition, re-checked immediately before the irreversible step",
 	}
-	total := countOccurrences(body, "a.recordOpError(op,")
+	total := countOccurrences(body, "a.RecordOpError(op,")
 	accounted := 0
 	for call := range allowed {
 		n := countOccurrences(body, call)
 		if n == 0 {
-			t.Errorf("the allow-list names a call that is no longer in driveRetire:\n  %s\n\n"+
+			t.Errorf("the allow-list names a call that is no longer in DriveRetire:\n  %s\n\n"+
 				"An allow-list entry that matches nothing is a permanent exemption for a site that "+
 				"may have been replaced by an unbounded one.", call)
 		}
 		accounted += n
 	}
 	if total != accounted {
-		t.Fatalf("driveRetire has %d recordOpError call(s); %d are accounted for by the allow-list.\n\n"+
-			"recordOpError is non-terminal forever and does not count attempts, so an unaccounted one "+
-			"can fence the whole membership plane (assertNoActiveOp) behind an operation that will "+
-			"never finish. Route it through retireStepFailed, or add it here WITH the reason it is a "+
+		t.Fatalf("DriveRetire has %d RecordOpError call(s); %d are accounted for by the allow-list.\n\n"+
+			"RecordOpError is non-terminal forever and does not count attempts, so an unaccounted one "+
+			"can Fence the whole membership plane (AssertNoActiveOp) behind an operation that will "+
+			"never Finish. Route it through RetireStepFailed, or add it here WITH the reason it is a "+
 			"wait rather than a failure.", total, accounted)
 	}
 }
@@ -220,7 +224,7 @@ func TestRetireReadinessAsksAboutTheClusterAfterRemoval(t *testing.T) {
 // helper is how a scanner silently stops matching.
 func readSourceForRetireScan(t *testing.T) string {
 	t.Helper()
-	b, err := os.ReadFile("cluster_operation_controller.go")
+	b, err := os.ReadFile("../brokercontrol/cluster_operation_drive.go")
 	if err != nil {
 		t.Fatalf("read source: %v", err)
 	}
@@ -329,7 +333,7 @@ func TestClusterStreamsReadyUsesThePlacementAwarePredicate(t *testing.T) {
 	body := functionBody(t, string(src), "clusterStreamsReady")
 
 	if !strings.Contains(body, "replicaReportSurvivesRemoval(") {
-		t.Fatal("clusterStreamsReady does not call replicaReportSurvivesRemoval.\n\n" +
+		t.Fatal("clusterStreamsReady does not call ReplicaReportSurvivesRemoval.\n\n" +
 			"Whatever the helper does, production is not asking it — which is exactly how #15's " +
 			"first version passed every gate while the fix could be reverted at the call site.")
 	}

@@ -3,12 +3,12 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"strconv"
 	"text/tabwriter"
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/adminsock"
 	"github.com/LinZiyang666/tether/internal/cli"
+	"github.com/LinZiyang666/tether/internal/infracli"
 	"github.com/spf13/cobra"
 )
 
@@ -31,6 +31,7 @@ with read+write access to the socket file (mode 0600 — typically the
 	root.PersistentFlags().StringVar(&socketPath, "socket", defaultAdminSocket,
 		"path to the broker admin Unix socket")
 
+	root.AddCommand(infracli.AdminCommand(func() string { return socketPath }, infracli.AdminPorts{Call: infracli.CallAdmin, Exit: func(err error) error { return err }}))
 	root.AddCommand(newAdminSessionsCmd(&socketPath))
 	root.AddCommand(newAdminNodesCmd(&socketPath))
 	root.AddCommand(newAdminAuditCmd(&socketPath))
@@ -166,107 +167,8 @@ diagnose a stalled reconciler by watching its last_tick stop advancing.`,
 	return cmd
 }
 
-// renderAdminRuntime prints the human table for `admin runtime`. -1 counts (a platform where
-// /proc/self is unreadable) render as "n/a" so an operator never mistakes an unmeasurable value
-// for a real zero.
-func renderAdminRuntime(cmd *cobra.Command, rep *adminsock.RuntimeReport) error {
-	w := cmd.OutOrStdout()
-	_, _ = fmt.Fprintf(w, "goroutines : %d\n", rep.Goroutines)
-	_, _ = fmt.Fprintf(w, "threads    : %d\n", rep.Threads)
-	_, _ = fmt.Fprintf(w, "open_fds   : %s\n", intOrNA(rep.OpenFDs))
-	_, _ = fmt.Fprintf(w, "rss        : %s\n", rssHuman(rep.RSSBytes))
-	_, _ = fmt.Fprintf(w, "uptime     : %s\n", time.Duration(rep.UptimeSeconds*float64(time.Second)).Round(time.Second))
-	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
-	// SLOWEST is maxDur, not lastDur: a pass that wedged once and then recovered is exactly what an
-	// operator is looking for here, and a last-tick-only column would have already forgotten it.
-	// OVERRUNS says how many of those completions took longer than the pass's own interval.
-	_, _ = fmt.Fprintln(tw, "\nRECONCILER\tINTERVAL\tAUTHORITY\tLAST_TICK\tRUNS\tSKIPS\tSLOWEST\tOVERRUNS\tLAST_ERR")
-	now := time.Now()
-	for _, r := range rep.Reconcilers {
-		last := "never"
-		if !r.LastTick.IsZero() {
-			last = humaneAge(now.Sub(r.LastTick)) + " ago"
-		}
-		slowest := "-"
-		if r.MaxDurMS > 0 {
-			slowest = (time.Duration(r.MaxDurMS) * time.Millisecond).String()
-		}
-		_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%d\t%d\t%s\t%d\t%s\n",
-			r.Name, time.Duration(r.IntervalMS)*time.Millisecond, dashIfEmptyAdmin(r.Authority),
-			last, r.Runs, r.Skips, slowest, r.Overruns, dashIfEmptyAdmin(r.LastErr))
-	}
-	if len(rep.Reconcilers) == 0 {
-		_, _ = fmt.Fprintln(tw, "(no reconcilers registered)")
-	}
-
-	// The cluster loops own their own tickers, so they are NOT registry passes and get their own table.
-	// Reading it: a periodic loop (CADENCE set) whose ITERS is 0, or whose LAST_ITER stopped advancing,
-	// is wedged or died on its first line. An event-driven loop (CADENCE "-") with ITERS 0 has simply
-	// had nothing to do. Before this existed the only signal was STARTED, which a loop that returned
-	// immediately also has.
-	//
-	// ITERS is LIVENESS — completed iterations — for every row including alert-webhook. It is NOT
-	// "alerts delivered": a POST the endpoint rejects is still a completed iteration. Delivery outcome is
-	// the separate ALERT_WEBHOOK table below (external review B2-4; this legend previously said
-	// "delivered", which is what made the two readings collide).
-	if len(rep.ClusterLoops) > 0 {
-		_, _ = fmt.Fprintln(tw, "\nCLUSTER_LOOP\tCADENCE\tSTARTED\tITERS\tLAST_ITER")
-		for _, l := range rep.ClusterLoops {
-			cadence := "-"
-			if l.CadenceMS > 0 {
-				cadence = (time.Duration(l.CadenceMS) * time.Millisecond).String()
-			}
-			started, lastIter := "never", "never"
-			if !l.StartedAt.IsZero() {
-				started = humaneAge(now.Sub(l.StartedAt)) + " ago"
-			}
-			// nil means the loop has never completed an iteration. For a loop with a CADENCE that is the
-			// dead signal; for an event-driven one (cadence "-") it just means nothing has happened.
-			if l.LastIter != nil && !l.LastIter.IsZero() {
-				lastIter = humaneAge(now.Sub(*l.LastIter)) + " ago"
-			}
-			_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\t%d\t%s\n", l.Name, cadence, started, l.Iterations, lastIter)
-		}
-	}
-
-	// external review B2-4: the alert webhook's DELIVERY OUTCOME, printed next to the loop table rather
-	// than inside it. ITERS above answers "did the consumer consume"; these answer "did the endpoint take
-	// it". They used to be the same number, which meant a live poster against a 401 endpoint printed
-	// ITERS 0 — the value that means DEAD in the row above.
-	//
-	// ACCEPTED+REJECTED tracks the alert-webhook row's ITERS. DROPS is counted at enqueue, so it is
-	// deliberately outside that sum: a dropped event never reached the loop.
-	if w := rep.AlertWebhook; w != nil {
-		_, _ = fmt.Fprintln(tw, "\nALERT_WEBHOOK\tACCEPTED\tREJECTED\tDROPPED_QUEUE_FULL")
-		_, _ = fmt.Fprintf(tw, "delivery\t%d\t%d\t%d\n", w.Accepted, w.Rejected, w.Drops)
-		if w.Rejected > 0 && w.Accepted == 0 {
-			_, _ = fmt.Fprintln(tw, "\t(the consumer is ALIVE and the ENDPOINT is refusing every POST — check the URL/token, not the broker)")
-		}
-	}
-	return tw.Flush()
-}
-
-func intOrNA(n int) string {
-	if n < 0 {
-		return "n/a"
-	}
-	return strconv.Itoa(n)
-}
-
-func dashIfEmptyAdmin(s string) string {
-	if s == "" {
-		return "-"
-	}
-	return s
-}
-
-// rssHuman renders a byte count as a compact MiB string; -1 → "n/a".
-func rssHuman(b int64) string {
-	if b < 0 {
-		return "n/a"
-	}
-	return fmt.Sprintf("%.1f MiB", float64(b)/(1024*1024))
-}
+// Runtime rendering lives in the CLI presentation leaf with its original rationale.
+var renderAdminRuntime = infracli.RenderAdminRuntime
 
 func newAdminSessionsCmd(socketPath *string) *cobra.Command {
 	var asJSON bool
@@ -472,18 +374,7 @@ func shortFP(fp string) string {
 	return fp[:16] + "…"
 }
 
-func humaneAge(d time.Duration) string {
-	switch {
-	case d < time.Second:
-		return "<1s"
-	case d < time.Minute:
-		return fmt.Sprintf("%ds", int(d.Seconds()))
-	case d < time.Hour:
-		return fmt.Sprintf("%dm", int(d.Minutes()))
-	default:
-		return fmt.Sprintf("%dh", int(d.Hours()))
-	}
-}
+var humaneAge = infracli.HumaneAge
 
 // newAdminSessionAllowCmd administers WHO MAY CREATE A SESSION.
 //

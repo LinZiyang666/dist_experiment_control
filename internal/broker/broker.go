@@ -23,30 +23,34 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"net"
-	"net/url"
-	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/adminsock"
 	"github.com/LinZiyang666/tether/internal/auth"
+	"github.com/LinZiyang666/tether/internal/brokercontrol"
+	"github.com/LinZiyang666/tether/internal/brokerimage"
 	"github.com/LinZiyang666/tether/internal/brokermetrics"
+	"github.com/LinZiyang666/tether/internal/brokerupgrade"
 	"github.com/LinZiyang666/tether/internal/cluster"
 	"github.com/LinZiyang666/tether/internal/clustermanifest"
 	"github.com/LinZiyang666/tether/internal/httplisten"
+	"github.com/LinZiyang666/tether/internal/infraattach"
 	"github.com/LinZiyang666/tether/internal/jsstream"
 	"github.com/LinZiyang666/tether/internal/natsconf"
-	"github.com/LinZiyang666/tether/internal/natsinbox"
 	"github.com/LinZiyang666/tether/internal/node"
 	"github.com/LinZiyang666/tether/internal/port"
 	"github.com/LinZiyang666/tether/internal/proto"
 	"github.com/LinZiyang666/tether/internal/schema"
 	"github.com/LinZiyang666/tether/internal/session"
+	"github.com/LinZiyang666/tether/internal/storage"
 	"github.com/LinZiyang666/tether/internal/subhttp"
 	"github.com/LinZiyang666/tether/internal/tunnel"
+	"github.com/LinZiyang666/tether/internal/upgradeport"
+	"github.com/LinZiyang666/tether/internal/upgradetx"
+	"github.com/LinZiyang666/tether/internal/xferauth"
+	"github.com/LinZiyang666/tether/internal/xfercontrol"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 )
@@ -55,6 +59,33 @@ import (
 // so tests can override individual pieces (timing, clock, log sink) without
 // rebuilding the whole struct.
 type Config struct {
+	// TransferFactory assembles the continuation leaves after current JetStream
+	// and cluster forwarding are available. Nil keeps the legacy capability.
+	// origin: hot-update S7 plan §5.1 / §6.3 / P22
+	TransferFactory BrokerTransferFactory
+
+	// Nil cannot prove that all original transfer owners have settled.
+	// origin: hot-update S7 plan §6.4 / T31
+	TransferSettlement xferauth.SessionBarrier
+
+	// ImageRun binds the S6 owners. Missing adapters refuse reload before fencing.
+	// origin: hot-update S6 plan §3.2 / §12.1 P11
+	ImageRun *BrokerImageRun
+	// SingleStore owns cold DB/lock cleanup until ImageRun installs its current slot.
+	// origin: hot-update S6 plan §4.2 / T02
+	SingleStore brokerimage.StoreOwner
+
+	// Upgrade binds the canonical S8 transaction journal, runtime port and
+	// admission registry. Nil leaves every transaction entry refusing before it
+	// accepts work; an incomplete binding fails New instead of serving half a route.
+	// origin: hot-update S8 plan §2.2 / §11.2 P15
+	Upgrade *brokerupgrade.Dependencies
+
+	// Infra binds the S9 ordinary auth-first descriptor and P18's recovery gate.
+	// Nil keeps the legacy connection and never advertises infra capability.
+	// origin: hot-update S9 plan §4.3–§4.4 / P22
+	Infra *infraattach.BrokerInfra
+
 	// NATSURL is the broker's connection string (e.g. "nats://127.0.0.1:4222").
 	NATSURL string
 
@@ -376,12 +407,23 @@ func (c *Config) UpgradeForwardTimeout() time.Duration {
 type Broker struct {
 	cfg Config
 
+	// upgradeEndpoint is the sole S8 transaction endpoint for upgradeKey, bound
+	// once by New; nil means unwired (every entry refuses before acceptance).
+	upgradeEndpoint upgradeport.Endpoint
+	upgradeKey      upgradetx.Key
+	// agentForward relays agent upgrade-tx requests off the subscription
+	// goroutine, so a silent agent cannot delay another agent's transaction.
+	// origin: S8 BROKER-EXPORTER R-9
+	agentForward brokerupgrade.AgentForwarder
+
 	// nc is the active NATS connection. Set by Run; nil before Run /
 	// after shutdown. Stored as atomic.Pointer so the Run shutdown
 	// path (clear on context cancel) can't race with subscription
 	// callbacks still flushing through publishAudit / publishOnConn
 	// on a different goroutine.
 	nc atomic.Pointer[nats.Conn]
+	// infra owns every broker NC dial (S9 P22): legacy or auth-first. Nil before Run.
+	infra *infraattach.Broker
 
 	// tunnelSrv is the reverse-TCP tunnel server. Non-nil (stored) only when
 	// Config.TunnelControlAddr is set. Authorizes agent REGISTERs by
@@ -468,6 +510,13 @@ type Broker struct {
 	// receiver-finalization signal arrives or the watchdog fires.
 	// file-transfer-plan §Object bucket lifecycle.
 	transfers *transferTracker
+	// Only a fully restored and bound graph is published here. In particular,
+	// an empty cold tracker must not become absence evidence for either reaper.
+	// origin: hot-update S7 plan §5.3 / M11
+	transferRuntime atomic.Pointer[BrokerTransfers]
+	// Normal-register transfer capability per node; never inferred from release.
+	// origin: hot-update S7 plan §6.2 / §9 / INTEG-D capability compatibility
+	transferAgents xfercontrol.AgentCapabilities
 
 	// xferReapMinAge is the grace below which a freshly-modified OBJ_xfer object is never reaped
 	// (external review M-3). Defaulted to xferReapMinObjectAge in New; left 0 on a zero-value test
@@ -638,12 +687,17 @@ type Broker struct {
 	xferReapSkipped   atomic.Int64
 	xferReapSkippedAt atomic.Int64
 
-	// reExecRequested (G5 #13) is set by RequestReExec so serve.go, AFTER Run's ordered shutdown returns,
-	// re-execs the (freshly-staged) on-disk binary in place (PID-preserving; immune to the #23 clean-exit
-	// trap). reloadTrigger is the run-context cancel serve.go injects so RequestReExec unwinds Run through
-	// its EXISTING teardown rather than a bespoke shutdown path.
-	reExecRequested atomic.Bool
-	reloadTrigger   context.CancelFunc
+	// Reload wakes Run without cancelling its lifetime context: cancellation would
+	// unwind the cold defers before the LISTEN/raw/lock owners could be exported.
+	// origin: hot-update S6 plan §4 / T01
+
+	transferAdmission transferAdmissionGate
+	reloadSignal      brokerimage.StoreReloadSignal
+	imageState        brokerimage.RuntimeStatus
+	// imageControl is process wiring, never exported heap state. Its current
+	// generation owns control joins and permanent listener keepers.
+	// origin: hot-update S6 plan §1.2 / rv-fd-6
+	imageControl *brokerImageControl
 
 	// clusterAdminHandle (G5 #13 W2b) routes an account-signature-verified remote upgrade trigger through
 	// the SAME local admin backend the root Unix socket uses, so the reload/transfer gates are not
@@ -791,11 +845,9 @@ func (b *Broker) publishAudit(subject string, payload []byte) error {
 	if auditTapForTest != nil {
 		auditTapForTest(subject, payload)
 	}
-	if brokerJS(b) != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-		_, err := brokerJS(b).Publish(ctx, subject, payload)
-		return err
+	// S9 P18: the one audit producer takes its permit and records the original ACK.
+	if js := brokerJS(b); js != nil {
+		return infraattach.PublishAudit(b.infra, js, &nats.Msg{Subject: subject, Data: payload}, 2*time.Second)
 	}
 	nc := b.nc.Load()
 	if nc == nil {
@@ -824,10 +876,9 @@ func publishAuditDeduped(b *Broker, subject string, payload []byte, msgID string
 	if js == nil {
 		return errBrokerNotConnected
 	}
-	// Bounded by the same 2s budget publishAudit uses.
-	// ctx-none: its caller commitSyntheticTransferTerminal takes no ctx — it runs off the ledger scan, not a request
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
+	// Bounded by the same 2s budget publishAudit uses. Its caller commitSyntheticTransferTerminal
+	// takes no ctx — it runs off the ledger scan, not a request — so the bounded context (and its
+	// ctx annotation) moved with the shared S9 audit producer, infraattach.PublishAudit.
 	// PublishMsg with an EXPLICIT header rather than js.Publish + WithMsgID: the option form
 	// is a closure over an unexported struct, so the id it carries is invisible to any test
 	// double — and "both the first publish and the crash replay use the SAME id" is the
@@ -835,8 +886,7 @@ func publishAuditDeduped(b *Broker, subject string, payload []byte, msgID string
 	// what makes that argument checkable instead of asserted.
 	msg := &nats.Msg{Subject: subject, Data: payload, Header: nats.Header{}}
 	msg.Header.Set(jetstream.MsgIDHeader, msgID)
-	_, err := js.PublishMsg(ctx, msg)
-	return err
+	return infraattach.PublishAudit(b.infra, js, msg, 2*time.Second)
 }
 
 var errBrokerNotConnected = errBrokerSentinel("broker: not connected")
@@ -874,7 +924,7 @@ func New(cfg Config) (*Broker, error) {
 			return nil, fmt.Errorf("broker: cluster mode must be constructed with a nil cfg.DB " +
 				"(the FSM owns the single WAL pool; serve.go must skip storage.Open in cluster mode)")
 		}
-	} else if cfg.DB == nil {
+	} else if cfg.DB == nil && !brokerimage.RestoredStore(cfg.ImageRun) {
 		return nil, fmt.Errorf("broker: DB required")
 	}
 	if cfg.Now == nil {
@@ -922,6 +972,13 @@ func New(cfg Config) (*Broker, error) {
 		clusterMode:    clusterMode,
 		xferReapMinAge: xferReapMinObjectAge, // M-3: production shields fresh in-flight objects
 	}
+	// The role sampler reads b.cl at each gated step: an image activation may
+	// replace the cluster runtime, and a cached Node would answer for the past.
+	// The attached port is the S8 broker cut exporter (S8 BROKER-EXPORTER R-11).
+	b.upgradeEndpoint, b.upgradeKey, err = brokerupgrade.Bind(brokerupgrade.Attach(cfg.Upgrade, brokerTransactionPort(b)), func() error { return freshBrokerRole(b) })
+	if err != nil {
+		return nil, err
+	}
 
 	// proxyGen (round-3/4/5) is this broker incarnation's ordering generation: a
 	// PERSISTED monotonic counter (max(stored+1, now_nanos)) so it advances across
@@ -934,7 +991,10 @@ func New(cfg Config) (*Broker, error) {
 	// in cluster mode (cluster.Node owns the sole writer). The single-mode DB-marker
 	// consistency check + proxy-gen are here; the cluster-mode consistency check runs
 	// in Run AFTER cluster.Node opens the DB (cfg.DB is nil until then).
-	if !clusterMode {
+	// Imported authority retains its generation; the sealed/current store has
+	// already been validated by the image opener before this constructor.
+	// origin: hot-update S6 plan §6.3 / T28
+	if !clusterMode && !brokerimage.RestoredStore(cfg.ImageRun) {
 		if err := assertClusterDBConsistent(cfg.DB, false); err != nil {
 			return nil, err
 		}
@@ -973,16 +1033,57 @@ func n1ClusteredJetStreamFatal() error {
 // If cfg.AuthCallout is non-nil, the broker presents its pre-configured
 // nkey credentials on CONNECT (so it bypasses auth_callout itself) AND
 // subscribes to $SYS.REQ.USER.AUTH to issue per-connection user JWTs.
-func (b *Broker) Run(ctx context.Context) error {
+func (b *Broker) Run(ctx context.Context) (runErr error) {
+	managed := false
+	// The closure reads the current slot at terminal stop; an exec error may have
+	// installed an entirely different DB/NC/Node in the meantime.
+	// origin: hot-update S6 plan §4.2 / T02
+	defer func() {
+		// A successful cleanup must preserve Run's original cancellation sentinel.
+		// Joining a nil cleanup error still wraps it and breaks embedded callers.
+		// origin: hot-update S6 plan §4.2 / T52
+		runErr = brokercontrol.JoinCleanupError(runErr, brokerimage.CloseColdStore(b.cfg.SingleStore, managed))
+		b.reloadSignal.Clear()
+		if managed && b.cfg.ImageRun.Slot != nil {
+			deadline, err := brokerCutDeadline()
+			if err == nil {
+				err = b.cfg.ImageRun.Slot.StopCurrent(deadline)
+			}
+			if err != nil {
+				runErr = errors.Join(runErr, err)
+			}
+		}
+	}()
+
+	// Restored lineage is installed from the validated bundle before any status
+	// snapshot. SetPhase would otherwise initialize a cold generation here.
+	// origin: hot-update S6 plan §4.1 / T01
+	if !brokerimage.RestoredStore(b.cfg.ImageRun) {
+		setBrokerImagePhase(b, proto.BrokerImagePhaseServing)
+	}
 	b.runCtx = ctx
-	// R13: stamp the process boot instant for the OpRuntime uptime BEFORE anything spawns a
-	// goroutine that could read it (the admin socket's accept loop, below). Written once here, read
-	// in runtimeSnapshot from the admin goroutine — race-free via the goroutine-start ordering. Guard
-	// nil Now: a few tests drive Run on a bare Broker literal that refuses early (e.g. the data-dir
-	// lock interlock) and never reaches broker.New's Now default; they never serve the admin socket,
-	// so bootAt staying zero (uptime 0) is correct there.
-	if b.cfg.Now != nil {
-		b.bootAt = b.cfg.Now()
+	if b.cfg.ImageRun != nil && !brokerimage.RestoredStore(b.cfg.ImageRun) {
+		b.imageControl = newBrokerImageControl(b)
+		defer func() {
+			if !managed {
+				deadline, err := brokerCutDeadline()
+				if err == nil {
+					runErr = brokercontrol.JoinCleanupError(runErr, b.imageControl.StopCurrent(deadline))
+				}
+				if b.imageControl.lock != nil && b.imageControl.store == nil {
+					runErr = brokercontrol.JoinCleanupError(runErr, b.imageControl.lock.Release())
+				}
+			}
+		}()
+	}
+	stampBrokerUptime(b)
+	// Imported store/control/listener owners are already authoritative. Re-entering
+	// the cold startup below would open a second pool/Node and run boot cleanup.
+	// origin: hot-update S6 plan §4.1 / §6.3 / T01
+	configureProductionTransferImage(b)
+	if brokerimage.RestoredStore(b.cfg.ImageRun) {
+		managed = true
+		return brokerimage.RunRestoredStore(b.cfg.ImageRun, b)
 	}
 	// Round-5 B3: hold ${ClusterDataDir}/tether.lock for the WHOLE process lifetime. The offline recovery
 	// tools already take this exact lock, but until now nothing else did — so their only protection against
@@ -991,7 +1092,7 @@ func (b *Broker) Run(ctx context.Context) error {
 	// it here makes the interlock continuous and bidirectional: a daemon refuses to start while a recovery
 	// is in flight, and a recovery refuses to start while a daemon is up. The flock dies with the process,
 	// so a crashed daemon never wedges recovery.
-	if b.cfg.ClusterDataDir != "" {
+	if b.cfg.ClusterDataDir != "" && b.cfg.ImageRun == nil {
 		release, err := cluster.AcquireDataDirLock(b.cfg.ClusterDataDir)
 		if err != nil {
 			// Round-6: do NOT print "stop the previous broker" for a PERMISSION problem. A root-run recovery
@@ -1006,6 +1107,17 @@ func (b *Broker) Run(ctx context.Context) error {
 				"  if a previous broker is still running, stop it first (systemctl stop tether-broker)", err)
 		}
 		defer release()
+	}
+	if b.cfg.ImageRun != nil && b.clusterMode {
+		identity, err := storage.CanonicalStoreIdentity(b.cfg.DBPath, b.cfg.ClusterDataDir)
+		if err != nil {
+			return err
+		}
+		b.cfg.DBPath = identity.Path
+		b.imageControl.lock, err = cluster.AcquireImageDataDirLock(identity.DataDir)
+		if err != nil {
+			return err
+		}
 	}
 	if !b.clusterMode && b.cfg.StableTunnelCertDir != "" {
 		cert, present, err := loadOptionalStableTunnelCert(b.cfg.StableTunnelCertDir)
@@ -1029,12 +1141,12 @@ func (b *Broker) Run(ctx context.Context) error {
 			return fmt.Errorf("broker: build cluster runtime: %w", err)
 		}
 		b.cl = cl
-		b.cfg.DB = cl.node.RODB()
+		bindClusterReadDB(b, cl.node.RODB())
 		if err := assertClusterDBConsistent(b.cfg.DB, true); err != nil {
 			_ = cl.node.Shutdown()
 			return err
 		}
-		defer func() { _ = b.cl.node.Shutdown() }()
+		defer brokerimage.ColdCleanup(&managed, b.cl.node.Shutdown)
 		// Early seam: stable tunnel cert + selfID, BEFORE the tunnel server is created
 		// (so it advertises the stable cert_fp that agents pin against).
 		if err := b.wireClusterEarly(); err != nil {
@@ -1042,41 +1154,42 @@ func (b *Broker) Run(ctx context.Context) error {
 		}
 	}
 
-	connOpts, ownPubKey, err := b.brokerConnectOptions()
-	if err != nil {
-		return err
-	}
-	var nc *nats.Conn
-	if ownPubKey == "" {
-		nc, err = nats.Connect(b.cfg.NATSURL, connOpts...)
-	} else {
-		var sharedInbox bool
-		nc, sharedInbox, err = natsinbox.Connect(b.cfg.NATSURL, ownPubKey, connOpts)
-		if err == nil && sharedInbox {
-			// The one failure mode brokerConnectOptions enumerates that an operator has
-			// to fix by hand: a conf that was rendered while clustered and then frozen by
-			// force-single. Loud on purpose — the broker still works, so nothing else
-			// will ever complain, and what is lost is the confidentiality of every reply
-			// the broker receives.
-			b.cfg.Logger.Error("broker: this nats.conf does not grant the broker its private reply inbox; "+
-				"falling back to the SHARED inbox space, where every agent on this deployment can read "+
-				"the broker's replies. Re-render nats.conf (cluster natsconf) so the broker's static "+
-				"users: entry carries the current PermissionsForBroker, then restart",
-				"inbox_root", auth.InboxRoot)
+	if b.cfg.ImageRun != nil {
+		if err := validateBrokerImageRun(b.cfg.ImageRun); err != nil {
+			return err
+		}
+		owner, err := brokerimage.ValidateInitialStore(b.cfg.ImageRun, b)
+		defer func() {
+			if !managed && owner != nil {
+				runErr = brokercontrol.JoinCleanupError(runErr, brokerimage.CloseStoreOwner(owner))
+			}
+		}()
+		if err != nil {
+			return err
 		}
 	}
+	// Cold, hot and ordinary-reconnect admission share ONE S9 descriptor. The legacy
+	// dial, with its loud shared-inbox fallback, moved verbatim into that owner.
+	// Registered before the drain defer, so the auth-only NC retires after it.
+	// origin: hot-update S9 plan §4.4 / T48; rv-business F2 / rv-infra F10
+	err := brokerInfraConnect(b, 0)
+	defer brokerimage.ColdCleanup(&managed, func() error { return b.infra.Close(0) })
 	if err != nil {
 		return fmt.Errorf("broker: NATS connect: %w", err)
 	}
-	b.nc.Store(nc)
+	nc := b.nc.Load()
 	defer func() {
 		// Drain first so all in-flight subscription callbacks
 		// finish reading b.nc on this connection; only THEN clear
 		// the pointer. The atomic.Pointer + drain-before-clear
 		// ordering closes the publishAudit-vs-Run-shutdown race
 		// that race-tested test/p4 used to expose intermittently.
-		_ = nc.Drain()
-		b.nc.Store(nil)
+		if !managed {
+			if current := b.nc.Load(); current != nil {
+				runErr = brokercontrol.JoinCleanupError(runErr, brokercontrol.JoinNATSControl(current))
+			}
+			b.nc.Store(nil)
+		}
 	}()
 
 	// D9 round-1 BLOCKER: build the follower→leader forwarder BEFORE installAuthCallout so
@@ -1086,13 +1199,18 @@ func (b *Broker) Run(ctx context.Context) error {
 		b.cl.forwarder = b.newForwarder(nc, b.cfg.ExposeForwardTimeout())
 	}
 
-	if subAuth, err := b.installAuthCallout(nc); err != nil {
+	var coldAuth *brokerAuthOwner
+	if b.imageControl != nil && b.cfg.AuthCallout != nil {
+		coldAuth = newBrokerAuthOwner(b, 0)
+		b.imageControl.auth = coldAuth
+	}
+	if subAuth, err := b.installAuthCallout(nc, coldAuth); err != nil {
 		return err
 	} else if subAuth != nil {
-		defer func() { _ = subAuth.Unsubscribe() }()
+		defer brokerimage.ColdCleanup(&managed, subAuth.Unsubscribe)
 	}
 
-	if b.cfg.TunnelControlAddr != "" {
+	if b.cfg.TunnelControlAddr != "" || b.imageControl != nil {
 		host := b.cfg.TunnelPublicHost
 		if host == "" {
 			host = "0.0.0.0"
@@ -1102,9 +1220,23 @@ func (b *Broker) Run(ctx context.Context) error {
 		// only when the harness attached a cert. Production is byte-equivalent to
 		// the prior tunnel.NewServer call.
 		srv := b.newTunnelServer(b.cfg.TunnelControlAddr, host, b.tunnelTokenLookup, b.cfg.Logger)
-		if err := srv.Start(ctx); err != nil {
+		// Authorization must be installed before TLS can advertise resumable flows.
+		// origin: hot-update S5 plan §2.1 / §4.1 / §4.3
+		if err := configureTunnelAuthority(b, srv); err != nil {
 			return err
 		}
+		if b.cfg.TunnelControlAddr != "" {
+			var err error
+			if b.imageControl != nil {
+				err = tunnel.StartOwned(srv)
+			} else {
+				err = srv.Start(ctx)
+			}
+			if err != nil {
+				return err
+			}
+		}
+		defer brokerimage.ColdCleanupAction(&managed, srv.Close)
 		b.tunnelSrv.Store(srv)
 	}
 
@@ -1120,17 +1252,27 @@ func (b *Broker) Run(ctx context.Context) error {
 			return fmt.Errorf("broker: subscription http: %w", err)
 		}
 		b.cfg.Logger.Info("broker: subscription http listening", "addr", subLn.Addr().String())
-		go func() {
-			if err := subhttp.ServeListener(ctx, subLn, subhttp.Config{
-				DB:          b.cfg.DB,
-				PublicHost:  b.publicHostFor(),
-				Logger:      b.cfg.Logger,
-				ClusterMode: b.clusterMode, // C5: resolve each node's authoritative home host
-				Vendable:    b.proxyVendable,
-			}); err != nil {
-				b.cfg.Logger.Error("broker: subscription http server", "err", err)
+		if b.imageControl != nil {
+			deadline, err := brokerCutDeadline()
+			if err != nil {
+				return err
 			}
-		}()
+			if err := startBrokerOwnedHTTP(b, subLn, "broker.sub-http", deadline); err != nil {
+				return err
+			}
+		} else {
+			go func() {
+				if err := subhttp.ServeListener(ctx, subLn, subhttp.Config{
+					DB:          b.cfg.DB,
+					PublicHost:  b.publicHostFor(),
+					Logger:      b.cfg.Logger,
+					ClusterMode: b.clusterMode, // C5: resolve each node's authoritative home host
+					Vendable:    b.proxyVendable,
+				}); err != nil {
+					b.cfg.Logger.Error("broker: subscription http server", "err", err)
+				}
+			}()
+		}
 	}
 
 	// B5 OPS#1: Prometheus /metrics + /healthz + /readyz. Off by default (MetricsAddr empty) ⇒
@@ -1144,11 +1286,21 @@ func (b *Broker) Run(ctx context.Context) error {
 			return fmt.Errorf("broker: metrics http: %w", err)
 		}
 		b.cfg.Logger.Info("broker: metrics http listening", "addr", metLn.Addr().String())
-		go func() {
-			if err := brokermetrics.ServeListener(ctx, metLn, b.metricsSnapshot, b.metricsReady); err != nil {
-				b.cfg.Logger.Error("broker: metrics http server", "err", err)
+		if b.imageControl != nil {
+			deadline, err := brokerCutDeadline()
+			if err != nil {
+				return err
 			}
-		}()
+			if err := startBrokerOwnedHTTP(b, metLn, "broker.metrics", deadline); err != nil {
+				return err
+			}
+		} else {
+			go func() {
+				if err := brokermetrics.ServeListener(ctx, metLn, b.metricsSnapshot, b.metricsReady); err != nil {
+					b.cfg.Logger.Error("broker: metrics http server", "err", err)
+				}
+			}()
+		}
 	}
 
 	// C2: the well-known cluster discovery manifest (loopback, Caddy-fronted). Gated on cluster mode
@@ -1161,88 +1313,33 @@ func (b *Broker) Run(ctx context.Context) error {
 			return fmt.Errorf("broker: cluster manifest http: %w", err)
 		}
 		b.cfg.Logger.Info("broker: cluster manifest http listening", "addr", manLn.Addr().String())
-		go func() {
-			if err := clustermanifest.ServeListener(ctx, manLn, b.manifestBytes); err != nil {
-				b.cfg.Logger.Error("broker: cluster manifest http server", "err", err)
+		if b.imageControl != nil {
+			deadline, err := brokerCutDeadline()
+			if err != nil {
+				return err
 			}
-		}()
+			if err := startBrokerOwnedHTTP(b, manLn, "broker.manifest", deadline); err != nil {
+				return err
+			}
+		} else {
+			go func() {
+				if err := clustermanifest.ServeListener(ctx, manLn, b.manifestBytes); err != nil {
+					b.cfg.Logger.Error("broker: cluster manifest http server", "err", err)
+				}
+			}()
+		}
 	}
 
-	subRegister, err := nc.Subscribe(
-		proto.SubjectPrefix+".ctrl.s.*.node.*.register.req",
-		b.handleRegister,
-	)
-	if err != nil {
-		return fmt.Errorf("broker: subscribe register: %w", err)
-	}
-	defer func() { _ = subRegister.Unsubscribe() }()
-
-	subHB, err := nc.Subscribe(
-		proto.SubjectPrefix+".ctrl.s.*.node.*.heartbeat",
-		b.handleHeartbeat,
-	)
-	if err != nil {
-		return fmt.Errorf("broker: subscribe heartbeat: %w", err)
-	}
-	defer func() { _ = subHB.Unsubscribe() }()
-
-	// P3 session management subjects.
-	for _, ss := range []struct {
-		subj    string
-		handler nats.MsgHandler
-	}{
-		{proto.SubjectPrefix + ".ctrl.by.*.session.create.req", b.handleSessionCreate},
-		{proto.SubjectPrefix + ".ctrl.by.*.session.list.req", b.handleSessionList},
-		{proto.SubjectPrefix + ".ctrl.by.*.session.*.rm.req", b.handleSessionRm},
-		// P4 control plane.
-		{proto.SubjectPrefix + ".s.*.cmd.by.*.node.*.exec.req",
-			func(msg *nats.Msg) { b.handleExecReq(nc, msg) }},
-		{proto.SubjectPrefix + ".ctrl.by.*.s.*.ps.req", b.handlePsReq},
-		{proto.SubjectPrefix + ".ctrl.by.*.s.*.node.list.req", b.handleNodeListReq},
-		{proto.SubjectPrefix + ".s.*.ev.node.*.proc.*.started", b.handleProcEvent},
-		{proto.SubjectPrefix + ".s.*.ev.node.*.proc.*.exit", b.handleProcEvent},
-		// P5 PTY control plane.
-		{proto.SubjectPrefix + ".s.*.cmd.by.*.node.*.run.req",
-			func(msg *nats.Msg) { b.handleRunReq(nc, msg) }},
-		{proto.SubjectPrefix + ".s.*.cmd.by.*.node.*.kill.req",
-			func(msg *nats.Msg) { b.handleKillReq(nc, msg) }},
-		{proto.SubjectPrefix + ".s.*.pty.*.failed", b.handlePtyFailed},
-		// P6 data-plane control (expose / expose-rm).
-		{proto.SubjectPrefix + ".s.*.cmd.by.*.node.*.expose.req",
-			func(msg *nats.Msg) { b.handleExposeReq(nc, msg) }},
-		{proto.SubjectPrefix + ".s.*.cmd.by.*.node.*.expose-rm.req",
-			func(msg *nats.Msg) { b.handleExposeRmReq(nc, msg) }},
-		// P10 J.4 — `tether node upgrade <nid>`.
-		{proto.SubjectPrefix + ".s.*.cmd.by.*.node.*.upgrade.req",
-			func(msg *nats.Msg) { b.handleUpgradeReq(nc, msg) }},
-		// P11 file transfer (file-transfer-plan v0.2.0).
-		{proto.SubjectPrefix + ".s.*.cmd.by.*.node.*.push.req",
-			func(msg *nats.Msg) { b.handlePushReq(nc, msg) }},
-		{proto.SubjectPrefix + ".s.*.cmd.by.*.node.*.pull.req",
-			func(msg *nats.Msg) { b.handlePullReq(nc, msg) }},
-		{proto.SubjectPrefix + ".s.*.cmd.by.*.node.*.push-commit.req",
-			func(msg *nats.Msg) { b.handlePushCommitReq(nc, msg) }},
-		{proto.SubjectPrefix + ".s.*.ev.node.*.transfer.*.complete", b.handleEvTransfer},
-		{proto.SubjectPrefix + ".s.*.ev.node.*.transfer.*.failed", b.handleEvTransfer},
-		{proto.SubjectPrefix + ".ctrl.by.*.s.*.transfer.*.finalize.req", b.handleFinalizeReq},
-		{proto.SubjectPrefix + ".ctrl.by.*.s.*.caps.req", b.handleCapsReq},
-		// P13 proxy subscription control plane.
-		{proto.SubjectPrefix + ".ctrl.by.*.s.*.proxy.set.req",
-			func(msg *nats.Msg) { b.handleProxySet(nc, msg) }},
-		{proto.SubjectPrefix + ".ctrl.by.*.s.*.proxy.status.req", b.handleProxyStatus},
-		// Mega-audit MAJ-2: register the CONCRETE create/revoke/list leaves, NOT the wildcard
-		// `.proxy.sub.*.req`. The wildcard never matched isBroadcastClusterSubject's per-leaf
-		// HasSuffix check, so it was queue-grouped and the leader-only create/revoke landed on a
-		// silent follower ~(N-1)/N of the time → ctl timeout. create/revoke → broadcast+leader-only
-		// (the handler's follower gate collapses the fan-out); list → queue-grouped RODB read.
-		{proto.SubjectPrefix + ".ctrl.by.*.s.*.proxy.sub.create.req",
-			func(msg *nats.Msg) { b.handleProxySub(nc, msg) }},
-		{proto.SubjectPrefix + ".ctrl.by.*.s.*.proxy.sub.revoke.req",
-			func(msg *nats.Msg) { b.handleProxySub(nc, msg) }},
-		{proto.SubjectPrefix + ".ctrl.by.*.s.*.proxy.sub.list.req",
-			func(msg *nats.Msg) { b.handleProxySub(nc, msg) }},
-		{proto.SubjectPrefix + ".s.*.ev.node.*.proxy.*", b.handleProxyReadyEvent},
-	} {
+	// Register and heartbeat lead the shared business table. They are never
+	// queue-grouped: every broker must see liveness and the leader-only register
+	// gate collapses the fan-out (the restored graph applies the same rule).
+	// P3 session management subjects follow. A nonce-bound heartbeat request is
+	// also an S8 target's external control probe (brokerupgrade.WithControlProbe).
+	// origin: hot-update S6 plan §6.3 / S8 §12.1 (P15 broker.go net-zero move); S8 FIX-DESCRIBE
+	for _, ss := range append([]brokerBusinessSubscription{
+		{proto.SubjectPrefix + ".ctrl.s.*.node.*.register.req", b.handleRegister},
+		{proto.SubjectPrefix + ".ctrl.s.*.node.*.heartbeat", brokerupgrade.WithControlProbe(nc, b.handleHeartbeat)},
+	}, brokerBusinessSubscriptions(b, nc)...) {
 		// D9 round-2 BLOCKER: in a ≥2-node cluster the leader-forwarded ctl-command + event
 		// subjects must be handled by EXACTLY ONE broker per message (a QUEUE group), not
 		// broadcast — otherwise every broker handles each command, the followers'
@@ -1257,15 +1354,16 @@ func (b *Broker) Run(ctx context.Context) error {
 			sub *nats.Subscription
 			err error
 		)
-		if b.clusterMode && !isBroadcastClusterSubject(ss.subj) {
-			sub, err = nc.QueueSubscribe(ss.subj, ctlQueueGroup, ss.handler)
+		if infraattach.QueueBusiness(b.clusterMode, ss.subj, isBroadcastClusterSubject(ss.subj)) {
+			sub, err = nc.QueueSubscribe(ss.subj, ctlQueueGroup, brokerBusinessHandler(b, ss.handler))
 		} else {
-			sub, err = nc.Subscribe(ss.subj, ss.handler)
+			sub, err = nc.Subscribe(ss.subj, brokerBusinessHandler(b, ss.handler))
 		}
 		if err != nil {
 			return fmt.Errorf("broker: subscribe %s: %w", ss.subj, err)
 		}
-		defer func(s *nats.Subscription) { _ = s.Unsubscribe() }(sub)
+		trackBrokerSubscription(b, sub)
+		defer brokerimage.ColdCleanup(&managed, sub.Unsubscribe)
 	}
 
 	// Flush so the SUB protocol frames have actually reached the
@@ -1273,12 +1371,8 @@ func (b *Broker) Run(ctx context.Context) error {
 	// can race ahead and fire a Request() to a subject the server
 	// "knows about" via our nc but hasn't yet processed the SUB for.
 	// 200ms is plenty for the loopback case + slow CI runners.
-	_ = nc.FlushTimeout(200 * time.Millisecond)
-
-	// Signal ready. Tests use this to gate request firing on a slow
-	// runner; production callers leave Config.ReadyCh nil.
-	if b.cfg.ReadyCh != nil {
-		close(b.cfg.ReadyCh)
+	if err := nc.FlushTimeout(200 * time.Millisecond); err != nil {
+		return err
 	}
 
 	// P7 — try JetStream AFTER all subscriptions are installed so the
@@ -1321,14 +1415,40 @@ func (b *Broker) Run(ctx context.Context) error {
 			}
 			return clusteredJetStreamDiagnostic(b)
 		}
-		if err := b.wireClusterLate(ctx, nc); err != nil {
+		loopCtx := ctx
+		if b.imageControl != nil {
+			loopCtx = b.imageControl.root
+		}
+		if err := b.wireClusterLate(loopCtx, nc); err != nil {
 			return err
 		}
 		// D9 step 5: explicit ordered shutdown. Registered AFTER the nc.Drain defer (line
 		// ~531) so it runs BEFORE it (LIFO) on EVERY return path: WaitTransferAudit while
 		// nc is live → cancel+join the leader loops → unsubscribe responders. The Run-top
 		// node.Shutdown defer (registered first) then runs LAST, after nc.Drain.
-		defer b.clusterShutdownOrdered()
+		defer func() {
+			if !managed {
+				b.clusterShutdownOrdered()
+			}
+		}()
+	}
+
+	// Transfer restoration precedes continuation SUBs and destructive passes.
+	// Cluster sinks above must already refer to this incarnation's backend.
+	// origin: hot-update S7 plan §5.3 / §6.3 / P22
+	if err := startBrokerTransfers(ctx, b, nc); err != nil {
+		return err
+	}
+	defer stopBrokerTransferRun(b, &managed, &runErr)
+
+	// History streams exist only with JetStream. Before P22 relocated it, this
+	// pass ran inside enableJetStream; without the guard a JetStream-less
+	// broker dereferenced a nil JetStream handle on every boot (p2–p9 panic).
+	// origin: hot-update S7 lead integration — make test on the merged tree
+	if brokerJS(b) != nil {
+		if rerr := b.reconcileHistoryStreamsOnBoot(ctx); rerr != nil {
+			b.cfg.Logger.Warn("broker: history-stream boot reconcile", "err", rerr)
+		}
 	}
 
 	// P7 / H.1 — emit tetherd_restarted as the broker becomes
@@ -1340,7 +1460,11 @@ func (b *Broker) Run(ctx context.Context) error {
 	})
 
 	// P7 / H.4 — disk-pressure monitor. No-op when StoreDir empty.
-	b.startDiskMonitor(ctx)
+	diskCtx := ctx
+	if b.imageControl != nil {
+		diskCtx = b.imageControl.root
+	}
+	b.startDiskMonitor(diskCtx)
 
 	// R7: build the reconciliation registry and register the standing passes HERE — before the
 	// admin socket's accept goroutine exists — so runtimeSnapshot's cross-goroutine read of
@@ -1356,7 +1480,7 @@ func (b *Broker) Run(ctx context.Context) error {
 	// P9 / I.2b — local admin socket. No-op when path empty (the
 	// in-process tests that don't exercise admin leave it unset).
 	if b.cfg.AdminSocketPath != "" {
-		backend := adminsock.Backend{
+		backend := infraattach.BindAdmin(b.infra, adminsock.Backend{
 			DB:              b.cfg.DB,
 			Now:             b.cfg.Now,
 			Logger:          b.cfg.Logger,
@@ -1366,7 +1490,9 @@ func (b *Broker) Run(ctx context.Context) error {
 			// R13: process self-introspection (goroutines/threads/fds/rss/uptime + reconciler
 			// last-tick) for `tether admin runtime`. Works in single AND cluster mode.
 			RuntimeSnapshot: b.runtimeSnapshot,
-		}
+			// S8: the sole transaction writer for the canonical broker key (nil refuses).
+			UpgradeEndpoint: brokercontrol.BindAdminUpgrade(b.upgradeEndpoint), UpgradeKey: b.upgradeKey,
+		})
 		// D9: in cluster mode the `tether cluster *` admin verbs are served by the
 		// ClusterAdmin orchestrator (D7); nil in single mode ⇒ "cluster mode not enabled".
 		if b.clusterMode {
@@ -1399,42 +1525,30 @@ func (b *Broker) Run(ctx context.Context) error {
 			// TestAdminBackendClusterModeIsWiredBesideTheSeam asserts they stay together.
 			backend.ClusterMode = true
 		}
+		// Single mode exposes only the local broker reload surface. Cluster verbs
+		// retain their existing backend and leader gates.
+		backend.Cluster = &brokerReloadBackend{broker: b, cluster: backend.Cluster}
+		b.setClusterAdminHandle(backend.Cluster.HandleCluster)
 		b.admin = adminsock.New(b.cfg.AdminSocketPath, backend)
-		if err := b.admin.Start(ctx); err != nil {
-			return fmt.Errorf("broker: admin socket start: %w", err)
+		var startErr error
+		if b.imageControl != nil {
+			startErr = adminsock.StartOwned(b.admin)
+		} else {
+			startErr = b.admin.Start(ctx)
 		}
-		defer func() { _ = b.admin.Close() }()
+		if startErr != nil {
+			return fmt.Errorf("broker: admin socket start: %w", startErr)
+		}
+		if b.imageControl != nil {
+			b.imageControl.keepers = append(b.imageControl.keepers, adminsock.ImageKeeper(b.admin))
+		}
+		defer brokerimage.ColdCleanup(&managed, b.admin.Close)
 		b.cfg.Logger.Info("broker: admin socket ready", "path", b.cfg.AdminSocketPath)
 	}
 
-	// R16 #57 (minor-2): eagerly finalize any transfer stranded by a PRIOR crash, so a broker that crash-loops
-	// faster than XferReapInterval still closes dangling start rows (the periodic pass is anchored at
-	// start+interval). M1 makes it safe when leaderless — the ledger is deleted only on a CONFIRMED commit.
-	//
-	// PLACEMENT IS LOAD-BEARING: this walks a ledger and, per stranded transfer, forwards to the leader with a
-	// bounded retry (~500ms each when leaderless). It MUST run AFTER the admin socket is serving. Running it
-	// earlier delays the socket, and the socket IS the joiner-readiness signal `tether cluster add` polls
-	// (joinerBrokerUpLocal → OpClusterStatus): a joiner restarted mid-grow that is merely still finalizing
-	// would be misread as "not up in cluster mode" and the grow would HALT at the start-joiner boundary.
-	// Observed on the deploy tier (drill 42 returning-node re-grow) when this ran before the socket.
-	//
-	// NOT GATED ON clusterMode — origin: prerelease audit round 2, F-T7. It was, and
-	// that made the crash-loop case this block exists for unreachable on exactly the
-	// deployment #57 had just been extended to: batch F made synthesis work on a single
-	// broker (commitSyntheticTransferTerminal's single-mode branch) and the ledger root
-	// falls back to the DB's directory when no ClusterDataDir is set, so a lone broker
-	// really does accumulate stranded rows — and then only the periodic pass, anchored at
-	// start+XferReapInterval, would ever close them. A broker crash-looping faster than
-	// that interval closed none, forever, which is the whole reason for finalizing here.
-	//
-	// finalizeStrandedXfers is a no-op when there is no ledger dir at all (an in-memory
-	// test broker), so the added call costs nothing on the shapes that have nothing to
-	// finalize.
-	if n, ferr := b.finalizeStrandedXfers(ctx); ferr != nil {
-		b.cfg.Logger.Warn("broker: eager stranded-transfer finalize on boot", "err", ferr)
-	} else if n > 0 {
-		b.cfg.Logger.Info("broker: eagerly finalized stranded in-flight transfers on boot (#57)", "count", n)
-	}
+	// The transfer boot pass must follow admin readiness; its helper retains the rationale.
+	// origin: hot-update S7 plan §5.3 / P22
+	reconcileBrokerTransfersOnBoot(ctx, b)
 
 	// G.2 step ① — recompute node states from persisted
 	// last_heartbeat_at once at boot. The ticker below would do this
@@ -1498,6 +1612,25 @@ func (b *Broker) Run(ctx context.Context) error {
 		b.cfg.Logger.Warn("broker: no reconcile passes registered; falling back to the reconcile interval")
 		granularity = b.cfg.ReconcileInterval
 	}
+	if b.cfg.ImageRun != nil {
+		if err := b.cfg.ImageRun.InstallCurrent(b); err != nil {
+			return err
+		}
+		managed = true
+	}
+	setBrokerImagePhase(b, proto.BrokerImagePhaseControlReady)
+	if b.imageControl != nil {
+		emitBrokerImageEvent(b, "control_ready", 0)
+		setBrokerImagePhase(b, proto.BrokerImagePhaseServing)
+	}
+	bindBrokerImageHealth(b)
+	// Signal only after the current terminal owner is installed. An admin reload
+	// admitted before this point could otherwise run against cold teardown roots.
+	// origin: hot-update S6 plan §3.2 / T01
+	if b.cfg.ReadyCh != nil {
+		close(b.cfg.ReadyCh)
+	}
+	defer unbindBrokerImageHealth(b)
 	ticker := time.NewTicker(granularity)
 	defer ticker.Stop()
 
@@ -1506,6 +1639,16 @@ func (b *Broker) Run(ctx context.Context) error {
 		case <-ctx.Done():
 			b.cfg.Logger.Info("broker: shutting down")
 			return ctx.Err()
+		case <-brokerReloadRequests(b):
+			// Shutdown is an explicit part of the cut inside Run, before final export.
+			// Its ordinary exit defer is reserved for terminal stop.
+			// origin: hot-update S6 plan §3.2 / T01
+			err := runBrokerImageReload(b, brokerNodeShutdown(b, brokerimage.StoreShutdownPrepare(b.cfg.ImageRun)))
+			notifyBrokerReloadArmed(b, err)
+			b.reloadSignal.Clear()
+			if err != nil {
+				b.cfg.Logger.Error("broker: image reload returned", "err", err)
+			}
 		case <-ticker.C:
 			b.reconcilers.runDue(ctx, b.cfg.Now())
 		}
@@ -2088,8 +2231,14 @@ func replyLeaseVerdict(b *Broker, msg *nats.Msg, sid, nid string, req *proto.Nod
 		// rare corner: `broker upgrade` re-execs the process on every roll. In
 		// that window a sibling clone's farewell still landed all three effects
 		// on a live incumbent. The map is cold; the FLEET is not. Ask it.
+		//
+		// A farewell whose inherited creation no longer matches (or cannot be
+		// proven) comes from a deleted session's process: it holds nothing in the
+		// recreated session and may not flag, probe-invalidate or offline it.
+		// origin: hot-update S8 plan §6.2 / §11.2 P15
 		var mayRelease bool
-		if v, ok := b.leaseHolder.Load(leaseKey(sid, nid)); ok {
+		_, staleErr := brokerupgrade.RegisterAuthority(b.read().SQL(), sid, req.Incarnation)
+		if v, ok := b.leaseHolder.Load(leaseKey(sid, nid)); ok && staleErr == nil {
 			g, _ := v.(leaseGrant)
 			mayRelease = g.instanceID == req.InstanceID
 			if mayRelease {
@@ -2097,7 +2246,7 @@ func replyLeaseVerdict(b *Broker, msg *nats.Msg, sid, nid string, req *proto.Nod
 				g.released = true
 				b.leaseHolder.Store(leaseKey(sid, nid), g)
 			}
-		} else {
+		} else if staleErr == nil {
 			mayRelease = !liveHolderContradicts(b, sid, nid, req.InstanceID)
 		}
 		if !mayRelease {
@@ -2106,7 +2255,7 @@ func replyLeaseVerdict(b *Broker, msg *nats.Msg, sid, nid string, req *proto.Nod
 			// it retry — but change nothing on the incumbent's behalf.
 			b.cfg.Logger.Warn("broker: ignoring a farewell from a non-holder instance",
 				"sid", sid, "nid", nid, "from_instance", req.InstanceID)
-			b.replyJSON(msg, proto.NodeRegisterResp{OK: true})
+			b.replyJSON(msg, proto.NodeRegisterResp{OK: true, BrokerImageMaintenance: acceptedMaintenanceCapability(*req)})
 			return true
 		}
 		// Inside the holder check on purpose: invalidating the probe evidence is
@@ -2165,7 +2314,7 @@ func replyLeaseVerdict(b *Broker, msg *nats.Msg, sid, nid string, req *proto.Nod
 		// Stop here. Falling through would run the ordinary register and stamp a
 		// FRESH heartbeat for a process that is on its way out — making the row
 		// look more alive at the moment of death than it did while running.
-		b.replyJSON(msg, proto.NodeRegisterResp{OK: true})
+		b.replyJSON(msg, proto.NodeRegisterResp{OK: true, BrokerImageMaintenance: acceptedMaintenanceCapability(*req)})
 		return true
 	}
 
@@ -2213,7 +2362,11 @@ func replyLeaseVerdict(b *Broker, msg *nats.Msg, sid, nid string, req *proto.Nod
 	// challenger must honour: we have PROVEN a different live process holds this
 	// name, so falling through would overwrite its row, clear its proxy_ready
 	// and close its running processes.
-	payload, _ := json.Marshal(proto.NodeRegisterResp{OK: true, Lease: lease})
+	//
+	// The lease carries the session's actual creation so a contested image
+	// keeps (and compares) its inherited authority. origin: hot-update S8 plan §6.2 / P15
+	lease.Incarnation, _ = brokerupgrade.RegisterAuthority(b.read().SQL(), sid, "")
+	payload, _ := json.Marshal(proto.NodeRegisterResp{OK: true, Lease: lease, Incarnation: lease.Incarnation, BrokerImageMaintenance: acceptedMaintenanceCapability(*req)})
 	if msg.Reply != "" {
 		b.respondBytes(msg, payload)
 	}
@@ -2410,6 +2563,19 @@ func liveHolderContradicts(b *Broker, sid, nid, sender string) bool {
 	return a.answered && a.responder != "" && a.responder != sender
 }
 
+// replyRegisterRoster handles the read-only refresh without registration side effects.
+func replyRegisterRoster(b *Broker, msg *nats.Msg, sid, nid string, req proto.NodeRegisterReq) {
+	rememberAgentMaintenance(b, sid, nid, req)
+	resp := proto.NodeRegisterResp{OK: true, BrokerImageMaintenance: acceptedMaintenanceCapability(req)}
+	resp.Roster = b.rosterForRegister(req)
+	resp.ConnectedBrokerID = connectedBrokerID(b, req.ServerID)
+	b.maybeEmitRosterStale(sid, nid, req.RosterGen, resp.Roster)
+	payload, _ := json.Marshal(resp)
+	if msg.Reply != "" {
+		b.respondBytes(msg, payload)
+	}
+}
+
 func (b *Broker) handleRegister(msg *nats.Msg) {
 	sid, nid, ok := proto.ParseSidNidFromCtrl(msg.Subject)
 	if !ok {
@@ -2478,13 +2644,7 @@ func (b *Broker) handleRegister(msg *nats.Msg) {
 	}
 
 	if req.RosterRefreshOnly {
-		resp := proto.NodeRegisterResp{OK: true}
-		resp.Roster = b.rosterForRegister(req)
-		b.maybeEmitRosterStale(sid, nid, req.RosterGen, resp.Roster)
-		payload, _ := json.Marshal(resp)
-		if msg.Reply != "" {
-			b.respondBytes(msg, payload)
-		}
+		replyRegisterRoster(b, msg, sid, nid, req)
 		return
 	}
 
@@ -2500,6 +2660,13 @@ func (b *Broker) handleRegister(msg *nats.Msg) {
 	//   ordering, and not any change to reconcile.go, is what stops a clone
 	//   from zeroing the incumbent's proxy_ready and from closing every process
 	//   row the incumbent is actually running.
+	//
+	// AUTHORITY FIRST (registerAuthority): an inherited image must name this
+	// session's creation before it can take a lease or a row.
+	incarnation, admitted := registerAuthority(b, msg, sid, &req)
+	if !admitted {
+		return
+	}
 	if replyLeaseVerdict(b, msg, sid, nid, &req) {
 		return
 	}
@@ -2593,19 +2760,7 @@ func (b *Broker) handleRegister(msg *nats.Msg) {
 
 	b.cfg.Logger.Info("broker: node registered",
 		"sid", sid, "nid", nid, "release", req.ReleaseVersion)
-	// upgrade-safety plan §4: an agent's first register after a `node upgrade`
-	// carries the outcome — without this line a rollback is indistinguishable
-	// from a plain reconnect on the broker side. Log-only by design: nodes rows
-	// travel through the raft-frozen RegisterInput payload, where a new field
-	// would silently drop in a mixed-version cluster (wire_freeze_test.go).
-	// "agent-reported" wording is deliberate (internal review S23): an
-	// in-flight register racing the agent's own rollback can carry a state
-	// the marker no longer holds; a later register delivers the correction.
-	if req.UpgradeState != "" {
-		b.cfg.Logger.Info("broker: agent-reported upgrade outcome",
-			"sid", sid, "nid", nid, "upgrade_state", req.UpgradeState,
-			"detail", req.UpgradeDetail, "release", req.ReleaseVersion)
-	}
+	noteRegisterUpgrade(b, sid, nid, req)
 	b.pubSysEvent("agent_registered", map[string]any{
 		"sid": sid, "nid": nid, "release": req.ReleaseVersion,
 		"os": req.OS, "arch": req.Arch,
@@ -2615,7 +2770,8 @@ func (b *Broker) handleRegister(msg *nats.Msg) {
 	// (proc.MarkExited, audit.proc / audit.port emissions) happen
 	// inside reconcileOnRegister; the directive arrays are returned
 	// to the agent so it can drop orphan processes / proxies.
-	resp := proto.NodeRegisterResp{OK: true}
+	resp := proto.NodeRegisterResp{OK: true, BrokerImageMaintenance: acceptedMaintenanceCapability(req), Incarnation: incarnation}
+	resp.TransferVersion = recordTransferAgent(b, sid, nid, req)
 	resp.AcceptedProcesses,
 		resp.ReconciledProcesses,
 		resp.KeepPorts,
@@ -2637,6 +2793,7 @@ func (b *Broker) handleRegister(msg *nats.Msg) {
 	// B7 DOC#3: attach the account-signed broker roster for agent discovery. Self-gating — nil in
 	// single mode (selfID=="") so the reply stays byte-identical (the Home/Proxy precedent).
 	resp.Roster = b.rosterForRegister(req)
+	resp.ConnectedBrokerID = connectedBrokerID(b, req.ServerID)
 
 	// C1 §6: flag a sustained-behind agent (leader-only here; nil roster ⇒ no-op, byte-equiv).
 	b.maybeEmitRosterStale(sid, nid, req.RosterGen, resp.Roster)
@@ -2764,124 +2921,13 @@ func ValidateConfig(cfg Config) error {
 	return nil
 }
 
-// validateListenAddr checks a host:port listen address FORMAT (empty ⇒ ok,
-// meaning disabled or default). A ":8090" (host-less) form is valid — net.Listen
-// accepts it — so only the port must parse and be in range. Port 0 is VALID:
-// net.Listen treats it as "assign an ephemeral port", so config-check must
-// accept it too (F1 parity — a preflight must not reject what a real start
-// accepts).
-func validateListenAddr(name, addr string) error {
-	if addr == "" {
-		return nil
-	}
-	host, port, err := net.SplitHostPort(addr)
-	if err != nil {
-		return fmt.Errorf("%s %q: %w", name, addr, err)
-	}
-	p, err := strconv.Atoi(port)
-	if err != nil || p < 0 || p > 65535 {
-		return fmt.Errorf("%s %q: port must be 0-65535", name, addr)
-	}
-	// A host, when present, must be a bare IP or a syntactically valid DNS
-	// hostname — reject what net.Listen would reject at bind (F1-B). A bare
-	// ":9090" (host-less wildcard) is fine.
-	if !validListenHost(host) {
-		return fmt.Errorf("%s %q: malformed host", name, addr)
-	}
-	return nil
-}
-
-// validateNATSURL checks the NATS server URL(s) for the same pure-syntax
-// validity nats.go requires, WITHOUT dialing (F1-A). The client accepts a
-// comma-separated list and gives a scheme-less "host:port" entry an implicit
-// "nats://"; this mirrors that so config-check and Connect reach one verdict.
-// Reachability (host resolvable, port open) is deliberately NOT checked — that
-// is a runtime availability concern, not a config error.
-func validateNATSURL(raw string) error {
-	// nats.go rejects a pool that mixes ws/wss with nats/tls before it dials
-	// anything (ErrMixingWebsocketSchemes). Track the same pool-level class;
-	// validating each URL independently is insufficient.
-	poolClass := -1 // 0 = nats/tls, 1 = ws/wss
-	for _, s := range strings.Split(raw, ",") {
-		s = strings.TrimSpace(s)
-		if s == "" {
-			return fmt.Errorf("broker.nats.url %q: empty server entry", raw)
-		}
-		toParse := s
-		if !strings.Contains(toParse, "://") {
-			toParse = "nats://" + toParse // nats.go's implicit scheme
-		}
-		u, err := url.Parse(toParse)
-		if err != nil {
-			return fmt.Errorf("broker.nats.url %q: %w", s, err)
-		}
-		var class int
-		switch u.Scheme {
-		case "nats", "tls":
-			class = 0
-		case "ws", "wss":
-			class = 1
-		default:
-			return fmt.Errorf("broker.nats.url %q: scheme must be nats/tls/ws/wss", s)
-		}
-		if u.Host == "" {
-			return fmt.Errorf("broker.nats.url %q: missing host", s)
-		}
-		if poolClass >= 0 && class != poolClass {
-			return fmt.Errorf("broker.nats.url %q: %w", raw, nats.ErrMixingWebsocketSchemes)
-		}
-		poolClass = class
-	}
-	return nil
-}
-
-// validListenHost reports whether host is a bind-legal listen host: empty
-// (wildcard), a bare IP (v4/v6, optional IPv6 zone), or a syntactically valid
-// DNS hostname. It rejects shell/URL metacharacters ("bad$host") that
-// net.Listen would fail on, so config-check and a real Bind agree (F1-B).
-func validListenHost(host string) bool {
-	if host == "" {
-		return true // wildcard bind
-	}
-	// A zone is legal only on an IPv6 literal (fe80::1%eth0). Do not strip an
-	// arbitrary suffix before DNS validation: example.com%eth0 is not an IPv6
-	// address and a real bind cannot interpret it as the hostname example.com.
-	if i := strings.IndexByte(host, '%'); i >= 0 {
-		ip, zone := host[:i], host[i+1:]
-		return zone != "" && strings.Contains(ip, ":") && net.ParseIP(ip) != nil
-	}
-	if net.ParseIP(host) != nil {
-		return true
-	}
-	// A single trailing dot is the standard absolute-FQDN spelling and is
-	// accepted by resolvers. Remove it for label validation, but reject ".".
-	host = strings.TrimSuffix(host, ".")
-	if host == "" {
-		return false
-	}
-	if len(host) > 253 {
-		return false
-	}
-	// DNS hostname: dot-separated labels of [A-Za-z0-9_-], each 1..63 chars,
-	// not starting/ending with '-'. Underscore is tolerated (real deployments
-	// use it in service names); '$', space, '/' and the like are not.
-	for _, label := range strings.Split(host, ".") {
-		if label == "" || len(label) > 63 {
-			return false
-		}
-		if label[0] == '-' || label[len(label)-1] == '-' {
-			return false
-		}
-		for _, r := range label {
-			switch {
-			case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_':
-			default:
-				return false
-			}
-		}
-	}
-	return true
-}
+// The pure listen-address and NATS URL validators live with the S8 config
+// compatibility gate (brokerupgrade/config_compat.go), which asks a candidate
+// the same question; these names keep the existing config-check callers.
+// origin: hot-update S8 plan §6.1 / §12.1 (P15 broker.go net-zero move)
+func validateListenAddr(name, addr string) error { return brokerupgrade.ValidateListenAddr(name, addr) }
+func validateNATSURL(raw string) error           { return brokerupgrade.ValidateNATSURL(raw) }
+func validListenHost(host string) bool           { return brokerupgrade.ValidListenHost(host) }
 
 // leaseAssignedName renders a verdict for the adjudication log: the name that
 // was issued, or "" when the register was left to keep the name it asked for.
@@ -2892,99 +2938,20 @@ func leaseAssignedName(l *proto.NodeLease) string {
 	return l.AssignedNID
 }
 
-// configuredBasename returns the root of this agent's credential family.
-//
-// It is what the agent SAYS it was configured with, falling back to the
-// presented name when it says nothing — which is both the pre-feature case and
-// the ordinary unleased case, and in each the presented name IS the root.
-//
-// Deliberately never SplitLeaseName: that would fold a real device named
-// `gpu-02` into the `gpu` family (external review F2).
+// The credential-family authority (configured root and trusted PreviousNID)
+// is decided in the register-authority leaf with the incarnation comparison.
+// origin: hot-update S8 plan §6.2 / §12.1 (P15 broker.go net-zero move)
 func configuredBasename(b *Broker, sid, nid string, req *proto.NodeRegisterReq) string {
-	if req == nil || req.ConfiguredNID == "" || req.ConfiguredNID == nid {
-		return nid
-	}
-	// IT IS CLIENT-SUPPLIED, SO IT IS CHECKED AGAINST THE NAME THIS REGISTER
-	// ARRIVED UNDER.
-	//
-	// The only legitimate case where the two differ is an agent that already
-	// holds a lease: it registers as `<base>-NN` while its configured root is
-	// `<base>`. Anything else is an agent claiming membership of a credential
-	// family it did not authenticate into — and the external re-review showed
-	// what that buys: an agent holding gpu1's credential could declare
-	// ConfiguredNID "victim" and have the broker allocate victim-02,
-	// victim-03 … reserving another family's suffix space in leaseHolder,
-	// without ever being able to authenticate as one of those names.
-	//
-	// auth_callout already binds this connection to `nid`; this makes the
-	// register body agree with it instead of overriding it. On a mismatch the
-	// presented name is used, which is the pre-feature reading and cannot
-	// reach outside the family the agent actually authenticated as.
-	if base, _, leased := proto.SplitLeaseName(nid); leased && base == req.ConfiguredNID {
-		// Name shape alone is not evidence that this is a lease. A real device
-		// may be provisioned as `gpu-02`; letting that device claim configured
-		// root `gpu` crosses into a different credential family. When bindings
-		// are available, accept the relationship only when the presented name
-		// has no binding of its own and the claimed root does.
-		// len(provisioned) > 0, NOT the readable flag: this call site has always meant
-		// "are there bindings to reason about at all", and E1's contract fix changed what
-		// the second return says. Spelled out here so the two sites cannot drift again.
-		provisioned, readable := node.ProvisionedNIDs(b.read().SQL(), sid)
-		if readable && len(provisioned) > 0 && (provisioned[nid] || !provisioned[req.ConfiguredNID]) {
-			return nid
-		}
-		return req.ConfiguredNID
-	}
-	return nid
+	return brokerupgrade.ConfiguredBasename(b.read().SQL(), sid, nid, req)
 }
-
 func trustedPreviousNID(b *Broker, sid, nid string, req *proto.NodeRegisterReq) string {
-	if req == nil || req.PreviousNID == "" {
-		return ""
-	}
-	base := configuredBasename(b, sid, nid, req)
-	// A carry is meaningful only when the current presented name is an
-	// assigned member of the proved family. In particular, an independently
-	// provisioned `gpu-02` resolves its base to itself and cannot name `gpu` as
-	// a process-row source.
-	presentedBase, _, presentedLeased := proto.SplitLeaseName(nid)
-	if !presentedLeased || presentedBase != base {
-		return ""
-	}
-	if req.PreviousNID == base {
-		return req.PreviousNID
-	}
-	previousBase, _, previousLeased := proto.SplitLeaseName(req.PreviousNID)
-	if previousLeased && previousBase == base {
-		return req.PreviousNID
-	}
-	return ""
+	return brokerupgrade.TrustedPreviousNID(b.read().SQL(), sid, nid, req)
 }
 
 // jsHandle boxes the JetStream interface so it can live in an atomic.Pointer. A nil
 // pointer means "JetStream is not available", which is the same signal the old nil
 // interface carried.
 type jsHandle struct{ js jetstream.JetStream }
-
-// brokerJS returns the live JetStream handle, or nil when JetStream is unavailable.
-//
-// A package-level function taking *Broker, not a method: the structural-budget ratchet
-// pins this type's method count exactly (the same reason replyLeaseVerdict is one).
-func brokerJS(b *Broker) jetstream.JetStream {
-	if h := b.jsp.Load(); h != nil {
-		return h.js
-	}
-	return nil
-}
-
-// setBrokerJS publishes the handle. Passing nil clears it.
-func setBrokerJS(b *Broker, js jetstream.JetStream) {
-	if js == nil {
-		b.jsp.Store(nil)
-		return
-	}
-	b.jsp.Store(&jsHandle{js: js})
-}
 
 // withholdSharedInboxSecrets strips the credential-bearing directive from a register reply
 // that is about to be published into the SHARED inbox space.
@@ -3092,6 +3059,11 @@ func enableJetStream(ctx context.Context, b *Broker, nc *nats.Conn) error {
 		b.cfg.Logger.Debug("broker: JetStream client scaffolding unavailable", "err", err)
 		return nil
 	}
+	// Cold repair (the events ensure below) and every later producer take P18 permits:
+	// a sealed recovery refuses them before any JetStream mutation (S9 T49).
+	if js, err = b.infra.BindJetStream(js, nil); err != nil {
+		return err
+	}
 	probeCtx, cancelProbe := context.WithTimeout(ctx, 1*time.Second)
 	_, infoErr := js.AccountInfo(probeCtx)
 	cancelProbe()
@@ -3115,16 +3087,6 @@ func enableJetStream(ctx context.Context, b *Broker, nc *nats.Conn) error {
 	ensureCancel()
 	setBrokerJS(b, js)
 	b.cfg.Logger.Info("broker: JetStream enabled")
-	if rerr := b.reconcileHistoryStreamsOnBoot(ctx); rerr != nil {
-		b.cfg.Logger.Warn("broker: history-stream boot reconcile", "err", rerr)
-	}
-	// file-transfer-plan §Object bucket lifecycle G.2 — reap leftover OBJ_xfer-* streams
-	// from a previous crash.
-	if n, rerr := b.reconcileXferObjects(ctx); rerr != nil {
-		b.cfg.Logger.Warn("broker: OBJ_xfer boot reconcile", "err", rerr)
-	} else if n > 0 {
-		b.cfg.Logger.Info("broker: orphan xfer buckets reaped", "count", n)
-	}
 	return nil
 }
 

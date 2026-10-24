@@ -12,9 +12,9 @@ package broker
 
 import (
 	"context"
-	"fmt"
-	"syscall"
 	"time"
+
+	"github.com/LinZiyang666/tether/internal/brokercontrol"
 )
 
 // defaultDiskCheckInterval / defaultDiskPressureThreshold mirror
@@ -55,7 +55,14 @@ func (b *Broker) startDiskMonitor(ctx context.Context) {
 		usageFn = diskUsage
 	}
 
+	// Image cuts cancel and join this actual worker before replacing NC/Node.
+	// origin: hot-update S6 plan §3.2 / rv-fd-6
+	done := make(chan struct{})
+	if b.imageControl != nil {
+		b.imageControl.diskDone = done
+	}
 	go func() {
+		defer close(done)
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		// Tick once on startup so an already-full disk surfaces
@@ -120,24 +127,6 @@ func (b *Broker) signalDiskAlert(active bool) {
 	}
 }
 
-// diskUsage returns (used, total) bytes on the filesystem containing
-// path, via syscall.Statfs. Linux-only; Windows / Plan 9 builds would
-// need a different implementation but v1 ships Linux-only (see
-// architecture I.5).
-func diskUsage(path string) (used, total uint64, err error) {
-	var st syscall.Statfs_t
-	if err := syscall.Statfs(path, &st); err != nil {
-		return 0, 0, fmt.Errorf("statfs %s: %w", path, err)
-	}
-	// Statfs_t.Bsize is int64 on linux, so the conversion is real. (There used to be a
-	// //nolint here naming unconvert+gosec; neither is enabled, so it suppressed nothing while
-	// reading as a considered exemption. TestNolintDirectivesNameEnabledLinters now forbids that.)
-	bsize := uint64(st.Bsize)
-	total = uint64(st.Blocks) * bsize
-	free := uint64(st.Bavail) * bsize
-	if free > total {
-		return 0, total, nil
-	}
-	used = total - free
-	return used, total, nil
-}
+// Compatibility adapters keep callers bound to the extracted control owner.
+// origin: hot-update S6 plan §9.3 / BROKER-SLIM
+func diskUsage(path string) (used, total uint64, err error) { return brokercontrol.DiskUsage(path) }

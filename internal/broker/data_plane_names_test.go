@@ -14,6 +14,10 @@ import (
 // unambiguously auto-pick this broker's bus nkey. The status banner is the long-lived recovery prompt an
 // operator sees until the data plane is fixed, so it must not print an incomplete command.
 func TestG2ExternalReviewDataPlaneBannerNamesRequiredStandaloneFlags(t *testing.T) {
+	// origin: hot-update S10 plan §11.1 / TEST-BUDGET
+	if runIsolatedBrokerTest(t) {
+		return
+	}
 	n, addr := d7SingleNode(t, "brk-a")
 	admin := NewClusterAdmin(n, nil)
 	caughtUp := func(barrier uint64) (bool, error) { cur, err := n.AppliedIndex(); return cur >= barrier, err }

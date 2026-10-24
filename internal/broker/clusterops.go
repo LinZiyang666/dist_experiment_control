@@ -19,7 +19,7 @@ import (
 // ledger table. The persistent retire-then-re-add history is an additive post-v2 follow-up.)
 
 func (b *clusterAdminBackend) handleClusterOps(req adminsock.Request) adminsock.Response {
-	ro := b.admin.node.RODB()
+	ro := b.admin.Node.RODB()
 	// C4: the REAL operation log is authoritative; the phase-derived view is a FALLBACK for legacy
 	// rows (a `cluster add` one-shot / a pre-C4 membership state) with no op record.
 	realOps, err := cluster.RecentOperations(ro, 200)

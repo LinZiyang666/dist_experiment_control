@@ -119,3 +119,9 @@ func (b *Broker) singleWriter() (*sql.DB, bool) {
 // remedy wording in one place, so an operator who hits it on a clustered broker is pointed at
 // raft rather than at their own command.
 func singleWriteRefusal() error { return errClusterModeSingleWrite }
+
+// bindClusterReadDB installs the current generation's read pool in cold and hot
+// assembly. Keeping this assignment beside read/singleWriter prevents new image
+// consumers from reaching around the DB-role boundary to rebind it themselves.
+// origin: hot-update S6 plan §8.1 / T29
+func bindClusterReadDB(b *Broker, db *sql.DB) { b.cfg.DB = db }

@@ -27,15 +27,34 @@ package stackharness
 
 import (
 	"database/sql"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/LinZiyang666/tether/internal/auth"
 	"github.com/LinZiyang666/tether/internal/session"
 )
 
 // PlaceholderPINHash is the placeholder pin hash every absorbed seed used. Tests that need a REAL PIN go
 // through auth.HashPIN themselves (the WithPIN variants were not absorbed).
+// Normal seeds now use SessionPINHash so their creation salt can authorize
+// removal; retain this literal for explicit malformed-creation counterexamples.
 const PlaceholderPINHash = "test-pin-hash"
+
+var sessionPINHash = sync.OnceValues(func() (string, error) { return auth.HashPIN("stack-fixture-pin") })
+
+// SessionPINHash retains real creation material for fixtures that do not join
+// by PIN. A placeholder cannot satisfy the authority guard on session removal.
+// Cache the expensive derivation; created_at still distinguishes each creation.
+// origin: S7 internal review MAKETEST-TRANSFER F2; hot-update S8 plan §6.2
+func SessionPINHash(t testing.TB) string {
+	t.Helper()
+	hash, err := sessionPINHash()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return hash
+}
 
 // SeedSession creates the ACTIVE session `sid` owned by `ownerFP` through the production writer
 // (session.Create), exactly as the eight absorbed helpers did. It deliberately does NOT take a raw
@@ -43,7 +62,7 @@ const PlaceholderPINHash = "test-pin-hash"
 // column-level fixtures on a raft-replicated DB and were left alone.
 func SeedSession(t testing.TB, db *sql.DB, sid, ownerFP string) {
 	t.Helper()
-	if _, err := session.Create(db, sid, sid, ownerFP, PlaceholderPINHash, time.Now().UTC()); err != nil {
+	if _, err := session.Create(db, sid, sid, ownerFP, SessionPINHash(t), time.Now().UTC()); err != nil {
 		t.Fatalf("session.Create(%q): %v", sid, err)
 	}
 }

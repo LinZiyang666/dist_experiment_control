@@ -91,10 +91,10 @@ func (b *clusterAdminBackend) handleAlertRaise(req adminsock.Request) adminsock.
 	if err := validAlertText("dedup_key (derived from --label)", key, maxAlertDedupKeyLen); err != nil {
 		return bad(err.Error() + " — shorten --label")
 	}
-	now := b.admin.now()
+	now := b.admin.Now()
 	id := newAlertID(key, now)
 	var alreadyActive bool
-	if err := b.admin.node.Propose(func(db *sql.DB) (*cluster.Command, error) {
+	if err := b.admin.Node.Propose(func(db *sql.DB) (*cluster.Command, error) {
 		var n int
 		if e := db.QueryRow(`SELECT COUNT(*) FROM alerts WHERE dedup_key=? AND state='ACTIVE'`, key).Scan(&n); e != nil {
 			return nil, e
@@ -123,8 +123,8 @@ func (b *clusterAdminBackend) handleAlertClear(req adminsock.Request) adminsock.
 	if err := validAlertText("dedup_key", req.AlertDedupKey, maxAlertDedupKeyLen); err != nil {
 		return adminsock.Response{Op: op, Error: err.Error(), Code: adminsock.CodeBadRequest}
 	}
-	now := b.admin.now()
-	if err := b.admin.node.Propose(func(*sql.DB) (*cluster.Command, error) {
+	now := b.admin.Now()
+	if err := b.admin.Node.Propose(func(*sql.DB) (*cluster.Command, error) {
 		return cluster.PlanAlertClear(req.AlertDedupKey, now)
 	}); err != nil {
 		return b.alertProposeError(op, err)
@@ -138,8 +138,8 @@ func (b *clusterAdminBackend) handleAlertClear(req adminsock.Request) adminsock.
 // (LitText) rejection cannot occur here, so there is no bad_request branch.
 func (b *clusterAdminBackend) alertProposeError(op string, err error) adminsock.Response {
 	if cluster.IsNotLeader(err) {
-		_, leaderID := b.admin.node.LeaderWithID()
-		host := b.admin.leaderHost(leaderID)
+		_, leaderID := b.admin.Node.LeaderWithID()
+		host := b.admin.LeaderHost(leaderID)
 		msg := "not leader; re-run on the leader host"
 		if leaderID == "" {
 			msg = "no leader (election in progress); retry"

@@ -28,6 +28,10 @@ import (
 // as authority to update by PID alone, the old broker becomes a confused deputy and
 // rolling upgrade reopens the cross-session process-kill primitive.
 func TestLegacyForwardedProcExitCannotBypassTheSessionFence(t *testing.T) {
+	// origin: hot-update S10 plan §11.1 / TEST-BUDGET
+	if runIsolatedBrokerTest(t) {
+		return
+	}
 	leader, _ := d7SingleNode(t, "leader-legacy-exit-fence")
 	now := time.Now().UTC()
 	if err := leader.Propose(func(db *sql.DB) (*cluster.Command, error) {
@@ -169,6 +173,10 @@ func nonLeaderNode(t *testing.T, id string) *cluster.Node {
 // applying a real PlanMarkExited. The only thing constructed for the test is a node that
 // cannot win an election, which is how the forward branch is reached at all.
 func TestAForwardedProcExitCarriesTheSessionFence(t *testing.T) {
+	// origin: hot-update S10 plan §11.1 / TEST-BUDGET
+	if runIsolatedBrokerTest(t) {
+		return
+	}
 	leader, _ := d7SingleNode(t, "leader-1")
 	now := time.Now().UTC()
 	if err := leader.Propose(func(db *sql.DB) (*cluster.Command, error) {

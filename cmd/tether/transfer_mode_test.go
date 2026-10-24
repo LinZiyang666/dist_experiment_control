@@ -1,9 +1,23 @@
 package main
 
 import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
+	"time"
+
+	"github.com/LinZiyang666/tether/internal/cli"
+	"github.com/LinZiyang666/tether/internal/proto"
+	"github.com/LinZiyang666/tether/internal/testharness"
+	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 )
 
 // transfer_mode_test.go — a forced overwrite replaces CONTENT, not permissions.
@@ -32,8 +46,8 @@ func TestForcedLocalWriteKeepsTheDestinationsMode(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := writeLocalAtomic(dst, []byte("new content\n"), true); err != nil {
-		t.Fatalf("writeLocalAtomic: %v", err)
+	if err := prepareLocalTransferCommit(t, dst, []byte("new content\n"), "forced", true)(); err != nil {
+		t.Fatalf("commit forced local write: %v", err)
 	}
 
 	st, err := os.Stat(dst)
@@ -58,8 +72,8 @@ func TestAFreshLocalWriteDoesNotInventAMode(t *testing.T) {
 	dir := t.TempDir()
 	dst := filepath.Join(dir, "brand-new.bin")
 
-	if err := writeLocalAtomic(dst, []byte("x"), false); err != nil {
-		t.Fatalf("writeLocalAtomic: %v", err)
+	if err := prepareLocalTransferCommit(t, dst, []byte("x"), "fresh", false)(); err != nil {
+		t.Fatalf("commit fresh local write: %v", err)
 	}
 	st, err := os.Stat(dst)
 	if err != nil {
@@ -76,46 +90,176 @@ func TestAFreshLocalWriteDoesNotInventAMode(t *testing.T) {
 // carry and the tier-B path did not, and no behavioural test could tell, because
 // neither path had one.
 //
+// The following records the original source-scanning rationale, retained as an asset.
+// S7 drives the real result stream and Cobra entry instead.
 // Driving the tier-B lander needs an ObjectStore result stream; asserting the call site
 // in the source is what is affordable here, and it is exactly what a future edit would
 // drop.
+// The old text counter accepted two copies in one path and stopped seeing the
+// real implementation after a leaf move. Drive the retained Cobra entry with
+// real inline/object bytes; the fixture supplies only the remote control replies.
+// origin: hot-update S7 plan §7 / §11.4 / P31.
 func TestBothPullPathsCarryTheMode(t *testing.T) {
-	src, err := os.ReadFile("transfer.go")
-	if err != nil {
-		t.Fatal(err)
+	before := runtime.NumGoroutine()
+	fdBefore := testharness.FDCount()
+	for round := 0; round < 5; round++ {
+		exercisePullModePaths(t)
 	}
-	const carry = "f.Chmod(st.Mode().Perm())"
-	if n := countAll(string(src), carry); n < 2 {
-		t.Fatalf("only %d of the two local-write paths carries the destination's mode.\n\n"+
-			"finishPullTierA writes inline through writeLocalAtomic; the tier-B lander streams "+
-			"into its own temp. A fix on one of them leaves `pull --force` resetting the mode for "+
-			"every file over the 8 MiB tier-A ceiling — which is most of the files anyone uses "+
-			"--force on.", n)
-	}
+	testharness.AssertNoGoroutineLeak(t, "pull mode paths", before)
+	testharness.AssertNoFDLeak(t, "pull mode paths", fdBefore, 0)
 }
 
-func countAll(hay, needle string) int {
-	n, i := 0, 0
-	for {
-		j := indexFrom(hay, needle, i)
-		if j < 0 {
-			return n
-		}
-		n++
-		i = j + len(needle)
+func exercisePullModePaths(t *testing.T) {
+	t.Helper()
+	for _, tc := range []struct {
+		tier  string
+		force bool
+	}{{"a", true}, {"b", true}, {"a", false}, {"b", false}} {
+		tier, force := tc.tier, tc.force
+		t.Run(fmt.Sprintf("%s/force=%t", tier, force), func(t *testing.T) {
+			url := startJetStreamNATS(t)
+			nc, err := nats.Connect(url)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer nc.Close()
+			home := t.TempDir()
+			writeReviewPsIdentity(t, home, "lab")
+			id, err := cli.EnsureIdentity(home)
+			if err != nil {
+				t.Fatal(err)
+			}
+			payload := []byte("new permission-preserving bytes\n")
+			if tier == "b" {
+				payload = bytes.Repeat(payload, int(proto.XferTierAMaxBytes)/len(payload)+1)
+			}
+			digest := sha256.Sum256(payload)
+			dir := t.TempDir()
+			dst := filepath.Join(dir, "app.sh")
+			wantMode := os.FileMode(0o600)
+			if force {
+				wantMode = 0o755
+				if err := os.WriteFile(dst, []byte("old\n"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Chmod(dst, wantMode); err != nil {
+					t.Fatal(err)
+				}
+			}
+			js, err := jetstream.New(nc)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var store jetstream.ObjectStore
+			if tier == "b" {
+				store, err = js.CreateObjectStore(t.Context(), jetstream.ObjectStoreConfig{Bucket: proto.XferBucketName("lab")})
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			prepared, finalized := make(chan proto.PullPrepareReq, 1), make(chan proto.TransferFinalize, 1)
+			callbackErrors := make(chan error, 2)
+			subscribe := func(subject string, handler nats.MsgHandler) {
+				t.Helper()
+				sub, err := nc.Subscribe(subject, handler)
+				if err != nil {
+					t.Fatal(err)
+				}
+				deferUnsubscribe := func() { _ = sub.Unsubscribe() }
+				t.Cleanup(deferUnsubscribe)
+			}
+			respond := func(msg *nats.Msg, value any) {
+				body, err := json.Marshal(value)
+				if err == nil {
+					err = msg.Respond(body)
+				}
+				if err != nil {
+					callbackErrors <- err
+				}
+			}
+			subscribe(proto.SubjCtrlCaps(id.PublicKey, "lab"), func(msg *nats.Msg) {
+				respond(msg, proto.CapsResp{OK: true, MaxPayload: nc.MaxPayload()})
+			})
+			subscribe(proto.SubjCmdBy("lab", id.PublicKey, "lab-1", "pull"), func(msg *nats.Msg) {
+				var req proto.PullPrepareReq
+				if err := json.Unmarshal(msg.Data, &req); err != nil {
+					callbackErrors <- err
+					return
+				}
+				prepared <- req
+				resp := proto.PullPrepareResp{OK: true, Tier: tier, Size: int64(len(payload)), SHA256: hex.EncodeToString(digest[:])}
+				if tier == "a" {
+					resp.InlineData = payload
+				} else {
+					// SDK Put is fixture setup for a negotiated legacy remote,
+					// never a capable writer or a retry inside the tested ctl.
+					if _, err := store.PutBytes(t.Context(), req.TransferID, payload); err != nil {
+						callbackErrors <- err
+						return
+					}
+					resp.Bucket, resp.ObjectKey = proto.XferBucketName("lab"), req.TransferID
+				}
+				respond(msg, resp)
+			})
+			subscribe(proto.SubjCtrlTransferFinalize(id.PublicKey, "lab", "*"), func(msg *nats.Msg) {
+				var fin proto.TransferFinalize
+				if err := json.Unmarshal(msg.Data, &fin); err != nil {
+					callbackErrors <- err
+					return
+				}
+				finalized <- fin
+				respond(msg, proto.TransferFinalizeResp{OK: true})
+			})
+			if err := nc.Flush(); err != nil {
+				t.Fatal(err)
+			}
+			cmd := newPullCmd()
+			args := []string{"lab-1:/remote/app.sh", dst, "--home", home, "--nats-url", url, "--timeout", "5s"}
+			if force {
+				args = append(args, "--force")
+			}
+			cmd.SetArgs(args)
+			var output, stderr bytes.Buffer
+			cmd.SetOut(&output)
+			cmd.SetErr(&stderr)
+			ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+			defer cancel()
+			if err := cmd.ExecuteContext(ctx); err != nil {
+				t.Fatalf("pull tier %s: %v; stderr=%s", tier, err, stderr.String())
+			}
+			select {
+			case err := <-callbackErrors:
+				t.Fatal(err)
+			default:
+			}
+			var req proto.PullPrepareReq
+			select {
+			case req = <-prepared:
+				if req.TransferID == "" || req.Force != force {
+					t.Fatalf("pull did not prepare the original invocation: %+v", req)
+				}
+			default:
+				t.Fatal("pull returned without invoking the remote prepare")
+			}
+			select {
+			case fin := <-finalized:
+				if fin.TransferID != req.TransferID || fin.Kind != "complete" || fin.Tier != tier || fin.Bytes != int64(len(payload)) {
+					t.Fatalf("pull finalized a different invocation or incomplete bytes: %+v", fin)
+				}
+			default:
+				t.Fatal("pull returned without completing its original invocation")
+			}
+			st, err := os.Stat(dst)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if st.Mode().Perm() != wantMode {
+				t.Fatalf("tier %s local write mode=%o, want %o (force=%t)", tier, st.Mode().Perm(), wantMode, force)
+			}
+			got, err := os.ReadFile(dst)
+			if err != nil || !bytes.Equal(got, payload) {
+				t.Fatalf("tier %s content not replaced completely: bytes=%d err=%v", tier, len(got), err)
+			}
+		})
 	}
-}
-
-func indexFrom(hay, needle string, from int) int {
-	if from >= len(hay) {
-		return -1
-	}
-	idx := -1
-	for k := from; k+len(needle) <= len(hay); k++ {
-		if hay[k:k+len(needle)] == needle {
-			idx = k
-			break
-		}
-	}
-	return idx
 }

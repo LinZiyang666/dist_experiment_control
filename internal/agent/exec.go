@@ -1,11 +1,13 @@
 package agent
 
 import (
-	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"maps"
+	"math"
 	"os"
 	"os/exec"
 	"strings"
@@ -13,10 +15,14 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/LinZiyang666/tether/internal/execsession"
 	"github.com/LinZiyang666/tether/internal/proc"
+	"github.com/LinZiyang666/tether/internal/procrequest"
 	"github.com/LinZiyang666/tether/internal/proto"
+	"github.com/LinZiyang666/tether/internal/pty"
 	"github.com/LinZiyang666/tether/internal/spawnexec"
 	"github.com/LinZiyang666/tether/internal/spawnsafe"
+	"github.com/LinZiyang666/tether/internal/workload"
 	"github.com/nats-io/nats.go"
 )
 
@@ -58,6 +64,8 @@ func (a *Agent) dispatchForwarded(nc *nats.Conn, msg *nats.Msg) {
 	switch verb {
 	case "exec":
 		go a.handleExecForwarded(nc, msg)
+	case proto.ProcessResumeVerb:
+		go handleProcessResumeForwarded(a, nc, msg)
 	case "run":
 		go a.handleRunForwarded(nc, msg)
 	case "kill":
@@ -71,7 +79,9 @@ func (a *Agent) dispatchForwarded(nc *nats.Conn, msg *nats.Msg) {
 		// barrier UNDER proxyDrainMu, so once Run sets proxyDraining no further
 		// Add can happen and proxyHandlerWG.Wait is a sound shutdown barrier.
 		a.proxyDrainMu.Lock()
-		if a.proxyDraining {
+		// origin: hot-update S5 plan §7.2. Never wrap the signed sequence or
+		// admit a handler whose arrival cannot be represented by the sealed cut.
+		if a.proxyDraining || a.proxyDispatchN < 0 || a.proxyDispatchN == math.MaxInt64 {
 			a.proxyDrainMu.Unlock()
 			return
 		}
@@ -115,6 +125,15 @@ func (a *Agent) handleExecForwarded(nc *nats.Conn, msg *nats.Msg) {
 		a.cfg.Logger.Warn("agent: exec.req.forwarded without Reply inbox")
 		return
 	}
+	// origin: hot-update S3 plan §4.0. Hold admission for the whole handler.
+	release, admitted := a.gate.admit(gateExec)
+	if !admitted {
+		// origin: hot-update S4 plan §9.2 / N1-REFUSAL. v0.6.0 knows try_again as 75; keep the upgrade reason in detail.
+		a.replyChunk(nc, msg.Reply, proto.ExecChunk{Kind: "error", Error: "try_again: agent_upgrading: image switch in progress; retry"})
+		return
+	}
+	defer release()
+
 	var req proto.ExecReq
 	if err := json.Unmarshal(msg.Data, &req); err != nil {
 		a.replyChunk(nc, msg.Reply, proto.ExecChunk{
@@ -135,11 +154,14 @@ func (a *Agent) handleExecForwarded(nc *nats.Conn, msg *nats.Msg) {
 	// h1 C1: lifecycle events go through the courier (current-conn, ACKed,
 	// register-replayed) — never a fire-and-forget publish on the captured
 	// spawn-time conn, which silently lost every exit after a conn rebuild
-	// (zombie class a, the 2026-08-04 incident).
-	a.courier.enqueueStarted(pid, req.Argv, req.ActorFP, "", 0, time.Now().UTC())
+	// (zombie class a, the 2026-08-04 incident). Since S1 the proc.started
+	// is enqueued by startExecPipes right after the real spawn and BEFORE
+	// the child enters the process table (the single started site shared
+	// with the reliable runtime), so a spawn that never happened leaves no
+	// EXITED(-1) row behind — the same convention `run` has always had.
+	// origin: docs/reviews/hot-update-reliable-exec-plan.md §3.1.
 
 	exitCode, err := a.runChild(nc, msg.Reply, pid, &req)
-	a.courier.enqueueExit(pid, exitCode)
 
 	if err != nil {
 		a.replyChunk(nc, msg.Reply, proto.ExecChunk{
@@ -152,19 +174,33 @@ func (a *Agent) handleExecForwarded(nc *nats.Conn, msg *nats.Msg) {
 	})
 }
 
-// runChild spawns the child process, streams stdout/stderr to replyTo,
-// and returns the exit code. A non-nil error is returned ONLY for setup
-// failures (pipe / Start), not for child exit codes — those are the
-// returned exitCode value and the caller pubs an "exit" chunk.
-func (a *Agent) runChild(nc *nats.Conn, replyTo, pid string, req *proto.ExecReq) (int, error) {
+// startExecPipes starts one validated exec request using the shared safe-spawn
+// policy and transfers successful child wait/signal ownership to workloads.
+// Success returns explicit parent pipe ends with AdoptDraining already active;
+// the caller owns stdin, output delivery, AllowReap/Wait and final retirement.
+// No successful child is waited here, and no courier or transport is touched.
+//
+// Failure returns no pipes and closes every owned stdio end. A timed-out spawn
+// keeps the existing abandoned-helper waiter and wedge-slot lifecycle. Warning
+// is retained after a successful safe Start, including a later adoption failure,
+// so each caller can deliver that existing side effect on its chosen stream.
+func startExecPipes(a *Agent, pid string, req *proto.ExecReq) (_ *workload.Stdio, warning string, err error) {
 	cmd, decision, err := a.buildExecCmd(req)
 	if err != nil {
 		// Hung-fs fail-fast (remote_fs_unhealthy / _unsafe_cwd / _not_found).
-		return -1, err
+		return nil, warning, err
 	}
-	if len(req.Stdin) > 0 {
-		cmd.Stdin = bytes.NewReader(req.Stdin)
+	stdio, err := workload.NewStdio()
+	if err != nil {
+		return nil, warning, err
 	}
+	transferred := false
+	defer func() {
+		if !transferred {
+			stdio.Close()
+		}
+	}()
+	stdio.Bind(cmd)
 	var handshake *spawnexec.Handshake
 	if decision.Active {
 		// Do not abandon a direct cmd.Start goroutine: a target execve stalled in
@@ -173,18 +209,9 @@ func (a *Agent) runChild(nc *nats.Conn, replyTo, pid string, req *proto.ExecReq)
 		// execs quickly; only its independent runtime touches the risky target.
 		cmd, handshake, err = spawnexec.Prepare(cmd)
 		if err != nil {
-			return -1, err
+			return nil, warning, err
 		}
 		setExecProcGroup(cmd) // helper is the target subtree's group leader
-	}
-
-	stdoutPipe, err := cmd.StdoutPipe()
-	if err != nil {
-		return -1, err
-	}
-	stderrPipe, err := cmd.StderrPipe()
-	if err != nil {
-		return -1, err
 	}
 
 	// Start. In safe mode the execve is bounded by a spawn-window deadline so a
@@ -198,8 +225,8 @@ func (a *Agent) runChild(nc *nats.Conn, replyTo, pid string, req *proto.ExecReq)
 			func() error { return handshake.Start(cmd) },
 			func() {
 				handshake.Cancel()
-				_ = stdoutPipe.Close()
-				_ = stderrPipe.Close()
+				_ = stdio.Stdout.Close()
+				_ = stdio.Stderr.Close()
 			},
 			func(startErr error) {
 				reapAbandonedExecChild(a, cmd, startErr)
@@ -211,49 +238,100 @@ func (a *Agent) runChild(nc *nats.Conn, replyTo, pid string, req *proto.ExecReq)
 			// gotcha #81 had to be attributed entirely from the ctl side.
 			a.cfg.Logger.Warn("agent: exec spawn bounded-start failed",
 				"pid", pid, "argv0", req.Argv[0], "cwd", req.Cwd, "err", err)
-			return -1, err
+			return nil, warning, err
 		}
-		if decision.Warn != "" {
-			a.replyChunk(nc, replyTo, proto.ExecChunk{Kind: "stderr", Data: []byte(decision.Warn + "\n")})
-		}
+		warning = decision.Warn
 	} else if err := cmd.Start(); err != nil {
-		return -1, err
+		return nil, warning, err
 	}
+	stdio.CloseChild()
+
+	// C-5 (hot-update S1): the courier owns the proc.started BEFORE the child
+	// becomes visible in the process table. A register snapshot taken between
+	// the two reads (owners first, then the courier) then always sees either
+	// a pending started or a table row already covered by one; the reverse
+	// order re-opened the G.1 false-orphan window at microsecond scale. The
+	// identity is captured once here and shared by the started event, the
+	// table row and the reliable runtime's Started hook.
+	// origin: docs/reviews/hot-update-reliable-exec-plan.md §3.1.
+	id := execChildIdentity(pid, cmd.Process)
+	a.courier.enqueueStarted(pid, req.Argv, req.ActorFP, id.BootID, id.StartTimeTicks, id.StartedAt)
+	fireAfterEnqueueStarted(a, pid) // test seam: the order above is the C-5 invariant
 
 	// #26: track the live child so an admin EVICT can reap it (setsid-nohup deploys
 	// have no cgroup to do it when the daemon self-exits). Pruned when this
-	// synchronous handler returns (cmd.Wait below), whether the child exits on its
+	// synchronous handler transfers its exit to the courier, whether it exits on its
 	// own or is SIGKILLed by reapManagedChildren.
-	a.registerExecChild(pid, cmd.Process)
-	defer a.unregisterExecChild(pid)
+	if err := a.workloads.AdoptDraining(id, cmd.Process); err != nil {
+		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		_ = cmd.Wait() // adoption failed: the caller still owns this one waiter
+		return nil, warning, err
+	}
+	transferred = true
+	return stdio, warning, nil
+}
+
+// runChild spawns the child process, streams stdout/stderr to replyTo,
+// and returns the exit code. A non-nil error is returned ONLY for setup
+// failures (pipe / Start), not for child exit codes — those are the
+// returned exitCode value and the caller pubs an "exit" chunk.
+func (a *Agent) runChild(nc *nats.Conn, replyTo, pid string, req *proto.ExecReq) (exitCode int, runErr error) {
+	// The process table retains the real exit until the courier owns it. A
+	// register snapshot can therefore never see a gap between the two owners.
+	defer func() {
+		a.courier.enqueueExit(pid, exitCode)
+		a.unregisterExecChild(pid)
+	}()
+	stdio, warning, err := startExecPipes(a, pid, req)
+	if stdio != nil {
+		defer stdio.Close()
+	}
+	if warning != "" {
+		a.replyChunk(nc, replyTo, proto.ExecChunk{Kind: "stderr", Data: []byte(warning + "\n")})
+	}
+	if err != nil {
+		return -1, err
+	}
+	inputDone := make(chan struct{})
+	go func() {
+		defer close(inputDone)
+		defer func() { _ = stdio.Stdin.Close() }()
+		// Explicit ownership replaces os/exec's hidden stdin copier. Empty input
+		// closes immediately, preserving the legacy EOF seen by non-PTY children.
+		_, _ = stdio.Stdin.Write(req.Stdin)
+	}()
 
 	var wg sync.WaitGroup
 	wg.Add(2)
-	go a.streamPipe(&wg, nc, stdoutPipe, replyTo, "stdout")
-	go a.streamPipe(&wg, nc, stderrPipe, replyTo, "stderr")
+	go a.streamPipe(&wg, nc, stdio.Stdout, replyTo, "stdout")
+	go a.streamPipe(&wg, nc, stdio.Stderr, replyTo, "stderr")
 	wg.Wait()
-
-	if err := cmd.Wait(); err != nil {
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) {
-			// ExitCode() returns -1 when the child was terminated by a
-			// signal rather than a clean exit. Stream a stderr note so
-			// the operator can tell e.g. "my own `pkill -f <pattern>`
-			// caught the exec child's shell" apart from "agent crashed",
-			// but keep the legacy wire shape (exit chunk with ExitCode=-1)
-			// so existing ctl tooling that special-cases negative exit
-			// codes keeps working.
-			if exitErr.ExitCode() < 0 {
-				note := []byte(fmt.Sprintf(
-					"\n[tether agent] child terminated by signal (%s) — usually external pkill / SIGTERM matched the shell's argv\n",
-					exitErr.String()))
-				a.replyChunk(nc, replyTo, proto.ExecChunk{Kind: "stderr", Data: note})
-			}
-			return exitErr.ExitCode(), nil
-		}
+	if err := a.workloads.AllowReap(pid); err != nil {
 		return -1, err
 	}
-	return 0, nil
+	result, err := a.workloads.Wait(pid)
+	// As with Cmd.Wait, a child that exits without reading its input must not
+	// retain the parent's writer goroutine. Its descendants may still have the
+	// read end, so close the owned writer explicitly after the output drained.
+	_ = stdio.Stdin.Close()
+	<-inputDone
+	if err != nil {
+		return -1, err
+	}
+	if result.Signal != 0 {
+		// ExitStatus returns -1 when the child was terminated by a
+		// signal rather than a clean exit. Stream a stderr note so
+		// the operator can tell e.g. "my own `pkill -f <pattern>`
+		// caught the exec child's shell" apart from "agent crashed",
+		// but keep the legacy wire shape (exit chunk with ExitCode=-1)
+		// so existing ctl tooling that special-cases negative exit
+		// codes keeps working.
+		note := []byte(fmt.Sprintf(
+			"\n[tether agent] child terminated by signal (%s) — usually external pkill / SIGTERM matched the shell's argv\n",
+			syscall.Signal(result.Signal).String()))
+		a.replyChunk(nc, replyTo, proto.ExecChunk{Kind: "stderr", Data: note})
+	}
+	return result.Code, nil
 }
 
 func (a *Agent) streamPipe(wg *sync.WaitGroup, nc *nats.Conn, r io.ReadCloser, replyTo, kind string) {
@@ -326,82 +404,11 @@ func (a *Agent) replyChunk(nc *nats.Conn, replyTo string, c proto.ExecChunk) {
 // the PTY variant carried now rides enqueueStarted's parameters; exec children
 // pass ""/0 as before (sync lifecycle, no G.1 verification need).
 
-func envSliceFromMap(m map[string]string) []string {
-	if len(m) == 0 {
-		return nil
-	}
-	out := make([]string, 0, len(m))
-	for k, v := range m {
-		out = append(out, k+"="+v)
-	}
-	return out
-}
-
-// buildExecCmd constructs the child *exec.Cmd. When the hung-fs-safe spawn
-// policy is active it pre-resolves argv[0] against a sanitized PATH and builds
-// &exec.Cmd{Path: <abs>, Args: argv} DIRECTLY — bypassing exec.Command's
-// LookPath, which would D-hang stat'ing a wedged PATH dir. Otherwise it falls
-// back to the legacy exec.Command path, byte-identical to before the feature.
-// The returned Decision tells the caller whether to bound cmd.Start and emit the
-// sanitize warning.
+func envSliceFromMap(m map[string]string) []string { return spawnsafe.EnvSliceFromMap(m) }
 func (a *Agent) buildExecCmd(req *proto.ExecReq) (*exec.Cmd, spawnsafe.Decision, error) {
-	// lookupPATH is the AGENT process PATH — the one exec.Command's LookPath would
-	// walk and D-hang on (review F2) — NOT the child env's PATH.
-	d, err := a.spawnPolicy.Prepare(req.Argv, req.Cwd, os.Getenv("PATH"), a.execBaseEnv(req), req.Safe)
-	if err != nil {
-		return nil, spawnsafe.Decision{}, err
-	}
-	if !d.Active {
-		// Legacy path (booted with no hangable mount).
-		cmd := exec.Command(req.Argv[0], req.Argv[1:]...)
-		if req.Cwd != "" {
-			cmd.Dir = req.Cwd
-		}
-		if len(req.Env) > 0 {
-			cmd.Env = envSliceFromMap(req.Env)
-		}
-		// Env stays nil here on purpose (remote-fs-resilience M2 pins this path
-		// as byte-identical). The instance lineage cannot leak through it
-		// because the agent UNSETS those variables from its own environment at
-		// startup — see mintInstanceID. A child cannot inherit what the parent
-		// no longer has.
-		setExecProcGroup(cmd)
-		return cmd, d, nil
-	}
-	// Active: ALWAYS &exec.Cmd{Path,Args} (bypass the hanging LookPath). Args[0]
-	// keeps the ORIGINAL argv[0] so multi-call binaries that inspect os.Args[0]
-	// still work.
-	cmd := &exec.Cmd{Path: d.Path, Args: req.Argv}
-	if d.Outage {
-		cmd.Env = d.Env
-		cmd.Dir = d.Cwd
-	} else {
-		// Healthy-hangable: keep the LEGACY env/cwd so the child is byte-identical
-		// to before the feature; only resolution + execve are now bounded.
-		if req.Cwd != "" {
-			cmd.Dir = req.Cwd
-		}
-		if len(req.Env) > 0 {
-			cmd.Env = envSliceFromMap(req.Env)
-		}
-		// Same as the legacy branch: nil is deliberate, and the lineage is
-		// already absent from this process's environment.
-	}
-	setExecProcGroup(cmd)
-	return cmd, d, nil
+	return spawnsafe.BuildExecCmd(a.spawnPolicy, req, a.execBaseEnv(req))
 }
-
-// setExecProcGroup puts the exec child in its OWN process group (Setpgid) so an
-// admin EVICT can reap the child AND any subtree it forks with one kill(-pgid)
-// (#26 reapManagedChildren) — a bare setsid-nohup agent host has no systemd
-// cgroup to do it. pgid == child pid once started. It does not detach a
-// controlling terminal (exec is non-PTY), so output streaming is unchanged.
-func setExecProcGroup(cmd *exec.Cmd) {
-	if cmd.SysProcAttr == nil {
-		cmd.SysProcAttr = &syscall.SysProcAttr{}
-	}
-	cmd.SysProcAttr.Setpgid = true
-}
+func setExecProcGroup(cmd *exec.Cmd) { spawnsafe.SetExecProcGroup(cmd) }
 
 // execBaseEnv is the env an exec child would otherwise run with: the override
 // map when set (which REPLACES the agent env, matching today's semantics), else
@@ -436,55 +443,8 @@ func (a *Agent) execBaseEnv(req *proto.ExecReq) []string {
 // callbacks that make abandon/reap accounting hermetically testable without a
 // real D-state execve.
 
-// reapAbandonedExecChild ends a child whose spawn window we already gave up on.
-//
-// origin: prerelease audit agent-exec/L3-F3. This used to be a bare cmd.Wait(). Waiting
-// reaps the process table entry, which is what the fd-leak review asked for, but it does
-// nothing about the process: the handler has ALREADY answered
-// remote_fs_spawn_timeout and nobody is reading the child's output or will ever report
-// its exit, yet it keeps running, holding the mount it wedged on and consuming the
-// resources the abandon was supposed to reclaim. On a remote filesystem that recovers
-// minutes later, the wait itself blocks that whole time.
-//
-// SIGKILL to the process GROUP, mirroring the PTY path's
-// KillAndWaitAfterAbandonedStart (internal/pty). exec children get their own group
-// (setExecProcGroup), so the negative pid reaches the child's own descendants and
-// nothing else.
-//
-// THE GUARD IS `cmd.Process == nil`, AND ONLY THAT.
-//
-// origin: prerelease audit round 2, I-F1. The first version also returned early on a
-// non-nil startErr, reasoning that "Start itself failed, so os/exec has already cleaned
-// up". That reasoning describes a case this function is almost never called in. The
-// abandon path runs onAbandon FIRST, and exec's onAbandon calls handshake.Cancel() and
-// closes both pipes — so when the wedged execve finally returns it returns an ERROR, and
-// the early return skipped the only path that actually occurs. The child stayed alive,
-// holding the mount it wedged on, and the wedge slot was released immediately because
-// reapOnReturn returned without waiting — disarming the too_many_wedged_spawns ceiling
-// that is supposed to bound exactly this situation.
-//
-// A failed cmd.Start() leaves cmd.Process nil, so the one case the startErr check was
-// reaching for is already covered by the pointer check — and covered correctly, because
-// it tests the thing that matters (is there a process) rather than a proxy for it.
-//
-// Reading cmd.ProcessState is race-free here: the caller reaches this only after
-// receiving the start result over a channel, which supplies the happens-before edge.
-//
-// A package-level function taking *Agent, not a method: the structural-budget ratchet
-// pins this type's method count exactly.
 func reapAbandonedExecChild(a *Agent, cmd *exec.Cmd, startErr error) {
-	_ = startErr // deliberately unused — see above
-	if cmd == nil || cmd.Process == nil {
-		return
-	}
-	if cmd.ProcessState != nil {
-		return // already reaped by whoever observed the exit
-	}
-	pid := cmd.Process.Pid
-	if err := syscall.Kill(-pid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
-		a.cfg.Logger.Warn("agent: kill abandoned exec child group", "pid", pid, "err", err)
-	}
-	_ = cmd.Wait()
+	spawnsafe.ReapAbandonedExecChild(a.cfg.Logger, cmd, startErr)
 }
 
 func (a *Agent) startBounded(start func() error, onAbandon func(), reapOnReturn func(error)) error {
@@ -509,37 +469,225 @@ func remoteFSFailReason(err error) string {
 	}
 }
 
-// mergeChildEnv builds a child env array starting from os.Environ()
-// (so PATH / HOME / locale come for free) and overlays the override
-// map on top — last-wins semantics, matching os/exec docs. Always
-// guarantees TERM is set so curses programs (tmux, vim, htop, less)
-// don't fail with "terminal does not support clear" under systemd
-// --user where TERM is unset by default.
-//
-// Used by `tether run` for PTY children. `tether exec` non-PTY
-// children may want a stricter env (no inherited TERM since stdout
-// isn't a tty); they keep using envSliceFromMap directly.
 func mergeChildEnv(override map[string]string) []string {
-	// stripInstanceEnv for the same reason as execBaseEnv: a PTY child that
-	// launches an agent must start its own lineage, not continue ours.
-	base := stripInstanceEnv(os.Environ())
-	out := make([]string, 0, len(base)+len(override)+1)
-	out = append(out, base...)
-	hasTerm := false
-	for _, e := range base {
-		if strings.HasPrefix(e, "TERM=") {
-			hasTerm = true
-			break
+	return spawnsafe.MergeChildEnv(stripInstanceEnv(os.Environ()), override)
+}
+
+func initProcessRuntime(a *Agent) {
+	// The routing lineage can survive a legacy exec without a request table.
+	// Use a separate incarnation here; a process dispatched with an image
+	// restores that exact runtime instead (restoreImage, hot-update S3) and
+	// never reaches this mint.
+	cfg := processRuntimeConfig(a)
+	cfg.Instance = "process-" + proc.NewPID()
+	runtime, err := execsession.New(cfg)
+	if err != nil {
+		a.cfg.Logger.Debug("agent: reliable process runtime unavailable", "err", err)
+		return
+	}
+	a.processRuntime = runtime
+}
+
+// processBootClock is captured into each runtime configuration. Tests can
+// advance terminal retention without changing the process table's real clock.
+// origin: hot-update S4 plan §6.1 / T26
+var processBootClock = procrequest.BootNow
+
+// processRuntimeConfig is the runtime's adapter into this agent: the shared
+// process table and exec/PTY hooks. Instance is left empty — the mint fills
+// it for a fresh runtime, an imported image supplies its own (the lease keys
+// of every carried task are bound to it).
+func processRuntimeConfig(a *Agent) execsession.Config {
+	// origin: hot-update S5 plan §3.4 / T30. Every domain keeps this pointer;
+	// initializing it before either owner starts prevents split reservations.
+	if a.replayBudget == nil {
+		a.replayBudget = &workload.ReplayBudget{Limit: workload.DefaultReplayBudget}
+	}
+	return execsession.Config{
+		Logger:             a.cfg.Logger,
+		Manager:            &a.workloads,
+		Clock:              processBootClock,
+		SharedReplayBudget: a.replayBudget,
+		Start: func(pid string, req *proto.ExecReq) (*workload.Stdio, string, error) {
+			return startExecPipes(a, pid, req)
+		},
+		StartPTY: func(pid string, req *proto.RunReq) (*pty.Session, string, error) {
+			return startRunPTY(a, pid, req)
+		},
+		// The runtime owns the payload-free audit because it also owns RequestID.
+		// origin: hot-update S4 plan §9.1; P18.
+		PTYStarted:   func(string, proto.RunReq, workload.Identity) {},
+		PTYAdmission: func() error { return checkPTYAdmission(a) },
+		// The proc.started itself is enqueued by startExecPipes (the single
+		// started site, before adoption — C-5). This hook only leaves the
+		// audit line drills count: exactly one `agent: exec … reliable=true`
+		// per real spawn, with the OS identity the table row carries.
+		Started: func(pid string, req proto.ExecReq, id workload.Identity) {
+			a.cfg.Logger.Info("agent: exec", "pid", pid, "argv", req.Argv, "reliable", true,
+				"os_pid", id.OSPID, "start_time_ticks", id.StartTimeTicks)
+		},
+		Exited: func(pid string, code int) { a.courier.enqueueExit(pid, code) },
+		Warn:   func(msg string, err error) { a.cfg.Logger.Warn(msg, "err", err) },
+	}
+}
+
+// processRefusalCode maps a runtime refusal to the stable wire code the client
+// classifies by (proto.CodeProcess*). Unknown errors carry no code and the
+// client falls back to the message prefix. origin: hot-update reliable-exec plan §3.4.
+func processRefusalCode(err error) string {
+	switch {
+	case err == nil:
+		return ""
+	case errors.Is(err, procrequest.ErrInstance):
+		return proto.CodeProcessInstanceLost
+	case errors.Is(err, procrequest.ErrCapacity):
+		return proto.CodeProcessCapacity
+	case errors.Is(err, procrequest.ErrExpired):
+		return proto.CodeProcessExpired
+	case errors.Is(err, procrequest.ErrConflict), errors.Is(err, workload.ErrReplayOffset):
+		return proto.CodeProcessConflict
+	case errors.Is(err, procrequest.ErrStale):
+		return proto.CodeProcessStale
+	// origin: hot-update S4 CLOSE admission contract / plan §4.1
+	// The composite also matches ErrBusy: classify retained recovery first.
+	case errors.Is(err, execsession.ErrRollbackPending):
+		return proto.CodeProcessRecovering
+	case errors.Is(err, procrequest.ErrBusy), errors.Is(err, procrequest.ErrFrozen):
+		return proto.CodeProcessBusy
+	case errors.Is(err, execsession.ErrRevoked):
+		return proto.CodeProcessRevoked
+	case errors.Is(err, execsession.ErrOutputDiscarded):
+		return proto.CodeProcessOutputDiscarded
+	case errors.Is(err, execsession.ErrClosed):
+		return proto.CodeProcessRuntimeClosed
+	case errors.Is(err, procrequest.ErrIdentity), errors.Is(err, procrequest.ErrUnknown), errors.Is(err, execsession.ErrTerminalUnrecorded):
+		return proto.CodeProcessIdentity
+	}
+	return ""
+}
+
+func handleProcessResumeForwarded(a *Agent, nc *nats.Conn, msg *nats.Msg) {
+	if msg.Reply == "" || msg.Subject != proto.SubjCmdForwarded(a.cfg.SID, nidOf(a), proto.ProcessResumeVerb) {
+		return
+	}
+	var req proto.ProcessResumeReq
+	reply := proto.ProcessResumeReply{Version: proto.ProcessResumeVersion, Kind: "error"}
+	err := json.Unmarshal(msg.Data, &req)
+	if err == nil {
+		reply.CallID = req.CallID
+		if a.processRuntime == nil {
+			err = errProcessUnsupported
+		} else {
+			lineage := req.ClientLineage
+			if req.Handle != nil {
+				lineage = req.Handle.Lease.ClientLineage
+			}
+			scope := procrequest.Scope{SID: a.cfg.SID, NID: nidOf(a), ActorFP: req.ActorFP, ClientLineage: lineage}
+			req = ownProcessRun(scope, req)
+			reply, err = a.processRuntime.Handle(scope, req, msg.Reply)
 		}
 	}
-	for k, v := range override {
-		out = append(out, k+"="+v)
-		if k == "TERM" {
-			hasTerm = true
+	if err != nil {
+		code := processRefusalCode(err)
+		if code == "" {
+			// A newer kind-specific runtime may already classify its refusal.
+			// Preserve that typed code while replacing only the wire envelope.
+			code = reply.Code
+		}
+		if errors.Is(err, errProcessUnsupported) {
+			code = proto.CodeProcessUnsupported
+		}
+		// A composite literal so the wire-code coverage gate sees this Code
+		// site; its outcomes are the proto.CodeProcess* constants.
+		reply = proto.ProcessResumeReply{Version: proto.ProcessResumeVersion, CallID: reply.CallID,
+			Kind: "error", Code: code, Error: err.Error()}
+		// origin: hot-update S4 plan §2.1/§3.3; P10 integration — every PTY reply,
+		// refusals included, names its task kind and carries the fixed empty stderr,
+		// or the reliable client rejects the envelope instead of reading the code.
+		if req.Kind == proto.ProcessKindPTY {
+			reply.TaskKind = proto.ProcessKindPTY
+			reply.Stderr = &proto.ProcessOutput{FIN: true}
 		}
 	}
-	if !hasTerm {
-		out = append(out, "TERM=xterm-256color")
+	body, marshalErr := json.Marshal(reply)
+	if marshalErr != nil {
+		return
 	}
-	return out
+	if conn := liveConn(a, nc); conn != nil {
+		_ = conn.Publish(msg.Reply, body)
+	}
+}
+
+// ownProcessRun severs caller-owned storage before the runtime's asynchronous
+// startup can observe it. Only the broker-stamped scope supplies audit identity.
+// origin: hot-update S4 plan §2.1 / T28
+func ownProcessRun(scope procrequest.Scope, req proto.ProcessResumeReq) proto.ProcessResumeReq {
+	if req.Run != nil {
+		run := *req.Run
+		run.Argv = append([]string(nil), run.Argv...)
+		run.Env = maps.Clone(run.Env)
+		run.ActorFP = scope.ActorFP
+		req.Run = &run
+	}
+	return req
+}
+
+// errProcessUnsupported is the agent's own "no runtime here" refusal; its
+// text is the legacy-fallback signal older clients match on.
+var errProcessUnsupported = errors.New("unsupported process protocol")
+
+// revokeSessionWorkloads answers the broker's session_destroyed for this
+// agent's session: every reliable task is killed and tombstoned (Revoke),
+// every legacy exec child and PTY session is SIGKILLed. The daemon itself
+// stays up — exiting would let a systemd control-group stop take every
+// unrelated workload in the unit with it; the register refusal path retires
+// the daemon on its own schedule. origin: hot-update reliable-exec plan §3.5 / §-1 Q3.
+func revokeSessionWorkloads(a *Agent, reason string) {
+	killed := 0
+	if a.processRuntime != nil {
+		// The runtime stamps the revocation with the clock that issued the
+		// leases it will refuse; a clock failure is logged, never a silent
+		// "nothing to revoke" (S1 review P6). The legacy reap below runs
+		// regardless.
+		n, err := a.processRuntime.Revoke(a.cfg.SID, reason)
+		if err != nil {
+			a.cfg.Logger.Error("agent: reliable tasks NOT revoked", "reason", reason, "err", err)
+		}
+		killed = n
+	}
+	// origin: hot-update S7 plan §6.4 / P20. Authority loss also closes transfer byte gates.
+	reapRevokedAgentTransfers(a)
+	a.cfg.Logger.Warn("agent: session revoked; managed workloads killed", "reason", reason, "reliable_killed", killed)
+}
+
+// sweepProcessRuntime bounds abandoned terminals on an idle node; the agent's
+// heartbeat tick drives it so no extra goroutine or ctx site is needed.
+func sweepProcessRuntime(a *Agent) {
+	if a.processRuntime == nil {
+		return
+	}
+	res, err := a.processRuntime.Sweep()
+	if err != nil {
+		a.cfg.Logger.Warn("agent: abandoned exec sweep skipped", "err", err)
+		return
+	}
+	if res != (execsession.SweepResult{}) {
+		a.cfg.Logger.Info("agent: abandoned exec results reclaimed", "discarded", res.Discarded,
+			"expired", res.Expired, "truncated", res.Truncated)
+	}
+}
+
+func stopProcessRuntime(ctx context.Context, a *Agent) {
+	// origin: hot-update S3 plan §2.5. Close of an exported runtime discards
+	// it, so Run must wait for a failed exec to thaw before cleaning up.
+	a.cutMu.Lock()
+	defer a.cutMu.Unlock()
+	if a.processRuntime == nil {
+		return
+	}
+	cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	if err := a.processRuntime.Close(cleanup); err != nil {
+		a.cfg.Logger.Warn("agent: process runtime cleanup incomplete", "err", err)
+	}
 }

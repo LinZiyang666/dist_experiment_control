@@ -41,6 +41,10 @@ import (
 // MUTATION: swap proposeOrForward back for a bare b.cl.node.Propose in
 // registerNode and this goes red.
 func TestRegisterDuringLeadershipLossIsRetriableNotTerminal(t *testing.T) {
+	// origin: hot-update S10 plan §11.1 / TEST-BUDGET
+	if runIsolatedBrokerTest(t) {
+		return
+	}
 	n := leadershipLossNode(t, "brk-x4")
 
 	// A REAL forwarder pointed at a bus nobody answers on. That is the honest

@@ -33,11 +33,12 @@ func startNATS(t *testing.T) string {
 // Use :memory: in unit tests — modernc.org/sqlite occasionally leaves a
 // transient -journal file behind that races t.TempDir's RemoveAll. The
 // full-file path is exercised by test/p2 e2e instead.
-// openDB delegates to internal/testharness (B9) — see the note in internal/session/session_test.go.
-// openDBWithSession below still builds on it, so the seeding variants stay local where they belong.
+// The schema is copied from one production-migrated empty database; every caller
+// still owns independent SQLite pages and a single-writer pool. See the fixture
+// contract in database_fixture_test.go. Seeding variants stay local below.
 func openDB(t *testing.T) *sql.DB {
 	t.Helper()
-	return testharness.OpenDB(t)
+	return openBrokerFixtureDB(t)
 }
 
 // openDBWithSession returns openDB(t) plus a single ACTIVE session row

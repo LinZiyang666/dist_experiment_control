@@ -1,5 +1,36 @@
 package broker
 
+import (
+	"context"
+	"crypto/tls"
+	"crypto/x509"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"slices"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/LinZiyang666/tether/internal/brokercontrol"
+	"github.com/LinZiyang666/tether/internal/brokerimage"
+	"github.com/LinZiyang666/tether/internal/cluster"
+	"github.com/LinZiyang666/tether/internal/clusternodes"
+	"github.com/LinZiyang666/tether/internal/jsstream"
+	"github.com/LinZiyang666/tether/internal/node"
+	"github.com/LinZiyang666/tether/internal/port"
+	"github.com/LinZiyang666/tether/internal/proc"
+	"github.com/LinZiyang666/tether/internal/proto"
+	"github.com/LinZiyang666/tether/internal/session"
+	"github.com/LinZiyang666/tether/internal/tunnel"
+	"github.com/LinZiyang666/tether/internal/upgradeauthority"
+	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
+)
+
 // clusterwrite.go — D9 step 3: the authoritative-write router. The whole point of the
 // epic is that in cluster mode the FSM (not the broker) is the single writer, so the
 // broker must route every authoritative control-state write through raft instead of
@@ -12,35 +43,6 @@ package broker
 // the leader runs the Plan. This is the same shape as D4's NewProvisionSeam /
 // NewJoinSeam; D9 extends it to the session/port/home control verbs.
 
-import (
-	"context"
-	"crypto/tls"
-	"crypto/x509"
-	"database/sql"
-	"encoding/json"
-	"errors"
-	"fmt"
-	"os"
-	"path/filepath"
-	"slices"
-	"strings"
-	"sync"
-	"sync/atomic"
-	"time"
-
-	"github.com/LinZiyang666/tether/internal/cluster"
-	"github.com/LinZiyang666/tether/internal/clusternodes"
-	"github.com/LinZiyang666/tether/internal/jsstream"
-	"github.com/LinZiyang666/tether/internal/node"
-	"github.com/LinZiyang666/tether/internal/port"
-	"github.com/LinZiyang666/tether/internal/proc"
-	"github.com/LinZiyang666/tether/internal/proto"
-	"github.com/LinZiyang666/tether/internal/session"
-	"github.com/LinZiyang666/tether/internal/tunnel"
-	"github.com/nats-io/nats.go"
-	"github.com/nats-io/nats.go/jetstream"
-)
-
 // ctlQueueGroup is the shared NATS queue group the ctl-command + event subscriptions join
 // in CLUSTER mode, so each command/event is handled by EXACTLY ONE broker (which then
 // forwards/proposes through raft) instead of every broker handling it (the broadcast
@@ -48,36 +50,6 @@ import (
 const ctlQueueGroup = "tether-broker-ctl"
 
 type clusterTunnelClosePayload = tunnel.SessionInfo
-
-// isBroadcastClusterSubject reports whether a subject must stay a plain (broadcast)
-// Subscribe even in cluster mode (round-3 BLOCKER). The FILE-TRANSFER subjects are
-// broadcast + per-broker in-memory tracker presence + a home-keyed START gate (D8 /
-// transfer_home.go): the HOME broker (the tracker holder) must see every push/pull/commit/
-// finalize/transfer-event message, so they MUST NOT be queue-grouped (a queue group would
-// hand each to a random member with no tracker entry → the transfer hangs). The home gate +
-// tracker-presence collapse the broadcast fan-out to one answering broker, so broadcast here
-// does not reintroduce the double-reply the queue group fixed for the leader-forwarded writes.
-func isBroadcastClusterSubject(subj string) bool {
-	for _, leaf := range []string{
-		".push.req", ".pull.req", ".push-commit.req",
-		".transfer.*.complete", ".transfer.*.failed", ".transfer.*.finalize.req",
-		// External-review F3: expose is leader-local (leak-once token) → broadcast +
-		// leader-only handler, so it always reaches the leader (never a random follower).
-		".expose.req",
-		// Correctness-sensitive ingress that reads authoritative session/node/port state
-		// before publishing to an agent or freeing a port must run on the leader's view.
-		".run.req", ".exec.req", ".kill.req", ".expose-rm.req",
-		// C5: proxy CONTROL writes are leader-only (the leak-once subscriber token is minted on the
-		// leader + returned in the reply; forwardReply carries no token). sub.list + status stay a
-		// queue-group RODB read (any broker).
-		".proxy.set.req", ".proxy.sub.create.req", ".proxy.sub.revoke.req",
-	} {
-		if strings.HasSuffix(subj, leaf) {
-			return true
-		}
-	}
-	return false
-}
 
 func (b *Broker) isClusterFollower() bool {
 	return b.clusterMode && b.cl != nil && b.cl.node != nil && !b.cl.node.IsLeader()
@@ -89,6 +61,16 @@ func (b *Broker) isClusterFollower() bool {
 type clusterRuntime struct {
 	// node is the raft state layer (owns the sole WAL DB writer).
 	node *cluster.Node
+	// This admission counts the whole audit callback, including its completion
+	// borrower. A refused cut retains this gate and can retry the same join; no
+	// goroutine waiting on a WaitGroup is left behind after the deadline.
+	// origin: hot-update S7 plan §8.2 / T39
+	transferAuditUsers brokerimage.StoreAdmission
+	// Retain transfer RPC borrowers until image join, including a partial SUB failure.
+	// origin: hot-update S7 plan §8.2 / T39
+	transferRPC *TransferClusterForward
+	// origin: hot-update S6 plan §7.2 / T41 / T43
+	homeMaintenance homeMaintenanceRuntime
 	// forwarder is the D4 follower→leader cluster.apply.<verb> client.
 	forwarder *Forwarder
 	// subs are the cluster responders (ClusterApply / ClusterHealth / AlertLs /
@@ -126,17 +108,6 @@ type clusterRuntime struct {
 	// status/health responders. atomic so the responder (other goroutine) reads it race-free; nil
 	// until the first reconcile pass.
 	topoSelf atomic.Pointer[topoSelfReport]
-}
-
-// topoSelfReport is one broker's reconcile state, read by the status/health responders (C3 §2.7).
-type topoSelfReport struct {
-	Applied  uint64
-	Observed uint64
-	// Action (batch C) is the natsconf.Action* the last pass returned — a CLOSED enum, unlike
-	// Reason. It is what both status renderers classify on; Reason survives only as the operator's
-	// detail text and as the mixed-version fallback for a broker that predates this field.
-	Action string
-	Reason string
 }
 
 // ClusterAdminForTest exposes the membership orchestrator for the d9_integration harness
@@ -187,6 +158,19 @@ func (b *Broker) clusterShutdownOrdered() {
 // server (so newTunnelServer picks NewServerWithCert with the stable cert and the
 // advertised cert_fp matches cluster_nodes.cert_fp).
 func (b *Broker) wireClusterEarly() error {
+	if err := installHomeMaintenance(b); err != nil {
+		return err
+	}
+	// Install and validate all four concrete writer planners before any loop
+	// starts; the source remains a live snapshot of this runtime's proof cache.
+	// origin: hot-update S6 internal review rv-cluster-1
+	maintenance := &b.cl.homeMaintenance
+	maintenance.mu.Lock()
+	plans, source, clock := maintenance.plans, maintenance.proofs, maintenance.now
+	maintenance.mu.Unlock()
+	if err := ConfigureHomeMaintenance(b, plans, source, clock); err != nil {
+		return err
+	}
 	cert, gotFP, err := b.loadStableTunnelCert()
 	if err != nil {
 		return err
@@ -331,8 +315,8 @@ func (b *Broker) wireClusterLate(ctx context.Context, nc *nats.Conn) error {
 	// follower (the leader answers); collected for ordered unsubscribe.
 	subscribers := []func() (*nats.Subscription, error){
 		func() (*nats.Subscription, error) {
-			return SubscribeClusterApply(nc, node, b.cfg.Now, b.cfg.Logger,
-				func(pin, hash string) error { return verifyPINOnLeader(b, pin, hash) })
+			return subscribeClusterApplyOwned(nc, node, b.cfg.Now, b.cfg.Logger,
+				func(pin, hash string) error { return verifyPINOnLeader(b, pin, hash) }, nil, b)
 		},
 		func() (*nats.Subscription, error) { return b.subscribeTunnelClose(nc) },
 		func() (*nats.Subscription, error) {
@@ -341,8 +325,7 @@ func (b *Broker) wireClusterLate(ctx context.Context, nc *nats.Conn) error {
 		func() (*nats.Subscription, error) {
 			return SubscribeClusterRosterPull(nc, b.manifestBytes, b.cfg.Logger)
 		}, // G3 #17
-		func() (*nats.Subscription, error) { return b.SubscribeClusterUpgradeTrigger(nc) }, // G5 #13 W2b
-		func() (*nats.Subscription, error) { return b.SubscribeClusterGrowTrigger(nc) },    // G4 §B grow trigger
+		func() (*nats.Subscription, error) { return b.SubscribeClusterGrowTrigger(nc) }, // G4 §B grow trigger
 		func() (*nats.Subscription, error) {
 			return SubscribeClusterCursor(nc, node, b.cfg.DB, b.cfg.Now, topoSelf, b.jsUnavail.Load, b.cfg.ColocatedAgentNID, b.accountPubOrEmpty, b.cfg.Logger)
 		},
@@ -354,6 +337,22 @@ func (b *Broker) wireClusterLate(ctx context.Context, nc *nats.Conn) error {
 		func() (*nats.Subscription, error) { return SubscribeAlertLs(nc, b.cfg.DB, b.cfg.Logger) },
 		func() (*nats.Subscription, error) { return SubscribeAlertAck(nc, fwd, b.cfg.Logger) },
 	}
+	// Hot auth has already installed the joined current apply responder before
+	// probing callout. A second subscription would execute each forwarded write twice.
+	// origin: hot-update S6 plan §8.1 / rv-cluster-2
+	if b.imageControl != nil && b.imageControl.apply != nil {
+		subscribers = subscribers[1:]
+	}
+	// The initiating reload responder survives Fence until its DB-free reply.
+	// Reversible Thaw keeps the same NC: reuse that owner instead of duplicating it.
+	// origin: S6 internal review rv-final F2 / G5 #13 W2b
+	upgradeLive := false
+	for _, sub := range b.cl.subs {
+		upgradeLive = upgradeLive || sub.IsValid() && sub.Subject == proto.SubjCtrlClusterUpgradeWildcard
+	}
+	if !upgradeLive {
+		subscribers = append(subscribers, func() (*nats.Subscription, error) { return b.SubscribeClusterUpgradeTrigger(nc) })
+	}
 	for _, sub := range subscribers {
 		s, err := sub()
 		if err != nil {
@@ -362,6 +361,14 @@ func (b *Broker) wireClusterLate(ctx context.Context, nc *nats.Conn) error {
 		b.cl.subs = append(b.cl.subs, s)
 	}
 
+	return startClusterServices(ctx, b, topoSelf)
+}
+
+// Keep responder admission separate from the joined service lifetime: all
+// subscriptions must succeed before any publisher or reconciler can start.
+// origin: hot-update S10 lint L3a / maintidx wireClusterLate
+func startClusterServices(ctx context.Context, b *Broker, topoSelf func() *topoSelfReport) error {
+	node := b.cl.node
 	// D5 audit publisher (re-derivable post-commit publish + JS replica reconfig) +
 	// D8b alert reconciler (leader-gated raise/clear). Both leader-gated internally.
 	pub := NewAuditPublisher(AuditPublisherConfig{
@@ -373,7 +380,7 @@ func (b *Broker) wireClusterLate(ctx context.Context, nc *nats.Conn) error {
 			return listSessionsByState(b.cfg.DB, "ACTIVE")
 		},
 		XferState: func(ctx context.Context, sid string, target int) (jsstream.StreamReplicaState, error) {
-			return XferReplicaState(ctx, brokerJS(b), sid, target)
+			return XferReplicaState(ctx, brokerTransferConfigJS(b), sid, target)
 		},
 		// audit M5: a no-stream publish error is a permanent loss only when the session is no
 		// longer ACTIVE (rm'd / DELETING — its history stream was deleted by finalizeSessionRm);
@@ -424,8 +431,8 @@ func (b *Broker) wireClusterLate(ctx context.Context, nc *nats.Conn) error {
 	// socket (the adminsock backend, wired later in Run, uses it iff the socket is set).
 	b.cl.admin = NewClusterAdmin(node, b.cfg.Logger)
 	// EXTERNAL review B1: the ONLINE force-single intent lives beside the raft sub-tree.
-	b.cl.admin.dataDir = b.cfg.ClusterDataDir
-	b.cl.admin.prepareTunnelCertRotate = b.prepareTunnelCertRotate
+	b.cl.admin.DataDir = b.cfg.ClusterDataDir
+	b.cl.admin.PrepareTunnelCertRotate = b.prepareTunnelCertRotate
 	// B5 OPS#9: self-row capacity probes (disk statfs + port band) for `cluster status`.
 	b.cl.admin.SetCapacityProbes(b.cfg.StoreDir, b.cfg.PortBandLow, b.cfg.PortBandHigh)
 	// G2 #20: the live nats.conf path so status can raise the DATA-PLANE-DEGRADED banner when
@@ -434,38 +441,42 @@ func (b *Broker) wireClusterLate(ctx context.Context, nc *nats.Conn) error {
 	b.cl.admin.SetJSUnavailFn(b.jsUnavail.Load) // External-review m2: socket status surfaces runtime JS-503 too
 	// B7 DOC#5 + C6 BD6: the generic leader-side event emitter the drain uses for `expose_rehomed`
 	// (back-compat) + the C6 home_reassign_* / rehome_stalled lifecycle events.
-	b.cl.admin.emitEvent = b.pubSysEvent
+	b.cl.admin.EmitEvent = b.pubSysEvent
 	// C6 建议5: the `cluster status --homes` aggregate (leader-agnostic RODB read).
-	b.cl.admin.homesReport = b.buildHomesReport
+	b.cl.admin.HomesReport = b.buildHomesReport
 	// §17 row 3: give the admin the broker-only cursor scatter-gather so `cluster status`
 	// reports REAL per-peer reachability + applied-lag (not a blanket self-report).
-	b.cl.admin.healthPoll = func() map[string]proto.ClusterHealthResp {
+	b.cl.admin.HealthPoll = func() map[string]proto.ClusterHealthResp {
 		return pollClusterHealth(b.nc.Load(), proto.SubjClusterCursor, observePollWindow)
 	}
 	// External-review F1: give the admin the read-only JS replica observation so `cluster
 	// status` renders the REAL stream actual (not a synthesized actual==target).
-	b.cl.admin.streamObserve = func() (ReplicaReport, error) {
+	b.cl.admin.StreamObserve = func() (ReplicaReport, error) {
 		// B7: bounded, and the budget SCALES with the number of sessions the observation will walk.
 		// This seam is reached from StatusReport, which the operation controller calls on every leader
 		// tick (topoConvergedForOp), so an unbounded observation here stalls the whole convergence
 		// ladder rather than just one status render — and a budget too small for the fleet turns a
 		// healthy cluster into a reported replica deficit (internal review B7-02).
+		// ctx-none: ClusterAdmin.StreamObserve has no context parameter.
 		ctx, cancel := context.WithTimeout(context.Background(),
 			clusterReplicaObserveBudget(b.observeStreamCountForBudget()))
 		defer cancel()
 		return pub.ObserveReplicas(ctx)
 	}
-	b.cl.admin.topoSelf = topoSelf                    // C3: authoritative self-row topology report for status (nil ⇒ inert, B2)
-	b.cl.admin.accountPubSelf = b.accountPubOrEmpty   // batch B / B4: the ACCT.NK comparison baseline (see clusteradmin.go)
-	b.cl.admin.caughtUpFn = b.clusterCaughtUp         // C4: operation-controller catch-up probe
-	b.cl.admin.streamsReadyFn = b.clusterStreamsReady // C4: operation-controller stream-readiness probe
-	b.cl.admin.jsPlaceableFn = b.clusterJSPlaceable   // G69 (#67 sub-face 4): join terminal placement gate
+	b.cl.admin.TopoSelf = topoSelf                    // C3: authoritative self-row topology report for status (nil ⇒ inert, B2)
+	b.cl.admin.AccountPubSelf = b.accountPubOrEmpty   // batch B / B4: the ACCT.NK comparison baseline (see clusteradmin.go)
+	b.cl.admin.CaughtUpFn = b.clusterCaughtUp         // C4: operation-controller catch-up probe
+	b.cl.admin.StreamsReadyFn = b.clusterStreamsReady // C4: operation-controller stream-readiness probe
+	b.cl.admin.JsPlaceableFn = b.clusterJSPlaceable   // G69 (#67 sub-face 4): join terminal placement gate
 	// R8a P1: the drain/retire data-plane convergence oracle + the immediate delivery kick.
 	// WITHOUT these two the drain would go back to returning rc=0 on an unconverged data
 	// plane — TestWireClusterLateWiresHomeConvergence is the anti-half-wiring guard, and
 	// TestDrainRefusesRcZeroWhenDataPlaneStale is its behavioural mutation test.
-	b.cl.admin.homeAppliedFn = b.homeAppliedEpoch
-	b.cl.admin.homeDeliverFn = b.deliverHomeNow
+	b.cl.admin.HomeAppliedFn = b.homeAppliedEpoch
+	b.cl.admin.HomeDeliverFn = b.deliverHomeNow
+	b.cl.admin.HomeReassign = func(db *sql.DB, expected *port.Allocation, target string) (int64, *cluster.Command, error) {
+		return planHomeReassign(b, db, expected, target)
+	}
 
 	// The loops run on a child ctx so the ordered shutdown can cancel + JOIN them; each
 	// signals loopDone on exit. (Run's ctx cancel also reaches this child, so a hard
@@ -482,8 +493,8 @@ func (b *Broker) wireClusterLate(ctx context.Context, nc *nats.Conn) error {
 	// the event-driven poster below just means no alerts fired. Before this, all five reported only a
 	// StartedAt, so a loop that returned on its first line was indistinguishable from a healthy one
 	// (topology-reconcile does exactly that when NatsConfPath is empty).
-	b.cl.loops.GoEvery(loopCtx, "audit-publisher", pub.cfg.Poll, pub.Run)
-	b.cl.loops.GoEvery(loopCtx, "reconciler", rec.cfg.Poll, rec.Run)
+	b.cl.loops.GoEvery(loopCtx, "audit-publisher", pub.Cfg.Poll, pub.Run)
+	b.cl.loops.GoEvery(loopCtx, "reconciler", rec.Cfg.Poll, rec.Run)
 	// D9 §17 step 10b: the leader-gated observability poll (broker_down / raft_lag).
 	b.cl.loops.GoEvery(loopCtx, "observe", observeTickInterval, b.runObserveLoop)
 	// C3: the per-broker (NOT leader-gated) NATS topology reconcile loop.
@@ -493,7 +504,7 @@ func (b *Broker) wireClusterLate(ctx context.Context, nc *nats.Conn) error {
 		// event-driven — it grows once per event DEQUEUED AND PROCESSED, so Iters == 0 means "nothing
 		// arrived", never "the endpoint refused us". Whether the endpoint accepted is a separate
 		// question, answered by the alert_webhook.accepted/rejected counters (external review B2-4).
-		poster.beat = func() { b.cl.loops.Beat(webhookLoopName) }
+		poster.Beat = func() { b.cl.loops.Beat(webhookLoopName) }
 		b.cl.webhook.Store(poster)
 		b.cl.loops.Go(loopCtx, webhookLoopName, poster.Run)
 	}
@@ -1004,11 +1015,7 @@ func (b *Broker) createSession(sid, fp, pinHash string) (*session.Session, error
 	if !b.clusterMode {
 		return session.Create(b.cfg.DB, sid, sid, fp, pinHash, b.cfg.Now())
 	}
-	payload, err := json.Marshal(SessionCreatePayload{Name: sid, FP: fp, PinHash: pinHash})
-	if err != nil {
-		return nil, err
-	}
-	if err := b.proposeOrForward(VerbSessionCreate, "", payload, func(db *sql.DB) (*cluster.Command, error) {
+	if err := proposeValue(b, VerbSessionCreate, SessionCreatePayload{Name: sid, FP: fp, PinHash: pinHash}, func(db *sql.DB) (*cluster.Command, error) {
 		return planAuthorizedSessionCreate(db, sid, fp, pinHash, b.cfg.Now())
 	}); err != nil {
 		// NOT committed (leadership lost, forward failed) or a genuine ErrAlreadyExists (the name is
@@ -1101,7 +1108,7 @@ func (b *Broker) allocatePort(sid, nid, name string, localPort, remotePort int, 
 	}
 	var captured *port.Allocation
 	if err := b.cl.node.Propose(func(db *sql.DB) (*cluster.Command, error) {
-		a, cmd, e := port.PlanAllocate(db, sid, nid, name, localPort, remotePort, fp, homeBroker, rebuildOff, cfg)
+		a, cmd, e := planHomeAllocate(b, db, nil, port.AllocationIntent{SID: sid, NID: nid, Name: name, LocalPort: localPort, DesiredPort: remotePort, CreatedByFP: fp, HomeBroker: homeBroker, RebuildOff: rebuildOff, Config: cfg})
 		if e != nil {
 			return nil, e
 		}
@@ -1109,6 +1116,17 @@ func (b *Broker) allocatePort(sid, nid, name string, localPort, remotePort int, 
 		return cmd, nil
 	}); err != nil {
 		return nil, err
+	}
+	// origin: hot-update S6 plan §7.2 / T41
+	if captured == nil {
+		return nil, port.ErrNotFound
+	}
+	committed, err := port.LookupByTokenHash(b.read().SQL(), captured.TokenHash)
+	if err != nil {
+		return nil, err
+	}
+	if !sameHomeAllocation(committed, captured) {
+		return nil, port.ErrNotFound
 	}
 	return captured, nil
 }
@@ -1137,16 +1155,12 @@ func (b *Broker) registerNode(in node.RegisterInput, previousNID string, localPr
 	// PERMANENT rejection and exits the process on. One ordinary leader failover
 	// would take every agent down with it. (See proposeOrForward's own comment —
 	// audit M2 / write-forward F3 bought that mapping the hard way.)
-	payload, err := json.Marshal(in)
-	if err != nil {
-		return err
-	}
-	if err := b.proposeOrForward(VerbNodeRegister, "", payload, func(db *sql.DB) (*cluster.Command, error) {
+	if err := proposeValue(b, VerbNodeRegister, in, func(db *sql.DB) (*cluster.Command, error) {
 		return planRegisterWithRefiles(db, in, previousNID, localProcesses, b.cfg.Now())
 	}); err != nil {
 		return err
 	}
-	if err := node.Heartbeat(b.livenessDB(), in.SID, in.NID, b.cfg.Now()); err != nil {
+	if err := heartbeatNodeAuthority(b, in, b.cfg.Now()); err != nil {
 		b.cfg.Logger.Debug("broker: register liveness write deferred (apply lag)", "sid", in.SID, "nid", in.NID, "err", err)
 	}
 	return nil
@@ -1162,7 +1176,12 @@ func planRegisterWithRefiles(db *sql.DB, in node.RegisterInput, previousNID stri
 	for _, p := range localProcesses {
 		pids = append(pids, p.PID)
 	}
-	moves, err := proc.PlanRefileStatements(in.SID, previousNID, in.NID, pids)
+	var moves []cluster.Statement
+	if in.Authority != nil {
+		_, moves, err = proc.PlanRefileStatementsGuarded(db, *in.Authority, previousNID, in.NID, pids)
+	} else {
+		moves, err = proc.PlanRefileStatements(in.SID, previousNID, in.NID, pids)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -1179,30 +1198,26 @@ func (b *Broker) recordProc(p proc.Process) error {
 	if !b.clusterMode {
 		return proc.Insert(b.cfg.DB, p)
 	}
-	payload, err := json.Marshal(p)
-	if err != nil {
-		return err
-	}
-	return b.proposeOrForward(VerbProcInsert, "", payload, func(db *sql.DB) (*cluster.Command, error) {
+	return proposeValue(b, VerbProcInsert, p, func(db *sql.DB) (*cluster.Command, error) {
 		return proc.PlanInsert(db, p)
 	})
 }
 
+// Both cleanup routes preserve the same captured identity projection through
+// the direct transaction, local planner, and forwarded planner.
+// origin: hot-update S8 plan §6.2 / P16
+// origin: S7 internal review GATES-PROD F4 / F5
 // freePortAllocation routes an expose-rm free. All three paths (single-mode direct,
 // leader-local Plan, forwarded Plan) take the SAME narrowed identity — see allocIdentity
 // in cluster_forward.go for why the leader must not keep the wider struct.
 func (b *Broker) freePortAllocation(a port.Allocation) error {
 	id := allocIdentity(a)
-	narrowed := id.allocation()
-	if !b.clusterMode {
-		return port.FreeAllocation(b.cfg.DB, narrowed, b.cfg.Now())
+	narrowed, now := id.allocation(), b.cfg.Now()
+	if db, ok := b.singleWriter(); ok {
+		return port.FreeAllocation(db, narrowed, now)
 	}
-	payload, err := json.Marshal(id)
-	if err != nil {
-		return err
-	}
-	return b.proposeOrForward(VerbPortFreeAllocation, "", payload, func(db *sql.DB) (*cluster.Command, error) {
-		return port.PlanFreeAllocation(db, narrowed, b.cfg.Now())
+	return proposeValue(b, VerbPortFreeAllocation, id, func(db *sql.DB) (*cluster.Command, error) {
+		return port.PlanFreeAllocation(db, narrowed, now)
 	})
 }
 
@@ -1259,16 +1274,11 @@ func (b *Broker) subscribeTunnelClose(nc *nats.Conn) (*nats.Subscription, error)
 // fence is the only thing stopping a delayed revoke from hitting the wrong row.
 func (b *Broker) revokePortAllocation(a port.Allocation, now time.Time) error {
 	id := allocIdentity(a)
-	narrowed := id.allocation()
-	if !b.clusterMode {
-		return port.RevokeAllocation(b.cfg.DB, narrowed, now)
+	if db, ok := b.singleWriter(); ok {
+		return port.RevokeAllocation(db, id.allocation(), now)
 	}
-	payload, err := json.Marshal(id)
-	if err != nil {
-		return err
-	}
-	return b.proposeOrForward(VerbPortRevoke, "", payload, func(db *sql.DB) (*cluster.Command, error) {
-		return port.PlanRevokeAllocation(db, narrowed, now)
+	return proposeValue(b, VerbPortRevoke, id, func(db *sql.DB) (*cluster.Command, error) {
+		return port.PlanRevokeAllocation(db, id.allocation(), now)
 	})
 }
 
@@ -1294,51 +1304,25 @@ func (b *Broker) revokePortAllocation(a port.Allocation, now time.Time) error {
 // a property of cluster_forward.go's VerbProcMarkExited handler, and the two are only
 // held together by TestAForwardedProcExitCarriesTheSessionFence, which drives both.
 func (b *Broker) markProcExited(pid, sid string, exitCode int, when time.Time) error {
-	if !b.clusterMode {
-		return proc.MarkExited(b.cfg.DB, pid, sid, exitCode, when)
-	}
-	payload, err := json.Marshal(ProcMarkExitedPayload{Pid: pid, Sid: sid, ExitCode: exitCode, EndedAt: when})
-	if err != nil {
-		return err
-	}
-	return b.proposeOrForward(VerbProcMarkExited, "", payload, func(db *sql.DB) (*cluster.Command, error) {
-		return proc.PlanMarkExited(db, pid, sid, exitCode, when)
-	})
+	return markProcExitAuthority(b, ProcMarkExitedPayload{Pid: pid, Sid: sid, ExitCode: exitCode, EndedAt: when})
 }
 
+// The original authority, rather than a late SID lookup, reaches each writer.
+// origin: hot-update S8 plan §6.2 / P16
+
+// Historical SID-only adapters are retired; creation-scoped authority now owns
+// these transitions. Retain their original ordering rationale below.
 // tombstoneSession routes a session rm's ACTIVE->DELETING transition (D9 round-1 BLOCKER,
 // audit #11). Single mode: the direct mutator. Cluster mode: PlanTombstone via
 // Propose/forward (the leader bakes deleting_at; ErrNotFound/ErrDeleting surface as typed
 // forward errors so `session rm` reports the same codes as single mode).
-func (b *Broker) tombstoneSession(sid string) error {
-	if !b.clusterMode {
-		return session.Tombstone(b.cfg.DB, sid, b.cfg.Now())
-	}
-	payload, err := json.Marshal(SessionMutatePayload{SID: sid})
-	if err != nil {
-		return err
-	}
-	return b.proposeOrForward(VerbSessionTombstone, "", payload, func(db *sql.DB) (*cluster.Command, error) {
-		return session.PlanTombstone(db, sid, b.cfg.Now())
-	})
-}
 
 // dropSession routes the H.3 finalize cascade (the 7-table DELETE of a DELETING session's
 // rows after teardown; D9 round-1 BLOCKER). Single mode: dropSessionRows direct. Cluster
 // mode: PlanHardDelete via Propose/forward (one FSM txn, same as the single-tx semantics;
 // a no-op on an absent row so a retry / a re-run of resumeSessionRm is harmless).
-func (b *Broker) dropSession(sid string) error {
-	if !b.clusterMode {
-		return dropSessionRows(b.cfg.DB, sid)
-	}
-	payload, err := json.Marshal(SessionMutatePayload{SID: sid})
-	if err != nil {
-		return err
-	}
-	return b.proposeOrForward(VerbSessionDrop, "", payload, func(db *sql.DB) (*cluster.Command, error) {
-		return session.PlanHardDelete(db, sid)
-	})
-}
+// A finalizer must supply the creation captured before settlement.
+// origin: hot-update S8 plan §6.2 / P16
 
 // evictNode routes an `admin evict` (D9 round-2 BLOCKER). Single mode: handled by the
 // adminsock's direct tx (EvictWrite stays nil). Cluster mode: PlanEvict via Propose/forward
@@ -1351,11 +1335,7 @@ func (b *Broker) evictNode(sid, nid string) error {
 	if !b.clusterMode || b.cl == nil {
 		return fmt.Errorf("broker: evictNode is cluster-mode only (single mode uses the adminsock direct tx)")
 	}
-	payload, err := json.Marshal(EvictPayload{SID: sid, NID: nid})
-	if err != nil {
-		return err
-	}
-	return b.proposeOrForward(VerbNodeEvict, "", payload, func(db *sql.DB) (*cluster.Command, error) {
+	return proposeValue(b, VerbNodeEvict, EvictPayload{SID: sid, NID: nid}, func(db *sql.DB) (*cluster.Command, error) {
 		return node.PlanEvict(sid, nid)
 	})
 }
@@ -1387,11 +1367,7 @@ func setSessionCreator(b *Broker, fp, addedBy, note string, allow bool) error {
 		}
 	}
 	now := b.cfg.Now()
-	payload, err := json.Marshal(SessionCreatorPayload{FP: fp, AddedBy: addedBy, Note: note, Allow: allow})
-	if err != nil {
-		return err
-	}
-	return b.proposeOrForward(VerbSessionCreatorSet, "", payload, func(*sql.DB) (*cluster.Command, error) {
+	return proposeValue(b, VerbSessionCreatorSet, SessionCreatorPayload{FP: fp, AddedBy: addedBy, Note: note, Allow: allow}, func(*sql.DB) (*cluster.Command, error) {
 		return session.PlanSetCreator(fp, addedBy, note, allow, now)
 	})
 }
@@ -1550,4 +1526,69 @@ func refileProc(b *Broker, sid, pid, from, to string) (bool, error) {
 // that actually needed the write.
 func markNodeOfflineOnRelease(b *Broker, sid, nid string) error {
 	return node.ReleaseLeaseRow(b.livenessDB(), sid, nid)
+}
+
+// Compatibility adapters keep callers bound to the extracted control owner.
+// origin: hot-update S6 plan §9.3 / BROKER-SLIM
+type topoSelfReport = brokercontrol.TopoSelfReport
+
+// Encode the concrete captured payload once; local and forwarded planners must
+// consume the same value, including the original authority guard.
+// origin: hot-update S8 plan §6.2 / P16
+func proposeValue[P any](b *Broker, verb string, value P, plan func(*sql.DB) (*cluster.Command, error)) error {
+	payload, err := json.Marshal(value)
+	if err != nil {
+		return err
+	}
+	return b.proposeOrForward(verb, "", payload, plan)
+}
+
+func planProcExitAuthority(db *sql.DB, p ProcMarkExitedPayload) (*cluster.Command, error) {
+	if p.Authority == nil {
+		return proc.PlanMarkExited(db, p.Pid, p.Sid, p.ExitCode, p.EndedAt)
+	}
+	if p.Authority.SID != p.Sid {
+		return nil, upgradeauthority.Match("", "")
+	}
+	_, cmd, err := proc.PlanMarkExitedGuarded(db, *p.Authority, p.Pid, p.ExitCode, p.EndedAt)
+	return cmd, err
+}
+
+// The captured removal guard survives the authoritative tombstone and forward.
+// The SQL statement itself retains creation identity across compare/recreate.
+// origin: hot-update S8 plan §6.2 / P16
+func tombstoneSessionAuthority(b *Broker, guard upgradeauthority.Guard) error {
+	return tombstoneMutationAuthority(b, SessionMutatePayload{SID: guard.SID, Authority: &guard})
+}
+
+// origin: S7 internal review GATES-PROD F5
+func tombstoneMutationAuthority(b *Broker, p SessionMutatePayload) error {
+	if db, ok := b.singleWriter(); ok {
+		cmd, err := planSessionTombstoneAuthority(db, p, b.cfg.Now())
+		if err != nil {
+			return err
+		}
+		var sid string
+		return db.QueryRow(cmd.Body[0].SQL + ` RETURNING sid`).Scan(&sid)
+	}
+	return proposeValue(b, VerbSessionTombstone, p, func(db *sql.DB) (*cluster.Command, error) { return planSessionTombstoneAuthority(db, p, b.cfg.Now()) })
+}
+
+// P15 supplies the originally admitted farewell guard after incumbent checks.
+// Liveness stays local, with the same creation predicate at its actual UPDATE.
+// origin: hot-update S8 plan §6.2 / P16
+func markNodeOfflineOnReleaseAuthority(b *Broker, g upgradeauthority.Guard, nid string) error {
+	if g.Incarnation == "" || (g.ConfiguredNID != nid && g.ConfiguredNID != proto.BasenameOf(nid)) {
+		return upgradeauthority.Match("", "")
+	}
+	predicate, err := upgradeauthority.GuardPredicate(b.livenessDB(), g, cluster.LitText)
+	if err != nil {
+		return err
+	}
+	var updated string
+	err = b.livenessDB().QueryRow(`UPDATE nodes SET status='OFFLINE',proxy_ready=0 WHERE sid=? AND nid=? AND `+predicate+` RETURNING nid`, g.SID, nid).Scan(&updated)
+	if errors.Is(err, sql.ErrNoRows) {
+		return upgradeauthority.Match("", "")
+	}
+	return err
 }

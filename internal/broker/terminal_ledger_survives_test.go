@@ -1,10 +1,16 @@
 package broker
 
 import (
+	"bytes"
+	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
+
+	"github.com/LinZiyang666/tether/internal/testharness"
+	"github.com/LinZiyang666/tether/internal/xfertrack"
 )
 
 // TestExternalReviewTerminalLedgerSurvivesUntilAuditCommit exercises the crash window that
@@ -14,13 +20,25 @@ import (
 // that forward succeeds, otherwise a home-broker crash in the interval leaves the original
 // start row dangling forever.
 func TestExternalReviewTerminalLedgerSurvivesUntilAuditCommit(t *testing.T) {
+	g, fd := runtime.NumGoroutine(), testharness.FDCount()
+	for round := 0; round < 5; round++ {
+		exerciseTerminalLedger(t)
+	}
+	testharness.AssertNoGoroutineLeak(t, "staged terminal before audit commit", g)
+	testharness.AssertNoFDLeak(t, "staged terminal before audit commit", fd, 0)
+}
+func exerciseTerminalLedger(t *testing.T) {
+	t.Helper()
+
 	dir := t.TempDir()
 	b := &Broker{transfers: newTransferTracker()}
 	b.cfg = Config{ClusterDataDir: dir, Logger: silentLogger(), Now: time.Now}
 
 	forwardEntered := make(chan struct{})
 	releaseForward := make(chan struct{})
-	b.attachTransferAuditSinkWith(func([]byte) error {
+	var forwarded []byte
+	b.attachTransferAuditSinkWith(func(data []byte) error {
+		forwarded = append([]byte(nil), data...)
 		close(forwardEntered)
 		<-releaseForward
 		return nil
@@ -30,19 +48,19 @@ func TestExternalReviewTerminalLedgerSurvivesUntilAuditCommit(t *testing.T) {
 		b.WaitTransferAudit()
 	}()
 
-	e := &transferEntry{
-		transferID: "external-review-terminal-window",
-		sid:        "sess",
-		nid:        "node-1",
-		verb:       "push",
-		tier:       "b",
-		startedAt:  time.Now(),
-	}
-	if code := b.transfers.put(e); code != "" {
+	e := xfertrack.NewLegacyEntry(xfertrack.LegacyRecord{
+		TransferID: "external-review-terminal-window",
+		SID:        "sess",
+		NID:        "node-1",
+		Verb:       "push",
+		Tier:       "b",
+		StartedAt:  time.Now(),
+	})
+	if code := putLegacyTransfer(b.transfers, e); code != "" {
 		t.Fatalf("put: %s", code)
 	}
 	b.writeXferInflight(e)
-	ledger := filepath.Join(dir, "xfer-inflight", xferInflightFilename(e.transferID))
+	ledger := filepath.Join(dir, "xfer-inflight", xferInflightFilename(b.transfers.Record(e).TransferID))
 	if _, err := os.Stat(ledger); err != nil {
 		t.Fatalf("ledger must exist before terminal handling: %v", err)
 	}
@@ -57,4 +75,16 @@ func TestExternalReviewTerminalLedgerSurvivesUntilAuditCommit(t *testing.T) {
 	if _, err := os.Stat(ledger); err != nil {
 		t.Fatalf("terminal audit has not committed yet, so crash-recovery evidence must remain; stat ledger: %v", err)
 	}
+	// Existence alone is insufficient: the start row already existed before
+	// staging. Crash recovery must retain the exact bytes currently forwarding.
+	// origin: hot-update S7 plan §5.1 / T21
+	row, err := readXferInflight(ledger)
+	if err != nil || row.Terminal == nil {
+		t.Fatalf("exact staged terminal missing: %v", err)
+	}
+	staged, err := json.Marshal(*row.Terminal)
+	if err != nil || !bytes.Equal(staged, forwarded) {
+		t.Fatalf("staged terminal differs from in-flight publication: %v", err)
+	}
+
 }

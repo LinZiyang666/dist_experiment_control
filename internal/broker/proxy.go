@@ -1,6 +1,7 @@
 package broker
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -8,16 +9,18 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/nats-io/nats.go"
-
 	"github.com/LinZiyang666/tether/internal/agent/ssproxy"
 	"github.com/LinZiyang666/tether/internal/auth"
+	"github.com/LinZiyang666/tether/internal/cluster"
 	"github.com/LinZiyang666/tether/internal/clusternodes"
 	"github.com/LinZiyang666/tether/internal/node"
 	"github.com/LinZiyang666/tether/internal/port"
 	"github.com/LinZiyang666/tether/internal/proto"
 	"github.com/LinZiyang666/tether/internal/proxysub"
 	"github.com/LinZiyang666/tether/internal/session"
+	"github.com/LinZiyang666/tether/internal/tokenhash"
+	"github.com/LinZiyang666/tether/internal/tunnel"
+	"github.com/nats-io/nats.go"
 )
 
 // P13 — session-scoped proxy subscription handlers (architecture p13-plan §5).
@@ -477,35 +480,6 @@ func (b *Broker) sessionNIDs(sid string) []string {
 // hash, keep it (Token empty → agent reuses its persisted token); otherwise
 // mint a fresh port+token.
 func (b *Broker) proxyDirectiveForRegister(sid, nid string, req proto.NodeRegisterReq) *proto.ProxyDirective {
-	if b.clusterMode {
-		// C5: deliver the AUTHORITATIVE directive for an EXISTING reaper-allocated __proxy__ row — the
-		// PRIMARY rehome-delivery path (the D6 server-id bridge co-locates home with the agent's
-		// connected broker, so a home death bounces the agent → re-register → the new Home here). No
-		// allocation here (the leader-gated reaper owns the token-correct mint); a missing row ⇒ nil and
-		// the reaper pushes once it allocates.
-		enabled, err := session.GetProxyEnabled(b.cfg.DB, sid)
-		if err != nil || !enabled || !nodeParticipatesInProxy(req) {
-			return nil
-		}
-		existing, err := port.LookupProxyByNode(b.cfg.DB, sid, nid)
-		if err != nil || existing == nil {
-			return nil
-		}
-		keys, err := b.activeProxyKeys(sid)
-		if err != nil {
-			return nil
-		}
-		epoch, _ := session.GetProxyEpoch(b.cfg.DB, sid)
-		// No token (the agent reuses its persisted one; Generation=0 in cluster mode → epoch-only order).
-		return &proto.ProxyDirective{
-			Enabled: true, PublicPort: existing.Port, Cipher: ssproxy.Cipher, Keys: keys, Epoch: epoch,
-			Home: b.homeForExpose(existing),
-		}
-	}
-	enabled, err := session.GetProxyEnabled(b.cfg.DB, sid)
-	if err != nil || !enabled {
-		return nil
-	}
 	// F7/F5 capability gate + #78 opt-out: never allocate a proxy port / push
 	// a directive to a pre-P13 agent OR an opted-out node. Gate on the
 	// EXPLICIT proto.CapProxyV1 capability (release semver is only a
@@ -513,11 +487,24 @@ func (b *Broker) proxyDirectiveForRegister(sid, nid string, req proto.NodeRegist
 	if !nodeParticipatesInProxy(req) {
 		return nil
 	}
-	keys, err := b.activeProxyKeys(sid)
-	if err != nil {
+	// origin: hot-update S5 plan §6.4 / T28. Enabled, allocation, keys and
+	// ordering pair must come from one cut, including on the keep-token arm.
+	a, err := proxyAuthoritySnapshot(b, sid, nid)
+	if err != nil || !a.Enabled {
 		return nil
 	}
-	epoch, _ := session.GetProxyEpoch(b.cfg.DB, sid)
+	if b.clusterMode {
+		// C5: deliver the AUTHORITATIVE directive for an EXISTING reaper-allocated __proxy__ row — the
+		// PRIMARY rehome-delivery path (the D6 server-id bridge co-locates home with the agent's
+		// connected broker, so a home death bounces the agent → re-register → the new Home here). No
+		// allocation here (the leader-gated reaper owns the token-correct mint); a missing row ⇒ nil and
+		// the reaper pushes once it allocates.
+		if a.Allocation == nil {
+			return nil
+		}
+		// No token (the agent reuses its persisted one; Generation=0 in cluster mode → epoch-only order).
+		return proxyAuthorityDirective(b, a)
+	}
 
 	agentHash := ""
 	for _, lp := range req.LocalPorts {
@@ -526,23 +513,28 @@ func (b *Broker) proxyDirectiveForRegister(sid, nid string, req proto.NodeRegist
 			break
 		}
 	}
-	if existing, err := port.LookupProxyByNode(b.cfg.DB, sid, nid); err == nil {
-		if agentHash != "" && existing.TokenHash == agentHash {
-			return &proto.ProxyDirective{
-				Enabled: true, PublicPort: existing.Port,
-				Cipher: ssproxy.Cipher, Keys: keys, Generation: b.proxyGenLoad(), Epoch: epoch,
-			}
-		}
+	if a.Allocation != nil && agentHash != "" && a.Allocation.TokenHash == agentHash {
+		return proxyAuthorityDirective(b, a)
 	}
-	alloc, err := port.AllocateProxy(b.cfg.DB, sid, nid, b.cfg.PortAllocCfg())
+	db, ok := b.singleWriter()
+	if !ok {
+		return nil
+	}
+	alloc, err := port.AllocateProxy(db, sid, nid, b.cfg.PortAllocCfg())
 	if err != nil {
 		b.cfg.Logger.Warn("broker: proxy allocate on register", "sid", sid, "nid", nid, "err", err)
 		return nil
 	}
-	return &proto.ProxyDirective{
-		Enabled: true, PublicPort: alloc.Port, Token: alloc.Token,
-		Cipher: ssproxy.Cipher, Keys: keys, Generation: b.proxyGenLoad(), Epoch: epoch,
+	// The allocator is an independent write transaction. Re-read all authority
+	// afterwards: a concurrent OFF/revoke/rotation must not inherit the keys or
+	// pair from the pre-allocation cut. The raw token is usable only if this
+	// exact allocation still owns its hash; otherwise it is withheld.
+	// origin: hot-update S5 plan §6.4 / T28
+	d, err := proxyDirectiveForPush(b, sid, nid, &proto.ProxyDirective{PublicPort: alloc.Port, Token: alloc.Token})
+	if err != nil || !d.Enabled {
+		return nil
 	}
+	return d
 }
 
 // --- helpers -------------------------------------------------------------
@@ -911,14 +903,16 @@ func (b *Broker) nodeProxyReady(sid, nid string) bool {
 }
 
 func (b *Broker) pushProxyDirective(nc *nats.Conn, sid, nid string, d *proto.ProxyDirective) {
-	// C5: in cluster mode the ordering is EPOCH-ONLY (Generation constant 0) — the register-reply
-	// directives (proxyDirectiveForRegister) carry no generation, so a pushed directive must not stamp
-	// b.proxyGen either, or the two delivery paths would order against different generations and the
-	// agent's proxyNewer would drop one. Single mode keeps the escalatable ordering generation.
-	if !b.clusterMode {
-		d.Generation = b.proxyGenLoad() // round-3/5: stamp the (escalatable) ordering generation on every push
+	// C5: cluster ordering is EPOCH-ONLY (Generation constant 0), matching
+	// register. Single mode reads its durable escalatable generation in the
+	// same transaction as the keyset, rather than stamping it after the fact.
+	// origin: hot-update S5 plan §6.4 / T28
+	current, err := proxyDirectiveForPush(b, sid, nid, d)
+	if err != nil {
+		b.cfg.Logger.Warn("broker: proxy authority push refused", "sid", sid, "nid", nid, "err", err)
+		return
 	}
-	body, err := json.Marshal(d)
+	body, err := json.Marshal(current)
 	if err != nil {
 		return
 	}
@@ -1228,4 +1222,239 @@ func proxySubCreateReply(b *Broker, sid, name, rawToken, reply string) proto.Pro
 			"client is receiving replies on the shared inbox, where any connection could " +
 			"read it. Upgrade tether on this machine, then `proxy sub revoke` and re-create.",
 	}
+}
+
+// proxyAuthority is private: key material must never become a log field or an
+// image manifest. Allocation and the ordering pair describe the same SQL cut.
+// A missing allocation is permitted here only so register can decide to mint;
+// the delivery paths require one before sending an enabled directive.
+type proxyAuthority struct {
+	Enabled         bool
+	Generation      int64
+	Epoch           int64
+	AppliedRevision uint64
+	Keys            []proto.ProxyKey
+	Allocation      *port.Allocation
+	Home            *proto.HomeDirective
+}
+
+// Proxy participation is an authorization boundary shared by pushed directives
+// and fresh tunnel grants; an allocated row may outlive an opt-out or teardown.
+// origin: hot-update S5 internal review rv-authority-1
+func proxyParticipationEnabled(enabled, capable int, state string) bool {
+	return enabled == 1 && capable == 1 && state == "ONLINE"
+}
+
+// readProxyAuthorityTx also serves the bounded tunnel adapter: its caller owns
+// the transaction, deadline and fresh lag/scope checks. Never call a *sql.DB
+// leaf lookup from here: that both splits the snapshot and deadlocks a one-
+// connection pool. Errors deliberately omit driver text, which can quote PSKs
+// when a corrupt value fails a scan.
+// origin: hot-update S5 plan §4.3 / §6.4 / T28
+func readProxyAuthorityTx(ctx context.Context, tx *sql.Tx, sid, nid string, clustered bool) (proxyAuthority, error) {
+	var a proxyAuthority
+	var enabled int
+	var state string
+	if err := tx.QueryRowContext(ctx, `SELECT proxy_enabled, state FROM sessions WHERE sid=?`, sid).Scan(&enabled, &state); err != nil {
+		return proxyAuthority{}, errors.New("proxy authority: session unreadable")
+	}
+	if state != "ACTIVE" || (enabled != 0 && enabled != 1) {
+		return proxyAuthority{}, errors.New("proxy authority: session inactive or invalid")
+	}
+	a.Enabled = enabled == 1
+	// A node teardown can race a delayed ON push while its session remains
+	// enabled. Participation is part of authority, so refreshing that push
+	// must not hand the opted-out/offline node the session's live keyset.
+	// origin: hot-update S5 plan §4.3 / §6.4 / T28
+	var capable int
+	var nodeState string
+	if err := tx.QueryRowContext(ctx, `SELECT proxy_capable, status FROM nodes WHERE sid=? AND nid=?`, sid, nid).Scan(&capable, &nodeState); err != nil {
+		return proxyAuthority{}, errors.New("proxy authority: node unreadable")
+	}
+	a.Enabled = proxyParticipationEnabled(enabled, capable, nodeState)
+	// Epoch errors are authority failures even when every other read succeeds.
+	// A zero fallback could pair a current keyset with an older receipt.
+	if err := tx.QueryRowContext(ctx, `SELECT proxy_epoch FROM sessions WHERE sid=?`, sid).Scan(&a.Epoch); err != nil {
+		return proxyAuthority{}, errors.New("proxy authority: epoch unreadable")
+	}
+	if !clustered {
+		if err := tx.QueryRowContext(ctx, `SELECT generation FROM proxy_meta WHERE id=1`).Scan(&a.Generation); err != nil {
+			return proxyAuthority{}, errors.New("proxy authority: generation unreadable")
+		}
+	}
+	if a.Epoch < 0 || a.Generation < 0 || a.Generation >= maxProxyGeneration {
+		return proxyAuthority{}, errors.New("proxy authority: ordering pair invalid")
+	}
+	var revision string
+	err := tx.QueryRowContext(ctx, `SELECT value FROM cluster_meta WHERE key='applied_index'`).Scan(&revision)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return proxyAuthority{}, errors.New("proxy authority: applied revision unreadable")
+	}
+	if err == nil {
+		a.AppliedRevision, err = strconv.ParseUint(revision, 10, 64)
+		if err != nil {
+			return proxyAuthority{}, errors.New("proxy authority: applied revision invalid")
+		}
+	}
+	alloc := &port.Allocation{SID: sid, NID: nid, Name: port.ProxyPortName, State: port.StateAllocated}
+	err = tx.QueryRowContext(ctx, `SELECT port, token_hash, home_broker, epoch FROM port_allocations
+		WHERE sid=? AND nid=? AND name='__proxy__' AND state='ALLOCATED'`, sid, nid).
+		Scan(&alloc.Port, &alloc.TokenHash, &alloc.HomeBroker, &alloc.Epoch)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return proxyAuthority{}, errors.New("proxy authority: allocation unreadable")
+	}
+	if err == nil {
+		if alloc.Port < 1 || alloc.Port > 65535 || alloc.TokenHash == "" || alloc.Epoch < 0 {
+			return proxyAuthority{}, errors.New("proxy authority: allocation invalid")
+		}
+		a.Allocation = alloc
+	}
+	// Home routing and pins must not be resolved by a later *sql.DB lookup:
+	// a rotation there could splice another cut onto this allocation/keyset.
+	// An unreadable or undeliverable home withholds the complete directive.
+	// origin: hot-update S5 plan §4.3 / §6.4 / T28
+	if a.Enabled && a.Allocation != nil && alloc.HomeBroker != "" {
+		var home clusternodes.HomeNode
+		var previous sql.NullString
+		var validUntil sql.NullTime
+		if err := tx.QueryRowContext(ctx, `SELECT phase, tunnel_addr, cert_fp, cert_fp_prev, cert_fp_valid_until
+			FROM cluster_nodes WHERE node_id=?`, alloc.HomeBroker).
+			Scan(&home.Phase, &home.TunnelAddr, &home.CertFP, &previous, &validUntil); err != nil {
+			return proxyAuthority{}, errors.New("proxy authority: home unreadable")
+		}
+		if !home.Eligible() || home.CertFP == "" {
+			return proxyAuthority{}, errors.New("proxy authority: home undeliverable")
+		}
+		if previous.Valid {
+			home.CertFPPrev = previous.String
+		}
+		if validUntil.Valid {
+			home.CertValid = &validUntil.Time
+		}
+		a.Home = &proto.HomeDirective{Name: alloc.Name, PublicPort: alloc.Port, NodeID: alloc.HomeBroker,
+			BrokerAddr: home.TunnelAddr, Epoch: alloc.Epoch, CertPins: certPinsFor(&home)}
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT sub_id, psk FROM proxy_subscribers
+		WHERE sid=? AND state='ACTIVE' ORDER BY created_at, sub_id`, sid)
+	if err != nil {
+		return proxyAuthority{}, errors.New("proxy authority: keys unreadable")
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var key proto.ProxyKey
+		if err := rows.Scan(&key.SubID, &key.Secret); err != nil {
+			return proxyAuthority{}, errors.New("proxy authority: key unreadable")
+		}
+		a.Keys = append(a.Keys, key)
+	}
+	if rows.Err() != nil {
+		return proxyAuthority{}, errors.New("proxy authority: keys incomplete")
+	}
+	return a, nil
+}
+
+// proxyAuthoritySnapshot gives register and every push the same builder.
+// NATS handlers have no caller ctx; one operation root bounds pool wait and
+// every SQL read. The cluster check compares the command-domain SQL cursor,
+// never Raft.AppliedIndex (which can include configuration/election entries).
+// origin: hot-update S5 plan §4.3 / §6.4 / T28
+func proxyAuthoritySnapshot(b *Broker, sid, nid string) (proxyAuthority, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), tunnel.LookupBudget) // ctx-none: NATS proxy delivery has no caller context.
+	defer cancel()
+	conn, err := b.read().SQL().Conn(ctx)
+	if err != nil {
+		return proxyAuthority{}, errTunnelAuthorityRetry
+	}
+	defer func() { _ = conn.Close() }()
+	// A context alone cannot interrupt SQLite's five-second busy handler.
+	// Share the tunnel reader's immediate lock refusal on this same connection.
+	// origin: hot-update S5 internal review rv-authority-2
+	tx, release, err := beginBoundedAuthorityRead(ctx, conn)
+	if err != nil {
+		return proxyAuthority{}, errTunnelAuthorityRetry
+	}
+	defer release()
+	a, err := readProxyAuthorityTx(ctx, tx, sid, nid, b.clusterMode)
+	if err != nil {
+		return proxyAuthority{}, errTunnelAuthorityRetry
+	}
+	if err := proxyAuthorityCheckLag(ctx, b, a.AppliedRevision); err != nil {
+		if ctx.Err() != nil {
+			return proxyAuthority{}, errTunnelAuthorityRetry
+		}
+		return proxyAuthority{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return proxyAuthority{}, errTunnelAuthorityRetry
+	}
+	if ctx.Err() != nil {
+		return proxyAuthority{}, errTunnelAuthorityRetry
+	}
+	return a, nil
+}
+
+// Check against the exact revision just read, rather than asking another SQL
+// connection for a newer cursor and blessing an older positive snapshot.
+// No Future.Error/Barrier or detached timeout worker is involved.
+// origin: hot-update S5 plan §4.3 / T28
+func proxyAuthorityCheckLag(ctx context.Context, b *Broker, revision uint64) error {
+	if !b.clusterMode {
+		return ctx.Err()
+	}
+	if b.cl == nil || b.cl.node == nil || !b.cl.node.CaughtUp() {
+		return errors.New("proxy authority: replica catching up")
+	}
+	for index := b.cl.node.CommitIndex(); index > revision; index-- {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		_, err := b.cl.node.CommittedCommandAt(index)
+		switch {
+		case errors.Is(err, cluster.ErrLogTruncated):
+			return nil
+		case errors.Is(err, cluster.ErrLogNonCommand):
+			continue
+		default:
+			// Poison commands still advance the SQL command cursor. An unreadable
+			// log is equally unable to prove this positive snapshot fresh.
+			return errors.New("proxy authority: replica catching up")
+		}
+	}
+	return ctx.Err()
+}
+
+func proxyAuthorityDirective(b *Broker, a proxyAuthority) *proto.ProxyDirective {
+	d := &proto.ProxyDirective{Enabled: a.Enabled, Generation: a.Generation, Epoch: a.Epoch}
+	if a.Enabled {
+		d.Cipher, d.Keys = ssproxy.Cipher, a.Keys
+		if a.Allocation != nil {
+			d.PublicPort = a.Allocation.Port
+			if b.selfID != "" {
+				d.Home = a.Home
+			}
+		}
+	}
+	return d
+}
+
+// A delayed producer's keys/pair/home are never reused. Only its one-time raw
+// token can survive, after comparison against this snapshot's allocation.
+// Thus even a same-pair producer with different keys cannot splice authority.
+// origin: hot-update S5 plan §6.4 / T28
+func proxyDirectiveForPush(b *Broker, sid, nid string, pending *proto.ProxyDirective) (*proto.ProxyDirective, error) {
+	a, err := proxyAuthoritySnapshot(b, sid, nid)
+	if err != nil {
+		return nil, err
+	}
+	if a.Enabled && a.Allocation == nil {
+		return nil, errors.New("proxy authority: allocation missing")
+	}
+	d := proxyAuthorityDirective(b, a)
+	if d.Enabled && pending != nil && pending.Token != "" {
+		if pending.PublicPort != a.Allocation.Port || tokenhash.Sum(pending.Token) != a.Allocation.TokenHash {
+			return nil, errors.New("proxy authority: token allocation changed")
+		}
+		d.Token = pending.Token
+	}
+	return d, nil
 }

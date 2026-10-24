@@ -6,11 +6,13 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"path/filepath"
 	"strconv"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/LinZiyang666/tether/internal/testharness"
 	"github.com/LinZiyang666/tether/internal/tunnel"
 )
 
@@ -46,6 +48,9 @@ func startCountingTunnelServer(t *testing.T) (addr string, registers *atomic.Int
 
 // origin: simcluster-speed external review F1 (adapter lock wait outside the budget)
 func TestAddProxyGivesUpTheLockWaitAtTheCallersDeadline(t *testing.T) {
+	// origin: hot-update S5 PROC-LEAK / final process census.
+	testharness.GuardProcessDirectory(t, filepath.Dir(t.TempDir()))
+
 	addr, registers := startCountingTunnelServer(t)
 	ad := NewTunnelExposeAdapter(addr, "lab", "lab-1", silentAdapterLog())
 	ctx, cancel := context.WithCancel(context.Background())
@@ -94,6 +99,9 @@ func TestAddProxyGivesUpTheLockWaitAtTheCallersDeadline(t *testing.T) {
 // The lock is the same lock: a successful AddProxy still excludes RemoveProxy, and an AddProxy that
 // gets the lock inside its budget opens normally.
 func TestAddProxyOpensWhenTheLockIsFreeInsideTheBudget(t *testing.T) {
+	// origin: hot-update S5 PROC-LEAK / final process census.
+	testharness.GuardProcessDirectory(t, filepath.Dir(t.TempDir()))
+
 	addr, registers := startCountingTunnelServer(t)
 	ad := NewTunnelExposeAdapter(addr, "lab", "lab-1", silentAdapterLog())
 	ctx, cancel := context.WithCancel(context.Background())

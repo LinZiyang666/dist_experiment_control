@@ -3,12 +3,14 @@ package broker
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/LinZiyang666/tether/internal/xfertrack"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 
@@ -59,6 +61,40 @@ func (c *idCapturingJS) StreamNameBySubject(context.Context, string) (string, er
 	return "", jetstream.ErrStreamNotFound
 }
 
+// ObjectStore reports NO transfer bucket, i.e. "nothing to purge". Since S7 T21 a
+// single-mode replay is not disposal until it has retired the transfer's object and
+// consumed its ledger rows, so the replay now asks for the bucket; the embedded nil
+// interface panicked here exactly as StreamNameBySubject did above.
+// origin: hot-update S7 plan §5.1 / T21; S7 lead integration — make test on the merged tree
+func (c *idCapturingJS) ObjectStore(context.Context, string) (jetstream.ObjectStore, error) {
+	return nil, jetstream.ErrBucketNotFound
+}
+
+// stageReplayRow persists a staged-terminal row exactly where recovery reads it and
+// returns its path. A single-mode replay consumes the primary row before the outbox
+// row, and a missing primary DIRECTORY is not proof the row is gone (R5-F1: it may be
+// an unmounted/replaced data dir), so a row that exists only in memory models a ledger
+// recovery could never have read — and since T21 the replay rightly refuses to call
+// that disposed.
+// origin: hot-update S7 plan §5.1 / T21; S7 lead integration — make test on the merged tree
+func stageReplayRow(t *testing.T, b *Broker, rec xferInflightRecord) string {
+	t.Helper()
+	dir := b.xferInflightDir()
+	if err := b.writeLedgerRecord(dir, rec); err != nil {
+		t.Fatal(err)
+	}
+	return filepath.Join(dir, xferInflightFilename(rec.TransferID))
+}
+
+// assertReplayRowConsumed is the other half of disposal: a replay that reports true while
+// its row survives would be re-driven on every pass forever (the pre-T21 early return).
+func assertReplayRowConsumed(t *testing.T, path string) {
+	t.Helper()
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("replay reported disposal but its ledger row survives (%s): %v", path, err)
+	}
+}
+
 func (c *idCapturingJS) snapshot() ([]string, []string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -77,7 +113,7 @@ func dedupTestTerminal(now time.Time) schema.AuditTransfer {
 func singleModeDedupBroker(t *testing.T, now time.Time) (*Broker, *idCapturingJS, string) {
 	t.Helper()
 	root := t.TempDir()
-	b := &Broker{transfers: newTransferTracker()}
+	b := &Broker{transfers: xfertrack.NewLegacyTracker()}
 	b.cfg = Config{ClusterDataDir: root, Logger: silentLogger(), Now: func() time.Time { return now }}
 	js := &idCapturingJS{}
 	setBrokerJS(b, js)
@@ -95,7 +131,10 @@ func TestTheFirstTerminalAndItsReplayCarryTheSameDedupID(t *testing.T) {
 	rec := dedupTestTerminal(now)
 
 	// --- the normal first publish ---
-	b.pubAuditTransfer(rec)
+	// origin: hot-update S10 lint L3a / errcheck
+	if err := b.pubAuditTransfer(rec); err != nil {
+		t.Fatal(err)
+	}
 
 	// --- the crash-recovery replay of the SAME staged terminal ---
 	staged := xferInflightRecord{
@@ -104,11 +143,13 @@ func TestTheFirstTerminalAndItsReplayCarryTheSameDedupID(t *testing.T) {
 		StartedAt: now.Add(-time.Minute),
 		Terminal:  &rec,
 	}
+	row := stageReplayRow(t, b, staged)
 	if !b.replayStagedTerminal(context.Background(), staged) {
 		t.Fatal("a single broker must now DISPOSE of a staged terminal by replaying it. " +
 			"Retaining leaves a decided transfer with no terminal at all and a ledger row " +
 			"that nothing ever drains — the OPEN this closes.")
 	}
+	assertReplayRowConsumed(t, row)
 
 	subs, ids := js.snapshot()
 	if len(ids) != 2 {
@@ -153,8 +194,14 @@ func TestADifferentTerminalGetsADifferentDedupID(t *testing.T) {
 	failed := complete
 	failed.Kind = "failed"
 
-	b.pubAuditTransfer(complete)
-	b.pubAuditTransfer(failed)
+	// origin: hot-update S10 lint L3a / errcheck
+	if err := b.pubAuditTransfer(complete); err != nil {
+		t.Fatal(err)
+	}
+	// origin: hot-update S10 lint L3a / errcheck
+	if err := b.pubAuditTransfer(failed); err != nil {
+		t.Fatal(err)
+	}
 
 	_, ids := js.snapshot()
 	if len(ids) != 2 {

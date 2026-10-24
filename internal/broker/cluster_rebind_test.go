@@ -4,6 +4,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/LinZiyang666/tether/internal/brokercontrol"
 	"github.com/LinZiyang666/tether/internal/cluster"
 	"github.com/LinZiyang666/tether/internal/proto"
 )
@@ -14,6 +15,10 @@ import (
 // wedge N=1). Uses the d7SingleNode harness (a real single-voter raft leader).
 
 func TestSetRaftAddrSelfOnlyAndIdempotent(t *testing.T) {
+	// origin: hot-update S10 plan §11.1 / TEST-BUDGET
+	if runIsolatedBrokerTest(t) {
+		return
+	}
 	n, addr := d7SingleNode(t, "self-1")
 	admin := NewClusterAdmin(n, nil)
 	in := d7JoinInput(t, "self-1", addr)
@@ -63,6 +68,10 @@ func TestSetRaftAddrSelfOnlyAndIdempotent(t *testing.T) {
 }
 
 func TestAddNonvoterUnreachableNoWedge(t *testing.T) {
+	// origin: hot-update S10 plan §11.1 / TEST-BUDGET
+	if runIsolatedBrokerTest(t) {
+		return
+	}
 	n, _ := d7SingleNode(t, "lead-1")
 	// THE keystone: stage an UNREACHABLE peer as a NONVOTER. A nonvoter does not count toward quorum,
 	// so adding an unreachable one to an N=1 cluster must commit at the OLD quorum and NOT wedge — the
@@ -108,13 +117,13 @@ func TestDriveJoinStagesNonvoterNoWedge(t *testing.T) {
 	admin := NewClusterAdmin(n, nil)
 	// join-2 @ 10.0.0.2:7400 is UNREACHABLE (not a registered InmemTransport addr) and never catches
 	// up — so it must remain a NONVOTER forever, which is exactly the no-wedge property.
-	admin.caughtUpFn = func(string, uint64) (bool, error) { return false, nil }
+	admin.CaughtUpFn = func(string, uint64) (bool, error) { return false, nil }
 	bundle, _ := makeJoinBundle(t, "join-2", "10.0.0.2:7400", "nonce-stage")
 	if _, err := admin.StartJoinOperation(bundle); err != nil {
 		t.Fatalf("StartJoinOperation: %v", err)
 	}
 	for i := 0; i < 8; i++ {
-		admin.driveInFlightOperations()
+		admin.DriveInFlightOperations()
 	}
 	cfg, err := n.RaftConfiguration()
 	if err != nil {
@@ -145,26 +154,26 @@ func TestPhaseFluidityCapabilityGate(t *testing.T) {
 	all := []cluster.ServerInfo{{NodeID: "self", Voter: true}, {NodeID: "peer-a", Voter: true}, {NodeID: "peer-b", Voter: true}}
 
 	// N=1 (only self) — always allowed, even with no health map.
-	if err := checkVotersSupportPhaseFluidityOps("set-raft-addr", all[:1], "self", nil); err != nil {
+	if err := brokercontrol.CheckVotersSupportPhaseFluidityOps("set-raft-addr", all[:1], "self", nil); err != nil {
 		t.Fatalf("N=1 must pass the capability gate: %v", err)
 	}
 	// All non-self voters advertise the capability — allowed.
 	okHealth := map[string]proto.ClusterHealthResp{"peer-a": {PhaseFluidityOps: true}, "peer-b": {PhaseFluidityOps: true}}
-	if err := checkVotersSupportPhaseFluidityOps("set-raft-addr", all, "self", okHealth); err != nil {
+	if err := brokercontrol.CheckVotersSupportPhaseFluidityOps("set-raft-addr", all, "self", okHealth); err != nil {
 		t.Fatalf("all-capable voters must pass: %v", err)
 	}
 	// One voter is an OLD binary (PhaseFluidityOps=false) — refuse (the mixed-version fork hazard).
 	oldHealth := map[string]proto.ClusterHealthResp{"peer-a": {PhaseFluidityOps: true}, "peer-b": {PhaseFluidityOps: false}}
-	if err := checkVotersSupportPhaseFluidityOps("set-raft-addr", all, "self", oldHealth); err == nil {
+	if err := brokercontrol.CheckVotersSupportPhaseFluidityOps("set-raft-addr", all, "self", oldHealth); err == nil {
 		t.Fatal("an old voter (PhaseFluidityOps=false) must be refused — it would poison-skip the op and fork")
 	}
 	// A voter is UNREACHABLE (absent from the health map) — fail CLOSED.
-	if err := checkVotersSupportPhaseFluidityOps("set-raft-addr", all, "self", map[string]proto.ClusterHealthResp{"peer-a": {PhaseFluidityOps: true}}); err == nil {
+	if err := brokercontrol.CheckVotersSupportPhaseFluidityOps("set-raft-addr", all, "self", map[string]proto.ClusterHealthResp{"peer-a": {PhaseFluidityOps: true}}); err == nil {
 		t.Fatal("an unreachable voter must be refused (fail-closed)")
 	}
 	// A nonvoter (learner) is ignored — only voters apply the replicated op.
 	mixed := []cluster.ServerInfo{{NodeID: "self", Voter: true}, {NodeID: "learner", Voter: false}}
-	if err := checkVotersSupportPhaseFluidityOps("set-raft-addr", mixed, "self", nil); err != nil {
+	if err := brokercontrol.CheckVotersSupportPhaseFluidityOps("set-raft-addr", mixed, "self", nil); err != nil {
 		t.Fatalf("a lone voter + a nonvoter must pass (the nonvoter does not apply): %v", err)
 	}
 }

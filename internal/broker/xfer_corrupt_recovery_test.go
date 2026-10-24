@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/schema"
+	"github.com/LinZiyang666/tether/internal/xfertrack"
 )
 
 // xfer_corrupt_recovery_test.go — the two operator recovery actions the unfinalizable-transfer warning
@@ -38,6 +39,10 @@ import (
 // advice was destructive" is checked rather than asserted.
 
 func TestCorruptOutboxRecoveryActionsBehaveAsDocumented(t *testing.T) {
+	// origin: hot-update S10 plan §11.1 / TEST-BUDGET
+	if runIsolatedBrokerTest(t) {
+		return
+	}
 	cases := []struct {
 		name string
 		// act performs the operator action on the quarantined outbox row and the primary start row.
@@ -154,7 +159,7 @@ func newCorruptOutboxFixture(t *testing.T) (*Broker, *[]schema.AuditTransfer) {
 	t.Helper()
 	n, _ := d7SingleNode(t, corruptTestTID)
 	now := time.Now().UTC()
-	b := &Broker{transfers: newTransferTracker()}
+	b := &Broker{transfers: xfertrack.NewLegacyTracker()}
 	b.cfg = Config{ClusterDataDir: t.TempDir(), Logger: silentLogger(), Now: func() time.Time { return now }}
 	b.cl = &clusterRuntime{node: n}
 

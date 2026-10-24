@@ -2,18 +2,22 @@ package main
 
 import (
 	"context"
-	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"time"
 
+	"github.com/LinZiyang666/tether/internal/adminsock"
 	"github.com/LinZiyang666/tether/internal/auth"
 	"github.com/LinZiyang666/tether/internal/cli"
-	"github.com/LinZiyang666/tether/internal/clusterroster"
 	"github.com/LinZiyang666/tether/internal/clusterupgrade"
+	"github.com/LinZiyang666/tether/internal/infracli"
 	"github.com/LinZiyang666/tether/internal/proto"
+	"github.com/LinZiyang666/tether/internal/upgradebudget"
+	"github.com/LinZiyang666/tether/internal/upgradecli"
+	"github.com/LinZiyang666/tether/internal/upgradecli/legacy"
 	"github.com/nats-io/nats.go"
 	"github.com/spf13/cobra"
 )
@@ -29,23 +33,27 @@ import (
 // documented follow-ups (the roll HALTS on any refusal, never de-clusters).
 
 const (
-	upgradeTriggerTimeout  = 10 * time.Second
+	upgradeTriggerTimeout  = upgradebudget.RequestLatency
 	upgradeConvergeTimeout = 3 * time.Minute
 	upgradeConvergePoll    = 3 * time.Second
 )
 
 func newClusterUpgradeCmd() *cobra.Command {
+	var infra infracli.Options
 	var (
-		natsURL, home, seedPath, toVersion, expectSHA, webhook string
-		dryRun, ackWriteFence, backupTaken                     bool
+		natsURL, home, seedPath, toVersion, expectSHA, webhook, resume string
+		dryRun, ackWriteFence, backupTaken, brokerOnly                 bool
 	)
 	cmd := &cobra.Command{
 		Use:   "upgrade",
-		Short: "Rolling broker-daemon upgrade (transfer-leader-first, one host at a time)",
+		Short: "Rolling host upgrade or NATS/Caddy component management",
 		Example: "  tether cluster upgrade --to-version v0.5.0 --dry-run                          # preview the ordered roll\n" +
 			"  tether cluster upgrade --to-version v0.5.0 --expect-sha256 <hex> \\\n" +
 			"    --account-seed /etc/tether/secrets/account.nk --backup-taken               # execute (staging + backup done first)",
-		Long: "Rolls every broker host to --to-version ONE AT A TIME, transferring leadership off a host\n" +
+		Long: "Select --component nats|caddy for infrastructure upgrade, rollback or Caddy config reload.\n" +
+			"Use --status <tx> for JSON status or --recover <tx> for the original journal; these need no target version.\n" +
+			"Without --component, the existing whole-host roll and --broker-only scope apply.\n\n" +
+			"Rolls every broker host to --to-version ONE AT A TIME, transferring leadership off a host\n" +
 			"before restarting it, so an N>=3 cluster keeps quorum throughout. The target binary must be\n" +
 			"STAGED on each host first (a privileged step — /usr/local/bin/tether is root-owned); the reload\n" +
 			"verifies the on-disk sha and refuses a stale image. Requests are signed with the cluster account\n" +
@@ -53,6 +61,21 @@ func newClusterUpgradeCmd() *cobra.Command {
 			"F=0) — pass --ack-writefence to proceed; production should run N>=3.",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			infra.ToVersion, infra.ExpectSHA256, infra.Resume = toVersion, expectSHA, resume
+			infra.BrokerOnly, infra.AckWriteFence, infra.BackupTaken, infra.DryRun = brokerOnly, ackWriteFence, backupTaken, dryRun
+			// origin: hot-update S9 plan §7.1 / T52 / M26
+			if infracli.Selected(infra) || cmd.Flags().Changed("status") || cmd.Flags().Changed("recover") {
+				return infracli.RunCluster(cmd, infra, home, natsURL, seedPath, infracli.ClusterPorts{Connect: connectCtl, Health: probeClusterHealth, Manifest: fetchManifestOverNATS, Unavailable: unavailErr})
+			}
+			// origin: hot-update S8 plan §3.1 / §7.1 / §11.2 P19 — a resume names only the
+			// original parent; it accepts no new version, SHA or scope to re-plan with.
+			if resume != "" {
+				if toVersion != "" || expectSHA != "" || dryRun || brokerOnly {
+					return usageErr("--resume continues the original sealed plan and accepts no new target or scope")
+				}
+				_, err := resumeClusterUpgrade(cmd, home, natsURL, seedPath, resume)
+				return upgradeExit("cluster upgrade --resume", err)
+			}
 			if toVersion == "" {
 				return usageErr("--to-version is required (the release every broker host should end on)")
 			}
@@ -92,7 +115,17 @@ func newClusterUpgradeCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			plan := clusterupgrade.Compute(nodes, toVersion)
+			scope := clusterupgrade.ScopeWholeHost
+			if brokerOnly {
+				scope = clusterupgrade.ScopeBrokerDaemon
+			}
+			// origin: hot-update S6 plan §5 / T45
+			// Version is not a running-image witness for a same-release rebuild.
+			health, err := cli.QueryBrokerRollHealth(cmd.Context(), nc, id.PublicKey)
+			if err != nil {
+				return err
+			}
+			plan := cli.PlanClusterRoll(nodes, toVersion, scope, expectSHA, health)
 			renderUpgradePlan(out, plan, toVersion)
 			if len(plan.Refused) > 0 {
 				return unavailErr("cluster upgrade refused (restore HA first): %v", plan.Refused)
@@ -100,33 +133,6 @@ func newClusterUpgradeCmd() *cobra.Command {
 			if plan.N2WriteFence && !ackWriteFence {
 				return usageErr("N=2: each broker restart fences writes for its restart duration (inherent F=0). " +
 					"Pass --ack-writefence to proceed, or grow to N>=3 first.")
-			}
-			if plan.Upgrades() == 0 {
-				// External-review round2 B1: a prior roll that COMPLETED but whose release-lock did not confirm
-				// leaves cluster_upgrade_active set — and since every host is now at target, the roll loop that
-				// would clear it never runs. Detect that stale lock here and clear it (a reachable self-heal, not
-				// an undocumented manual path). Needs the account seed to sign release-lock; a pure dry-run/no-seed
-				// preview never set a lock, so skipping the clear there is correct.
-				if upgradeLockHeld(nc, id.PublicKey) {
-					// External-review round3 doubt: clearing needs the account seed to SIGN release-lock. If the
-					// operator re-ran WITHOUT --account-seed, do NOT print a bare "nothing to do" while membership
-					// stays blocked — tell them exactly how to clear it.
-					if accountSeed == nil {
-						_, _ = fmt.Fprintln(out, "  ⚠ WARNING: a stale cluster_upgrade_active lock is set (a prior roll finished but its release did not confirm) — `cluster join`/`cluster retire` stay BLOCKED. Re-run `tether cluster upgrade --to-version "+toVersion+" --account-seed <path>` to clear it (the seed is needed to sign the release).")
-					} else {
-						leader, lerr := currentLeader(cmd.Context(), nc, id.PublicKey)
-						if lerr != nil {
-							return unavailErr("all hosts at target, but a stale cluster_upgrade_active lock is set and no leader is visible to clear it (%v) — membership stays blocked until it is released", lerr)
-						}
-						resp, terr := sendUpgradeTrigger(cmd.Context(), nc, id.PublicKey, accountSeed, &proto.ClusterUpgradeReq{Op: "release-lock", TargetNode: leader})
-						if terr != nil || resp == nil || !resp.OK {
-							return unavailErr("all hosts at target, but a stale cluster_upgrade_active lock could NOT be cleared (leader=%s): membership stays blocked until it is released — retry, or check the leader", leader)
-						}
-						_, _ = fmt.Fprintln(out, "cleared a stale upgrade lock (a prior roll finished but its release did not confirm).")
-					}
-				}
-				_, _ = fmt.Fprintln(out, "all broker hosts are already at the target — nothing to do.")
-				return nil
 			}
 			if dryRun {
 				_, _ = fmt.Fprintln(out, "(dry-run — no host was touched)")
@@ -146,280 +152,42 @@ func newClusterUpgradeCmd() *cobra.Command {
 			if !backupTaken {
 				return usageErr("take a verified `tether cluster backup` on the leader FIRST (a target's first-boot migration is one-way; restore is the only recovery), then re-run with --backup-taken")
 			}
-			return driveUpgrade(cmd, nc, id.PublicKey, sid, accountSeed, plan, toVersion, expectSHA, webhook)
+			return driveUpgrade(cmd, nc, id.PublicKey, accountSeed, plan, toVersion, expectSHA, webhook)
 		},
 	}
 	cmd.Flags().StringVar(&toVersion, "to-version", "", "the release every broker host should end on (required)")
 	cmd.Flags().StringVar(&expectSHA, "expect-sha256", "", "hex sha256 of the STAGED on-disk binary; each reload refuses a mismatch")
 	cmd.Flags().StringVar(&seedPath, "account-seed", "", "path to the cluster account nkey seed (signs each broker trigger; required to execute)")
+	cmd.Flags().BoolVar(&brokerOnly, "broker-only", false, "upgrade only broker daemons; leave co-located agents running")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "print the ordered roll plan and exit without touching any host")
 	cmd.Flags().BoolVar(&ackWriteFence, "ack-writefence", false, "acknowledge the inherent N=2 write-fence and proceed")
 	cmd.Flags().BoolVar(&backupTaken, "backup-taken", false, "confirm a verified `cluster backup` was taken first (a target's first-boot migration is one-way — restore is the only recovery)")
 	cmd.Flags().StringVar(&webhook, "notify-webhook", "", "POST a JSON milestone to this URL on start / per-host / complete / HALT")
 	cmd.Flags().StringVar(&natsURL, "nats-url", "", "broker NATS URL")
 	cmd.Flags().StringVar(&home, "home", cli.DefaultHome(), "tether home dir")
+	infracli.Flags(cmd, &infra, true)
+	cmd.Flags().StringVar(&resume, "resume", "", "continue the original sealed S8 parent plan by its parent transaction ID")
 	return cmd
 }
 
-// buildUpgradeNodes folds the live cluster-health probe (broker daemons: VER + leader + co-located agent
-// nid) with the node list (agent RELEASEs) into the planner's []Node. A broker that answers the health
-// probe is a current voter (the observe target IS the voter roster); CaughtUp is approximated true here and
-// re-verified live by the per-host converge wait during the roll.
+// buildUpgradeNodes folds the live cluster-health probe with the node list into
+// the planner's []Node; the body and its A7/B1/B3 rationale moved verbatim to
+// legacy.BuildLegacyRollNodes (S8 P19 slim move).
 func buildUpgradeNodes(ctx context.Context, nc *nats.Conn, actor, sid, accountPub string, out io.Writer) ([]clusterupgrade.Node, error) {
-	// A7: the node list gives each host's co-located AGENT release (the #19 whole-host at-target check needs
-	// it). FAIL CLOSED on a transport/decode failure — silently swallowing it left agentRelease empty, so
-	// EVERY host looked stale (AgentVer=="") and an already-at-target cluster got planned into a full,
-	// disruptive roll (a spurious leader transfer + agent re-execs) with no diagnostic. A genuinely-unpaired
-	// agent (the reply arrives but its nid is absent from Nodes) still yields "" → not-at-target, intended.
-	agentRelease := map[string]string{}
-	body, merr := json.Marshal(proto.NodeListReq{})
-	if merr != nil {
-		return nil, unavailErr("marshal node-list request: %v", merr)
-	}
-	rctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	msg, rerr := nc.RequestWithContext(rctx, proto.SubjCtrlNodeList(actor, sid), body)
-	cancel()
-	if rerr != nil {
-		return nil, unavailErr("node-list RPC failed (%v) — cannot determine co-located agent versions; refusing to plan a roll on incomplete data (every host would falsely look stale)", rerr)
-	}
-	var nlResp proto.NodeListResp
-	if uerr := json.Unmarshal(msg.Data, &nlResp); uerr != nil {
-		return nil, unavailErr("decode node-list reply: %v — refusing to plan a roll on incomplete data", uerr)
-	}
-	// A7 (Stage-C): an application-error reply (store_error / not_a_member / session_not_found_or_deleting /
-	// actor_invalid) decodes cleanly but carries a non-empty Code and an EMPTY Nodes slice — which would
-	// leave agentRelease empty and make EVERY host look stale, the exact symptom the transport/decode guards
-	// above exist to prevent. Fail closed on it too. A legitimately-empty node list returns Code=="".
-	if nlResp.Code != "" {
-		return nil, unavailErr("node-list RPC returned %s (%s) — refusing to plan a roll on incomplete data (every host would falsely look stale)", nlResp.Code, nlResp.Error)
-	}
-	for _, n := range nlResp.Nodes {
-		agentRelease[n.NID] = n.ReleaseVersion
-	}
-	replies, err := probeClusterHealth(nc, actor)
-	if err != nil {
-		// Distinct from "nobody answered": the roll planner has learned nothing at all,
-		// and the message below would send an operator to look at brokers that are fine.
-		return nil, unavailErr("could not ask the cluster for its health: %v", err)
-	}
-	if len(replies) == 0 {
-		return nil, unavailErr("no broker answered the cluster-health probe (single broker, or brokers unreachable) — nothing to roll")
-	}
-	byNode := map[string]proto.ClusterHealthResp{}
-	for _, h := range replies {
-		if h.NodeID != "" {
-			if _, dup := byNode[h.NodeID]; !dup {
-				byNode[h.NodeID] = h // first-wins dedup (a flapping broker cannot answer twice)
-			}
-		}
-	}
-	build := func(id string, h proto.ClusterHealthResp, voter bool) clusterupgrade.Node {
-		agentNID, presence := resolveColocatedAgent(id, h, agentRelease)
-		if presence == clusterupgrade.AgentAbsent {
-			// LOUD, never silent: the operator must be able to see why this host's verdict is
-			// broker-only. A host that DOES run an agent but under another session would show up
-			// here, and this line is how they notice.
-			_, _ = fmt.Fprintf(out, "  note: %s runs no co-located tether agent (none declared via `serve --colocated-agent-nid`, none registered under nid %q in this session) — its upgrade verdict is broker-only.\n", id, id)
-		}
-		return clusterupgrade.Node{
-			ID: id, IsLeader: h.WritableLeaderConfirmed, BrokerVer: h.ReleaseVersion,
-			AgentVer: agentRelease[agentNID], Agent: presence, Voter: voter, CaughtUp: true,
-		}
-	}
-	// External-review B1: the AUTHORITATIVE voter set is the leader's account-signed roster, NOT "who
-	// answered the probe". A configured voter that is momentarily absent must fail the roll CLOSED — never
-	// be silently dropped (dropping it can dip quorum, miscount the N=2 fence, or print complete while a
-	// real voter is never upgraded). Only when there is NO roster (single mode / a pre-G3 broker) do we
-	// fall back to the responders — there is no quorum to lose there.
-	// A2: the signed roster is the SAFETY basis for a quorum-touching roll, but fetchManifestOverNATS
-	// returns nil on ANY transient failure (timeout / no responder / decode). RETRY a few times before
-	// conceding — a single blip must not silently drop to the fail-OPEN responder path below (which cannot
-	// detect a momentarily-absent voter or miscount the N=2 fence). A genuine no-roster cluster (single
-	// mode / pre-G3) returns nil on every attempt and correctly reaches the fallback.
-	if m := fetchUpgradeRosterWithRetry(ctx, nc, actor); m != nil && m.Roster != nil && len(m.Roster.Brokers) > 0 {
-		// External-review round2 B3: this roster is the SAFETY basis for a quorum-touching roll, but the fetch
-		// path does not adopt/VerifyAt it. When the operator supplied the account seed, VERIFY the roster's
-		// account signature + expiry against the pinned account pub before trusting it — never plan a roll over
-		// an unverified/expired/wrong-account roster. (A dry-run without a seed still gets the bidirectional
-		// responder cross-check below, which needs no key.)
-		if accountPub != "" {
-			if verr := clusterroster.VerifyAt(m.Roster, accountPub, time.Now()); verr != nil {
-				return nil, unavailErr("the signed roster used to plan the roll failed verification (%v) — refusing to plan a quorum-touching upgrade over an unverified/expired roster", verr)
-			}
-		}
-		rosterSet := map[string]bool{} // ALL roster brokers, ANY phase (voter/learner/draining/…)
-		var voters, absent []string
-		for _, b := range m.Roster.Brokers {
-			rosterSet[b.NodeID] = true
-			if b.Phase == proto.RosterPhaseVoter {
-				voters = append(voters, b.NodeID)
-				if _, ok := byNode[b.NodeID]; !ok {
-					absent = append(absent, b.NodeID)
-				}
-			}
-		}
-		if len(absent) > 0 {
-			return nil, unavailErr("configured voter(s) %v did not answer the cluster-health probe — cannot verify a quorum-safe roll (restore them or wait); refusing to infer the voter set from responders", absent)
-		}
-		// External-review round2 B3 / round3 B1: the roster manifest is served from a >=30s discovery cache, so
-		// a RECENT grow can leave a broker answering cluster-health that the stale roster omits — the
-		// manifest-only loop above would silently drop it from the plan (miss a real voter / miscount the N=2
-		// fence). Cross-check the OTHER direction VERSION-AGNOSTICALLY: any broker that answered health but is
-		// absent from the signed roster means the snapshot is stale → fail closed. This must NOT rely on the
-		// additive IsVoter field — a pre-G5 voter answers health WITHOUT it (IsVoter decodes false), so keying
-		// the check on IsVoter would let exactly that mixed-version voter slip through (round3 B1). Membership
-		// is the roster's job; presence-in-roster is the invariant, phase/voterness is not the discriminator.
-		var unexpected []string
-		for id := range byNode {
-			if id != "" && !rosterSet[id] {
-				unexpected = append(unexpected, id)
-			}
-		}
-		if len(unexpected) > 0 {
-			return nil, unavailErr("broker(s) %v answered cluster-health but are absent from the signed roster snapshot (a recent membership change has not reached the roster cache yet) — refusing to plan over a stale roster; wait ~30s and re-run", unexpected)
-		}
-		nodes := make([]clusterupgrade.Node, 0, len(voters))
-		for _, v := range voters {
-			nodes = append(nodes, build(v, byNode[v], true))
-		}
-		return nodes, nil
-	}
-	// Fallback (no signed roster ⇒ single mode / a pre-G3 broker): plan over the responders. There is no
-	// quorum to lose in the single/degraded case the authoritative-roster path does not cover. A2: this path
-	// is fail-OPEN (no signature, no absent-voter guard), legitimately needed for a pre-G3 cluster that
-	// answers health but has no roster responder — but WARN loudly when >1 broker answered, so an operator
-	// whose roster fetch merely blipped is not silently planning a quorum-touching roll over responders.
-	if len(replies) > 1 {
-		_, _ = fmt.Fprintf(out, "  ⚠ WARNING: the signed cluster roster was unavailable — planning the roll over the %d broker(s) that answered the health probe. A momentarily-absent voter CANNOT be detected this way; verify every voter is present (`tether cluster status`) before proceeding, or retry.\n", len(replies))
-	}
-	seen := map[string]bool{}
-	var nodes []clusterupgrade.Node
-	for _, h := range replies {
-		if h.NodeID == "" || seen[h.NodeID] {
-			continue
-		}
-		seen[h.NodeID] = true
-		nodes = append(nodes, build(h.NodeID, h, h.IsVoter))
-	}
-	anyVoter := false
-	for _, n := range nodes {
-		if n.Voter {
-			anyVoter = true
-			break
-		}
-	}
-	if !anyVoter {
-		for i := range nodes {
-			nodes[i].Voter = true
-		}
-	}
-	return nodes, nil
+	return legacy.BuildLegacyRollNodes(ctx, legacy.RollPlanIO{Request: natsRequest(nc), Unavailable: unavailErr,
+		Probe:    func() ([]proto.ClusterHealthResp, error) { return probeClusterHealth(nc, actor) },
+		Manifest: func(ctx context.Context) *proto.ClusterManifest { return fetchManifestOverNATS(ctx, nc, actor) },
+	}, actor, sid, accountPub, out)
 }
 
-// resolveColocatedAgent answers P3's three-state question for ONE broker host: which nid is its
-// co-located agent, and does it have one at all? agentRelease is keyed by every nid the session's node
-// list returned.
-//
-// The two branches are deliberately asymmetric, because the evidence is:
-//
-//   - DECLARED (`serve --colocated-agent-nid <nid>`): presence is a CONFIGURATION fact, so it holds even
-//     when that agent is currently down or absent from the node list. Such a host stays state (b) —
-//     not-at-target — and the roll HALTs loudly on it. An operator who declared an agent gets told when
-//     it cannot be upgraded; we never "helpfully" downgrade their host to broker-only.
-//
-//   - UNDECLARED: the only signal is the node_id==nid convention, so presence must be OBSERVED. The node
-//     list is the right observer — handleNodeListReq projects every node EVER registered in the session
-//     (Status ONLINE | STALE | OFFLINE), so an agent that merely stopped is still listed and still
-//     counts as PRESENT. Absence from that list therefore means "no such agent has ever registered
-//     here", i.e. state (c): the dedicated broker host.
-func resolveColocatedAgent(brokerID string, h proto.ClusterHealthResp, agentRelease map[string]string) (string, clusterupgrade.AgentPresence) {
-	if h.ColocatedAgentNID != "" {
-		return h.ColocatedAgentNID, clusterupgrade.AgentPresent
-	}
-	if _, ok := agentRelease[brokerID]; ok {
-		return brokerID, clusterupgrade.AgentPresent
-	}
-	return "", clusterupgrade.AgentAbsent
-}
+// resolveColocatedAgent is the P3 three-state presence verdict (upgradecli).
+var resolveColocatedAgent = legacy.ResolveColocatedAgent
 
-// fetchUpgradeRosterWithRetry pulls the signed cluster manifest, retrying a few times (A2). fetchManifest
-// OverNATS collapses every transient failure (timeout / no responder / decode) to nil, so a single blip
-// must not drop the quorum-touching roll to the fail-OPEN responder path. Returns nil only after the
-// retries are exhausted — a genuine no-roster cluster (single mode / pre-G3) returns nil on every attempt.
-func fetchUpgradeRosterWithRetry(ctx context.Context, nc *nats.Conn, actor string) *proto.ClusterManifest {
-	for attempt := 0; attempt < 3; attempt++ {
-		if m := fetchManifestOverNATS(ctx, nc, actor); m != nil && m.Roster != nil && len(m.Roster.Brokers) > 0 {
-			return m
-		}
-		if attempt < 2 {
-			select {
-			case <-ctx.Done():
-				return nil
-			case <-time.After(400 * time.Millisecond):
-			}
-		}
-	}
-	return nil
-}
-
-// upgradeLockHeld probes cluster-health and reports whether ANY broker still advertises the cluster-scoped
-// roll lock (External-review round2 B1). Used by the no-op re-run path to detect a stale lock left by a
-// prior roll whose release-lock did not confirm.
-//
-// A PROBE THAT COULD NOT BE MADE REPORTS "held", not "clear" — origin: increment 2
-// internal review, pairing-sweep/IMPACT-F1. The caller's only reaction to `true` is to
-// TELL THE OPERATOR the lock may be stale and how to clear it; its reaction to `false` is
-// to print "nothing to do" while membership may still be blocked. Between a spurious
-// warning and a silent block, the warning is the one an operator can act on.
-func upgradeLockHeld(nc *nats.Conn, actor string) bool {
-	replies, err := probeClusterHealth(nc, actor)
-	if err != nil {
-		return true
-	}
-	for _, h := range replies {
-		if h.UpgradeLockActive {
-			return true
-		}
-	}
-	return false
-}
-
-func renderUpgradePlan(w interface{ Write([]byte) (int, error) }, plan clusterupgrade.Plan, target string) {
-	_, _ = fmt.Fprintf(w, "rolling upgrade plan → %s (%d host(s) to upgrade):\n", target, plan.Upgrades())
-	for _, s := range plan.Steps {
-		switch s.Kind {
-		case clusterupgrade.StepSkip:
-			_, _ = fmt.Fprintf(w, "  SKIP    %s (already at target)\n", s.NodeID)
-		case clusterupgrade.StepUpgrade:
-			scope := ""
-			if s.BrokerOnly {
-				scope = " [broker-only — no co-located agent on this host]"
-			}
-			if s.TransferTo != "" {
-				_, _ = fmt.Fprintf(w, "  UPGRADE %s (leader — transfer to %s first)%s\n", s.NodeID, s.TransferTo, scope)
-			} else {
-				_, _ = fmt.Fprintf(w, "  UPGRADE %s%s\n", s.NodeID, scope)
-			}
-		}
-	}
-	if plan.N2WriteFence {
-		_, _ = fmt.Fprintln(w, "  ⚠ N=2: each restart fences writes for its restart duration (inherent F=0); production should run N>=3.")
-	}
-	for _, r := range plan.Refused {
-		_, _ = fmt.Fprintf(w, "  ✗ REFUSED: %s\n", r)
-	}
-}
+// renderUpgradePlan prints the ordered S6 roll (body in legacy.RenderLegacyRollPlan).
+var renderUpgradePlan = legacy.RenderLegacyRollPlan
 
 // signUpgradeTrigger stamps IssuedAt + the account signature onto a request and marshals it.
-func signUpgradeTrigger(seed []byte, req *proto.ClusterUpgradeReq, now time.Time) ([]byte, error) {
-	req.IssuedAt = now.UTC().Format(time.RFC3339)
-	sig, err := auth.SignWithSeed(seed, proto.CanonicalUpgradeReqBytes(req))
-	if err != nil {
-		return nil, err
-	}
-	req.Sig = hex.EncodeToString(sig)
-	return json.Marshal(req)
-}
+var signUpgradeTrigger = infracli.SignUpgradeTrigger
 
 // upgradeTriggerCodeNotReady mirrors the broker's retriable "admin backend not wired yet" code.
 const upgradeTriggerCodeNotReady = "cluster_not_ready"
@@ -465,4 +233,84 @@ func sendUpgradeTriggerOnce(ctx context.Context, nc *nats.Conn, actor string, se
 		return nil, fmt.Errorf("decode trigger reply: %w", err)
 	}
 	return &resp, nil
+}
+
+// newBrokerCmd is a local daemon surface, independent of node upgrade's agent
+// identity and the NATS session. Installed candidate/prev checks belong to the
+// broker's reload admission; this command reports only observed running status.
+// origin: hot-update S6 plan §5 / T45 / lead L3
+func newBrokerCmd() *cobra.Command {
+	var socketPath string
+	root := &cobra.Command{Use: "broker", Short: "Manage the local broker daemon"}
+	root.PersistentFlags().StringVar(&socketPath, "socket", defaultAdminSocket, "path to the broker admin Unix socket")
+	upgrade := &cobra.Command{Use: "upgrade", Short: "Reload or inspect the broker image"}
+	var version, sha, home, txID string
+	var tx upgradecli.UpgradeOptions
+	var asJSON bool
+	ports := upgradecli.BrokerPorts{Call: cli.CallBrokerAdmin, Exit: upgradeExit, DefaultHome: cli.DefaultHome(),
+		Socket: func(*cobra.Command) string { return socketPath }}
+	// origin: S8 FIX-DESCRIBE (P19 request R1) — the broker describes itself and
+	// its staged candidate; a prepared grant is attributed to the local identity.
+	ports.Describe, ports.Actor = upgradecli.DescribeBroker(ports), upgradecli.IdentityActor(cli.EnsureIdentity, func(id *cli.Identity) string { return id.Fingerprint })
+	reload := &cobra.Command{Use: "reload", Short: "Reload the staged broker image and verify its running SHA", Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			// origin: hot-update S8 plan §5.2 / §7.1 / §11.2 P19
+			if tx.TxID != "" || tx.PrepareOnly || tx.GrantOut != "" || tx.ArtifactReceipt != "" {
+				tx.ToVersion, tx.ExpectSHA256 = version, sha
+				return upgradecli.RunBrokerReload(cmd, ports, home, tx, upgradeConvergeTimeout)
+			}
+			if version == "" || sha == "" {
+				return usageErr("--to-version and --expect-sha256 are required")
+			}
+			status, err := cli.ReloadLocalBroker(cmd.Context(), socketPath, version, sha)
+			if err != nil {
+				return brokerUpgradeError(err)
+			}
+			return emitJSON(cmd.OutOrStdout(), status)
+		},
+	}
+	reload.Flags().StringVar(&version, "to-version", "", "release of the staged image")
+	reload.Flags().StringVar(&sha, "expect-sha256", "", "SHA256 of the staged image")
+	reload.Flags().StringVar(&tx.TxID, "tx-id", "", "resume only the original transaction (with --artifact-receipt: Start it)")
+	reload.Flags().BoolVar(&tx.PrepareOnly, "prepare-only", false, "obtain the broker-issued inert grant only; requires --grant-out")
+	reload.Flags().StringVar(&tx.GrantOut, "grant-out", "", "write the prepared grant here for `tether upgrade stage`")
+	reload.Flags().StringVar(&tx.ArtifactReceipt, "artifact-receipt", "", "artifact receipt from `tether upgrade stage` for --tx-id")
+	status := &cobra.Command{Use: "status", Short: "Read the running broker image", Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			// origin: hot-update S8 plan §7.1 — additive: one transaction's private View.
+			if txID != "" {
+				return ports.Exit("broker upgrade status", upgradecli.RunBrokerVerb(cmd, ports, upgradecli.VerbStatus, home, txID, upgradeTriggerTimeout, asJSON))
+			}
+			resp, err := cli.CallBrokerAdmin(cmd.Context(), socketPath, adminsock.Request{Op: adminsock.OpRuntime})
+			if err != nil {
+				return unavailErr("broker status: %v", err)
+			}
+			if resp.Code != "" || resp.Error != "" || resp.Runtime == nil || resp.Runtime.BrokerImage == nil {
+				return unavailErr("broker runtime image is unavailable")
+			}
+			return emitJSON(cmd.OutOrStdout(), resp.Runtime.BrokerImage)
+		},
+	}
+	status.Flags().StringVar(&txID, "tx-id", "", "query one upgrade transaction instead of the running image")
+	status.Flags().BoolVar(&asJSON, "json", false, "with --tx-id: emit the private transaction View as JSON")
+	for _, c := range []*cobra.Command{reload, status} {
+		c.Flags().StringVar(&home, "home", cli.DefaultHome(), "tether home dir (holds the grants this ctl prepared)")
+	}
+	upgrade.AddCommand(reload, status)
+	upgrade.AddCommand(upgradecli.BrokerTransactionCommands(ports)...)
+	root.AddCommand(upgrade)
+	return root
+}
+
+// origin: hot-update S6 plan §9.1 / T45
+func brokerUpgradeError(err error) error {
+	var refusal *cli.BrokerReloadError
+	if errors.As(err, &refusal) {
+		return &ExitError{Class: brokerCodeExitClass(refusal.Code), Code: refusal.Code, Err: err}
+	}
+	var unknown *cli.BrokerReloadUnknownError
+	if errors.As(err, &unknown) {
+		return &ExitError{Class: exitUnsettled, Code: proto.CodeAgentNoResponders, Err: err}
+	}
+	return unavailErr("broker upgrade: %v", err)
 }

@@ -24,26 +24,24 @@ func TestHasOtherDialableVoter(t *testing.T) {
 	voter := func(host string) proto.RosterBroker {
 		return proto.RosterBroker{PublicHost: host, Phase: proto.RosterPhaseVoter}
 	}
-	mk := func(brokers ...proto.RosterBroker) *Agent {
-		a := &Agent{}
-		a.cachedRoster = &proto.ClusterRoster{Brokers: brokers}
-		return a
+	hasOther := func(brokers ...proto.RosterBroker) bool {
+		_, other := rosterVoterDestination(&proto.ClusterRoster{Brokers: brokers}, "a.example.com", "", nil, time.Now())
+		return other
 	}
 
-	if !mk(voter("a.example.com"), voter("b.example.com")).hasOtherDialableVoter("a.example.com") {
+	if !hasOther(voter("a.example.com"), voter("b.example.com")) {
 		t.Error("two distinct dialable voters: must find the other one as an exit")
 	}
-	if mk(voter("a.example.com")).hasOtherDialableVoter("a.example.com") {
+	if hasOther(voter("a.example.com")) {
 		t.Error("a lone voter (itself) must NOT count as an exit")
 	}
-	if mk(voter("a.example.com"), proto.RosterBroker{PublicHost: "b.example.com", Phase: proto.RosterPhaseDraining}).
-		hasOtherDialableVoter("a.example.com") {
+	if hasOther(voter("a.example.com"), proto.RosterBroker{PublicHost: "b.example.com", Phase: proto.RosterPhaseDraining}) {
 		t.Error("a non-voter must not count as a dialable-voter exit")
 	}
-	if mk(voter("a.example.com"), voter("127.0.0.1")).hasOtherDialableVoter("a.example.com") {
+	if hasOther(voter("a.example.com"), voter("127.0.0.1")) {
 		t.Error("an undialable (loopback) voter must not count")
 	}
-	if (&Agent{}).hasOtherDialableVoter("a.example.com") {
+	if _, other := rosterVoterDestination(nil, "a.example.com", "", nil, time.Now()); other {
 		t.Error("no cached roster → no exit")
 	}
 }
@@ -97,7 +95,7 @@ func TestBrokerSilenceEscapesToVoter(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// A survivor voter on a distinct DIALABLE host so hasOtherDialableVoter sees an exit.
+	// A survivor voter on a distinct DIALABLE host so the roster policy sees an exit.
 	// Use a documentation address: this test exercises host exclusion, not external DNS.
 	roster, err := clusterroster.Build(seed, pub, 10,
 		[]proto.RosterBroker{{NodeID: "survivor", PublicHost: "203.0.113.1", Phase: proto.RosterPhaseVoter}},
@@ -117,7 +115,7 @@ func TestBrokerSilenceEscapesToVoter(t *testing.T) {
 			return
 		}
 		established.Store(true)
-		body, _ := json.Marshal(proto.NodeRegisterResp{OK: true, Roster: roster})
+		body, _ := json.Marshal(proto.NodeRegisterResp{OK: true, Roster: roster, ConnectedBrokerID: "retired"})
 		_ = msg.Respond(body)
 	}); err != nil {
 		t.Fatal(err)

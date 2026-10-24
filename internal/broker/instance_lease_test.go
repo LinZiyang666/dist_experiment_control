@@ -21,7 +21,7 @@ import (
 // (ErrNoResponders ⇒ grant) needs a real bus and is covered separately.
 func leaseBroker(t *testing.T) *Broker {
 	t.Helper()
-	db := testharness.OpenDB(t)
+	db := openDB(t)
 	if _, err := db.Exec(
 		`INSERT INTO sessions(sid, name, owner_pubkey_fp, pin_hash) VALUES (?,?,?,?)`,
 		"lab", "lab", "SHA256:test-owner", "test-hash"); err != nil {

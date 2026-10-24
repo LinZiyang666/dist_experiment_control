@@ -72,6 +72,17 @@ type verbSpec struct {
 	// Zero value = do not echo, which is both the majority behaviour and the less
 	// information-leaking one. Only exec sets it, and only because it always has.
 	echoSubjectOnMalformed bool
+
+	// allowStaleNode lets a STALE node (heartbeat gap > StaleAfter, agent most likely
+	// alive) through the node check; OFFLINE is still refused. Zero value = strict,
+	// matching this file's polarity rule. Only the process-resume ATTACH ops set it:
+	// the task already lives on the agent, and a 5 s heartbeat gap during a NATS or
+	// broker restart must not turn a running exec into `node_offline` (drill 35 arms
+	// A/B). The price, documented in usage §9.13.2 and gotcha #90: a truly dead agent's
+	// attach requests are forwarded to nobody until OFFLINE (≤ 60 s) — the ctl gets no
+	// 503 for them (no-responders only reaches a publisher that holds the reply
+	// subscription itself) and resends on its 500 ms attempt timeout until then.
+	allowStaleNode bool
 }
 
 // ingress is the identity the gate resolved.
@@ -312,7 +323,8 @@ func (b *Broker) admitACL(ing *ingress, spec verbSpec) (denial, bool) {
 		return deny("node_not_found", "", "node_not_found"), false
 	case err != nil:
 		return b.storeErrDenial("node.LookupStatus", err), false
-	case status != node.StateOnline:
+	case status != node.StateOnline && (!spec.allowStaleNode || status != node.StateStale):
+		// ONLINE always passes; STALE passes only for the attach spec (gotcha #90); OFFLINE never.
 		// The two families render this differently and both renderings are pinned:
 		// the chunk verbs prefix the status with "status=", the typed verbs do not.
 		return deny("node_offline", string(status), "node_offline: status="+string(status)), false
@@ -335,9 +347,13 @@ func auditRefusal(d denial) string {
 
 // The per-verb specs. Their zero-value polarity is load-bearing — see verbSpec.
 var (
-	execSpec = verbSpec{verb: "exec", role: admitMember, echoSubjectOnMalformed: true}
-	runSpec  = verbSpec{verb: "run", role: admitMember}
-	killSpec = verbSpec{verb: "kill", role: admitMember}
+	execSpec          = verbSpec{verb: "exec", role: admitMember, echoSubjectOnMalformed: true}
+	runSpec           = verbSpec{verb: "run", role: admitMember}
+	killSpec          = verbSpec{verb: "kill", role: admitMember}
+	processResumeSpec = verbSpec{verb: proto.ProcessResumeVerb, role: admitMember}
+	// processResumeAttachSpec is the same verb for the ops that address a task the
+	// agent already owns (create/resume/ack/terminal-ack); see allowStaleNode.
+	processResumeAttachSpec = verbSpec{verb: proto.ProcessResumeVerb, role: admitMember, allowStaleNode: true}
 
 	exposeSpec = verbSpec{verb: "expose", role: admitMember}
 	// expose-rm resolves its target by (sid, name), not by nid, so an expose stays removable

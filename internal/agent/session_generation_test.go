@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"testing"
@@ -356,9 +357,20 @@ func TestExecChunksRideTheCurrentConnection(t *testing.T) {
 // it keeps running and holding the mount it wedged on. On a filesystem that recovers
 // minutes later, the wait itself blocks for that whole time.
 func TestAnAbandonedExecChildIsKilledNotJustWaitedOn(t *testing.T) {
+	// origin: hot-update S5 PROC-LEAK / final process census.
+	testharness.GuardProcessDirectory(t, filepath.Dir(t.TempDir()))
+
 	a := genTestAgent(t)
+	dir := t.TempDir()
 
 	cmd := exec.Command("sh", "-c", "sleep 30")
+	cmd.Dir = dir
+	t.Cleanup(func() {
+		if cmd.Process != nil {
+			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+			_ = cmd.Wait()
+		}
+	})
 	setExecProcGroup(cmd) // its own group, so the negative pid reaches only its descendants
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("start: %v", err)
@@ -404,6 +416,13 @@ func TestAnAbandonedExecChildIsKilledNotJustWaitedOn(t *testing.T) {
 	// ERROR — and the first version of this function returned early on exactly that,
 	// leaving the child alive and releasing the wedge slot immediately.
 	live := exec.Command("sh", "-c", "sleep 30")
+	live.Dir = dir
+	t.Cleanup(func() {
+		if live.Process != nil {
+			_ = syscall.Kill(-live.Process.Pid, syscall.SIGKILL)
+			_ = live.Wait()
+		}
+	})
 	setExecProcGroup(live)
 	if err := live.Start(); err != nil {
 		t.Fatalf("start: %v", err)

@@ -1,9 +1,8 @@
 package broker
 
 import (
+	"fmt"
 	"go/ast"
-	"go/parser"
-	"go/token"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,6 +11,7 @@ import (
 
 	"github.com/LinZiyang666/tether/internal/proto"
 	"github.com/LinZiyang666/tether/internal/schema"
+	"github.com/LinZiyang666/tether/internal/xfertrack"
 )
 
 // transfer_budget_test.go — the broker half of the size-derived tier-B budget: the watchdog, the
@@ -30,7 +30,7 @@ func TestWatchdogAndStrandedDecisionUseTheSameBudget(t *testing.T) {
 	// proto.XferBudget(...) to transferTimeoutFor(...) and therefore stayed green when the real arm
 	// site was changed to cover one leg instead of two.
 	for _, size := range []int64{0, 1, 64 * 1024 * 1024, 512 * 1024 * 1024, proto.XferMaxBytes} {
-		live := watchdogBudget(&transferEntry{tier: "b", size: size})
+		live := xfertrack.LegacyWatchdogBudget(xfertrack.NewLegacyEntry(xfertrack.LegacyRecord{Tier: "b", Size: size}))
 		recovered := transferTimeoutFor("b", size)
 		if live != recovered {
 			t.Errorf("size=%d: the live watchdog budgets %s but a recovering broker budgets %s — the "+
@@ -71,17 +71,51 @@ func TestSyntheticTerminalTimestampStaysOnTheTierFloor(t *testing.T) {
 	// the helper, while the decision it guards lives at the ONE call site in finalizeStrandedXfers.
 	// Assert the call site structurally instead: the synthetic terminal's Ts must be stamped from the
 	// tier floor, never from the size-derived budget.
-	src, err := os.ReadFile("xfer_inflight.go")
-	if err != nil {
-		t.Fatalf("read source: %v", err)
+	// origin: hot-update S7 plan §11.4 / P31; the finalizer moves out of broker.
+	//
+	// The synthesizing body moved to xferledger as (*Legacy).Finalize, where the
+	// helpers are named LegacyTierFloor / LegacyTimeout; the broker kept only a
+	// dispatching finalizeStrandedXfers adapter of the old name. Scanning the
+	// adapter alone finds no `timeout :=` at all, so BOTH are resolved and the
+	// site set must equal the one before the move: exactly one floor-derived
+	// `timeout :=` and no size-derived one, wherever the synthesis now lives.
+	// origin: S7 lead integration (scanner handoff for the moved finalizer)
+	roots := []string{".", "../xferledger", "../xferfinal"}
+	owner := requireTransferDeclaration(t, "Legacy.Finalize", roots...)
+	if err := syntheticTerminalFloorInvariant(owner); err != nil {
+		t.Fatal(err)
 	}
-	fset := token.NewFileSet()
-	f, perr := parser.ParseFile(fset, "xfer_inflight.go", src, 0)
-	if perr != nil {
-		t.Fatalf("parse: %v", perr)
+	adapter := requireTransferDeclaration(t, "finalizeStrandedXfers", roots...)
+	floor, budget := syntheticTerminalTimeoutSites(owner)
+	adapterFloor, adapterBudget := syntheticTerminalTimeoutSites(adapter)
+	t.Logf("synthetic-terminal timeout sites: finalizer floor=%d budget=%d; adapter floor=%d budget=%d",
+		floor, budget, adapterFloor, adapterBudget)
+	if floor+adapterFloor != 1 || budget+adapterBudget != 0 {
+		t.Fatalf("the stranded finalizer has %d floor-derived and %d size-derived `timeout :=` site(s) across "+
+			"its owner and adapter; before the move it had exactly 1 and 0. A second synthesis site, or one "+
+			"stamped from the size-derived budget, mints a second reqID for the same ledger record",
+			floor+adapterFloor, budget+adapterBudget)
 	}
-	var floorCalls, budgetCalls int
-	ast.Inspect(f, func(n ast.Node) bool {
+	exerciseTransferScannerMoves(t, "Legacy.Finalize", roots, syntheticTerminalFloorInvariant,
+		"func (b *Legacy) Finalize() { timeout := LegacyTierFloor(tier); use(timeout) }",
+		"func (b *Legacy) Finalize() { timeout := LegacyTimeout(tier, size); use(timeout) }")
+	exerciseTransferScannerMoves(t, "finalizeStrandedXfers", roots, syntheticTerminalFloorInvariant,
+		"func finalizeStrandedXfers() { timeout := transferTierFloorFor(tier); use(timeout) }",
+		"func finalizeStrandedXfers() { timeout := transferTimeoutFor(tier, size); use(timeout) }")
+}
+
+// The broker wrappers and the xferledger helpers they forward to are the same
+// two questions under two names. proto.XferBudget is the size-derived budget
+// itself, so stamping Ts from it directly is the same defect.
+var (
+	syntheticTerminalFloorFuncs  = map[string]bool{"transferTierFloorFor": true, "LegacyTierFloor": true}
+	syntheticTerminalBudgetFuncs = map[string]bool{"transferTimeoutFor": true, "LegacyTimeout": true, "XferBudget": true}
+)
+
+// syntheticTerminalTimeoutSites counts `timeout := f(...)` assignments whose
+// callee (plain or package-qualified) is a tier-floor or a size-derived helper.
+func syntheticTerminalTimeoutSites(fn *ast.FuncDecl) (floorCalls, budgetCalls int) {
+	ast.Inspect(fn, func(n ast.Node) bool {
 		as, ok := n.(*ast.AssignStmt)
 		if !ok || len(as.Rhs) != 1 || len(as.Lhs) != 1 {
 			return true
@@ -94,24 +128,36 @@ func TestSyntheticTerminalTimestampStaysOnTheTierFloor(t *testing.T) {
 		if !ok {
 			return true
 		}
-		switch fn, _ := call.Fun.(*ast.Ident); {
-		case fn != nil && fn.Name == "transferTierFloorFor":
+		var callee string
+		switch f := call.Fun.(type) {
+		case *ast.Ident:
+			callee = f.Name
+		case *ast.SelectorExpr:
+			callee = f.Sel.Name
+		}
+		switch {
+		case syntheticTerminalFloorFuncs[callee]:
 			floorCalls++
-		case fn != nil && fn.Name == "transferTimeoutFor":
+		case syntheticTerminalBudgetFuncs[callee]:
 			budgetCalls++
 		}
 		return true
 	})
+	return floorCalls, budgetCalls
+}
+
+func syntheticTerminalFloorInvariant(fn *ast.FuncDecl) error {
+	floorCalls, budgetCalls := syntheticTerminalTimeoutSites(fn)
 	if floorCalls == 0 {
-		t.Fatal("SELF-CHECK FAILED: no `timeout := transferTierFloorFor(...)` found in xfer_inflight.go — " +
-			"the scanner is looking for a shape that no longer exists, so a clean result means nothing")
+		return fmt.Errorf("SELF-CHECK FAILED: no `timeout := transferTierFloorFor(...)` (xferledger: LegacyTierFloor) found in the actual finalizer; a clean empty scan means nothing")
 	}
 	if budgetCalls > 0 {
-		t.Errorf("the synthetic terminal's timeout is derived from transferTimeoutFor (the size-derived "+
+		return fmt.Errorf("the synthetic terminal's timeout is derived from transferTimeoutFor (the size-derived "+
 			"budget) at %d site(s). Ts would then depend on XferMinThroughput, so a rollback or any "+
 			"future retune of that constant makes two binaries stamp different Ts for the SAME ledger "+
 			"record — two reqIDs, two contradictory terminals for one transfer.", budgetCalls)
 	}
+	return nil
 }
 
 // TestCrossHomeGraceCoversALiveTransferOfThatSize is the load-bearing relation of the whole change:
@@ -191,22 +237,24 @@ func TestWatchdogBudgetIsBoundedByAdmission(t *testing.T) {
 //
 // Mutation: make recentlyReaped return true unconditionally — the unknown-id assertion reddens.
 func TestRecentlyReapedRemembersOnlyWatchdogKills(t *testing.T) {
-	tr := newTransferTracker()
+	tr := xfertrack.NewLegacyTracker()
 	now := time.Now()
-	if tr.recentlyReaped("never-seen") {
+	if tr.RecentlyReaped("never-seen") {
 		t.Error("an id the watchdog never touched must not be reported as reaped")
 	}
-	tr.markReaped("t1", now)
-	if !tr.recentlyReaped("t1") {
+	tr.MarkReaped("t1", now)
+	if !tr.RecentlyReaped("t1") {
 		t.Error("a just-reaped id must be remembered so a late completion can be surfaced")
 	}
 	// The set must not grow without bound: an old entry is swept by a later insert.
-	tr.markReaped("t2", now.Add(-2*xferRecentlyReapedTTL))
-	tr.markReaped("t3", now)
-	if tr.recentlyReaped("t2") {
+	// origin: hot-update S7 plan §11.4 / P31; pin the historical ten-minute retention
+	// independently of its relocated private constant.
+	tr.MarkReaped("t2", now.Add(-20*time.Minute))
+	tr.MarkReaped("t3", now)
+	if tr.RecentlyReaped("t2") {
 		t.Error("an entry past the retention window was not swept")
 	}
-	if !tr.recentlyReaped("t1") || !tr.recentlyReaped("t3") {
+	if !tr.RecentlyReaped("t1") || !tr.RecentlyReaped("t3") {
 		t.Error("the sweep took live entries with it")
 	}
 }
@@ -223,16 +271,16 @@ func TestRecentlyReapedRemembersOnlyWatchdogKills(t *testing.T) {
 //
 // Mutation: make ledgerProtectedObjects return an empty set — reddens.
 func TestHomeReapConsultsTheDurableLedgerNotJustTheTracker(t *testing.T) {
-	b := &Broker{transfers: newTransferTracker()}
+	b := &Broker{transfers: xfertrack.NewLegacyTracker()}
 	now := time.Now().UTC()
 	b.cfg = Config{Logger: silentLogger(), Now: func() time.Time { return now }, ClusterDataDir: t.TempDir()}
 
 	// A maximum-size transfer that started one minute ago: far past the 2-minute orphan grace once the
 	// clock moves, and far inside its own size-derived budget.
-	b.writeXferInflight(&transferEntry{
-		transferID: "tid-big", sid: "s1", nid: "n1", verb: "push", tier: "b",
-		bucket: "xfer-s1", path: "/dst", size: proto.XferMaxBytes, startedAt: now,
-	})
+	b.writeXferInflight(xfertrack.NewLegacyEntry(xfertrack.LegacyRecord{
+		TransferID: "tid-big", SID: "s1", NID: "n1", Verb: "push", Tier: "b",
+		Bucket: "xfer-s1", Path: "/dst", Size: proto.XferMaxBytes, StartedAt: now,
+	}))
 
 	// Inside the budget: protected, even with an EMPTY tracker (the restart shape).
 	atThreeMin, _, err := b.ledgerProtectedObjects(now.Add(3 * time.Minute))
@@ -253,10 +301,10 @@ func TestHomeReapConsultsTheDurableLedgerNotJustTheTracker(t *testing.T) {
 	}
 
 	// A row that already carries a TERMINAL is a decided outcome: its object is disposable.
-	b.writeXferInflight(&transferEntry{
-		transferID: "tid-done", sid: "s1", nid: "n1", verb: "push", tier: "b",
-		bucket: "xfer-s1", path: "/dst2", size: 1024, startedAt: now,
-	})
+	b.writeXferInflight(xfertrack.NewLegacyEntry(xfertrack.LegacyRecord{
+		TransferID: "tid-done", SID: "s1", NID: "n1", Verb: "push", Tier: "b",
+		Bucket: "xfer-s1", Path: "/dst2", Size: 1024, StartedAt: now,
+	}))
 	if _, ok := b.stageXferInflightTerminal("tid-done", schema.AuditTransfer{
 		V: schema.AuditSchemaVersion, Kind: "complete", Verb: "push", Ts: now,
 		Session: "s1", Node: "n1", TransferID: "tid-done", Tier: "b", Bucket: "xfer-s1",
@@ -279,17 +327,20 @@ func TestHomeReapConsultsTheDurableLedgerNotJustTheTracker(t *testing.T) {
 // Mutation: pass true at the home-reap call site — reddens. (And if that is ever done deliberately,
 // this test and permanent decision N15 must be retired together.)
 func TestHomeReapIsNotSizeAware(t *testing.T) {
-	src, err := os.ReadFile("transfer_reconcile.go")
-	if err != nil {
-		t.Fatalf("read source: %v", err)
+	// origin: hot-update S7 plan §11.4 / P31; retain both GC call-site assertions after the move.
+	roots := []string{".", "../xfergc"}
+	fn := requireTransferDeclaration(t, "reconcileXferObjects", roots...)
+	if err := homeReapSizeInvariant(fn); err != nil {
+		t.Fatal(err)
 	}
-	fset := token.NewFileSet()
-	f, perr := parser.ParseFile(fset, "transfer_reconcile.go", src, 0)
-	if perr != nil {
-		t.Fatalf("parse: %v", perr)
-	}
+	exerciseTransferScannerMoves(t, "reconcileXferObjects", roots, homeReapSizeInvariant,
+		"func reconcileXferObjects() { b.reapBucketObjects(ctx, name, b.xferReapMinAge, false, protected, rows); b.reapBucketObjects(ctx, name, b.crossHomeReapAge(), true, protected, rows) }",
+		"func reconcileXferObjects() { b.reapBucketObjects(ctx, name, b.xferReapMinAge, true, protected, rows); b.reapBucketObjects(ctx, name, b.crossHomeReapAge(), true, protected, rows) }")
+}
+
+func homeReapSizeInvariant(fn *ast.FuncDecl) error {
 	sizeAware := map[string]bool{} // last-arg literal, keyed by the minAge expression it was called with
-	ast.Inspect(f, func(n ast.Node) bool {
+	ast.Inspect(fn, func(n ast.Node) bool {
 		call, ok := n.(*ast.CallExpr)
 		if !ok {
 			return true
@@ -316,23 +367,27 @@ func TestHomeReapIsNotSizeAware(t *testing.T) {
 				minAge = s.Sel.Name
 			}
 		}
+		if _, duplicate := sizeAware[minAge]; duplicate {
+			sizeAware["duplicate:"+minAge] = true
+		}
 		sizeAware[minAge] = flag.Name == "true"
 		return true
 	})
 	if len(sizeAware) != 2 {
-		t.Fatalf("SELF-CHECK FAILED: found %d reapBucketObjects call site(s) (%v), want the home reap and "+
+		return fmt.Errorf("SELF-CHECK FAILED: found %d reapBucketObjects call site(s) (%v), want the home reap and "+
 			"the cross-home GC — the scanner no longer matches the real shape", len(sizeAware), sizeAware)
 	}
 	if aware, ok := sizeAware["xferReapMinAge"]; !ok || aware {
-		t.Errorf("the HOME reap must pass sizeAware=false (got %v) — its short grace is protected by the "+
+		return fmt.Errorf("the HOME reap must pass sizeAware=false (got %v) — its short grace is protected by the "+
 			"per-bucket busy re-read, and widening it makes orphan garbage linger on the small-disk "+
 			"brokers this sweep exists to protect (permanent decision N15)", sizeAware)
 	}
 	if aware, ok := sizeAware["crossHomeReapAge"]; !ok || !aware {
-		t.Errorf("the CROSS-HOME GC must pass sizeAware=true (got %v) — it deletes another home's "+
+		return fmt.Errorf("the CROSS-HOME GC must pass sizeAware=true (got %v) — it deletes another home's "+
 			"objects, and since the watchdog became size-derived a single global floor can no longer "+
 			"bound \"still live over there\"", sizeAware)
 	}
+	return nil
 }
 
 // origin: prerelease audit broker-transfer/BT-F3.
@@ -348,14 +403,14 @@ func TestHomeReapIsNotSizeAware(t *testing.T) {
 // prevent, delivered by the guard instead of by the thing it guards.
 func TestAnUnreadableLedgerRowProtectsOnlyItsOwnObject(t *testing.T) {
 	now := time.Now().UTC()
-	b := &Broker{transfers: newTransferTracker()}
+	b := &Broker{transfers: xfertrack.NewLegacyTracker()}
 	b.cfg = Config{Logger: silentLogger(), Now: func() time.Time { return now }, ClusterDataDir: t.TempDir()}
 
 	// A healthy row, well past its budget: reapable.
-	b.writeXferInflight(&transferEntry{
-		transferID: "tid-old", sid: "s1", nid: "n1", verb: "push", tier: "b",
-		bucket: "xfer-s1", path: "/dst", size: 1024, startedAt: now.Add(-time.Hour),
-	})
+	b.writeXferInflight(xfertrack.NewLegacyEntry(xfertrack.LegacyRecord{
+		TransferID: "tid-old", SID: "s1", NID: "n1", Verb: "push", Tier: "b",
+		Bucket: "xfer-s1", Path: "/dst", Size: 1024, StartedAt: now.Add(-time.Hour),
+	}))
 	// A row that cannot be parsed at all.
 	dir := b.xferInflightDir()
 	if err := os.WriteFile(filepath.Join(dir, xferInflightFilename("tid-corrupt")), []byte("{"), 0o600); err != nil {
@@ -475,6 +530,9 @@ func TestTheLedgerDirectoryFallsBackToTheDatabaseDirectory(t *testing.T) {
 // disk with two fsyncs, on a handler that has no goroutine wrapper — so an oversized
 // payload is head-of-line blocking for every transfer on the broker, not just memory.
 func TestTransferRequestStringsAreBounded(t *testing.T) {
+	// origin: hot-update S7 plan §11.4 / P31; private constants move with the leaf.
+	// Frozen oracle values also catch an accidentally widened production ceiling.
+	const pathCeiling, idCeiling, digestCeiling = 4096, 128, 64
 	long := func(n int) string { return strings.Repeat("x", n) }
 	cases := []struct {
 		name              string
@@ -482,11 +540,11 @@ func TestTransferRequestStringsAreBounded(t *testing.T) {
 		wantRejectMention string // "" means the request must be ACCEPTED
 	}{
 		{name: "ordinary request", id: "01hxxxxxxxxxxxxxxxxxxxxxxx", path: "/home/u/data.bin", sha: long(64)},
-		{name: "path at the ceiling", id: "t", path: long(transferPathMaxLen), sha: ""},
-		{name: "id at the ceiling", id: long(transferIDMaxLen), path: "/x", sha: ""},
-		{name: "oversized path", id: "t", path: long(transferPathMaxLen + 1), sha: "", wantRejectMention: "path length"},
-		{name: "oversized id", id: long(transferIDMaxLen + 1), path: "/x", sha: "", wantRejectMention: "transfer_id length"},
-		{name: "oversized digest", id: "t", path: "/x", sha: long(transferSHA256MaxLen + 1), wantRejectMention: "sha256 length"},
+		{name: "path at the ceiling", id: "t", path: long(pathCeiling), sha: ""},
+		{name: "id at the ceiling", id: long(idCeiling), path: "/x", sha: ""},
+		{name: "oversized path", id: "t", path: long(pathCeiling + 1), sha: "", wantRejectMention: "path length"},
+		{name: "oversized id", id: long(idCeiling + 1), path: "/x", sha: "", wantRejectMention: "transfer_id length"},
+		{name: "oversized digest", id: "t", path: "/x", sha: long(digestCeiling + 1), wantRejectMention: "sha256 length"},
 		// A short digest is NOT this gate's business: the receiver recomputes the
 		// digest over the delivered bytes and refuses on mismatch. Rejecting it here
 		// would invent a format contract in a place nobody would look for one.
@@ -494,7 +552,7 @@ func TestTransferRequestStringsAreBounded(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := transferRequestBounds(tc.id, tc.path, tc.sha)
+			got := xfertrack.LegacyRequestBounds(tc.id, tc.path, tc.sha)
 			if tc.wantRejectMention == "" {
 				if got != "" {
 					t.Fatalf("a legitimate request was refused: %s", got)

@@ -35,7 +35,9 @@ func TestReviewUpgradeAllIncludesOnlineNodesWithoutProcesses(t *testing.T) {
 		t.Fatalf("node.Register: %v", err)
 	}
 
+	ready := make(chan struct{})
 	b, err := broker.New(broker.Config{
+		ReadyCh:           ready,
 		NATSURL:           url,
 		DB:                db,
 		Logger:            testharness.SilentLog(),
@@ -46,7 +48,7 @@ func TestReviewUpgradeAllIncludesOnlineNodesWithoutProcesses(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
 	go func() { done <- b.Run(ctx) }()
 	t.Cleanup(func() {
@@ -57,7 +59,13 @@ func TestReviewUpgradeAllIncludesOnlineNodesWithoutProcesses(t *testing.T) {
 			t.Fatal("broker did not exit")
 		}
 	})
-	time.Sleep(150 * time.Millisecond)
+	// The roster query requires installed subscriptions, not elapsed startup time.
+	// origin: S10 internal review E2E-PARALLEL-REAL-FAILS F1; plan §11.1
+	select {
+	case <-ready:
+	case <-time.After(5 * time.Second):
+		t.Fatal("broker did not become ready")
+	}
 
 	nc, err := nats.Connect(url)
 	if err != nil {
@@ -65,7 +73,7 @@ func TestReviewUpgradeAllIncludesOnlineNodesWithoutProcesses(t *testing.T) {
 	}
 	defer nc.Close()
 
-	got, skippedLeased, err := listOnlineNIDs(context.Background(), nc, "lab", pub)
+	got, skippedLeased, err := listOnlineNIDs(t.Context(), nc, "lab", pub)
 	if err != nil {
 		t.Fatal(err)
 	}

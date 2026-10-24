@@ -137,7 +137,7 @@ func TestReleaseSkewRefusalIsUnsignedAndSaysSo(t *testing.T) {
 	if err := versionSkewRefusal(proto.ProtoVersion, proto.ReleaseVersion, "br-liar", silentLogger()); err != nil {
 		t.Fatalf("a declared-matching joiner must be admitted by this gate: %v", err)
 	}
-	src, err := readSourceFile("clusterstatus.go")
+	src, err := readSourceFile("../brokercontrol/clusterstatus.go")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -355,6 +355,10 @@ func TestJoinPrepareStampsTheDeclaredVersion(t *testing.T) {
 // node, a skewed or version-undeclared bundle must be refused with NO operation row and NO roster
 // row. The gate's whole value is that a rejected joiner leaves nothing behind to clean up.
 func TestJoinVersionGateRefusesBeforeAnyStateIsCreated(t *testing.T) {
+	// origin: hot-update S10 plan §11.1 / TEST-BUDGET
+	if runIsolatedBrokerTest(t) {
+		return
+	}
 	cases := []struct {
 		name   string
 		mutate func(*cluster.JoinBundle)
@@ -368,7 +372,7 @@ func TestJoinVersionGateRefusesBeforeAnyStateIsCreated(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			n, _ := d7SingleNode(t, "br-1")
-			admin := &ClusterAdmin{node: n, logger: silentLogger(), now: time.Now}
+			admin := &ClusterAdmin{Node: n, Logger: silentLogger(), Now: time.Now}
 			bundle := signedBundle(t, "br-joiner", c.mutate)
 
 			opID, err := admin.StartJoinOperation(bundle)
@@ -406,7 +410,7 @@ func TestJoinVersionGateRefusesBeforeAnyStateIsCreated(t *testing.T) {
 // happy path. Without this, a gate that refused EVERYTHING would pass every test above.
 func TestJoinVersionGateAdmitsAMatchingJoiner(t *testing.T) {
 	n, _ := d7SingleNode(t, "br-1")
-	admin := &ClusterAdmin{node: n, logger: silentLogger(), now: time.Now}
+	admin := &ClusterAdmin{Node: n, Logger: silentLogger(), Now: time.Now}
 
 	bundle := signedBundle(t, "br-joiner", func(jb *cluster.JoinBundle) {
 		jb.ProtoVer = proto.ProtoVersion

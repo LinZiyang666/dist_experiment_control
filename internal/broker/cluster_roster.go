@@ -2,12 +2,9 @@ package broker
 
 import (
 	"database/sql"
-	"strings"
 	"time"
 
-	"github.com/LinZiyang666/tether/internal/auth"
-	"github.com/LinZiyang666/tether/internal/cluster"
-	"github.com/LinZiyang666/tether/internal/clusterroster"
+	"github.com/LinZiyang666/tether/internal/brokercontrol"
 	"github.com/LinZiyang666/tether/internal/proto"
 )
 
@@ -36,53 +33,12 @@ func (b *Broker) rosterForRegister(req proto.NodeRegisterReq) *proto.ClusterRost
 	return b.buildSignedRoster() // nil when no account seed
 }
 
-// buildSignedRoster reads the replicated roster off RODB() and account-signs it. Returns nil if
-// the account seed is unavailable (signing impossible) or no brokers are present.
+// origin: hot-update S7 plan §11.4 / S7 BROKER-SLIM-2
 func (b *Broker) buildSignedRoster() *proto.ClusterRoster {
 	if b.cfg.AuthCallout == nil { // no account seed available → cannot sign (defensive; set in cluster mode)
 		return nil
 	}
-	seed := b.cfg.AuthCallout.AccountSeed
-	if len(seed) == 0 {
-		return nil
-	}
-	accountPub, err := auth.PublicKeyFromSeed(seed)
-	if err != nil {
-		return nil
-	}
-	brokers, derived, err := readRosterBrokers(b.cfg.DB)
-	if err != nil || len(brokers) == 0 {
-		return nil
-	}
-	// C1 §D-2: stamp the TRULY-MONOTONE roster_generation counter (cluster_meta), NOT the
-	// derived max(added_at,phase_changed_at) — which regresses on retire-of-newest/recover and
-	// would make a strict-monotone agent reject the corrected roster.
-	gen, err := cluster.RosterGeneration(b.cfg.DB)
-	if err != nil {
-		return nil
-	}
-	// Stage-C BLOCKER-1 (rolling-upgrade floor): the counter row is ABSENT (reads 0) until the
-	// first membership/phase/cert op bumps it. Shipped v0.4.0 stamped the DERIVED max (~now.UnixNano)
-	// as the generation, so an agent that cached that high hwm from a v0.4.0 broker would reject a
-	// freshly-upgraded C1 broker's gen=0 roster as a rollback. FLOOR the wire gen with the derived
-	// max (which readRosterBrokers already computes): the floor only ever applies before the counter
-	// overtakes it (the first real op bumps it to >now > any prior hwm), after which the counter's
-	// strict monotonicity governs and the derived max's own regressions are irrelevant. Net: the wire
-	// gen is monotone AND never presents below what v0.4.0 served — closing the mixed-version wedge.
-	if derived > gen {
-		gen = derived
-	}
-	// External-review re-review: STAMP a TTL so the anti-replay seam (clusterroster.VerifyAt) is
-	// fully armed when the deferred agent consumer lands — a captured old roster cannot then be
-	// replayed indefinitely. The roster is re-pushed on every register (frequent), so a short TTL is
-	// safe; the agent treats a cached roster only as a short-lived fallback.
-	now := b.cfg.Now().UTC()
-	expires := now.Add(rosterTTL)
-	r, err := clusterroster.Build(seed, accountPub, gen, brokers, now.Format(time.RFC3339Nano), expires.Format(time.RFC3339Nano))
-	if err != nil {
-		return nil
-	}
-	return r
+	return brokercontrol.BuildSignedRoster(b.cfg.DB, b.cfg.AuthCallout.AccountSeed, b.cfg.Now, rosterTTL)
 }
 
 // rosterTTL bounds how long a signed roster a captured agent could replay stays valid. The roster
@@ -90,60 +46,8 @@ func (b *Broker) buildSignedRoster() *proto.ClusterRoster {
 // short-lived fallback; External-review F14 / re-review).
 const rosterTTL = 24 * time.Hour
 
-// readRosterBrokers projects the public broker fields off cluster_nodes + derives an ADVISORY
-// generation (the max of the leader-baked added_at/phase_changed_at times, as unix-nano). It
-// advances on most membership changes but is NOT strictly monotone (Stage-C M1: it can regress when
-// the max-stamp node is pruned/retired) — so delivery never gates on it (rosterForRegister always
-// emits); it is only an advisory tie-breaker. NOT the raft commit index (which resets on recover).
+// Compatibility adapters keep callers bound to the extracted control owner.
+// origin: hot-update S6 plan §9.3 / BROKER-SLIM
 func readRosterBrokers(ro *sql.DB) ([]proto.RosterBroker, uint64, error) {
-	rows, err := ro.Query(`SELECT node_id, nats_route, public_host, tunnel_addr, cert_fp, phase,
-	    COALESCE(added_at,''), COALESCE(phase_changed_at,'') FROM cluster_nodes ORDER BY node_id`)
-	if err != nil {
-		return nil, 0, err
-	}
-	defer func() { _ = rows.Close() }()
-	var out []proto.RosterBroker
-	var gen int64
-	for rows.Next() {
-		var br proto.RosterBroker
-		var addedAt, changedAt string
-		if err := rows.Scan(&br.NodeID, &br.NatsRoute, &br.PublicHost, &br.TunnelAddr, &br.CertFP, &br.Phase, &addedAt, &changedAt); err != nil {
-			return nil, 0, err
-		}
-		out = append(out, br)
-		if v := tsUnixNano(addedAt); v > gen {
-			gen = v
-		}
-		if v := tsUnixNano(changedAt); v > gen {
-			gen = v
-		}
-	}
-	if err := rows.Err(); err != nil {
-		return nil, 0, err
-	}
-	if gen < 0 {
-		gen = 0
-	}
-	return out, uint64(gen), nil
-}
-
-// tsUnixNano parses a leader-baked timestamp (RFC3339Nano OR Go's time.String() form) to unix
-// nanos; 0 on any parse failure (the signature is the real anchor; generation is rollback-detection
-// and degrades safely to 0).
-func tsUnixNano(s string) int64 {
-	if s == "" {
-		return 0
-	}
-	// Stage-C m5: a Go time.String() with a monotonic-clock reading carries a trailing " m=+…"
-	// token the layouts below don't cover — strip it so such a stamp still parses (else it would
-	// silently yield 0).
-	if i := strings.Index(s, " m="); i >= 0 {
-		s = s[:i]
-	}
-	for _, layout := range []string{time.RFC3339Nano, "2006-01-02 15:04:05.999999999 -0700 MST", "2006-01-02 15:04:05 -0700 MST"} {
-		if t, err := time.Parse(layout, s); err == nil {
-			return t.UnixNano()
-		}
-	}
-	return 0
+	return brokercontrol.ReadRosterBrokers(ro)
 }

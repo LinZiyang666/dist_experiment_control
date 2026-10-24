@@ -5,7 +5,9 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"maps"
 	"reflect"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -15,6 +17,7 @@ import (
 	"github.com/LinZiyang666/tether/internal/proc"
 	"github.com/LinZiyang666/tether/internal/proto"
 	"github.com/LinZiyang666/tether/internal/schema"
+	"github.com/LinZiyang666/tether/internal/upgradeauthority"
 )
 
 // wire_freeze_test.go (batch B, commit 1) — freeze the cluster.apply broker<->broker wire.
@@ -34,8 +37,8 @@ import (
 //	                    error anywhere on that path.
 //
 // Before this file, NOTHING pinned either half: there was not a single verb literal in any
-// _test.go in the repo. Two payload types are worse than untagged —
-// `node.RegisterInput` and `proc.Process` carry NO json tags at all, so their Go FIELD
+// _test.go in the repo. Originally two payload types were worse than untagged —
+// `node.RegisterInput` and `proc.Process` carried NO json tags at all, so their Go FIELD
 // NAMES are the wire. Renaming `RegisterInput.ProxyCapable` is, today, a silent
 // cross-version data loss that compiles, passes `make test`, and passes
 // `make e2e-parallel` (both are single-binary, so both ends always agree).
@@ -112,7 +115,7 @@ var frozenPayloadKeys = map[string][]string{
 	"SessionCreatePayload":      {"fp", "name", "pin_hash"},
 	"BusNkeySetPayload":         {"bus_nkey_pub", "node_id"},
 	"PortMutatePayload":         {"port"},
-	"PortFreeAllocationPayload": {"name", "nid", "port", "sid", "token_hash"},
+	"PortFreeAllocationPayload": {"authority", "name", "nid", "port", "sid", "token_hash"},
 	// "sid" ADDED by the 2026-09-02 prerelease audit (broker-core #27). It is an
 	// ADDITIVE, omitempty key whose zero value is LEGAL and load-bearing: a broker on
 	// the previous release forwards without it, and proc.PlanMarkExited renders the
@@ -122,27 +125,45 @@ var frozenPayloadKeys = map[string][]string{
 	// decoding to the zero value on the other version's leader) is here the DESIGNED
 	// behaviour, and it is safe only because the sid the fence needs originates at the
 	// agent boundary, where exec.go reads it from a subject the NATS ACL pins.
-	"ProcMarkExitedPayload": {"ended_at", "exit_code", "pid", "sid"},
-	"SessionMutatePayload":  {"sid"},
+	"ProcMarkExitedPayload": {"authority", "ended_at", "exit_code", "pid", "sid"},
+	"SessionMutatePayload":  {"authority", "sid"},
 	"EvictPayload":          {"nid", "sid"},
 	"SessionCreatorPayload": {"added_by", "allow", "fp", "note"},
 
-	// UNTAGGED — the Go field names below ARE the wire. See TestUntaggedPayloadsAreDeclared.
+	// Originally UNTAGGED — the existing Go field names below remain the wire.
+	// See TestUntaggedPayloadsAreDeclared.
 	// Leased was briefly here, backed by migration 0019, and is GONE again: a
 	// same-proto rolling release must not add a migration (g5-plan OQ-2), and
 	// the classification it stored is derivable from the credential bindings
 	// both modes already replicate. This set shrinking is therefore a
 	// deliberate reversal, not a wire regression. (external review F1)
 	"node.RegisterInput": {"Arch", "BootID", "NID", "NatsServer", "OS", "ProtoVersion",
-		"ProxyCapable", "ReleaseVersion", "SID"},
+		"ProxyCapable", "ReleaseVersion", "SID", "authority"},
 	"proc.Process": {"Argv", "BootID", "Cwd", "EndedAt", "ExitCode", "NID", "PID", "SID",
 		"StartTimeTicks", "StartedAt", "StartedByFP", "Status"},
+	// S8 adds an optional authority pointer to the four mutation inputs above.
+	// Absent means ordinary legacy wire; present retains the admission's guard.
+	// A mixed writer cannot certify an S8 cut (§6.2), so an old leader ignoring
+	// this key never supplies hot authority proof. No existing key is renamed.
+	// Freeze the guard's interior too: a pointer key alone does not freeze it.
+	// origin: S7 internal review BROKER-REDS F4; hot-update S8 plan §6.2 / §7
+	"upgradeauthority.Guard": {"configured_nid", "incarnation", "instance_id", "sid"},
 
 	// Tagged, and shared with other wires (the audit stream) — frozen here because the
 	// forward envelope carries it verbatim.
-	"schema.AuditTransfer": {"actor_fp", "actor_nkey", "bucket", "bytes", "code", "duration_ms",
-		"error", "kind", "node", "path", "session", "sha256", "size", "tier", "transfer_id",
-		"ts", "v", "verb"},
+	// S7 adds the continuation identity (agent_instance, entry_nonce, intent_digest,
+	// object_version), the canonical terminal_id and outcome_unknown — all omitempty,
+	// zero value = a pre-S7 legacy record; an old leader drops them and audits the
+	// legacy fields unchanged. Freeze-on-entry: a RENAME of any is the break.
+	// origin: hot-update S7 plan §5 / §6.4 / P15
+	// best_effort (S7 cap0 bridge) is ADDITIVE omitempty and is never forwarded:
+	// a canonical cap0 row is published only by its origin's exact writer, so a
+	// forwarded record still decodes byte-identically on an old leader. Frozen
+	// here because the type is shared; a RENAME remains the break.
+	// origin: hot-update S7 plan §5.2 / §9 / L12 (S7 integration oplegacy F2)
+	"schema.AuditTransfer": {"actor_fp", "actor_nkey", "agent_instance", "best_effort", "bucket", "bytes", "code", "duration_ms",
+		"entry_nonce", "error", "intent_digest", "kind", "node", "object_version", "outcome_unknown", "path",
+		"session", "sha256", "size", "terminal_id", "tier", "transfer_id", "ts", "v", "verb"},
 
 	// Reached through ReconcilePayload.Req. These ride the forward envelope AND are the
 	// agent->broker register wire, so a change here breaks two wires at once.
@@ -211,18 +232,36 @@ var frozenPayloadKeys = map[string][]string{
 	// credential family — one gpu-02's own binding does not cover. Absent =
 	// "the presented NID is itself the root", which is what every pre-feature
 	// and every unleased agent means. (external review F2)
-	"proto.NodeRegisterReq": {"arch", "boot_id", "capabilities", "configured_nid", "instance_id", "leased_nid",
+	// S6 adds an explicit route-hold capability and public verification key.
+	// Missing fields preserve ordinary N-1 registration; planned cuts require
+	// capable observers. Both additions are omitempty and carry no secret.
+	// origin: hot-update S6 plan §7.3 / §9.1 / T46
+	// transfer_version: S7 capability announcement, ADDITIVE (omitempty; absent =
+	// a pre-S7 agent, served by the legacy transfer path). No leader plans against
+	// it: the forward payload that is planned is the key-frozen RegisterInput.
+	// origin: hot-update S7 plan §6.2 / P01 / P20
+	// Public S8 summaries are a separate closed root; full resource/actor state
+	// must never become reachable through the broadcast/register payload.
+	// origin: hot-update S8 plan §2.2 / P13
+	"proto.UpgradeSummary": {"cut_id", "generation", "outcome", "phase", "reason", "revision", "running_sha", "tx_id"},
+	"proto.NodeRegisterReq": {"arch", "boot_id", "broker_image_maintenance", "broker_image_maintenance_key", "capabilities", "configured_nid", "incarnation", "instance_id", "leased_nid",
 		"local_ports", "local_processes",
 		"nid", "os", "previous_nid", "proto_version", "proxy_opt_out", "release_version",
 		"releasing_name", "roster_gen",
-		"roster_refresh_only", "server_id", "upgrade_detail", "upgrade_state"},
+		"roster_refresh_only", "server_id", "transfer_version", "upgrade", "upgrade_detail", "upgrade_state"},
 	// ended_at: h1 C4, ADDITIVE (omitempty pointer; a courier's pending-exit
 	// snapshot row carries the true end instant, the broker clamps it to
 	// min(EndedAt, now), and an old leader ignoring the unknown key falls
 	// back to register-time now — exactly the pre-h1 semantics). Same
 	// freeze-on-entry contract as upgrade_state above: from here on a RENAME
 	// is the cross-version break this test exists to catch.
-	"proto.LocalProcess": {"ended_at", "pid", "rc", "start_time_ticks", "started_at", "state"},
+	// started_unacked: hot-update S1 C-5, ADDITIVE (omitempty bool). Set on a
+	// snapshot row whose child is adopted but whose proc.started the courier
+	// still owes; both reconcile orphan loops skip such a row instead of
+	// killing it. An old leader ignores the key and keeps today's (narrow)
+	// G.1 false-orphan window; an old agent never sends it. Same
+	// freeze-on-entry contract: a rename from here is the break.
+	"proto.LocalProcess": {"ended_at", "pid", "rc", "start_time_ticks", "started_at", "started_unacked", "state"},
 	"proto.LocalPort":    {"local_port", "name", "port", "token_hash"},
 }
 
@@ -232,8 +271,6 @@ var frozenPayloadKeys = map[string][]string{
 // consistently — across the whole repo, on BOTH sides — which is exactly why the wire
 // break is invisible.
 var untaggedPayloadTypes = map[string]string{
-	"node.RegisterInput": "D9 §3 forwards this verbatim as VerbNodeRegister; it is a domain " +
-		"input type that predates the forward wire and was never tagged.",
 	"proc.Process": "D9 §3 forwards this verbatim as VerbProcInsert; same history.",
 }
 
@@ -255,9 +292,11 @@ func payloadSpecimens() map[string]any {
 		"EvictPayload":              EvictPayload{},
 		"SessionCreatorPayload":     SessionCreatorPayload{},
 		"node.RegisterInput":        nodepkg.RegisterInput{},
+		"upgradeauthority.Guard":    upgradeauthority.Guard{},
 		"proc.Process":              proc.Process{},
 		"schema.AuditTransfer":      schema.AuditTransfer{},
 		"proto.NodeRegisterReq":     proto.NodeRegisterReq{},
+		"proto.UpgradeSummary":      proto.UpgradeSummary{},
 		"proto.LocalProcess":        proto.LocalProcess{},
 		"proto.LocalPort":           proto.LocalPort{},
 	}
@@ -602,6 +641,7 @@ func TestEveryDispatchedPayloadTypeIsFrozen(t *testing.T) {
 	}
 }
 
+// origin: S7 internal review BROKER-REDS F4
 func TestForwardPayloadKeysAreWireFrozen(t *testing.T) {
 	for name, spec := range payloadSpecimens() {
 		want, ok := frozenPayloadKeys[name]
@@ -741,6 +781,7 @@ var offWireForwardStructs = map[string]string{
 // TestUntaggedPayloadsAreDeclared makes the "field name IS the wire" hazard explicit and
 // bounded. If a NEW untagged type joins the forward wire, this fails and the author has to
 // write down why, rather than discovering it during a rolling upgrade.
+// origin: S7 internal review BROKER-REDS F4
 func TestUntaggedPayloadsAreDeclared(t *testing.T) {
 	for name, spec := range payloadSpecimens() {
 		rt := reflect.TypeOf(spec)
@@ -776,6 +817,7 @@ func TestUntaggedPayloadsAreDeclared(t *testing.T) {
 // This is the check that caught proto.NodeRegisterReq's own LocalProcesses/LocalPorts
 // nesting when this file was first written; the first draft froze NodeRegisterReq and
 // stopped, silently leaving nine keys uncovered.
+// origin: S7 internal review BROKER-REDS F4
 func TestFrozenWireTypesHaveNoUnfrozenNesting(t *testing.T) {
 	roots := payloadSpecimens()
 	frozen := map[string]bool{"time.Time": true}
@@ -1027,12 +1069,7 @@ func marshalledKeys(t *testing.T, v any) []string {
 	if err := json.Unmarshal(raw, &obj); err != nil {
 		t.Fatal(err)
 	}
-	out := make([]string, 0, len(obj))
-	for k := range obj {
-		out = append(out, k)
-	}
-	sort.Strings(out)
-	return out
+	return slices.Sorted(maps.Keys(obj))
 }
 
 // fillNonZero sets every settable field to a non-zero value, recursing into structs, so no
@@ -1042,10 +1079,9 @@ func fillNonZero(v reflect.Value) {
 	case reflect.Struct:
 		for i := 0; i < v.NumField(); i++ {
 			f := v.Field(i)
-			if !f.CanSet() {
-				continue // unexported: encoding/json skips it too
+			if f.CanSet() { // unexported: encoding/json skips it too
+				fillNonZero(f)
 			}
-			fillNonZero(f)
 		}
 	case reflect.String:
 		v.SetString("x")

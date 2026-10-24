@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/schema"
+	"github.com/LinZiyang666/tether/internal/xfertrack"
 )
 
 // xfer_corrupt_outbox_permanence_test.go — what the row-level unreadable-outbox guard COSTS, made
@@ -50,7 +51,7 @@ import (
 func TestQuarantinedOutboxRowBlocksFinalizeForeverAndSilently(t *testing.T) {
 	root := t.TempDir()
 	now := time.Date(2026, 7, 27, 12, 0, 0, 0, time.UTC)
-	b := &Broker{transfers: newTransferTracker()}
+	b := &Broker{transfers: xfertrack.NewLegacyTracker()}
 	b.cfg = Config{ClusterDataDir: root, Logger: silentLogger(), Now: func() time.Time { return now }}
 
 	const blocked = "tid-outbox-row-quarantined"

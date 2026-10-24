@@ -30,7 +30,7 @@ import (
 func jsGateAdmin(t *testing.T, opID string, deadline time.Time, now *time.Time) (*ClusterAdmin, *cluster.Operation) {
 	t.Helper()
 	admin := g3AdminWithSelf(t, "host.example")
-	admin.now = func() time.Time { return *now }
+	admin.Now = func() time.Time { return *now }
 
 	in := cluster.OpStartInput{
 		OpID: opID, Kind: cluster.OpKindJoin, TargetNode: "joiner-1",
@@ -39,16 +39,16 @@ func jsGateAdmin(t *testing.T, opID string, deadline time.Time, now *time.Time) 
 		CatchupDeadline: deadline.UnixNano(),
 		Timeline:        `[{"s":"NATS_ROLLED_OUT"}]`,
 	}
-	if err := admin.node.Propose(func(_ *sql.DB) (*cluster.Command, error) {
+	if err := admin.Node.Propose(func(_ *sql.DB) (*cluster.Command, error) {
 		return cluster.PlanClusterOpStart(in, *now)
 	}); err != nil {
 		t.Fatalf("seed %s: %v", opID, err)
 	}
-	op, err := cluster.OperationByID(admin.node.RODB(), opID)
+	op, err := cluster.OperationByID(admin.Node.RODB(), opID)
 	if err != nil || op == nil {
 		t.Fatalf("read back seeded op: %v", err)
 	}
-	if ok, why := admin.topoConvergedForOp(op, true); !ok {
+	if ok, why := admin.TopoConvergedForOp(op, true); !ok {
 		t.Fatalf("fixture precondition failed: the TOPOLOGY gate must already be converged so these "+
 			"tests exercise the JS-placement conjunct and nothing else (%s)", why)
 	}
@@ -57,7 +57,7 @@ func jsGateAdmin(t *testing.T, opID string, deadline time.Time, now *time.Time) 
 
 func jsGateReload(t *testing.T, admin *ClusterAdmin, opID string) *cluster.Operation {
 	t.Helper()
-	op, err := cluster.OperationByID(admin.node.RODB(), opID)
+	op, err := cluster.OperationByID(admin.Node.RODB(), opID)
 	if err != nil || op == nil {
 		t.Fatalf("reload op: %v", err)
 	}
@@ -67,7 +67,7 @@ func jsGateReload(t *testing.T, admin *ClusterAdmin, opID string) *cluster.Opera
 // joinSub is the substrate a join sees at NATS_ROLLED_OUT: the joiner has been promoted, so there are
 // at least two voters.
 func joinSub() substrate {
-	return substrate{phase: "VOTER", inRaft: true, isVoter: true, numVoters: 2}
+	return substrate{Phase: "VOTER", InRaft: true, IsVoter: true, NumVoters: 2}
 }
 
 // TestJoinDoesNotServeWhileJSCannotPlace is P1, the RED-FIRST root-cause adjudication.
@@ -82,16 +82,16 @@ func TestJoinDoesNotServeWhileJSCannotPlace(t *testing.T) {
 	admin, op := jsGateAdmin(t, "op-js-hold", now.Add(2*time.Minute), &now)
 
 	calls := 0
-	admin.jsPlaceableFn = func() (bool, string) {
+	admin.JsPlaceableFn = func() (bool, string) {
 		calls++
 		return false, "the JS meta has assigned 1/2 peers to the events stream"
 	}
 
 	for i := range 3 {
-		admin.driveJoin(op, joinSub())
+		admin.DriveJoin(op, joinSub())
 		op = jsGateReload(t, admin, "op-js-hold")
 		if op.OpState == cluster.OpStateServing || op.Terminal {
-			t.Fatalf("tick %d: the join reached %s (terminal=%v) while the JS meta could not place an "+
+			t.Fatalf("Tick %d: the join reached %s (terminal=%v) while the JS meta could not place an "+
 				"R=N asset. The terminal gate checks only topology-generation convergence — a loaded "+
 				"nats.conf is not a placeable meta — so `cluster add` returns rc=0 at a moment when the "+
 				"first tier-B push is still refused (gotcha #67 sub-face 4)", i+1, op.OpState, op.Terminal)
@@ -99,7 +99,7 @@ func TestJoinDoesNotServeWhileJSCannotPlace(t *testing.T) {
 		now = now.Add(5 * time.Second) // the observe-loop tick interval
 	}
 	if calls == 0 {
-		t.Fatal("the placement probe was never consulted — the conjunct is not wired into driveJoin")
+		t.Fatal("the placement probe was never consulted — the conjunct is not wired into DriveJoin")
 	}
 	if !strings.Contains(op.LastError, "assigned 1/2") {
 		t.Fatalf("an operator reading `cluster ops show` must see WHY the join is waiting; last_error=%q", op.LastError)
@@ -110,27 +110,31 @@ func TestJoinDoesNotServeWhileJSCannotPlace(t *testing.T) {
 // The gate is a BOUNDED WAIT whose expiry outcome is ADVANCE. Turning it into a fail-closed hold (or
 // into an OpStateBlocked escalation) reddens this.
 func TestJoinAdvancesAtDeadlineInsteadOfWedging(t *testing.T) {
+	// origin: hot-update S10 plan §11.1 / TEST-BUDGET
+	if runIsolatedBrokerTest(t) {
+		return
+	}
 	now := time.Now()
 	// The waiting phase below must stay OUTSIDE jsGateExpiryReserve (the G-1 fix degrades early on
 	// purpose), so the window has to be comfortably longer than the reserve.
 	deadline := now.Add(jsGateExpiryReserve + 2*time.Minute)
 	admin, op := jsGateAdmin(t, "op-js-deadline", deadline, &now)
-	admin.jsPlaceableFn = func() (bool, string) { return false, "the JS meta has assigned 1/2 peers to the events stream" }
+	admin.JsPlaceableFn = func() (bool, string) { return false, "the JS meta has assigned 1/2 peers to the events stream" }
 
 	// Wait ticks BEFORE the deadline must cost no raft writes: the conjunct sits ahead of both
 	// Propose-bearing steps, and recordOpError is change-gated on op.LastError.
-	admin.driveJoin(op, joinSub())
+	admin.DriveJoin(op, joinSub())
 	op = jsGateReload(t, admin, "op-js-deadline")
-	idxBefore, err := admin.node.AppliedIndex()
+	idxBefore, err := admin.Node.AppliedIndex()
 	if err != nil {
 		t.Fatal(err)
 	}
 	for range 8 {
 		now = now.Add(time.Second)
-		admin.driveJoin(op, joinSub())
+		admin.DriveJoin(op, joinSub())
 		op = jsGateReload(t, admin, "op-js-deadline")
 	}
-	idxAfter, err := admin.node.AppliedIndex()
+	idxAfter, err := admin.Node.AppliedIndex()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -139,25 +143,25 @@ func TestJoinAdvancesAtDeadlineInsteadOfWedging(t *testing.T) {
 	}
 	if idxAfter != idxBefore {
 		t.Fatalf("waiting burned %d raft writes (%d -> %d) — an idle gate must not propose; the "+
-			"conjunct must sit ahead of both Propose steps and recordOpError must stay change-gated",
+			"conjunct must sit ahead of both Propose steps and RecordOpError must stay change-gated",
 			idxAfter-idxBefore, idxBefore, idxAfter)
 	}
 
 	// Past the deadline: ADVANCE, with the evidence preserved.
 	now = deadline.Add(time.Second)
-	admin.driveJoin(op, joinSub())
+	admin.DriveJoin(op, joinSub())
 	op = jsGateReload(t, admin, "op-js-deadline")
 
 	if op.OpState != cluster.OpStateServing || !op.Terminal {
 		t.Fatalf("at the deadline the join must ADVANCE to terminal SERVING, got %s (terminal=%v). "+
-			"Holding it would recreate gotcha #45: assertNoActiveOp then fences the next membership "+
+			"Holding it would recreate gotcha #45: AssertNoActiveOp then fences the next membership "+
 			"operation and the grow/shrink spine wedges with nothing an operator can act on. "+
 			"Escalating to BLOCKED is worse still — --auto-confirm-catchup defaults to 0, so the very "+
 			"first blocked poll reports budget-exhausted and `cluster add` fails with the wrong cause",
 			op.OpState, op.Terminal)
 	}
 	if !strings.Contains(op.Timeline, "WITHOUT proving JetStream placement") {
-		t.Fatalf("advancing unproven must leave a DURABLE record — it is the only evidence that this "+
+		t.Fatalf("advancing unproven must Leave a DURABLE record — it is the only evidence that this "+
 			"grow shipped a SERVING we could not prove, and the only way the added latency ever gets "+
 			"measured. timeline=%q", op.Timeline)
 	}
@@ -165,11 +169,15 @@ func TestJoinAdvancesAtDeadlineInsteadOfWedging(t *testing.T) {
 
 // TestJoinServesOncePlacementIsProven is P3, the happy path: the gate must actually open.
 func TestJoinServesOncePlacementIsProven(t *testing.T) {
+	// origin: hot-update S10 plan §11.1 / TEST-BUDGET
+	if runIsolatedBrokerTest(t) {
+		return
+	}
 	now := time.Now()
 	admin, op := jsGateAdmin(t, "op-js-happy", now.Add(2*time.Minute), &now)
 
 	calls := 0
-	admin.jsPlaceableFn = func() (bool, string) {
+	admin.JsPlaceableFn = func() (bool, string) {
 		calls++
 		if calls < 3 {
 			return false, "the JS meta has assigned 1/2 peers to the events stream"
@@ -178,7 +186,7 @@ func TestJoinServesOncePlacementIsProven(t *testing.T) {
 	}
 
 	for range 3 {
-		admin.driveJoin(op, joinSub())
+		admin.DriveJoin(op, joinSub())
 		op = jsGateReload(t, admin, "op-js-happy")
 		now = now.Add(5 * time.Second)
 	}
@@ -193,14 +201,14 @@ func TestJoinServesOncePlacementIsProven(t *testing.T) {
 		t.Fatalf("a successful grow must not carry a last_error; got %q", op.LastError)
 	}
 	var growMarker string
-	_ = admin.node.RODB().QueryRow(`SELECT value FROM cluster_meta WHERE key = ?`,
+	_ = admin.Node.RODB().QueryRow(`SELECT value FROM cluster_meta WHERE key = ?`,
 		cluster.MetaKeyGrowActive).Scan(&growMarker)
 	if growMarker != "" {
-		t.Fatalf("the cluster-add grow marker must be released by the terminal tick, still held by %q — "+
+		t.Fatalf("the cluster-add grow marker must be released by the terminal Tick, still held by %q — "+
 			"leaving it serializes the whole membership plane behind a finished grow", growMarker)
 	}
 	before := calls
-	admin.driveJoin(op, joinSub())
+	admin.DriveJoin(op, joinSub())
 	if calls != before {
 		t.Fatal("the probe must not be consulted after the op is terminal")
 	}
@@ -214,9 +222,9 @@ func TestJoinZeroDeadlineAdvances(t *testing.T) {
 	if op.CatchupDeadline != 0 {
 		t.Skipf("fixture did not produce a zero deadline (got %d)", op.CatchupDeadline)
 	}
-	admin.jsPlaceableFn = func() (bool, string) { return false, "never placeable" }
+	admin.JsPlaceableFn = func() (bool, string) { return false, "never placeable" }
 
-	admin.driveJoin(op, joinSub())
+	admin.DriveJoin(op, joinSub())
 	op = jsGateReload(t, admin, "op-js-zero")
 	if !op.Terminal {
 		t.Fatal("a zero CatchupDeadline must be treated as EXPIRED and advance, never as an unbounded wait")
@@ -229,7 +237,7 @@ func TestJoinZeroDeadlineAdvances(t *testing.T) {
 func TestRetireNeverConsultsThePlacementGate(t *testing.T) {
 	now := time.Now()
 	admin, _ := jsGateAdmin(t, "op-js-unused", now.Add(time.Minute), &now)
-	admin.jsPlaceableFn = func() (bool, string) {
+	admin.JsPlaceableFn = func() (bool, string) {
 		panic("the JS placement gate must never be consulted on the retire path")
 	}
 
@@ -243,13 +251,13 @@ func TestRetireNeverConsultsThePlacementGate(t *testing.T) {
 		TopoTargetGen: 0, CatchupDeadline: now.Add(time.Minute).UnixNano(),
 		Timeline: `[{"s":"NATS_ROLLED_OUT"}]`,
 	}
-	if err := admin.node.Propose(func(_ *sql.DB) (*cluster.Command, error) {
+	if err := admin.Node.Propose(func(_ *sql.DB) (*cluster.Command, error) {
 		return cluster.PlanClusterOpStart(in, now)
 	}); err != nil {
 		t.Fatalf("seed retire op: %v", err)
 	}
 	rop := jsGateReload(t, admin, "op-retire-js")
-	admin.driveRetire(rop, substrate{phase: "VOTER", inRaft: true, isVoter: true, numVoters: 2})
+	admin.DriveRetire(rop, substrate{Phase: "VOTER", InRaft: true, IsVoter: true, NumVoters: 2})
 
 	rop = jsGateReload(t, admin, "op-retire-js")
 	if rop.OpState == cluster.OpStateNatsRolledOut && !rop.Terminal {
@@ -334,8 +342,8 @@ func TestJSPlacementGateIsWired(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(src), "admin.jsPlaceableFn = b.clusterJSPlaceable") {
-		t.Fatal("wireClusterLate must assign jsPlaceableFn — the seam is fail-open when nil, so an " +
+	if !strings.Contains(string(src), "admin.JsPlaceableFn = b.clusterJSPlaceable") {
+		t.Fatal("wireClusterLate must assign JsPlaceableFn — the seam is fail-open when nil, so an " +
 			"unwired build ships the pre-G69 behaviour with every hermetic pin still green")
 	}
 }
@@ -358,22 +366,22 @@ func TestJoinDegradesBeforeTopoAdvanceCanBlock(t *testing.T) {
 	now := time.Now()
 	deadline := now.Add(2 * time.Minute)
 	admin, op := jsGateAdmin(t, "op-js-reserve", deadline, &now)
-	admin.jsPlaceableFn = func() (bool, string) { return false, "the JS meta has assigned 1/2 peers to the events stream" }
+	admin.JsPlaceableFn = func() (bool, string) { return false, "the JS meta has assigned 1/2 peers to the events stream" }
 
 	// Drive to just inside the reserve window: the JS conjunct must degrade here, BEFORE topoAdvance's
 	// own expiry branch (which fires only after the full deadline) can ever be reached.
 	now = deadline.Add(-jsGateExpiryReserve + time.Second)
-	admin.driveJoin(op, joinSub())
+	admin.DriveJoin(op, joinSub())
 	op = jsGateReload(t, admin, "op-js-reserve")
 
 	if op.OpState == cluster.OpStateBlocked {
 		t.Fatal("the composed gate landed in BLOCKED — `cluster add` would then exit non-zero with the " +
-			"wrong causal string and assertNoActiveOp would fence the membership plane, which is exactly " +
+			"wrong causal string and AssertNoActiveOp would Fence the membership plane, which is exactly " +
 			"the outcome the plan's OQ-1 rejected")
 	}
 	if op.OpState != cluster.OpStateServing || !op.Terminal {
 		t.Fatalf("the JS conjunct must degrade to terminal SERVING inside the reserve window (%v before "+
-			"the deadline), so the degrade tick always precedes any tick on which the fail-closed "+
+			"the deadline), so the degrade Tick always precedes any Tick on which the fail-closed "+
 			"topology gate could expire; got %s (terminal=%v)", jsGateExpiryReserve, op.OpState, op.Terminal)
 	}
 	if !strings.Contains(op.Timeline, "WITHOUT proving JetStream placement") {
@@ -387,8 +395,8 @@ func TestJoinDegradesBeforeTopoAdvanceCanBlock(t *testing.T) {
 func TestJSGateReserveExceedsTwoObserveTicks(t *testing.T) {
 	if jsGateExpiryReserve < 2*observeTickInterval {
 		t.Fatalf("jsGateExpiryReserve (%v) must be >= 2 observe ticks (%v): the controller only evaluates "+
-			"this ladder once per tick, so a smaller reserve can let topoAdvance's fail-closed expiry "+
-			"branch fire on the same tick the JS conjunct meant to degrade",
+			"this ladder once per Tick, so a smaller reserve can let TopoAdvance's fail-closed expiry "+
+			"branch fire on the same Tick the JS conjunct meant to degrade",
 			jsGateExpiryReserve, 2*observeTickInterval)
 	}
 	if jsGateExpiryReserve >= opTopoConvergeTimeout {
@@ -461,9 +469,9 @@ func TestCollectStreamStatePopulatesPlacementFields(t *testing.T) {
 func TestJSPlacementSeamIsFailOpenWhenUnwired(t *testing.T) {
 	now := time.Now()
 	admin, op := jsGateAdmin(t, "op-js-nilseam", now.Add(2*time.Minute), &now)
-	admin.jsPlaceableFn = nil // explicitly unwired
+	admin.JsPlaceableFn = nil // explicitly unwired
 
-	admin.driveJoin(op, joinSub())
+	admin.DriveJoin(op, joinSub())
 	op = jsGateReload(t, admin, "op-js-nilseam")
 	if op.OpState != cluster.OpStateServing || !op.Terminal {
 		t.Fatalf("an UNWIRED seam must be fail-OPEN (today's behaviour), got %s (terminal=%v). "+
@@ -479,9 +487,9 @@ func TestJSPlacementSeamIsFailOpenWhenUnwired(t *testing.T) {
 func TestJSPlacementRunsAfterTopologyConvergence(t *testing.T) {
 	now := time.Now()
 	admin := g3AdminWithSelf(t, "host.example")
-	admin.now = func() time.Time { return now }
+	admin.Now = func() time.Time { return now }
 	called := false
-	admin.jsPlaceableFn = func() (bool, string) { called = true; return false, "js not ready" }
+	admin.JsPlaceableFn = func() (bool, string) { called = true; return false, "js not ready" }
 
 	in := cluster.OpStartInput{
 		OpID: "op-js-order", Kind: cluster.OpKindJoin, TargetNode: "joiner-1",
@@ -490,13 +498,13 @@ func TestJSPlacementRunsAfterTopologyConvergence(t *testing.T) {
 		CatchupDeadline: now.Add(2 * time.Minute).UnixNano(),
 		Timeline:        `[{"s":"NATS_ROLLED_OUT"}]`,
 	}
-	if err := admin.node.Propose(func(_ *sql.DB) (*cluster.Command, error) {
+	if err := admin.Node.Propose(func(_ *sql.DB) (*cluster.Command, error) {
 		return cluster.PlanClusterOpStart(in, now)
 	}); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 	op := jsGateReload(t, admin, "op-js-order")
-	admin.driveJoin(op, joinSub())
+	admin.DriveJoin(op, joinSub())
 
 	if called {
 		t.Fatal("the JS placement probe ran while TOPOLOGY had not converged — the operator would then " +
@@ -548,6 +556,6 @@ func TestPlacementCanaryMeasuresRatherThanInfers(t *testing.T) {
 	}
 	// A failed probe must not leave a partial canary behind either.
 	if _, serr := js.Stream(ctx, jsstream.PlacementCanaryStreamName); serr == nil {
-		t.Fatal("a FAILED probe must leave no canary behind")
+		t.Fatal("a FAILED probe must Leave no canary behind")
 	}
 }

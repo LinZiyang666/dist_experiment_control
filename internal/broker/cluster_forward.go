@@ -22,27 +22,26 @@ package broker
 
 import (
 	"context"
-	"crypto/sha256"
 	"database/sql"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
-	"sort"
-	"strconv"
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/agentprov"
 	"github.com/LinZiyang666/tether/internal/authcallout"
 	"github.com/LinZiyang666/tether/internal/cluster"
+	"github.com/LinZiyang666/tether/internal/controlbudget"
 	nodepkg "github.com/LinZiyang666/tether/internal/node"
 	"github.com/LinZiyang666/tether/internal/port"
 	"github.com/LinZiyang666/tether/internal/proc"
 	"github.com/LinZiyang666/tether/internal/proto"
 	"github.com/LinZiyang666/tether/internal/schema"
 	"github.com/LinZiyang666/tether/internal/session"
+	"github.com/LinZiyang666/tether/internal/upgradeauthority"
 	"github.com/LinZiyang666/tether/internal/xferaudit"
+	"github.com/LinZiyang666/tether/internal/xferauth"
 	"github.com/nats-io/nats.go"
 	"golang.org/x/time/rate"
 )
@@ -144,13 +143,7 @@ type BusNkeySetPayload struct {
 }
 
 // PortFreeAllocationPayload fences expose-rm against stale name->port reads and port reuse.
-type PortFreeAllocationPayload struct {
-	Port      int    `json:"port"`
-	SID       string `json:"sid"`
-	NID       string `json:"nid"`
-	Name      string `json:"name"`
-	TokenHash string `json:"token_hash"`
-}
+type PortFreeAllocationPayload upgradeauthority.AllocationIdentity
 
 // allocIdentity narrows a port.Allocation to the five identity columns that every
 // allocation state change fences on: internal/port/plan.go's planAllocationStateChange
@@ -182,18 +175,23 @@ type PortFreeAllocationPayload struct {
 // path. Widening the payload instead would add wire surface and still leave the leader
 // closure reading a different value than the wire carries.
 func allocIdentity(a port.Allocation) PortFreeAllocationPayload {
-	return PortFreeAllocationPayload{
-		Port: a.Port, SID: a.SID, NID: a.NID, Name: a.Name, TokenHash: a.TokenHash,
+	p := PortFreeAllocationPayload{Port: a.Port, SID: a.SID, NID: a.NID, Name: a.Name, TokenHash: a.TokenHash}
+	if a.Authority != (upgradeauthority.Guard{}) {
+		g := a.Authority
+		p.Authority = &g
 	}
+	return p
 }
 
 // allocation rebuilds the narrowed port.Allocation. It is the SAME projection
 // dispatchForward performs on the receiving side, named once so the two sides cannot
 // drift apart again.
 func (p PortFreeAllocationPayload) allocation() port.Allocation {
-	return port.Allocation{
-		Port: p.Port, SID: p.SID, NID: p.NID, Name: p.Name, TokenHash: p.TokenHash,
+	a := port.Allocation{Port: p.Port, SID: p.SID, NID: p.NID, Name: p.Name, TokenHash: p.TokenHash}
+	if p.Authority != nil {
+		a.Authority = *p.Authority
 	}
+	return a
 }
 
 // SessionCreatePayload (D9) is the forwarded session-create request. The leader bakes the
@@ -206,9 +204,7 @@ type SessionCreatePayload struct {
 
 // SessionMutatePayload carries a single SID for the data-less session verbs (tombstone +
 // hard-delete). The leader bakes the deleting_at literal for tombstone.
-type SessionMutatePayload struct {
-	SID string `json:"sid"`
-}
+type SessionMutatePayload upgradeauthority.SessionMutation
 
 // ProcMarkExitedPayload (D9 round-1 BLOCKER) carries an agent-reported process exit. The
 // exit code + end time are FACTS from the agent (not leader-baked); PlanMarkExited's
@@ -222,12 +218,7 @@ type SessionMutatePayload struct {
 // exits are recovered by reconcileOnRegister at the agent's next register, which is why
 // closing the hatch costs a delay rather than the exit code.
 // origin: prerelease audit external review B-2.
-type ProcMarkExitedPayload struct {
-	Pid      string    `json:"pid"`
-	Sid      string    `json:"sid,omitempty"`
-	ExitCode int       `json:"exit_code"`
-	EndedAt  time.Time `json:"ended_at"`
-}
+type ProcMarkExitedPayload upgradeauthority.ProcessExit
 
 // EvictPayload (D9 round-2 BLOCKER) carries the (sid,nid) of an `admin evict` kick.
 // SessionCreatorPayload is the forwarded form of an admission-table write.
@@ -380,69 +371,10 @@ func forwardErrKind(err error) string {
 // LocalProcesses ++ sorted LocalPorts)))[:32]. bootID is the natural epoch: an agent
 // restart -> new bootID -> new key -> fresh reconcile; an ack-lost retry of the same
 // register -> identical inputs -> same key -> dedup.
+// Pure request identity keeps the captured creation in the deduplication key.
+// origin: hot-update S8 plan §6.2 / P16
 func ReconcileReqID(sid, nid string, req proto.NodeRegisterReq) string {
-	h := sha256.New()
-	for _, s := range []string{VerbReconcile, sid, nid, req.BootID} {
-		writeSeg(h, s)
-	}
-	// Total order over ALL hashed fields (not just PID/Port) so the digest is stable
-	// even when the agent reports duplicate-key entries in a map-randomized order
-	// (review M5: a PID/Port-only sort.Slice is unstable for equal keys, which would
-	// derive different keys for the same logical request on retry).
-	lps := append([]proto.LocalProcess(nil), req.LocalProcesses...)
-	sort.SliceStable(lps, func(i, j int) bool {
-		a, b := lps[i], lps[j]
-		if a.PID != b.PID {
-			return a.PID < b.PID
-		}
-		if a.State != b.State {
-			return a.State < b.State
-		}
-		if a.StartTimeTicks != b.StartTimeTicks {
-			return a.StartTimeTicks < b.StartTimeTicks
-		}
-		return rcKey(a.RC) < rcKey(b.RC)
-	})
-	for _, lp := range lps {
-		for _, s := range []string{lp.PID, lp.State, strconv.FormatInt(lp.StartTimeTicks, 10), rcKey(lp.RC)} {
-			writeSeg(h, s)
-		}
-	}
-	lpo := append([]proto.LocalPort(nil), req.LocalPorts...)
-	sort.SliceStable(lpo, func(i, j int) bool {
-		a, b := lpo[i], lpo[j]
-		if a.Port != b.Port {
-			return a.Port < b.Port
-		}
-		if a.LocalPort != b.LocalPort {
-			return a.LocalPort < b.LocalPort
-		}
-		if a.Name != b.Name {
-			return a.Name < b.Name
-		}
-		return a.TokenHash < b.TokenHash
-	})
-	for _, p := range lpo {
-		for _, s := range []string{strconv.Itoa(p.Port), p.Name, strconv.Itoa(p.LocalPort), p.TokenHash} {
-			writeSeg(h, s)
-		}
-	}
-	return hex.EncodeToString(h.Sum(nil))[:32]
-}
-
-// rcKey renders an optional rc for hashing/sorting: "" when nil, else the decimal.
-func rcKey(rc *int) string {
-	if rc == nil {
-		return ""
-	}
-	return strconv.Itoa(*rc)
-}
-
-// writeSeg writes a NUL-terminated segment so concatenation is unambiguous (no
-// "ab"+"c" == "a"+"bc" collision).
-func writeSeg(h interface{ Write([]byte) (int, error) }, s string) {
-	_, _ = h.Write([]byte(s))
-	_, _ = h.Write([]byte{0})
+	return upgradeauthority.ReconcileRequestID(sid, nid, req)
 }
 
 // ---- forwarder (originating broker side) ----
@@ -584,14 +516,36 @@ func SubscribeClusterApply(
 	nc *nats.Conn, node *cluster.Node, now func() time.Time, logger *slog.Logger,
 	verifyPIN func(pin, hash string) error,
 ) (*nats.Subscription, error) {
-	deps := forwardDeps{verifyPIN: verifyPIN}
+	return subscribeClusterApplyOwned(nc, node, now, logger, verifyPIN, nil, nil)
+}
+
+func subscribeClusterApplyOwned(nc *nats.Conn, node *cluster.Node, now func() time.Time,
+	logger *slog.Logger, verifyPIN func(string, string) error, owner *brokerAuthOwner, broker *Broker,
+) (*nats.Subscription, error) {
+	deps := forwardDeps{verifyPIN: verifyPIN, broker: broker}
 	return nc.Subscribe(proto.SubjClusterApplyWildcard, func(msg *nats.Msg) {
+		// Image shutdown must join the entire Plan/commit/readback borrower,
+		// not merely the PIN verifier nested inside some forwarded verbs.
+		// origin: hot-update S6 plan §8.1 / T29
+		if owner != nil {
+			if !owner.Enter() {
+				return
+			}
+			defer owner.Leave()
+		}
 		if msg.Reply == "" {
 			return
 		}
 		var env forwardEnvelope
 		if err := json.Unmarshal(msg.Data, &env); err != nil {
 			return // drop malformed (no reply)
+		}
+		// The exact transfer responder owns these non-Raft operations. The
+		// wildcard must stay silent even when this broker is leader, or its
+		// unknown-verb reply can outrun the original follower's census proof.
+		// origin: hot-update S7 plan §6.3 / T39
+		if isTransferForwardVerb(env.Verb) {
+			return
 		}
 		if !node.IsLeader() {
 			return // stay silent; the leader (if any) answers
@@ -622,7 +576,7 @@ var verbAllowsReqID = map[string]bool{VerbReconcile: true}
 type verbHandler func(node *cluster.Node, now func() time.Time, env forwardEnvelope, deps forwardDeps) error
 
 // forwardDeps carries the leader-side collaborators a forwarded verb needs beyond the raft
-// node and the clock. Today that is exactly one thing, and it is here rather than closed
+// node and the clock. Originally that was exactly one thing, and it is here rather than closed
 // over by the table because the table is a package-level var: a closure would have to be
 // installed by mutating global state at wiring time, which is how a second broker in the
 // same test binary would silently share (or clobber) the first one's budget.
@@ -635,6 +589,10 @@ type forwardDeps struct {
 	// unbudgeted verifier is precisely the defect this plumbing exists to remove, and it
 	// would come back invisibly the first time someone adds a caller that forgets it.
 	verifyPIN func(pin, hash string) error
+	// Production cold/hot responders also own external session teardown. Bare
+	// SubscribeClusterApply remains the storage-only adapter used by cluster fixtures.
+	// origin: S7 internal review BROKER-REDS F3; hot-update S8 plan §6.2
+	broker *Broker
 }
 
 // errPINVerifierUnwired fails a forwarded PIN write CLOSED when no budgeted verifier was
@@ -683,13 +641,7 @@ func proposeWithPIN[P any](
 		if err != nil {
 			return err
 		}
-		var p P
-		if err := json.Unmarshal(env.Payload, &p); err != nil {
-			return err
-		}
-		return node.Propose(func(db *sql.DB) (*cluster.Command, error) {
-			return plan(db, p, verify, now())
-		})
+		return propose(func(db *sql.DB, p P, at time.Time) (*cluster.Command, error) { return plan(db, p, verify, at) })(node, now, env, deps)
 	}
 }
 
@@ -738,7 +690,7 @@ var writeVerbs = map[string]verbHandler{
 		if err != nil {
 			return nil, err
 		}
-		return proc.PlanReconcileBatch(resolveReconcile(p.SID, p.NID, p.Req, procs, ports, now))
+		return planReconcileAuthority(db, p, procs, ports, now)
 	}),
 	// D8a §9: PlanTransferAudit sets the content-derived ReqID itself; node.Propose PRESERVES it
 	// (ProposeWithReqID only overwrites a NON-empty arg), so the 0011 ledger dedups a forwarder
@@ -837,13 +789,11 @@ var writeVerbs = map[string]verbHandler{
 		return proc.PlanInsert(db, p)
 	}),
 	VerbProcMarkExited: propose(func(db *sql.DB, p ProcMarkExitedPayload, _ time.Time) (*cluster.Command, error) {
-		return proc.PlanMarkExited(db, p.Pid, p.Sid, p.ExitCode, p.EndedAt)
+		return planProcExitAuthority(db, p)
 	}),
-	VerbSessionTombstone: propose(func(db *sql.DB, p SessionMutatePayload, now time.Time) (*cluster.Command, error) {
-		return session.PlanTombstone(db, p.SID, now)
-	}),
+	VerbSessionTombstone: propose(planSessionTombstoneAuthority),
 	VerbSessionDrop: propose(func(db *sql.DB, p SessionMutatePayload, _ time.Time) (*cluster.Command, error) {
-		return session.PlanHardDelete(db, p.SID)
+		return planSessionDropAuthority(db, p)
 	}),
 	VerbSessionCreatorSet: propose(func(_ *sql.DB, p SessionCreatorPayload, now time.Time) (*cluster.Command, error) {
 		return session.PlanSetCreator(p.FP, p.AddedBy, p.Note, p.Allow, now)
@@ -861,21 +811,31 @@ func dispatchForward(node *cluster.Node, now func() time.Time, deps forwardDeps,
 	if env.ReqID != "" && !verbAllowsReqID[env.Verb] {
 		return ErrReqIDNotAllowed
 	}
+	// The follower cannot hold the leader's applyMu while deleting history/OBJ.
+	// Run the captured cascade on this leader before committing the guarded SQL;
+	// forwarding only the final DELETE would strand streams or race recreation.
+	// origin: S7 internal review BROKER-REDS F3; hot-update S8 plan §6.2
+	if env.Verb == VerbSessionDrop && deps.broker != nil {
+		var p SessionMutatePayload
+		if err := json.Unmarshal(env.Payload, &p); err != nil {
+			return err
+		}
+		if p.Authority == nil || p.Authority.SID != p.SID {
+			return upgradeauthority.Match("", "")
+		}
+		d, err := controlbudget.After(5 * time.Second)
+		if err != nil {
+			return err
+		}
+		return node.Propose(func(db *sql.DB) (*cluster.Command, error) {
+			return planSessionCascadeAuthority(deps.broker, db, d, nil, *p.Authority)
+		})
+	}
 	h, ok := writeVerbs[env.Verb]
 	if !ok {
 		return fmt.Errorf("cluster_forward: unknown verb %q", env.Verb)
 	}
 	return h(node, now, env, deps)
-}
-
-// isLeaderUnavailable reports whether err is the transient "no leader committed this write
-// right now" signal (cluster.ErrForwardNotLeader — returned by proposeOrForward on a
-// leadership race / election). Handlers in broker.go (which deliberately does NOT import
-// internal/cluster — L-2) use this to reply proto.CodeLeaderUnavailable so the client retries
-// instead of treating a routine raft failover as a permanent rejection (audit M2 /
-// write-forward F3).
-func isLeaderUnavailable(err error) bool {
-	return errors.Is(err, cluster.ErrForwardNotLeader)
 }
 
 // marshalForwardReply maps a Propose result to the typed reply envelope.
@@ -925,25 +885,13 @@ func NewProvisionSeam(
 				return agentprov.PlanProvisionWithPIN(db, sid, nid, fp, pin, verifyPIN, t)
 			})
 			fwd.observeOutcome(VerbProvision, err)
-			if err != nil {
-				if cluster.IsNotLeader(err) {
-					return authcallout.ErrNotLeader
-				}
-				return err
-			}
-			return nil
+			return pinWriteError(err)
 		}
 		payload, err := json.Marshal(ProvisionPayload{SID: sid, NID: nid, FP: fp, PIN: pin})
 		if err != nil {
 			return err
 		}
-		if err := fwd.Forward(VerbProvision, "", payload); err != nil {
-			if errors.Is(err, cluster.ErrForwardNotLeader) {
-				return authcallout.ErrNotLeader
-			}
-			return err
-		}
-		return nil
+		return pinWriteError(fwd.Forward(VerbProvision, "", payload))
 	}
 }
 
@@ -962,24 +910,156 @@ func NewJoinSeam(
 				return session.PlanJoinWithPIN(db, sid, fp, pin, verifyPIN, t)
 			})
 			fwd.observeOutcome(VerbJoin, err)
-			if err != nil {
-				if cluster.IsNotLeader(err) {
-					return authcallout.ErrNotLeader
-				}
-				return err
-			}
-			return nil
+			return pinWriteError(err)
 		}
 		payload, err := json.Marshal(JoinPayload{SID: sid, FP: fp, PIN: pin})
 		if err != nil {
 			return err
 		}
-		if err := fwd.Forward(VerbJoin, "", payload); err != nil {
-			if errors.Is(err, cluster.ErrForwardNotLeader) {
-				return authcallout.ErrNotLeader
-			}
+		return pinWriteError(fwd.Forward(VerbJoin, "", payload))
+	}
+}
+
+// Both PIN seams translate the same local/forwarded leadership failures; share
+// that projection so session cascade forwarding does not grow broker code.
+// origin: S7 internal review BROKER-REDS F3; hot-update S7 plan §11.1
+func pinWriteError(err error) error {
+	if cluster.IsNotLeader(err) || errors.Is(err, cluster.ErrForwardNotLeader) {
+		return authcallout.ErrNotLeader
+	}
+	return err
+}
+
+// Rebind only after the new current store/node and NATS connection are owned by
+// P11. No old forwarder, read handle or verifier survives into the new seams.
+// The apply responder precedes auth so forwarded PIN joins never depend on
+// late business/JetStream wiring. P11 retains this owner and fences/joins it
+// with stopBrokerImageAuth before closing the current store.
+// origin: hot-update S6 plan §8.1 / T29
+func rebindBrokerImageAuthority(b *Broker, nc *nats.Conn, deadline controlbudget.Deadline) (*brokerAuthOwner, error) {
+	if b == nil || nc == nil || !nc.IsConnected() || deadline == 0 {
+		return nil, fmt.Errorf("broker: missing current authority connection or deadline")
+	}
+	if _, err := brokerAuthRemaining(deadline); err != nil {
+		return nil, err
+	}
+	b.leaderPINVerify.Store(nil)
+	if !b.clusterMode {
+		if b.read().SQL() == nil {
+			return nil, fmt.Errorf("broker: missing current single store")
+		}
+		return nil, nil
+	}
+	if b.cl == nil || b.cl.node == nil || b.cl.node.RODB() == nil {
+		return nil, fmt.Errorf("broker: missing current cluster store")
+	}
+	bindClusterReadDB(b, b.cl.node.RODB())
+	b.cl.forwarder = b.newForwarder(nc, b.cfg.ExposeForwardTimeout())
+	owner := newBrokerAuthOwner(b, deadline)
+	sub, err := subscribeClusterApplyOwned(nc, b.cl.node, b.cfg.Now, b.cfg.Logger,
+		func(pin, hash string) error { return verifyPINOnLeader(b, pin, hash) }, owner, b)
+	if err != nil {
+		return nil, err
+	}
+	owner.Sub = sub
+	b.cl.subs = append(b.cl.subs, sub)
+	sub.SetClosedHandler(func(string) { owner.Finish() })
+	timeout, err := brokerAuthRemaining(deadline)
+	if err == nil {
+		err = nc.FlushTimeout(timeout)
+	}
+	if err != nil {
+		return owner, errors.Join(err, stopBrokerImageAuth(owner, deadline))
+	}
+	return owner, nil
+}
+
+func finishSessionAuthority(b *Broker, d controlbudget.Deadline, stop <-chan struct{}, guard upgradeauthority.Guard, drop func() error) error {
+	return xferauth.CascadeSession(d, stop, brokerJS(b), guard.SID, func(string) error {
+		// Prune the tunnel's per-session kill-generation bookkeeping now that the
+		// session is permanently gone (self-review: bounds killGenSession growth).
+		// Hold the old tombstone until this retirement finishes; after SQL commit
+		// a new creation could already own a distinct domain with the same SID.
+		if srv := b.tunnelSrv.Load(); srv != nil {
+			srv.ForgetSession(guard.SID)
+		}
+		// Tunnel retirement occurs while the old tombstone is still held.
+		// The completion event is published only after the actual SQL commit.
+		return drop()
+	})
+}
+
+// The external cascade and the SQL plan share the existing applyMu boundary.
+// origin: hot-update S8 plan §6.2 / P16
+func planSessionCascadeAuthority(b *Broker, db *sql.DB, d controlbudget.Deadline, stop <-chan struct{}, guard upgradeauthority.Guard) (*cluster.Command, error) {
+	cmd, err := planSessionDropAuthority(db, SessionMutatePayload{SID: guard.SID, Authority: &guard})
+	if err != nil {
+		return nil, err
+	}
+	// A successful read confirms only the prepared guard; actual SQL still
+	// applies through the session owner after external destruction completes.
+	err = finishSessionAuthority(b, d, stop, guard, func() error { _, err := upgradeauthority.ReadCreation(db, guard); return err })
+	return cmd, err
+}
+
+// Shared JSON egress keeps the original marshal/error and respondBytes path.
+// origin: hot-update S8 plan §6.2 / P16 budget responsibility move
+func replyJSONValue(b *Broker, msg *nats.Msg, v any) {
+	payload, err := json.Marshal(v)
+	if err != nil {
+		b.cfg.Logger.Warn("broker: marshal reply", "err", err, "subject", msg.Subject)
+		return
+	}
+	b.respondBytes(msg, payload)
+}
+
+// Compare before interpreting DELETING as a retry: the new creation can itself
+// be tombstoned, and that does not give an old remover its settlement authority.
+// origin: hot-update S8 plan §6.2 / P16
+func planSessionTombstoneAuthority(db *sql.DB, p SessionMutatePayload, now time.Time) (*cluster.Command, error) {
+	predicate, err := upgradeauthority.MutationPredicate(db, upgradeauthority.SessionMutation(p), cluster.LitText)
+	if err != nil {
+		return nil, err
+	}
+	cmd, err := session.PlanTombstone(db, p.SID, now)
+	if err == nil {
+		cmd.Body[0].SQL += ` AND ` + predicate
+	}
+	return cmd, err
+}
+
+// origin: S7 internal review GATES-PROD F5
+func markProcExitAuthority(b *Broker, p ProcMarkExitedPayload) error {
+	if p.Authority != nil && (p.Authority.SID != p.Sid || p.Authority.Incarnation == "") {
+		return upgradeauthority.Match("", "")
+	}
+	if db, ok := b.singleWriter(); ok {
+		if p.Authority != nil {
+			_, err := proc.MarkExitedGuarded(db, *p.Authority, p.Pid, p.ExitCode, p.EndedAt)
 			return err
 		}
-		return nil
+		return proc.MarkExited(db, p.Pid, p.Sid, p.ExitCode, p.EndedAt)
 	}
+	return proposeValue(b, VerbProcMarkExited, p, func(db *sql.DB) (*cluster.Command, error) {
+		return planProcExitAuthority(db, p)
+	})
+}
+
+func planSessionDropAuthority(db *sql.DB, p SessionMutatePayload) (*cluster.Command, error) {
+	if p.Authority == nil || p.Authority.SID != p.SID {
+		return nil, upgradeauthority.Match("", "")
+	}
+	_, cmd, err := session.PlanHardDeleteGuarded(db, *p.Authority)
+	return cmd, err
+}
+
+// A completion notification cannot precede SQL commit. Receivers retain the
+// incarnation; receivers must compare it before revoking a same-SID domain.
+// origin: hot-update S8 plan §6.2 / P16
+func publishSessionDestroyedAuthority(b *Broker, g upgradeauthority.Guard, err error) error {
+	if err == nil {
+		b.pubSysEvent("session_destroyed", map[string]any{"sid": g.SID, "incarnation": g.Incarnation})
+		b.cfg.Logger.Info("broker: session removed", "sid", g.SID)
+	}
+	return err
 }

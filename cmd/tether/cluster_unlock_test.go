@@ -160,6 +160,10 @@ func TestUnlockRefusesALiveLease(t *testing.T) {
 
 // TestUnlockForceOverridesALiveLease: the escape hatch works, and says so loudly.
 func TestUnlockForceOverridesALiveLease(t *testing.T) {
+	// origin: hot-update S10 plan L17 / §11.1 / POLISH-B
+	if runIsolatedBinaryTest(t) {
+		return
+	}
 	f := newUnlockFixture(t, "force", true, false, rfc(unlockNow.Add(10*time.Minute)), "")
 	var out bytes.Buffer
 
@@ -177,6 +181,10 @@ func TestUnlockForceOverridesALiveLease(t *testing.T) {
 // TestUnlockClearsAnExpiredLease: the impatient-operator case. The reaper would get there too, but the
 // operator should not have to wait for it.
 func TestUnlockClearsAnExpiredLease(t *testing.T) {
+	// origin: hot-update S10 plan L17 / §11.1 / POLISH-B
+	if runIsolatedBinaryTest(t) {
+		return
+	}
 	f := newUnlockFixture(t, "expired", false, true, "", rfc(unlockNow.Add(-time.Minute)))
 	var out bytes.Buffer
 
@@ -195,6 +203,10 @@ func TestUnlockClearsAnExpiredLease(t *testing.T) {
 // pre-R7b broker carries no lease, the reaper is fail-closed on exactly that shape, and so it NEVER
 // expires. Without this path the only remedy is hand-editing a replicated SQLite row.
 func TestUnlockClearsALeaselessLock(t *testing.T) {
+	// origin: hot-update S10 plan L17 / §11.1 / POLISH-B
+	if runIsolatedBinaryTest(t) {
+		return
+	}
 	f := newUnlockFixture(t, "noleases", true, true, "", "")
 	var out bytes.Buffer
 
@@ -215,6 +227,10 @@ func TestUnlockClearsALeaselessLock(t *testing.T) {
 // advertised means membership is STILL fenced — reporting success there is the "control plane wrote, data
 // plane did not converge, rc=0" shape this whole batch targets.
 func TestUnlockConfirmsOrFails(t *testing.T) {
+	// origin: hot-update S10 plan L17 / §11.1 / POLISH-B
+	if runIsolatedBinaryTest(t) {
+		return
+	}
 	f := newUnlockFixture(t, "unconfirmed", true, false, rfc(unlockNow.Add(-time.Minute)), "")
 	f.stillHeld.Store(true) // the release "succeeds" but nothing changes
 	var out bytes.Buffer
@@ -233,6 +249,10 @@ func TestUnlockConfirmsOrFails(t *testing.T) {
 
 // TestUnlockSurfacesARefusedRelease: a leader that refuses the release must not be swallowed.
 func TestUnlockSurfacesARefusedRelease(t *testing.T) {
+	// origin: hot-update S10 plan L17 / §11.1 / POLISH-B
+	if runIsolatedBinaryTest(t) {
+		return
+	}
 	f := newUnlockFixture(t, "refused", true, false, rfc(unlockNow.Add(-time.Minute)), "")
 	f.refuse.Store(true)
 	var out bytes.Buffer
@@ -265,6 +285,10 @@ func TestUnlockNothingHeldIsACleanNoOp(t *testing.T) {
 
 // TestUnlockSelectorsAreHonored: --upgrade must not touch the grow lock, and vice versa.
 func TestUnlockSelectorsAreHonored(t *testing.T) {
+	// origin: hot-update S10 plan L17 / §11.1 / POLISH-B
+	if runIsolatedBinaryTest(t) {
+		return
+	}
 	t.Run("upgrade only", func(t *testing.T) {
 		f := newUnlockFixture(t, "sel-up", true, true, rfc(unlockNow.Add(-time.Minute)), rfc(unlockNow.Add(-time.Minute)))
 		var out bytes.Buffer

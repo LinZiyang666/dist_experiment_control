@@ -25,15 +25,21 @@ package broker
 // signals thread churn. Both are reported, from their own sources, so they can be seen to diverge.
 
 import (
-	"bufio"
-	"os"
+	"database/sql"
+	"errors"
 	"runtime"
 	"runtime/pprof"
 	"sort"
-	"strconv"
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/adminsock"
+	"github.com/LinZiyang666/tether/internal/brokerimage"
+	"github.com/LinZiyang666/tether/internal/brokerupgrade"
+	"github.com/LinZiyang666/tether/internal/brokerupgrade/brokerruntime"
+	"github.com/LinZiyang666/tether/internal/controlbudget"
+	"github.com/LinZiyang666/tether/internal/infraattach"
+	"github.com/LinZiyang666/tether/internal/proto"
+	"github.com/LinZiyang666/tether/internal/tunnel"
 )
 
 // runtimeSnapshot builds the OpRuntime report from THIS process's live runtime plus the R7
@@ -57,7 +63,7 @@ func (b *Broker) runtimeSnapshot() *adminsock.RuntimeReport {
 		Goroutines:    runtime.NumGoroutine(),               // in-process TRUTH, never the Threads proxy
 		Threads:       pprof.Lookup("threadcreate").Count(), // OS threads (M) EVER created — monotone, never falls
 		OpenFDs:       openFDCount(),                        // -1 if not measurable (non-Linux)
-		RSSBytes:      residentSetBytes(),                   // -1 if not measurable (non-Linux)
+		RSSBytes:      brokerruntime.ResidentSetBytes(),     // -1 if not measurable (non-Linux)
 	}
 	if !b.bootAt.IsZero() {
 		rep.UptimeSeconds = b.cfg.Now().Sub(b.bootAt).Seconds()
@@ -151,74 +157,85 @@ func (b *Broker) runtimeSnapshot() *adminsock.RuntimeReport {
 			})
 		}
 	}
+	rep.BrokerImage = brokerImageSnapshot(b)
+	infraattach.SetRuntimeReport(b.infra, rep)
 	return rep
 }
 
-// openFDCount returns the number of open file descriptors for this process by counting entries in
-// /proc/self/fd. Returns -1 when that directory cannot be read (non-Linux, or /proc not mounted) so
-// the caller reports "unavailable" rather than a fabricated 0. The directory handle is CLOSED before
-// returning — a leak probe that leaked an fd on every call would be its own worst bug.
-func openFDCount() int {
-	d, err := os.Open("/proc/self/fd")
-	if err != nil {
-		return -1
-	}
-	defer func() { _ = d.Close() }()
-	names, err := d.Readdirnames(-1)
-	if err != nil {
-		return -1
-	}
-	// Readdirnames includes the fd for the open directory handle itself; subtract it so the count is
-	// the process's steady-state open fds, not "+1 while this probe runs".
-	if n := len(names) - 1; n >= 0 {
-		return n
-	}
-	return len(names)
+func openFDCount() int { return infraattach.ProcessFDCount() }
+
+// The resident-set reader (residentSetBytes/splitFields) moved verbatim to
+// brokerruntime.ResidentSetBytes: the S8 broker exporter's thin Broker hooks
+// are funded by moving pure helpers out, never by growing the Broker.
+// origin: S8 BROKER-EXPORTER R-11 (P15 per-package net-zero)
+
+// The status has one producer for local runtime, reload replies and authenticated
+// remote health. Running SHA is measured from the executable inode, never the
+// staged pathname. Snapshot returns a value copy so consumers cannot mutate it.
+// origin: hot-update S6 plan §5 / §9.1
+func brokerImageSnapshot(b *Broker) *proto.BrokerImageStatus { return b.imageState.Snapshot() }
+
+func setBrokerImagePhase(b *Broker, phase string) {
+	b.imageState.SetPhase(phase, brokerruntime.ImageStatusMode(b.cl != nil && b.cl.node != nil, func() (int, error) { return b.cl.node.NumVoters() }))
 }
 
-// residentSetBytes returns the process resident-set size in bytes, parsed from /proc/self/statm
-// (field 2 = resident pages) times the page size. Returns -1 when not measurable. This is the actual
-// RSS, not a proxy for anything else.
-func residentSetBytes() int64 {
-	f, err := os.Open("/proc/self/statm")
-	if err != nil {
-		return -1
-	}
-	defer func() { _ = f.Close() }()
-	sc := bufio.NewScanner(f)
-	if !sc.Scan() {
-		return -1
-	}
-	// Format: "size resident shared text lib data dt" (all in pages). We want field index 1.
-	fields := splitFields(sc.Text())
-	if len(fields) < 2 {
-		return -1
-	}
-	residentPages, err := strconv.ParseInt(fields[1], 10, 64)
-	if err != nil {
-		return -1
-	}
-	return residentPages * int64(os.Getpagesize())
+// InitializeBrokerImageStatus installs validated boot lineage before responders.
+// origin: hot-update S6 plan §4.1 / §5 / §9.1
+func InitializeBrokerImageStatus(b *Broker, generation uint64, cutID string) error {
+	return b.imageState.Initialize(generation, cutID)
 }
 
-// splitFields splits on ASCII spaces without allocating a regexp; statm is a single space-separated
-// line so this is sufficient (strings.Fields would also work — kept explicit to avoid pulling a
-// larger import for one call).
-func splitFields(s string) []string {
-	var out []string
-	start := -1
-	for i := 0; i < len(s); i++ {
-		if s[i] == ' ' {
-			if start >= 0 {
-				out = append(out, s[start:i])
-				start = -1
+// sealBrokerCut runs at the S6 cut's pre-shutdown point (business fenced, store
+// still open) after the role check prior: an armed S8 cut seals its adjunct.
+func sealBrokerCut(b *Broker, prior error) error {
+	return brokerupgrade.SealCut(b.cfg.Upgrade, b.read().SQL(), prior)
+}
+
+// brokerTransactionPort is the S8 broker cut exporter's view of this Broker:
+// the live owners of the current control generation (counted by identity in
+// brokerruntime.TransactionFacts), the current store, the S6 cut's arming
+// signal and the real control request. It reads the generation installed at
+// call time: an image activation replaces imageControl, never this port.
+// Every planned cut first captures the role/maintenance admission the S6 cut
+// checks (captureBrokerReloadAdmission); without it the S6 cut itself refuses
+// ("image role admission missing"). Single mode retains its local owner lease.
+// origin: hot-update S8 plan §4.2 / §6.3 / §11.2 P15 P17; S8 BROKER-EXPORTER R-11
+func brokerTransactionPort(b *Broker) brokerupgrade.BrokerPort {
+	return brokerupgrade.BrokerPort{DB: func() *sql.DB { return b.read().SQL() },
+		Arm: func(d controlbudget.Deadline) error {
+			return brokerupgrade.ArmPlannedCut(d, func(admission controlbudget.Deadline) error {
+				req := adminsock.Request{}
+				if grant := brokerupgrade.ArmedTransaction(b.cfg.Upgrade); grant.ParentTxID != "" {
+					req.Holder, req.CutID = grant.ParentTxID, grant.Handle.CutID
+				}
+				// origin: S8 internal review roll-recovery-stall F5; S6 lead D-C
+				return captureBrokerReloadAdmission(b, req, admission)
+			}, b.reloadSignal.Arm)
+		},
+		Control: func(nonce string) error { return brokerruntime.ControlProbe(b.nc.Load(), nonce, b.selfID) },
+		Released: func(domain, id, origin string) bool {
+			return brokerruntime.ReleasedAllocation(b.read().SQL(), domain, id, origin, func(port int, sid, nid, hash string) bool {
+				return tunnel.ServerAllocationReleased(b.tunnelSrv.Load(), tunnel.SessionInfo{PublicPort: port, SID: sid, NID: nid, TokenHash: hash})
+			})
+		},
+		Facts: func() (brokerupgrade.BrokerFacts, error) {
+			c, srv := b.imageControl, b.tunnelSrv.Load()
+			if c == nil {
+				return brokerupgrade.BrokerFacts{}, brokerimage.ErrImage
 			}
-		} else if start < 0 {
-			start = i
-		}
-	}
-	if start >= 0 {
-		out = append(out, s[start:])
-	}
-	return out
+			var sessions func() []brokerupgrade.TunnelSession
+			if srv != nil {
+				sessions = func() (out []brokerupgrade.TunnelSession) {
+					for _, s := range srv.SessionInfos() {
+						out = append(out, brokerupgrade.TunnelSession{Port: s.PublicPort, SID: s.SID, NID: s.NID, Epoch: s.Epoch})
+					}
+					return out
+				}
+			}
+			return brokerruntime.TransactionFacts(c.store, c.keepers, sessions, c.transfers, func() (int, error) {
+				ids := map[string]struct{}{}
+				err := errors.Join(censusLegacyTransfers(b.transfers, ids), censusBrokerTransferLedgers(b, ids))
+				return len(ids), err
+			}, brokerImageSnapshot(b))
+		}}
 }

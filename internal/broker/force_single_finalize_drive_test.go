@@ -43,7 +43,7 @@ func fsFinalizeFixture(t *testing.T, selfID string, ghosts ...string) (*ClusterA
 		// ghost shape rather than whatever phase the upsert happens to start in. The predecessor set is
 		// mandatory (PlanClusterNodePhase refuses an empty one — a phase move with no guard is how a
 		// stale writer overwrites a newer state).
-		if err := a.setPhase(g, phaseVoter, []string{phasePending, phaseCatchingUp, phaseVoter}, ""); err != nil {
+		if err := a.SetPhase(g, phaseVoter, []string{phasePending, phaseCatchingUp, phaseVoter}, ""); err != nil {
 			t.Fatalf("set %s VOTER: %v", g, err)
 		}
 	}
@@ -85,10 +85,10 @@ func TestForceSingleGhostRowsSeesOnlyVoterRowsAbsentFromTheConfig(t *testing.T) 
 		t.Fatalf("insert joiner row: %v", err)
 	}
 	for _, phase := range []string{phasePending, phaseCatchingUp} {
-		if err := a.setPhase("joiner-b", phase, []string{phasePending, phaseCatchingUp, phaseVoter}, ""); err != nil {
+		if err := a.SetPhase("joiner-b", phase, []string{phasePending, phaseCatchingUp, phaseVoter}, ""); err != nil {
 			t.Fatalf("set joiner phase %s: %v", phase, err)
 		}
-		ghosts, err := a.forceSingleGhostRows()
+		ghosts, err := a.ForceSingleGhostRows()
 		if err != nil {
 			t.Fatalf("forceSingleGhostRows: %v", err)
 		}
@@ -101,7 +101,7 @@ func TestForceSingleGhostRowsSeesOnlyVoterRowsAbsentFromTheConfig(t *testing.T) 
 		}
 	}
 	// Self is a live voter IN the config, so it must never appear.
-	ghosts, _ := a.forceSingleGhostRows()
+	ghosts, _ := a.ForceSingleGhostRows()
 	for _, g := range ghosts {
 		if g == "fs-self" {
 			t.Fatal("the live self row was classified as a ghost")
@@ -116,7 +116,7 @@ func TestForceSingleGhostRowsSeesOnlyVoterRowsAbsentFromTheConfig(t *testing.T) 
 // has TestFinalizeOpAdvancesOnObservationNotPropose below.
 func TestFinalizeOpDrivesThePruneToTerminal(t *testing.T) {
 	a, n := fsFinalizeFixture(t, "fs-self", "ghost-a", "ghost-b")
-	opID, err := a.startForceSingleFinalize("fs-self", []string{"ghost-a", "ghost-b"})
+	opID, err := a.StartForceSingleFinalize("fs-self", []string{"ghost-a", "ghost-b"})
 	if err != nil {
 		t.Fatalf("startForceSingleFinalize: %v", err)
 	}
@@ -125,12 +125,12 @@ func TestFinalizeOpDrivesThePruneToTerminal(t *testing.T) {
 	}
 
 	// Tick 1: proposes the prune. It does NOT advance — the ladder is advance-after-observe.
-	a.driveForceSingleFinalize(opByID(t, n, opID))
+	a.DriveForceSingleFinalize(opByID(t, n, opID))
 	if rosterHas(t, n, "ghost-a") || rosterHas(t, n, "ghost-b") {
 		t.Fatal("the prune did not remove the ghost roster rows")
 	}
 	// Tick 2: observes them gone and goes terminal-success.
-	a.driveForceSingleFinalize(opByID(t, n, opID))
+	a.DriveForceSingleFinalize(opByID(t, n, opID))
 	op := opByID(t, n, opID)
 	if op == nil || !op.Terminal || op.OpState != cluster.OpStateFSFinalized {
 		t.Fatalf("after the rows were observed gone: op = %+v, want terminal FS_FINALIZED", op)
@@ -139,7 +139,7 @@ func TestFinalizeOpDrivesThePruneToTerminal(t *testing.T) {
 		t.Errorf("a successful finalize recorded last_error = %q", op.LastError)
 	}
 	// And the membership plane is free again — assertNoActiveOp must pass for self.
-	if err := a.assertNoActiveOp("fs-self"); err != nil {
+	if err := a.AssertNoActiveOp("fs-self"); err != nil {
 		t.Errorf("a terminal finalize still fences self's membership plane: %v", err)
 	}
 }
@@ -152,7 +152,7 @@ func TestFinalizeOpDrivesThePruneToTerminal(t *testing.T) {
 // TestFinalizeOpGivesUpTerminallyNotBlocked.
 func TestFinalizeOpAdvancesOnObservationNotPropose(t *testing.T) {
 	a, n := fsFinalizeFixture(t, "fs-self", "ghost-a")
-	opID, err := a.startForceSingleFinalize("fs-self", []string{"ghost-a"})
+	opID, err := a.StartForceSingleFinalize("fs-self", []string{"ghost-a"})
 	if err != nil {
 		t.Fatalf("start: %v", err)
 	}
@@ -162,7 +162,7 @@ func TestFinalizeOpAdvancesOnObservationNotPropose(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("out-of-band prune: %v", err)
 	}
-	a.driveForceSingleFinalize(opByID(t, n, opID))
+	a.DriveForceSingleFinalize(opByID(t, n, opID))
 	if op := opByID(t, n, opID); op == nil || op.OpState != cluster.OpStateFSFinalized || !op.Terminal {
 		t.Fatalf("op = %+v, want terminal FS_FINALIZED from the observation alone", op)
 	}
@@ -178,22 +178,22 @@ func TestFinalizeOpAdvancesOnObservationNotPropose(t *testing.T) {
 // Mutation: send the exhausted op to OpStateBlocked — reddens here AND in the AST gate.
 func TestFinalizeOpGivesUpTerminallyNotBlocked(t *testing.T) {
 	a, n := fsFinalizeFixture(t, "fs-self", "ghost-a")
-	opID, err := a.startForceSingleFinalize("fs-self", []string{"ghost-a"})
+	opID, err := a.StartForceSingleFinalize("fs-self", []string{"ghost-a"})
 	if err != nil {
 		t.Fatalf("start: %v", err)
 	}
 	// Expire the budget: drive with a clock far past the baked deadline. The op's row keeps the
 	// deadline it was created with, so moving `now` is the honest way to exhaust it.
-	a.now = func() time.Time { return time.Now().Add(2 * opForceSingleFinalizeBudget) }
+	a.Now = func() time.Time { return time.Now().Add(2 * opForceSingleFinalizeBudget) }
 	// Make ghost-a stop matching the ghost signature WITHOUT touching raft membership: its row stays,
 	// but its phase is no longer VOTER, so the prune step is not allowed to remove it. (Adding it as a
 	// real voter would be the other way to get here, but on a single-node fixture that raises quorum to
 	// 2 with one phantom peer and no Propose can commit again — the op would then be stuck for a reason
 	// that has nothing to do with what this test is about.)
-	if err := a.setPhase("ghost-a", phaseRetiring, []string{phaseVoter}, ""); err != nil {
+	if err := a.SetPhase("ghost-a", phaseRetiring, []string{phaseVoter}, ""); err != nil {
 		t.Fatalf("set ghost-a RETIRING: %v", err)
 	}
-	a.driveForceSingleFinalize(opByID(t, n, opID))
+	a.DriveForceSingleFinalize(opByID(t, n, opID))
 	op := opByID(t, n, opID)
 	if op == nil {
 		t.Fatal("op vanished")
@@ -207,7 +207,7 @@ func TestFinalizeOpGivesUpTerminallyNotBlocked(t *testing.T) {
 	if op.OpState == cluster.OpStateBlocked {
 		t.Fatal("the finalize ladder reached BLOCKED — it has no operator to confirm it")
 	}
-	if err := a.assertNoActiveOp("fs-self"); err != nil {
+	if err := a.AssertNoActiveOp("fs-self"); err != nil {
 		t.Errorf("a terminal finalize still fences self's membership plane: %v", err)
 	}
 }
@@ -221,16 +221,16 @@ func TestFinalizeOpGivesUpTerminallyNotBlocked(t *testing.T) {
 // Mutation: re-confirm with raftConfigIDs alone instead of forceSingleGhostRows — reddens.
 func TestFinalizeOpRefusesToPruneARowThatWasReAdmitted(t *testing.T) {
 	a, n := fsFinalizeFixture(t, "fs-self", "ghost-a")
-	opID, err := a.startForceSingleFinalize("fs-self", []string{"ghost-a"})
+	opID, err := a.StartForceSingleFinalize("fs-self", []string{"ghost-a"})
 	if err != nil {
 		t.Fatalf("start: %v", err)
 	}
 	// The operator rebuilt the cluster while the op sat in the queue: ghost-a's row is re-admitted and
 	// is mid-join — present in the roster, NOT yet in the raft configuration.
-	if err := a.setPhase("ghost-a", phasePending, []string{phaseVoter}, ""); err != nil {
+	if err := a.SetPhase("ghost-a", phasePending, []string{phaseVoter}, ""); err != nil {
 		t.Fatalf("re-admit ghost-a: %v", err)
 	}
-	a.driveForceSingleFinalize(opByID(t, n, opID))
+	a.DriveForceSingleFinalize(opByID(t, n, opID))
 	if !rosterHas(t, n, "ghost-a") {
 		t.Fatal("the finalize op deleted the roster row of a node that had been RE-ADMITTED and was " +
 			"mid-join. The join then completes into \"raft voter with no roster row\" — the state " +
@@ -250,9 +250,13 @@ func TestFinalizeOpRefusesToPruneARowThatWasReAdmitted(t *testing.T) {
 // Mutation: drop the force_single_active condition, or the NumVoters()==1 condition — the
 // "no marker" / "healthy cluster" subtests redden.
 func TestLeadershipEdgeCreatesFinalizeOpOnlyForTheGhostShape(t *testing.T) {
+	// origin: hot-update S10 plan §11.1 / TEST-BUDGET
+	if runIsolatedBrokerTest(t) {
+		return
+	}
 	t.Run("no force-single marker: log-only, no op", func(t *testing.T) {
 		a, n := fsFinalizeFixture(t, "fs-self", "ghost-a")
-		a.resumeForceSingleFinalizeOnLeadership()
+		a.ResumeForceSingleFinalizeOnLeadership()
 		if live, _ := cluster.ActiveOperationForTarget(n.RODB(), "fs-self"); live != nil {
 			t.Fatalf("a finalize op was created without proof that a force-single ever happened here "+
 				"(op %s). Any roster/raft divergence would then trigger a prune.", live.OpID)
@@ -269,14 +273,14 @@ func TestLeadershipEdgeCreatesFinalizeOpOnlyForTheGhostShape(t *testing.T) {
 		}); err != nil {
 			t.Fatalf("set marker: %v", err)
 		}
-		a.resumeForceSingleFinalizeOnLeadership()
+		a.ResumeForceSingleFinalizeOnLeadership()
 		live, _ := cluster.ActiveOperationForTarget(n.RODB(), "fs-self")
 		if live == nil || live.Kind != cluster.OpKindForceSingleFinalize {
 			t.Fatalf("the crash-window cover did not start a finalize op: %+v", live)
 		}
 		// Driving it to terminal must remove the ghost and free the plane.
-		a.driveForceSingleFinalize(opByID(t, n, live.OpID))
-		a.driveForceSingleFinalize(opByID(t, n, live.OpID))
+		a.DriveForceSingleFinalize(opByID(t, n, live.OpID))
+		a.DriveForceSingleFinalize(opByID(t, n, live.OpID))
 		if rosterHas(t, n, "ghost-a") {
 			t.Error("the resumed op did not prune the ghost")
 		}
@@ -292,12 +296,12 @@ func TestLeadershipEdgeCreatesFinalizeOpOnlyForTheGhostShape(t *testing.T) {
 		}); err != nil {
 			t.Fatalf("set marker: %v", err)
 		}
-		a.resumeForceSingleFinalizeOnLeadership()
+		a.ResumeForceSingleFinalizeOnLeadership()
 		first, _ := cluster.ActiveOperationForTarget(n.RODB(), "fs-self")
 		if first == nil {
 			t.Fatal("no op after the first edge")
 		}
-		a.resumeForceSingleFinalizeOnLeadership()
+		a.ResumeForceSingleFinalizeOnLeadership()
 		second, _ := cluster.ActiveOperationForTarget(n.RODB(), "fs-self")
 		if second == nil || second.OpID != first.OpID {
 			t.Fatalf("a second leadership edge produced a different op (%v vs %v) — every election "+
@@ -428,7 +432,7 @@ func TestCommitSuccessPathCreatesNoFinalizeOp(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("set marker: %v", err)
 	}
-	a.resumeForceSingleFinalizeOnLeadership()
+	a.ResumeForceSingleFinalizeOnLeadership()
 	if live, _ := cluster.ActiveOperationForTarget(n.RODB(), "fs-self"); live != nil {
 		t.Fatalf("the leadership-edge cover started an op (%s) with no ghost rows present", live.OpID)
 	}
@@ -453,22 +457,26 @@ func TestCommitSuccessPathCreatesNoFinalizeOp(t *testing.T) {
 // the "no marker" case reddens; (b) mint the epoch during recovery instead of carrying it in the
 // intent — the epoch-stability case reddens.
 func TestForceSingleIntentRecoversTheMarkerAndEpochWindow(t *testing.T) {
+	// origin: hot-update S10 plan §11.1 / TEST-BUDGET
+	if runIsolatedBrokerTest(t) {
+		return
+	}
 	a, n := fsFinalizeFixture(t, "fs-self", "ghost-a")
-	a.dataDir = t.TempDir()
+	a.DataDir = t.TempDir()
 
 	// EXACTLY the state the window leaves: intent fsync'd, rewrite done, nothing else.
 	intent := clusteroffline.OnlineIntent{
 		SelfID: "fs-self", Abandoned: []string{"ghost-a"},
 		Epoch: "e1e1e1e1", MarkedAt: time.Now().UTC().Format(time.RFC3339Nano),
 	}
-	if err := clusteroffline.WriteOnlineIntent(a.dataDir, intent); err != nil {
+	if err := clusteroffline.WriteOnlineIntent(a.DataDir, intent); err != nil {
 		t.Fatalf("write intent: %v", err)
 	}
 	if forceSingleActive(n.RODB()) {
 		t.Fatal("fixture invalid: the marker must be ABSENT — that is the window under test")
 	}
 
-	a.resumeForceSingleFinalizeOnLeadership()
+	a.ResumeForceSingleFinalizeOnLeadership()
 
 	if !forceSingleActive(n.RODB()) {
 		t.Fatal("after a leadership tick the force_single_active marker is STILL absent. `cluster status` " +
@@ -476,7 +484,7 @@ func TestForceSingleIntentRecoversTheMarkerAndEpochWindow(t *testing.T) {
 			"zero-redundancy node — and the documented repair (re-run --online) is refused by the arm " +
 			"gate, because this node now has leader contact: its own.")
 	}
-	got, err := a.forceSingleEpoch()
+	got, err := a.ForceSingleEpoch()
 	if err != nil {
 		t.Fatalf("read epoch: %v", err)
 	}
@@ -491,13 +499,13 @@ func TestForceSingleIntentRecoversTheMarkerAndEpochWindow(t *testing.T) {
 	if live == nil || live.Kind != cluster.OpKindForceSingleFinalize {
 		t.Fatalf("no finalize op after the intent recovery: %+v", live)
 	}
-	a.driveForceSingleFinalize(opByID(t, n, live.OpID))
-	a.driveForceSingleFinalize(opByID(t, n, live.OpID))
+	a.DriveForceSingleFinalize(opByID(t, n, live.OpID))
+	a.DriveForceSingleFinalize(opByID(t, n, live.OpID))
 	if rosterHas(t, n, "ghost-a") {
 		t.Error("the recovered finalize did not prune the ghost")
 	}
 	// With everything landed, the intent has nothing left to protect.
-	if in, _ := clusteroffline.ReadOnlineIntent(a.dataDir); in != nil {
+	if in, _ := clusteroffline.ReadOnlineIntent(a.DataDir); in != nil {
 		t.Error("the intent survived a fully completed recovery — a later tick would keep re-verifying it")
 	}
 }
@@ -511,7 +519,7 @@ func TestForceSingleIntentRecoversTheMarkerAndEpochWindow(t *testing.T) {
 // fixture writable while proving its committed configuration is not the recovered {self} shape.
 func TestForceSingleIntentBeforeRewriteDoesNotMarkAnUnrecoveredCluster(t *testing.T) {
 	a, n := fsFinalizeFixture(t, "fs-self")
-	a.dataDir = t.TempDir()
+	a.DataDir = t.TempDir()
 	if err := n.AddNonvoter("joining-peer", "joining-peer"); err != nil {
 		t.Fatalf("add nonvoter: %v", err)
 	}
@@ -519,22 +527,22 @@ func TestForceSingleIntentBeforeRewriteDoesNotMarkAnUnrecoveredCluster(t *testin
 		SelfID: "fs-self", Abandoned: []string{"joining-peer"}, Epoch: "pre-rewrite-epoch",
 		MarkedAt: time.Now().UTC().Format(time.RFC3339Nano),
 	}
-	if err := clusteroffline.WriteOnlineIntent(a.dataDir, intent); err != nil {
+	if err := clusteroffline.WriteOnlineIntent(a.DataDir, intent); err != nil {
 		t.Fatalf("write intent: %v", err)
 	}
 
-	a.resumeForceSingleFinalizeOnLeadership()
+	a.ResumeForceSingleFinalizeOnLeadership()
 
 	if forceSingleActive(n.RODB()) {
 		t.Fatal("a pre-rewrite intent marked an unrecovered cluster FORCE_SINGLE; intent presence " +
 			"proves only that recovery was requested, not that the raft rewrite landed")
 	}
-	if got, err := a.forceSingleEpoch(); err != nil {
+	if got, err := a.ForceSingleEpoch(); err != nil {
 		t.Fatalf("read epoch: %v", err)
 	} else if got != "" {
 		t.Fatalf("a pre-rewrite intent changed the recovery epoch to %q", got)
 	}
-	if in, err := clusteroffline.ReadOnlineIntent(a.dataDir); err != nil || in != nil {
+	if in, err := clusteroffline.ReadOnlineIntent(a.DataDir); err != nil || in != nil {
 		t.Fatalf("a confirmed pre-rewrite intent was not cleared: intent=%+v err=%v", in, err)
 	}
 }
@@ -543,11 +551,11 @@ func TestForceSingleIntentBeforeRewriteDoesNotMarkAnUnrecoveredCluster(t *testin
 // intent belonging to a DIFFERENT node must never be applied here.
 func TestForceSingleIntentIsIdempotentAndScoped(t *testing.T) {
 	a, n := fsFinalizeFixture(t, "fs-self")
-	a.dataDir = t.TempDir()
+	a.DataDir = t.TempDir()
 	intent := clusteroffline.OnlineIntent{SelfID: "fs-self", Abandoned: nil, Epoch: "abc123",
 		MarkedAt: time.Now().UTC().Format(time.RFC3339Nano)}
 
-	if err := a.applyForceSingleIntent(intent); err != nil {
+	if err := a.ApplyForceSingleIntent(intent); err != nil {
 		t.Fatalf("apply: %v", err)
 	}
 	before, err := n.AppliedIndex()
@@ -555,7 +563,7 @@ func TestForceSingleIntentIsIdempotentAndScoped(t *testing.T) {
 		t.Fatalf("applied index: %v", err)
 	}
 	// A second apply of the SAME intent must be a no-op: it is called on every leadership edge.
-	if err := a.applyForceSingleIntent(intent); err != nil {
+	if err := a.ApplyForceSingleIntent(intent); err != nil {
 		t.Fatalf("second apply: %v", err)
 	}
 	after, err := n.AppliedIndex()
@@ -571,21 +579,21 @@ func TestForceSingleIntentIsIdempotentAndScoped(t *testing.T) {
 	// leave the split-brain detector holding a token from the previous incident forever.
 	second := clusteroffline.OnlineIntent{SelfID: "fs-self", Epoch: "def456",
 		MarkedAt: time.Now().UTC().Format(time.RFC3339Nano)}
-	if err := a.applyForceSingleIntent(second); err != nil {
+	if err := a.ApplyForceSingleIntent(second); err != nil {
 		t.Fatalf("second incident: %v", err)
 	}
-	if got, _ := a.forceSingleEpoch(); got != "def456" {
+	if got, _ := a.ForceSingleEpoch(); got != "def456" {
 		t.Errorf("a second incident left the epoch at %q — the detector would hold the wrong incident's token", got)
 	}
 
 	// An intent naming a DIFFERENT node must be ignored by the resume path.
 	other := clusteroffline.OnlineIntent{SelfID: "some-other-broker", Epoch: "zzz",
 		MarkedAt: time.Now().UTC().Format(time.RFC3339Nano)}
-	if err := clusteroffline.WriteOnlineIntent(a.dataDir, other); err != nil {
+	if err := clusteroffline.WriteOnlineIntent(a.DataDir, other); err != nil {
 		t.Fatalf("write foreign intent: %v", err)
 	}
-	a.resumeForceSingleFinalizeOnLeadership()
-	if got, _ := a.forceSingleEpoch(); got == "zzz" {
+	a.ResumeForceSingleFinalizeOnLeadership()
+	if got, _ := a.ForceSingleEpoch(); got == "zzz" {
 		t.Error("an intent belonging to another broker was applied here")
 	}
 }
@@ -607,20 +615,24 @@ func TestForceSingleIntentIsIdempotentAndScoped(t *testing.T) {
 // Mutation: delete a.driveInterruptedForceSingle() from driveLeaderMaintenance — reddens on the very
 // first assertion (the marker never lands).
 func TestInterruptedForceSingleForwardCompletesOnAPlainLeaderTick(t *testing.T) {
+	// origin: hot-update S10 plan §11.1 / TEST-BUDGET
+	if runIsolatedBrokerTest(t) {
+		return
+	}
 	a, n := fsFinalizeFixture(t, "fs-self", "ghost-a")
-	a.dataDir = t.TempDir()
+	a.DataDir = t.TempDir()
 	intent := clusteroffline.OnlineIntent{
 		SelfID: "fs-self", Abandoned: []string{"ghost-a"},
 		Epoch: "tick-epoch", MarkedAt: time.Now().UTC().Format(time.RFC3339Nano),
 	}
-	if err := clusteroffline.WriteOnlineIntent(a.dataDir, intent); err != nil {
+	if err := clusteroffline.WriteOnlineIntent(a.DataDir, intent); err != nil {
 		t.Fatalf("write intent: %v", err)
 	}
 	if forceSingleActive(n.RODB()) {
 		t.Fatal("fixture invalid: the marker must be ABSENT — that is the window under test")
 	}
 
-	a.driveLeaderMaintenance() // a PLAIN leader tick: no edge, no restart, no operator command
+	a.DriveLeaderMaintenance() // a PLAIN leader tick: no edge, no restart, no operator command
 
 	if !forceSingleActive(n.RODB()) {
 		t.Fatal("an interrupted force-single did not forward-complete on a plain leader tick. The only " +
@@ -628,7 +640,7 @@ func TestInterruptedForceSingleForwardCompletesOnAPlainLeaderTick(t *testing.T) 
 			"so `cluster status` would keep reporting a merely-degraded cluster and the ctl destructive " +
 			"gate would stay open until somebody thought to restart the broker.")
 	}
-	if got, _ := a.forceSingleEpoch(); got != intent.Epoch {
+	if got, _ := a.ForceSingleEpoch(); got != intent.Epoch {
 		t.Errorf("recovery epoch = %q, want the intent's %q", got, intent.Epoch)
 	}
 	live, _ := cluster.ActiveOperationForTarget(n.RODB(), "fs-self")
@@ -639,7 +651,7 @@ func TestInterruptedForceSingleForwardCompletesOnAPlainLeaderTick(t *testing.T) 
 	// The gate that keeps this cheap AND quiet: once both facts are visible the tick must stop
 	// re-entering the resume, or every 5s it would re-log the ghost/backoff warnings for as long as
 	// the ghosts survive.
-	if !a.forceSingleFactsLanded(intent) {
+	if !a.ForceSingleFactsLanded(intent) {
 		t.Error("forceSingleFactsLanded is false after both facts landed — the periodic path would " +
 			"re-enter the full resume on every tick")
 	}
@@ -647,13 +659,13 @@ func TestInterruptedForceSingleForwardCompletesOnAPlainLeaderTick(t *testing.T) 
 	// some epoch is present. Mutation: `cur == in.Epoch` -> `cur != ""` — reddens here.
 	next := clusteroffline.OnlineIntent{SelfID: "fs-self", Epoch: "a-second-incident",
 		MarkedAt: time.Now().UTC().Format(time.RFC3339Nano)}
-	if a.forceSingleFactsLanded(next) {
+	if a.ForceSingleFactsLanded(next) {
 		t.Error("a second incident's intent was reported already-landed while the epoch still holds " +
 			"the previous incident's token")
 	}
 
 	// Idempotent: further ticks must not mint a second op for the same ghost.
-	a.driveLeaderMaintenance()
+	a.DriveLeaderMaintenance()
 	if again, _ := cluster.ActiveOperationForTarget(n.RODB(), "fs-self"); again == nil || again.OpID != live.OpID {
 		t.Errorf("a second leader tick replaced the finalize op (%v -> %v)", live.OpID, again)
 	}

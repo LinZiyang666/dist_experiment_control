@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/LinZiyang666/tether/internal/brokercontrol"
 	"github.com/LinZiyang666/tether/internal/cluster"
 )
 
@@ -139,19 +140,6 @@ func (b *Broker) orphanDrainMarkers() ([]string, error) {
 	return orphans, nil
 }
 
-// drainingWithoutMarker reports whether a node in phase DRAINING is missing its marker — the
-// corrected form of the roadmap's second predicate. It is a REPORTING helper: nothing here writes.
-//
-// Why this combination is not a legal transient, on all three producers:
-//
-//	DrainNode      raises the marker, then later flips VOTER -> DRAINING.
-//	driveRetire    raises the marker at NO_NEW_HOME, then flips the phase at REHOME_EXPOSES.
-//	AbortDrain     restores the phase to VOTER FIRST, then clears the marker.
-//
-// So the marker is always present before the phase becomes DRAINING and is always cleared after it
-// stops being DRAINING. DRAINING-without-marker therefore means a drain died between its own steps,
-// and nothing will resume it: the "no non-terminal op" conjunct rules out the one case that would
-// (a retire that started from an already-DRAINING phase and has not yet reached NO_NEW_HOME).
 func drainingWithoutMarker(phase string, markerRaised, hasActiveOp bool) bool {
-	return phase == phaseDraining && !markerRaised && !hasActiveOp
+	return brokercontrol.DrainingWithoutMarker(phase, markerRaised, hasActiveOp)
 }

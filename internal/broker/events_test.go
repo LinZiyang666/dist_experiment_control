@@ -3,6 +3,8 @@ package broker
 import (
 	"database/sql"
 	"encoding/json"
+	"fmt"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -12,6 +14,7 @@ import (
 	"github.com/LinZiyang666/tether/internal/proto"
 	"github.com/LinZiyang666/tether/internal/proxysub"
 	"github.com/LinZiyang666/tether/internal/session"
+	"github.com/LinZiyang666/tether/internal/testharness"
 	"github.com/nats-io/nats.go"
 )
 
@@ -105,10 +108,28 @@ func newClusterProxyBroker(t *testing.T, sid, ownerFP string) (*Broker, *cluster
 // TestClusterProxyRevokeEmitsKeysetChanged is the task-2 core: a real cluster-mode revoke emits
 // proxy_keyset_changed on the sys.events subject, and the event never carries the (known) PSK sentinel.
 func TestClusterProxyRevokeEmitsKeysetChanged(t *testing.T) {
+	// origin: hot-update S10 plan §11.1 / TEST-BUDGET
+	if runIsolatedBrokerTest(t) {
+		return
+	}
+	beforeG, beforeFD := runtime.NumGoroutine(), testharness.FDCount()
+	for round := 0; round < 5; round++ {
+		t.Run(fmt.Sprint(round), func(t *testing.T) { exerciseCommittedProxyRevoke(t) })
+	}
+	testharness.AssertNoGoroutineLeak(t, "committed proxy revoke x5", beforeG)
+	testharness.AssertNoFDLeak(t, "committed proxy revoke x5", beforeFD, 0)
+}
+
+// A real committed revoke must deliver fresh keys without a reaper tick or
+// agent heartbeat. The silent original recipient cannot drive its own repair.
+// origin: hot-update S5 plan §6.4 / §6.5 / T28 / DRILL-RUN 75.A
+func exerciseCommittedProxyRevoke(t *testing.T) {
+	t.Helper()
 	const sid, fp = "lab", "owner-fp"
 	const pskSentinel = "PSK-SENTINEL-must-never-appear"
 	const tokenHashSentinel = "TOKENHASH-SENTINEL"
-	b, n := newClusterProxyBroker(t, sid, fp)
+	f := newFlowReaperFixture(t, 14200, 14210)
+	b, n := f.b, f.b.cl.node
 
 	// Seed one ACTIVE subscriber "alice" with a KNOWN psk so the no-secret assertion has a sentinel.
 	if err := n.Propose(func(_ *sql.DB) (*cluster.Command, error) {
@@ -117,9 +138,37 @@ func TestClusterProxyRevokeEmitsKeysetChanged(t *testing.T) {
 		t.Fatalf("seed subscriber: %v", err)
 	}
 
-	tap := installEventTap(t)
-	b.handleProxySubRevokeCluster(sid, fp, "actor", "alice", &nats.Msg{}) // empty Reply ⇒ no NATS needed
+	// A second subscriber proves the push is the authoritative keyset, not
+	// a blanket disable or an empty synthetic revocation directive.
+	if err := n.Propose(func(_ *sql.DB) (*cluster.Command, error) {
+		return proxysub.PlanCreate(sid, "sub-bob", "bob", "bob-token", "bob-key", fp, time.Now().UTC())
+	}); err != nil {
+		t.Fatal(err)
+	}
+	nc := b.nc.Load()
+	sub, err := nc.SubscribeSync(proto.SubjCmdForwarded(sid, "node", "proxy-keys"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = sub.Unsubscribe() })
+	if err := nc.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	tap := f.tap
+	b.handleProxySubRevokeCluster(sid, fp, "actor", "alice", &nats.Msg{}) // Empty reply; observe the real forwarded directive.
 
+	message, err := sub.NextMsg(time.Second)
+	if err != nil {
+		t.Fatalf("committed revoke waited for periodic repair: %v", err)
+	}
+	var directive proto.ProxyDirective
+	if err := json.Unmarshal(message.Data, &directive); err != nil {
+		t.Fatal(err)
+	}
+	epoch, err := session.GetProxyEpoch(b.cfg.DB, sid)
+	if err != nil || !directive.Enabled || directive.Epoch != epoch || len(directive.Keys) != 1 || directive.Keys[0].SubID != "sub-bob" {
+		t.Fatal("immediate revoke push did not retain exactly the committed survivor key")
+	}
 	if got := tap.countKind(t, "proxy_keyset_changed"); got != 1 {
 		t.Fatalf("cluster revoke must emit exactly one proxy_keyset_changed, got %d (all sys.events: %+v)", got, tap.sysEvents(t))
 	}

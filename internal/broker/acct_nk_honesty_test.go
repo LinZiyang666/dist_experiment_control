@@ -91,8 +91,8 @@ func acctRow(t *testing.T, rep *adminsock.ClusterStatusReport, nodeID string) ad
 // reported a different key" rows would both have come back Y.
 func TestStatusReportAcctNkIsAThreeStateAnswer(t *testing.T) {
 	admin, _ := acctAdmin(t, "brk-self", "brk-same", "brk-odd", "brk-silent", "brk-noseed")
-	admin.accountPubSelf = func() string { return acctKeySelf }
-	admin.healthPoll = func() map[string]proto.ClusterHealthResp {
+	admin.AccountPubSelf = func() string { return acctKeySelf }
+	admin.HealthPoll = func() map[string]proto.ClusterHealthResp {
 		return map[string]proto.ClusterHealthResp{
 			"brk-same": {NodeID: "brk-same", AccountNkPub: acctKeySelf, AccountNkReported: true},
 			"brk-odd":  {NodeID: "brk-odd", AccountNkPub: acctKeyOdd, AccountNkReported: true},
@@ -136,6 +136,10 @@ func TestStatusReportAcctNkIsAThreeStateAnswer(t *testing.T) {
 // it compared against "" it would report N for every broker in the cluster — recreating the exact
 // fabricated-N defect, during the incident where the operator trusts the output most.
 func TestStatusReportGivesNoAcctVerdictWhenTheViewCannotNameItsOwnKey(t *testing.T) {
+	// origin: hot-update S10 plan §11.1 / TEST-BUDGET
+	if runIsolatedBrokerTest(t) {
+		return
+	}
 	for _, c := range []struct {
 		name   string
 		getter func() string
@@ -145,8 +149,8 @@ func TestStatusReportGivesNoAcctVerdictWhenTheViewCannotNameItsOwnKey(t *testing
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			admin, _ := acctAdmin(t, "brk-self", "brk-odd")
-			admin.accountPubSelf = c.getter
-			admin.healthPoll = func() map[string]proto.ClusterHealthResp {
+			admin.AccountPubSelf = c.getter
+			admin.HealthPoll = func() map[string]proto.ClusterHealthResp {
 				return map[string]proto.ClusterHealthResp{
 					"brk-odd": {NodeID: "brk-odd", AccountNkPub: acctKeyOdd, AccountNkReported: true},
 				}
@@ -174,9 +178,13 @@ func TestStatusReportGivesNoAcctVerdictWhenTheViewCannotNameItsOwnKey(t *testing
 // self row that waited for a health echo would render "?" on the one broker that can never be
 // mismatched.
 func TestStatusReportSelfRowIsAuthoritativeWithoutAHealthPoll(t *testing.T) {
+	// origin: hot-update S10 plan §11.1 / TEST-BUDGET
+	if runIsolatedBrokerTest(t) {
+		return
+	}
 	admin, _ := acctAdmin(t, "brk-solo")
-	admin.accountPubSelf = func() string { return acctKeySelf }
-	admin.healthPoll = nil // exactly the single-broker production shape
+	admin.AccountPubSelf = func() string { return acctKeySelf }
+	admin.HealthPoll = nil // exactly the single-broker production shape
 
 	rep, err := admin.StatusReport("ctl-nats")
 	if err != nil {
@@ -246,7 +254,7 @@ func TestAccountNkFieldsSurviveTheWire(t *testing.T) {
 // structurally cannot see.
 func TestNoConstructionSiteStampsAccountNkLiterally(t *testing.T) {
 	fset := token.NewFileSet()
-	f, err := parser.ParseFile(fset, "clusterstatus.go", nil, parser.ParseComments)
+	f, err := parser.ParseFile(fset, "../brokercontrol/clusterstatus.go", nil, parser.ParseComments)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -32,7 +32,11 @@ func proxyTestBroker(t *testing.T) (*nats.Conn, string /*ownerPub*/, string /*si
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	go func() { _ = b.Run(ctx) }()
+	runDone := make(chan struct{})
+	go func() {
+		defer close(runDone)
+		_ = b.Run(ctx)
+	}()
 	waitNATSReady(t, url)
 	// DIAL LIKE A POST-CUTOVER CLIENT. Production ctl/agent connections carry the
 	// per-identity inbox prefix (internal/natsinbox.InboxConnectOptions), and since
@@ -46,6 +50,25 @@ func proxyTestBroker(t *testing.T) (*nats.Conn, string /*ownerPub*/, string /*si
 		t.Fatal(err)
 	}
 	t.Cleanup(nc.Close)
+	// Run initiates an asynchronous NATS drain. Keep the embedded server alive
+	// until it finishes; shutting the server first leaves FlushTimeout workers
+	// behind and makes repeated heartbeat exercises report fixture leaks.
+	// origin: hot-update S5 plan §8 / T28
+	t.Cleanup(func() {
+		brokerConn := b.nc.Load()
+		cancel()
+		select {
+		case <-runDone:
+		case <-time.After(2 * time.Second):
+			t.Fatal("proxy fixture broker did not stop")
+		}
+		if brokerConn != nil {
+			defer brokerConn.Close()
+			if !testharness.WaitFor(t, 2*time.Second, time.Millisecond, brokerConn.IsClosed) {
+				t.Fatal("proxy fixture broker did not finish draining before NATS shutdown")
+			}
+		}
+	})
 	return nc, ownerPub, "lab", b
 }
 

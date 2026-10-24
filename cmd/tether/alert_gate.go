@@ -1,17 +1,19 @@
 package main
 
 import (
-	"encoding/json"
+	"context"
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"sort"
 	"strings"
 	"time"
 
+	"github.com/LinZiyang666/tether/internal/cli"
+	"github.com/LinZiyang666/tether/internal/controlbudget"
 	"github.com/LinZiyang666/tether/internal/proto"
 	"github.com/nats-io/nats.go"
+	"github.com/spf13/cobra"
 )
 
 // D8b (§10) ctl-side client-synthesized gating + banner. These are genuinely LIVE in ctl but
@@ -64,60 +66,13 @@ const (
 // the collapse and worked around it at ONE call site by counting responders; this is the
 // root fix the workaround was standing in for.
 func probeClusterHealth(nc *nats.Conn, actor string) ([]proto.ClusterHealthResp, error) {
-	// nc.NewInbox(), NOT the package-level nats.NewInbox(): only the method honours
-	// this connection's CustomInboxPrefix. With per-identity inbox subtrees
-	// (auth.InboxPrefixFor) the package-level helper mints `_INBOX.<nuid>`, which
-	// this connection is no longer granted, so the SubscribeSync below would fail.
-	// origin: prerelease audit proto-auth-acl/L1-F1 verifier.
-	inbox := nc.NewInbox()
-	sub, err := nc.SubscribeSync(inbox)
+	// ctx-none: compatibility helper has no caller context; cli bounds the wire operation.
+	ctx := context.Background()
+	deadline, err := cli.AdmissionDeadline(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("cluster health probe: subscribe to own reply inbox %q: %w", inbox, err)
+		return nil, err
 	}
-	defer func() { _ = sub.Unsubscribe() }()
-	// A REFUSED SUBSCRIBE DOES NOT COME BACK FROM SubscribeSync. nats-server answers
-	// `-ERR 'Permissions Violation for Subscription to "…"'` asynchronously, so the call
-	// above returns nil and the subscription is simply dead. Flush and look: the server
-	// processes SUB before the PING that Flush sends, and nats.go's readLoop sets
-	// LastError() synchronously in processPermissionsViolation, so by the time Flush
-	// returns a refusal is already observable. No sleep, no polling.
-	//
-	// Without this the whole error return below is decorative — which the guard in
-	// alerts_test.go demonstrated on the first attempt at this fix.
-	if ferr := nc.FlushTimeout(2 * time.Second); ferr == nil {
-		if last := nc.LastError(); last != nil && strings.Contains(last.Error(), inbox) {
-			return nil, fmt.Errorf("cluster health probe: this connection may not subscribe to its "+
-				"own reply inbox %q: %w", inbox, last)
-		}
-	}
-	if err := nc.PublishRequest(proto.SubjCtrlClusterHealth(actor), inbox, nil); err != nil {
-		return nil, fmt.Errorf("cluster health probe: publish: %w", err)
-	}
-	deadline := time.Now().Add(clusterHealthWindow)
-	var replies []proto.ClusterHealthResp
-	for {
-		remaining := time.Until(deadline)
-		if remaining <= 0 {
-			break
-		}
-		msg, err := sub.NextMsg(remaining)
-		if err != nil {
-			break // timeout / no more responders
-		}
-		// No-responders fast-path (M1): a manual SubscribeSync+PublishRequest does NOT get
-		// Conn.Request's ErrNoResponders, so at N=1 (no broker subscribes the health subject)
-		// the server's 503 sentinel arrives as a successful empty message — detect it and
-		// return at once, else `tether session rm` would block the full window every time
-		// (breaking the build-and-prove "byte-identical at N=1" wall-clock).
-		if len(msg.Data) == 0 && msg.Header.Get("Status") == "503" {
-			break
-		}
-		var r proto.ClusterHealthResp
-		if json.Unmarshal(msg.Data, &r) == nil {
-			replies = append(replies, r)
-		}
-	}
-	return replies, nil
+	return cli.ProbeClusterHealthWithin(ctx, nc, actor, cli.RetryConfig{Deadline: deadline, Family: cli.RetryReadOnly, LogicalID: "compat-health"})
 }
 
 // probeClusterHealthAdvisory is probeClusterHealth for callers that DISPLAY the answer or
@@ -159,7 +114,7 @@ func gateDestructive(nc *nats.Conn, actor string, ackAlerts bool) error {
 		// the second is worth a retry. Collapsing them would put a permanent condition in
 		// the class automation retries.
 		class := exitUnavailable
-		if strings.Contains(err.Error(), "Permissions Violation") {
+		if errors.Is(err, nats.ErrPermissionViolation) || strings.Contains(err.Error(), "Permissions Violation") {
 			class = exitNoPerm
 		}
 		return &ExitError{Class: class, Err: fmt.Errorf(
@@ -225,25 +180,8 @@ func gateBlockMessage(gate proto.DestructiveGate) string {
 // real error on no-responder / timeout / malformed reply — for the EXPLICIT `alert ls` command,
 // which must NOT show a false "no active alerts" when the store could not be queried (F4).
 func fetchAlertsStrict(nc *nats.Conn, actor string) ([]proto.AlertView, error) {
-	msg, err := nc.Request(proto.SubjCtrlAlertLs(actor), nil, alertLsTimeout)
-	if err != nil {
-		return nil, fmt.Errorf("alert ls: query: %w (no broker answered the alert store)", err)
-	}
-	var resp proto.AlertLsResp
-	if err := json.Unmarshal(msg.Data, &resp); err != nil {
-		return nil, fmt.Errorf("alert ls: malformed reply: %w", err)
-	}
-	return resp.Alerts, nil
-}
-
-// fetchAlerts is the BEST-EFFORT banner variant: a timeout / no responder / malformed reply
-// yields nil so the banner never breaks a read command (the always-on banner is advisory).
-func fetchAlerts(nc *nats.Conn, actor string) []proto.AlertView {
-	alerts, err := fetchAlertsStrict(nc, actor)
-	if err != nil {
-		return nil
-	}
-	return alerts
+	// ctx-none: compatibility banner helper has no caller context.
+	return cli.FetchAlertsWithin(context.Background(), nc, actor, alertLsTimeout)
 }
 
 // renderBanner writes the active SEVERE alerts to w (stderr) so stdout stays script-parseable.
@@ -259,12 +197,6 @@ func renderBanner(w io.Writer, alerts []proto.AlertView, jsonMode bool) {
 		}
 		_, _ = fmt.Fprintf(w, "‼ ALERT [%s] %s\n", a.Kind, a.Message)
 	}
-}
-
-// withBanner fetches + renders the severe-alert banner to stderr after a read command.
-// Best-effort; jsonMode suppresses it.
-func withBanner(nc *nats.Conn, actor string, jsonMode bool) {
-	renderBanner(os.Stderr, fetchAlerts(nc, actor), jsonMode)
 }
 
 // printAlertLs renders the full alert list (all severities) for the `alert ls` command, with
@@ -294,20 +226,78 @@ func printAlertLs(w io.Writer, alerts []proto.AlertView) {
 // accepted the ack), an empty/malformed reply, or a transport failure all return a non-nil
 // error, so an operator/script never treats an un-committed ack as acknowledged.
 func ackAlert(nc *nats.Conn, actor, dedupKey string) (string, error) {
-	body, err := json.Marshal(proto.AlertAckReq{DedupKey: dedupKey})
-	if err != nil {
-		return "", err
+	// ctx-none: legacy alert command supplies no caller context; one mutation is sent.
+	reply, err := cli.AckAlertWithin(context.Background(), nc, actor, dedupKey, alertAckTimeout)
+	if err != nil && strings.HasPrefix(err.Error(), proto.CodeAgentNoResponders+": ") {
+		return reply, brokerErrorMessage("alert ack", proto.CodeAgentNoResponders, strings.TrimPrefix(err.Error(), proto.CodeAgentNoResponders+": "))
 	}
-	msg, err := nc.Request(proto.SubjCtrlAlertAck(actor), body, alertAckTimeout)
+	return reply, err
+}
+
+// Admission callers keep health and banner work on the same deadline as
+// CONNECT. The wire helpers live in cli with the shared retry policy.
+// origin: hot-update S6 plan §8.2 / T30
+func probeClusterHealthWithin(cmd *cobra.Command, nc *nats.Conn, actor string) ([]proto.ClusterHealthResp, error) {
+	a, err := ensureCtlAdmission(cmd)
 	if err != nil {
-		return "", fmt.Errorf("alert ack: request: %w (no broker forwarded the ack)", err)
+		return nil, err
 	}
-	reply := string(msg.Data)
-	if reply != "ok" {
-		if reply == "" {
-			reply = "(empty reply)"
+	return cli.ProbeClusterHealthWithin(cmd.Context(), nc, actor, cli.RetryConfig{Deadline: a.deadline, Family: cli.RetryReadOnly, LogicalID: a.logicalID, Observer: a.observer})
+}
+
+func gateDestructiveWithin(cmd *cobra.Command, nc *nats.Conn, actor string, ackAlerts bool) error {
+	if ackAlerts {
+		return nil
+	}
+	replies, err := probeClusterHealthWithin(cmd, nc, actor)
+	if err != nil {
+		class := exitUnavailable
+		if errors.Is(err, nats.ErrPermissionViolation) || strings.Contains(err.Error(), "Permissions Violation") {
+			class = exitNoPerm
 		}
-		return reply, fmt.Errorf("alert ack not accepted: %s", reply)
+		return &ExitError{Class: class, Err: fmt.Errorf("refusing a destructive operation: cluster health could not be checked: %w", err)}
 	}
-	return reply, nil
+	gate := proto.EvalDestructiveGate(replies)
+	if !gate.Blocked() {
+		return nil
+	}
+	return &ExitError{Class: gateExitClass(gate), Err: errors.New(gateBlockMessage(gate))}
+}
+
+// A banner is advisory and never expands admission. Skipping it is observed,
+// including JSON output, so the collector can account for every phase.
+// origin: hot-update S6 plan §8.2 / T30
+func withBannerWithin(cmd *cobra.Command, nc *nats.Conn, actor string, jsonMode bool) error {
+	a, _ := cmd.Context().Value(ctlAdmissionKey{}).(*ctlAdmission)
+	if a == nil {
+		return nil
+	}
+	var attempt controlbudget.Attempt
+	if a.observer != nil {
+		var err error
+		attempt, err = a.observer.Begin(a.logicalID, controlbudget.PhaseBanner)
+		if err != nil {
+			return err
+		}
+	}
+	attempt.Class = "skipped"
+	remaining, remainingErr := controlbudget.Remaining(a.deadline)
+	if !jsonMode && remainingErr == nil && remaining >= cli.ControlBannerWindow {
+		ctx, cancel, err := ctlAdmissionContext(cmd.Context(), a.deadline)
+		if err == nil {
+			alerts, fetchErr := cli.FetchAlertsWithin(cli.WithControlObservation(ctx, a.logicalID, a.observer), nc, actor, alertLsTimeout)
+			cancel()
+			attempt.Class = "error"
+			if fetchErr == nil {
+				renderBanner(cmd.ErrOrStderr(), alerts, false)
+				attempt.Class = "success"
+			}
+		}
+	}
+	if a.observer == nil {
+		return nil
+	}
+	now, err := controlbudget.Now()
+	attempt.FinishedMonoNS = now
+	return errors.Join(err, a.observer.Record(attempt))
 }

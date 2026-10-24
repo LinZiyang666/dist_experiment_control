@@ -7,6 +7,7 @@ import (
 	"github.com/LinZiyang666/tether/internal/adminsock"
 	"github.com/LinZiyang666/tether/internal/cluster"
 	"github.com/LinZiyang666/tether/internal/clusteroffline"
+	"github.com/LinZiyang666/tether/internal/infracli"
 )
 
 // cluster_rotation.go (C7) — the GUIDED compromised-node credential-rotation printer + the persistent
@@ -92,6 +93,7 @@ func printCredentialRotationGuide(w io.Writer, node, secretsDir, confPath string
 	p("     on-disk issuer still disagrees with the rendered one).\n")
 	p("  See docs/cluster-runbook.md §2.1 for the verbatim commands.\n\n")
 
+	p("Infra policy: after Step A, synchronize revision/key_id/trust with `tether admin infra rotate-policy` as local root; old tickets must be revoked. Pending stays read-only until re-authorized.\n")
 	p("STEP B — tunnel-cert  (OPTIONAL defense-in-depth, online; does NOT mitigate %s's compromise):\n", node)
 	p("  The retired node's tunnel key left with it. Rotating survivors is fleet hygiene only.\n")
 	p("  Per surviving broker <self>: `tether cluster transfer-leader <self> --wait` then\n")
@@ -113,9 +115,4 @@ func printCredentialRotationGuide(w io.Writer, node, secretsDir, confPath string
 	}
 }
 
-// printNotSafeBanner is the non-green floor (rejection #5): no "done/safe/secure/complete" wording.
-func printNotSafeBanner(w io.Writer, node string) {
-	_, _ = fmt.Fprintf(w, "\nSECURITY: credentials are NOT yet rotated — %s can still authenticate. The cluster is NOT SAFE\n", node)
-	_, _ = fmt.Fprintf(w, "  against this node until you complete the rotation above and clear %s.\n", rotationTrackingKey(node))
-	_, _ = fmt.Fprintf(w, "  Track: `tether alert ls` / `tether cluster status`.\n")
-}
+var printNotSafeBanner = infracli.PrintNotSafeBanner

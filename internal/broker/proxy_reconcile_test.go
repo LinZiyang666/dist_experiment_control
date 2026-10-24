@@ -8,12 +8,24 @@ package broker
 
 import (
 	"database/sql"
+	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
+	"reflect"
+	"runtime"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/cluster"
+	"github.com/LinZiyang666/tether/internal/node"
+	"github.com/LinZiyang666/tether/internal/port"
+	"github.com/LinZiyang666/tether/internal/proto"
+	"github.com/LinZiyang666/tether/internal/session"
+	"github.com/LinZiyang666/tether/internal/testharness"
+	"github.com/nats-io/nats.go"
 )
 
 func damperBroker(clk *fakeClock) *Broker {
@@ -21,6 +33,345 @@ func damperBroker(clk *fakeClock) *Broker {
 	b.cfg.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	b.cfg.Now = clk.Now
 	return b
+}
+
+// flowReaperFixture keeps the real leader/FSM and event publisher in the loop.
+// Only observation time and the agent's readiness input are controlled here;
+// allocation rotation and rehome must execute their production SQL planners.
+// origin: hot-update S5 plan §4.5 / T14
+type flowReaperFixture struct {
+	b     *Broker
+	clock *fakeClock
+	alloc *port.Allocation
+	tap   *eventTap
+}
+
+// Election waits can overlap, but these fixtures publish through the existing
+// process-wide audit hook. Keep that hook exclusive until its cleanup removes
+// it; the real Raft/SQL/event assertions still run with one observation owner.
+// origin: hot-update S6 plan §9.3 / T56 / TESTFIX
+var flowReaperObservationMu sync.Mutex
+
+func newFlowReaperFixture(t *testing.T, low, high int) *flowReaperFixture {
+	t.Helper()
+	b, leader := newClusterProxyBroker(t, "lab", "owner-fp")
+	clock := newFakeClock(passEpoch)
+	b.cfg.Now = clock.Now
+	b.cfg.PortBandLow, b.cfg.PortBandHigh = low, high
+	// Roster fixtures are populated before any concurrent reconciliation. All
+	// writes under test below still go through the real leader's Propose/Apply.
+	seed := &Broker{cfg: Config{DB: leader.DB()}}
+	seedClusterNode(t, seed, "brk-a", "nats-a", "127.0.0.1:7443", "sha256:a", "VOTER")
+	seedClusterNode(t, seed, "brk-b", "nats-b", "127.0.0.1:7444", "sha256:b", "VOTER")
+	if err := leader.Propose(func(db *sql.DB) (*cluster.Command, error) {
+		return node.PlanRegister(db, node.RegisterInput{
+			SID: "lab", NID: "node", ProtoVersion: proto.ProtoVersion, ProxyCapable: true, NatsServer: "nats-a",
+		}, clock.Now())
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := node.Heartbeat(b.livenessDB(), "lab", "node", clock.Now()); err != nil {
+		t.Fatal(err)
+	}
+	setFlowReaperReady(t, b, true)
+	var alloc *port.Allocation
+	if err := leader.Propose(func(db *sql.DB) (*cluster.Command, error) {
+		var cmd *cluster.Command
+		var err error
+		alloc, cmd, err = port.PlanAllocateProxy(db, "lab", "node", "brk-a", b.cfg.PortAllocCfg())
+		return cmd, err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	nc, err := nats.Connect(startNATS(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(nc.Close)
+	b.nc.Store(nc)
+	flowReaperObservationMu.Lock()
+	t.Cleanup(flowReaperObservationMu.Unlock)
+	tap := installEventTap(t)
+	b.driveProxyReconcile()
+	// Healthy-all-ready is deliberately silent. The computed count snapshot
+	// witnesses that the gates did not skip the tick; negative controls below
+	// separately require nonempty rotation/rehome event publications.
+	if counts, ok := b.proxyEvtCounts.Load("lab"); !ok || counts != (proxyEventCounts{Enabled: true, CapableNodes: 1, ReadyNodes: 1}) {
+		t.Fatalf("initial reaper tick did not observe one healthy ready node: %v", counts)
+	}
+	return &flowReaperFixture{b: b, clock: clock, alloc: alloc, tap: tap}
+}
+
+func setFlowReaperReady(t *testing.T, b *Broker, ready bool) {
+	t.Helper()
+	if err := node.SetProxyReady(b.livenessDB(), "lab", "node", ready); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// One read transaction captures all allocation history, not just the currently
+// active row: a free/reallocate cycle can end at the same port and epoch.
+type flowReaperRow struct {
+	ID        int64
+	Port      int
+	TokenHash string
+	Home      string
+	Epoch     int64
+	State     string
+}
+
+func flowReaperSnapshot(t *testing.T, b *Broker) []flowReaperRow {
+	t.Helper()
+	tx, err := b.cfg.DB.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	rows, err := tx.Query(`SELECT row_id,port,token_hash,home_broker,epoch,state
+		FROM port_allocations WHERE sid='lab' AND nid='node' AND name='__proxy__' ORDER BY row_id`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = rows.Close() }()
+	var out []flowReaperRow
+	for rows.Next() {
+		var row flowReaperRow
+		if err := rows.Scan(&row.ID, &row.Port, &row.TokenHash, &row.Home, &row.Epoch, &row.State); err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, row)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if len(out) == 0 {
+		t.Fatal("allocation snapshot is empty")
+	}
+	return out
+}
+
+func assertFlowReaperUnchanged(t *testing.T, f *flowReaperFixture, before []flowReaperRow, events int) {
+	t.Helper()
+	if !reflect.DeepEqual(before, flowReaperSnapshot(t, f.b)) {
+		t.Fatal("planned rebuild changed allocation history, port, token, home, epoch or state")
+	}
+	if got := len(f.tap.sysEvents(t)); got != events {
+		t.Fatalf("planned rebuild emitted rotation/rehome/readiness events: before=%d after=%d", events, got)
+	}
+}
+
+// origin: hot-update S5 plan §4.5 / T14
+// These are the broker-side controls for the planned-cut readiness contract.
+// They deliberately do not claim to test the agent's latch implementation.
+func TestProxyReaperReadinessControls(t *testing.T) {
+	// origin: hot-update S10 plan §11.1 / TEST-BUDGET
+	if runIsolatedBrokerTest(t) {
+		return
+	}
+	before, beforeFD := runtime.NumGoroutine(), testharness.FDCount()
+	for round := 0; round < 5; round++ {
+		t.Run(fmt.Sprintf("round-%d", round), func(t *testing.T) {
+			exerciseProxyReaperReadinessControls(t)
+			t.Run("initial-home-apply", func(t *testing.T) { exerciseInitialProxyHomeApply(t) })
+		})
+	}
+	testharness.AssertNoGoroutineLeak(t, "proxy reaper readiness controls", before)
+	// The lazily initialized process-wide network poller retains two FDs.
+	testharness.AssertNoFDLeak(t, "proxy reaper readiness controls", beforeFD, 2)
+}
+
+func exerciseProxyReaperReadinessControls(t *testing.T) {
+	t.Helper()
+	for _, scenario := range []string{"recovered-ready", "lost-ready", "extended-loss", "unhealthy-home"} {
+		t.Run(scenario, func(t *testing.T) {
+			// Independent Raft owners overlap production election waits; the
+			// enclosing round joins every cleanup before leak measurement.
+			// origin: hot-update S6 plan §9.3 / T56 / TESTFIX
+			t.Parallel()
+			f := newFlowReaperFixture(t, 22000, 22010)
+			before := flowReaperSnapshot(t, f.b)
+			events := len(f.tap.sysEvents(t))
+			// Build two real bad observations. The damper must not yet have
+			// rotated; recovering readiness must clear this historical dwell.
+			setFlowReaperReady(t, f.b, false)
+			for tick := 0; tick < proxyRehomeDwell-1; tick++ {
+				f.b.driveProxyReconcile()
+				f.clock.advance(observeTickInterval)
+			}
+			if !reflect.DeepEqual(before, flowReaperSnapshot(t, f.b)) {
+				t.Fatal("allocation changed before the dwell threshold")
+			}
+			if got, _ := f.b.proxyDwell.Load(f.alloc.Port); got != proxyRehomeDwell-1 {
+				t.Fatalf("historical bad dwell=%v, want %d", got, proxyRehomeDwell-1)
+			}
+			setFlowReaperReady(t, f.b, true)
+			if scenario == "extended-loss" {
+				// Unlike the old-dwell loss control, this starts a fresh run of
+				// bad observations: t=0, interval, 2*interval must all be seen.
+				f.b.driveProxyReconcile()
+			}
+			if scenario == "lost-ready" {
+				setFlowReaperReady(t, f.b, false)
+			}
+			if scenario == "unhealthy-home" {
+				if err := f.b.cl.node.Propose(func(*sql.DB) (*cluster.Command, error) {
+					return cluster.PlanClusterNodePhase("brk-a", "DRAINING", []string{"VOTER"}, "", f.clock.Now())
+				}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// A cut immediately before the tick sees the old dwell=2. No
+			// healthy tick is smuggled between recovery and that first cut tick.
+			for tick := 0; tick < proxyRehomeDwell+1; tick++ {
+				if scenario == "extended-loss" {
+					setFlowReaperReady(t, f.b, false)
+				}
+				f.b.driveProxyReconcile()
+				if scenario == "extended-loss" && tick < proxyRehomeDwell-1 && !reflect.DeepEqual(before, flowReaperSnapshot(t, f.b)) {
+					t.Fatal("fresh readiness loss rotated before the shortest bad-observation span")
+				}
+				f.clock.advance(observeTickInterval)
+				if scenario == "recovered-ready" {
+					// The first recovered tick legitimately re-announces ready.
+					if tick == 0 {
+						events = len(f.tap.sysEvents(t))
+					}
+					assertFlowReaperUnchanged(t, f, before, events)
+				}
+			}
+			after := flowReaperSnapshot(t, f.b)
+			switch scenario {
+			case "recovered-ready":
+				if _, ok := f.b.proxyDwell.Load(f.alloc.Port); ok {
+					t.Fatal("a healthy ready tick retained historical bad dwell")
+				}
+			case "lost-ready", "extended-loss":
+				if len(after) != 2 || after[0].State != "FREED" || after[1].State != "ALLOCATED" ||
+					after[0].TokenHash == after[1].TokenHash || !f.b.proxyHomeHealthy(after[1].Home) || after[1].Epoch != 0 {
+					t.Fatal("readiness loss did not rotate the allocation through real SQL")
+				}
+				if f.tap.countKind(t, evRehomeStalled) != 1 || f.tap.countKind(t, evHomeReassignSucceeded) != 0 {
+					t.Fatal("rotation must emit stalled, never successful rehome")
+				}
+			case "unhealthy-home":
+				if len(after) != 1 || after[0].Port != before[0].Port || after[0].TokenHash != before[0].TokenHash ||
+					after[0].Home != "brk-b" || after[0].Epoch != before[0].Epoch+1 {
+					t.Fatal("unhealthy home did not rehome the original allocation despite ready latch")
+				}
+				if f.tap.countKind(t, evHomeReassignStarted) != 1 || f.tap.countKind(t, evHomeReassignSucceeded) != 1 {
+					t.Fatal("unhealthy home must emit exactly one started/succeeded event pair")
+				}
+			}
+		})
+	}
+}
+
+// A freshly minted token must not outrun a reachable remote home's committed
+// allocation. The same bounded wait as ordinary exposes keeps terminal unknown
+// token replies terminal; it does not turn them into client retries.
+// origin: hot-update S5 plan §6.4 / §9.1 / DRILL-RUN 75.C
+func exerciseInitialProxyHomeApply(t *testing.T) {
+	t.Helper()
+	for _, scenario := range []string{"applied", "disabled-during-wait", "home-unavailable"} {
+		t.Run(scenario, func(t *testing.T) {
+			// Independent Raft owners overlap production election waits; the
+			// enclosing round joins every cleanup before leak measurement.
+			// origin: hot-update S6 plan §9.3 / T56 / TESTFIX
+			t.Parallel()
+			f := newFlowReaperFixture(t, 22100, 22110)
+			b, leader, nc := f.b, f.b.cl.node, f.b.nc.Load()
+			if err := leader.Propose(func(db *sql.DB) (*cluster.Command, error) {
+				return node.PlanRegister(db, node.RegisterInput{SID: "lab", NID: "node",
+					ProtoVersion: proto.ProtoVersion, ProxyCapable: true, NatsServer: "nats-b"}, f.clock.Now())
+			}); err != nil {
+				t.Fatal(err)
+			}
+			before, err := leader.AppliedIndex()
+			if err != nil {
+				t.Fatal(err)
+			}
+			var allow atomic.Bool
+			polled := make(chan struct{}, 1)
+			cursor, err := nc.Subscribe(proto.SubjClusterCursor, func(m *nats.Msg) {
+				select {
+				case polled <- struct{}{}:
+				default:
+				}
+				// A high cursor from the wrong peer cannot release the push.
+				wrong, _ := json.Marshal(proto.ClusterHealthResp{NodeID: "brk-a", AppliedIndex: before + 1000})
+				_ = m.Respond(wrong)
+				if scenario == "home-unavailable" {
+					return
+				}
+				applied := before
+				if allow.Load() {
+					applied, _ = leader.AppliedIndex()
+				}
+				body, _ := json.Marshal(proto.ClusterHealthResp{NodeID: "brk-b", AppliedIndex: applied})
+				_ = m.Respond(body)
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = cursor.Unsubscribe() })
+			push, err := nc.SubscribeSync(proto.SubjCmdForwarded("lab", "node", "proxy-keys"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = push.Unsubscribe() })
+			if err := nc.Flush(); err != nil {
+				t.Fatal(err)
+			}
+			started := time.Now()
+			done := make(chan struct{})
+			go func() { b.allocateAndPushProxy(nc, "lab", "node", nil, 0); close(done) }()
+			// Joining on every failure keeps a red mutation from leaking its
+			// real proposer/publisher into the following exercise round.
+			defer func() { allow.Store(true); <-done }()
+			if msg, err := push.NextMsg(100 * time.Millisecond); err == nil || msg != nil {
+				t.Fatal("initial proxy token was pushed before the home applied its allocation")
+			}
+			select {
+			case <-polled:
+			case <-time.After(time.Second):
+				t.Fatal("initial proxy allocation never checked the remote home cursor")
+			}
+			if scenario == "disabled-during-wait" {
+				if err := leader.Propose(func(*sql.DB) (*cluster.Command, error) {
+					return session.PlanProxySetEnabled("lab", false, session.ProxyHAFreeze, f.clock.Now())
+				}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			allow.Store(true)
+			msg, err := push.NextMsg(exposeHomeApplyBudget + 2*exposeHomeApplyStep)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var d proto.ProxyDirective
+			if err := json.Unmarshal(msg.Data, &d); err != nil {
+				t.Fatal(err)
+			}
+			elapsed := time.Since(started)
+			if elapsed > exposeHomeApplyBudget+2*exposeHomeApplyStep {
+				t.Fatal("initial proxy allocation exceeded the existing home apply budget")
+			}
+			if scenario == "disabled-during-wait" {
+				if d.Enabled || d.Token != "" || len(d.Keys) != 0 {
+					t.Fatal("home wait reused authority revoked during the wait")
+				}
+			} else if !d.Enabled || d.Token == "" || d.Home == nil || d.Home.NodeID != "brk-b" {
+				t.Fatal("initial proxy push lost its single-use token or committed home")
+			}
+			if scenario == "home-unavailable" && elapsed < exposeHomeApplyBudget {
+				t.Fatal("another peer's cursor or a missing home bypassed the bounded apply wait")
+			}
+			rows := flowReaperSnapshot(t, b)
+			if len(rows) != 2 || rows[0].State != "FREED" || rows[1].State != "ALLOCATED" || rows[1].Home != "brk-b" {
+				t.Fatal("home apply wait reminted or discarded the committed allocation")
+			}
+		})
+	}
 }
 
 // TestProxyRotateBackoffSchedule pins the damped rotation ladder: with the

@@ -58,3 +58,32 @@ func (b *Broker) closeTunnelProxyIfStale(info tunnel.SessionInfo, reason string)
 	}
 	return false
 }
+
+// Revalidate only imported allocations. Cold boot's port/liveness cleanup is
+// inappropriate here: a broker cut does not imply an agent restart. Every grant
+// uses the current bounded SQL snapshot, including home/epoch and proxy fences;
+// transient reads block activation rather than making an old positive row usable.
+// CloseProxyIf carries the complete identity so a late A close cannot remove B.
+// origin: hot-update S6 plan §6.3 / T28
+func reconcileBrokerImageTunnel(b *Broker, srv *tunnel.Server) (int, error) {
+	if b == nil || b.read().SQL() == nil || srv == nil {
+		return 0, errors.New("broker: missing imported tunnel authority")
+	}
+	closed := 0
+	for _, info := range srv.SessionInfos() {
+		_, err := tunnelAuthorityLookup(b, tunnel.AuthRequest{Allocation: tunnel.Allocation{
+			Port: info.PublicPort, SID: info.SID, NID: info.NID,
+			TokenHash: info.TokenHash, Epoch: info.Epoch,
+		}})
+		if err == nil {
+			continue
+		}
+		if !errors.Is(err, errTunnelAuthorityRevoked) {
+			return closed, err
+		}
+		if srv.CloseProxyIf(info) {
+			closed++
+		}
+	}
+	return closed, nil
+}

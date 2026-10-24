@@ -87,7 +87,11 @@ func renderNodeLsBrokers(cmd *cobra.Command, nc *nats.Conn, actor string, nodes 
 		agentRelease[n.NID] = n.ReleaseVersion
 	}
 	brokers := map[string]brokerDaemon{}
-	for _, h := range probeClusterHealthAdvisory(nc, actor) {
+	health, err := probeClusterHealthWithin(cmd, nc, actor)
+	if err != nil {
+		return err
+	}
+	for _, h := range health {
 		if h.NodeID != "" {
 			brokers[h.NodeID] = brokerDaemon{BrokerVer: h.ReleaseVersion, ColocatedAgentNID: h.ColocatedAgentNID}
 		}

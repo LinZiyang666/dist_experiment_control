@@ -69,6 +69,10 @@ func TestC4ApproveIdempotent(t *testing.T) {
 // TestC4JoinSecondApproveWhileActiveRefused (M2): a fresh-bundle approve for a node that already has an
 // active op is REFUSED (no two-writer hole / identity clobber).
 func TestC4JoinSecondApproveWhileActiveRefused(t *testing.T) {
+	// origin: hot-update S10 plan §11.1 / TEST-BUDGET
+	if runIsolatedBrokerTest(t) {
+		return
+	}
 	n, _ := d7SingleNode(t, "ctl-1")
 	admin := NewClusterAdmin(n, nil)
 	b1, _ := makeJoinBundle(t, "join-2", "10.0.0.2:7400", "nonce-a")
@@ -85,6 +89,10 @@ func TestC4JoinSecondApproveWhileActiveRefused(t *testing.T) {
 // TestC4RetireGateLastVoter (BLOCKER-1 gate logic): driveRetire on the last voter routes to
 // RETIRE_FAILED (never proceeds to RemoveServer), via the isVoter-aware retireGatePasses.
 func TestC4RetireGateLastVoter(t *testing.T) {
+	// origin: hot-update S10 plan §11.1 / TEST-BUDGET
+	if runIsolatedBrokerTest(t) {
+		return
+	}
 	n, addr := d7SingleNode(t, "ctl-1")
 	admin := NewClusterAdmin(n, nil)
 	// Admit ctl-1 as the sole VOTER.
@@ -101,7 +109,7 @@ func TestC4RetireGateLastVoter(t *testing.T) {
 	if err := n.Propose(func(_ *sql.DB) (*cluster.Command, error) { return cluster.PlanClusterOpStart(op, now) }); err != nil {
 		t.Fatalf("seed retire op: %v", err)
 	}
-	admin.driveInFlightOperations()
+	admin.DriveInFlightOperations()
 	got, _ := cluster.OperationByID(n.RODB(), "op-r")
 	if got == nil || got.OpState != cluster.OpStateRetireFailed || !got.Terminal {
 		t.Fatalf("retire of the last voter must route to terminal RETIRE_FAILED, got %+v", got)
@@ -129,11 +137,11 @@ func TestC4RetireGatePassesLogic(t *testing.T) {
 
 	// (a) already removed from the raft config (isVoter=false) ⇒ gate PASSES (the removal already
 	// happened on resume) — this is the BLOCKER-1 fix (no false RETIRE_FAILED).
-	if op := seed("op-removed", true); !admin.retireGatePasses(op, substrate{isVoter: false, numVoters: 1}) {
+	if op := seed("op-removed", true); !admin.RetireGatePasses(op, substrate{IsVoter: false, NumVoters: 1}) {
 		t.Fatal("an already-removed target must PASS the gate (resume-after-removal), not false-fail")
 	}
 	// (b) last voter (isVoter=true, numVoters=1 ⇒ remaining 0) ⇒ RETIRE_FAILED.
-	if op := seed("op-last", true); admin.retireGatePasses(op, substrate{isVoter: true, numVoters: 1}) {
+	if op := seed("op-last", true); admin.RetireGatePasses(op, substrate{IsVoter: true, NumVoters: 1}) {
 		t.Fatal("the last voter must NOT pass")
 	}
 	if s := state("op-last"); s != cluster.OpStateRetireFailed {
@@ -141,14 +149,14 @@ func TestC4RetireGatePassesLogic(t *testing.T) {
 	}
 	// (c) F==0 unconfirmed (numVoters=2 ⇒ remaining 1, FT 0) ⇒ BLOCKED (the M3 re-check at the
 	// irreversible step routes a worsened F==0 here, never barrels through).
-	if op := seed("op-f0", false); admin.retireGatePasses(op, substrate{isVoter: true, numVoters: 2}) {
+	if op := seed("op-f0", false); admin.RetireGatePasses(op, substrate{IsVoter: true, NumVoters: 2}) {
 		t.Fatal("an F==0 unconfirmed retire must NOT pass")
 	}
 	if s := state("op-f0"); s != cluster.OpStateBlocked {
 		t.Fatalf("F==0 unconfirmed must route to BLOCKED, got %s", s)
 	}
 	// (d) healthy (numVoters=4 ⇒ remaining 3, FT 1>0) ⇒ PASSES without a confirm.
-	if op := seed("op-ok", false); !admin.retireGatePasses(op, substrate{isVoter: true, numVoters: 4}) {
+	if op := seed("op-ok", false); !admin.RetireGatePasses(op, substrate{IsVoter: true, NumVoters: 4}) {
 		t.Fatal("a retire that keeps fault tolerance > 0 must pass")
 	}
 }
@@ -167,7 +175,7 @@ func TestC4JoinBarrierPersistedBeforeAddVoter(t *testing.T) {
 		t.Fatalf("seed join op: %v", err)
 	}
 	op, _ := cluster.OperationByID(n.RODB(), "op-j")
-	admin.driveOne(op)
+	admin.DriveOne(op)
 	got, _ := cluster.OperationByID(n.RODB(), "op-j")
 	if got.OpState != cluster.OpStateRaftAdding {
 		t.Fatalf("ROSTER_COMMITTED must advance to RAFT_ADDING, got %s", got.OpState)
@@ -266,8 +274,8 @@ func TestC4DriveNoOpOnEmpty(t *testing.T) {
 	n, _ := d7SingleNode(t, "ctl-1")
 	admin := NewClusterAdmin(n, nil)
 	before, _ := n.AppliedIndex()
-	admin.driveInFlightOperations()
-	admin.driveInFlightOperations()
+	admin.DriveInFlightOperations()
+	admin.DriveInFlightOperations()
 	after, _ := n.AppliedIndex()
 	if after != before {
 		t.Fatalf("driving zero operations must write nothing: applied %d -> %d", before, after)
@@ -287,8 +295,12 @@ func TestC4DriveNoOpOnEmpty(t *testing.T) {
 // AddVoter — every one of which succeeded on the next tick and moved the op FORWARD —
 // was one flake away from BLOCKED, reported against whichever step happened to be fifth.
 func TestTheRetryBudgetCountsFailuresPerStepNotPerOperation(t *testing.T) {
+	// origin: hot-update S10 plan §11.1 / TEST-BUDGET
+	if runIsolatedBrokerTest(t) {
+		return
+	}
 	n, _ := d7SingleNode(t, "br-1")
-	a := &ClusterAdmin{node: n, logger: silentLogger(), now: time.Now}
+	a := &ClusterAdmin{Node: n, Logger: silentLogger(), Now: time.Now}
 	op := &cluster.Operation{OpID: "op-1", Kind: cluster.OpKindJoin, OpState: cluster.OpStateJoinProofVerified}
 
 	// Four DIFFERENT steps each fail once — the shape of a flaky cluster, not of a
@@ -296,41 +308,41 @@ func TestTheRetryBudgetCountsFailuresPerStepNotPerOperation(t *testing.T) {
 	for _, step := range []string{
 		"AddNonvoter", "converge client seeds after join", "release cluster-add grow lock", "AddVoter (promote)",
 	} {
-		a.blockAfterAttempts(op, step, errors.New("transient"))
+		a.BlockAfterAttempts(op, step, errors.New("transient"))
 	}
 	for _, step := range []string{
 		"AddNonvoter", "converge client seeds after join", "release cluster-add grow lock", "AddVoter (promote)",
 	} {
-		if got := a.opAttempts[opAttemptKey{opID: "op-1", step: step}]; got != 1 {
+		if got := a.OpAttempts[opAttemptKey{OpID: "op-1", Step: step}]; got != 1 {
 			t.Fatalf("step %q has %d recorded failures, want 1 — the counter is not per step", step, got)
 		}
 	}
 	// A fifth distinct step failing once must STILL not exhaust anything.
-	a.blockAfterAttempts(op, "read topology generation", errors.New("transient"))
-	for k, n := range a.opAttempts {
+	a.BlockAfterAttempts(op, "read topology generation", errors.New("transient"))
+	for k, n := range a.OpAttempts {
 		if n >= opMaxAttempts {
 			t.Fatalf("step %q reached the %d-attempt ceiling after ONE failure.\n\n"+
 				"Five different steps failing once each is a flaky cluster, and each of them "+
 				"succeeded on retry and moved the op forward. Blocking there tells an operator to "+
-				"go fix a step that is not broken.", k.step, opMaxAttempts)
+				"go fix a step that is not broken.", k.Step, opMaxAttempts)
 		}
 	}
 
 	// ...while a step that really is wedged still reaches the ceiling.
 	for i := 0; i < opMaxAttempts; i++ {
-		a.blockAfterAttempts(op, "AddNonvoter", errors.New("wedged"))
+		a.BlockAfterAttempts(op, "AddNonvoter", errors.New("wedged"))
 	}
-	if got := a.opAttempts[opAttemptKey{opID: "op-1", step: "AddNonvoter"}]; got < opMaxAttempts {
+	if got := a.OpAttempts[opAttemptKey{OpID: "op-1", Step: "AddNonvoter"}]; got < opMaxAttempts {
 		t.Fatalf("a genuinely wedged step recorded only %d failures, want >= %d — the bound is gone",
 			got, opMaxAttempts)
 	}
 
 	// And a clear forgets EVERY step of the op, not just one.
-	a.clearOpAttempts("op-1")
-	if len(a.opAttempts) != 0 {
+	a.ClearOpAttempts("op-1")
+	if len(a.OpAttempts) != 0 {
 		t.Fatalf("clearOpAttempts left %d step counter(s) behind: %v.\n\n"+
 			"They are keyed by (op, step) now, so deleting a single key would leave an operation "+
 			"an operator just confirmed carrying the budget it had already spent.",
-			len(a.opAttempts), a.opAttempts)
+			len(a.OpAttempts), a.OpAttempts)
 	}
 }

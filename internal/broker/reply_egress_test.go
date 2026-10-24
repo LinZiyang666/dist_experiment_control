@@ -11,6 +11,7 @@ package broker
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -22,7 +23,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/LinZiyang666/tether/internal/controlbudget"
 	"github.com/LinZiyang666/tether/internal/proto"
+	"github.com/LinZiyang666/tether/internal/xfercontract"
+	"github.com/LinZiyang666/tether/internal/xferforward"
 	natstest "github.com/nats-io/nats-server/v2/test"
 	"github.com/nats-io/nats.go"
 )
@@ -65,11 +69,13 @@ func TestReplyEgressSingleChokePoint(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := map[string]int{}
+	files := 0
 	for _, e := range entries {
 		name := e.Name()
 		if !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
 			continue
 		}
+		files++
 		f, err := parser.ParseFile(fset, filepath.Clean(name), nil, 0)
 		if err != nil {
 			t.Fatalf("parse %s: %v", name, err)
@@ -93,6 +99,9 @@ func TestReplyEgressSingleChokePoint(t *testing.T) {
 			})
 		}
 	}
+	// A receipt of what the census actually saw, so a change in scan coverage
+	// (fewer files, a moved site) is visible in -v output and not only as red.
+	t.Logf("reply-egress census: %d production file(s) scanned; sites %v", files, got)
 	for fnName, n := range got {
 		if allowed[fnName] != n {
 			t.Errorf("bare reply-egress census (Respond/RespondMsg): function %q has %d site(s), pinned %d — "+
@@ -258,5 +267,88 @@ func TestRespondLoggedClosedConnIsWarn(t *testing.T) {
 	levels := rec.levels()
 	if len(levels) != 1 || levels[0] != slog.LevelWarn {
 		t.Fatalf("closed-conn reply drop logged as %v, want exactly one WARN", levels)
+	}
+}
+
+// TestTransferForwardOversizeReplyIsTypedNotSilent drives the S7 transfer
+// forwarding responder (SubscribeTransferClusterForward) end to end against a
+// server with a tiny max_payload. Its reply used to leave through a bare
+// `_ = msg.Respond(raw)`, the exact pre-h1 shape: an oversize seal/census/probe
+// reply vanished and the forwarding client saw only its own timeout. Through
+// the choke point the client must receive the typed reply_too_large refusal
+// well inside its budget, and the broker must log it at ERROR.
+// origin: docs/reviews/h1-plan.md workstream A2; hot-update S7 plan §6.3 / T39
+func TestTransferForwardOversizeReplyIsTypedNotSilent(t *testing.T) {
+	opts := natstest.DefaultTestOptions
+	opts.Port = -1
+	opts.MaxPayload = 1024
+	ns := natstest.RunServer(&opts)
+	defer func() {
+		ns.Shutdown()
+		ns.WaitForShutdown()
+	}()
+	if !ns.ReadyForConnections(2 * time.Second) {
+		t.Fatal("embedded nats-server not ready")
+	}
+	ncOwner, err := nats.Connect(ns.ClientURL())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ncOwner.Close()
+	ncClient, err := nats.Connect(ns.ClientURL())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ncClient.Close()
+
+	rec := &levelRecorder{}
+	node := nonLeaderNode(t, "origin-1")
+	origin := xfercontract.Origin{BrokerID: node.SelfID(), InstanceID: "instance", BootID: "boot", Generation: 1}
+	owner, err := SubscribeTransferClusterForward(ncOwner, TransferClusterForwardConfig{
+		Node: node, Origin: origin, Logger: slog.New(rec),
+		Probe: func(controlbudget.Deadline) (xfercontract.ProbeResult, error) {
+			// A probe answer larger than the server's max_payload.
+			return xfercontract.ProbeResult{InstanceID: strings.Repeat("x", 4096)}, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		deadline, derr := controlbudget.After(2 * time.Second)
+		if derr != nil {
+			t.Error(derr)
+			return
+		}
+		if serr := StopTransferClusterForward(owner, deadline); serr != nil {
+			t.Error(serr)
+		}
+	}()
+	if err := ncOwner.Flush(); err != nil {
+		t.Fatal(err)
+	}
+
+	const budget = 3 * time.Second
+	deadline, err := controlbudget.After(budget)
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	_, err = xferforward.RPC(&xferforward.Client{NC: ncClient, Timeout: budget}, VerbTransferProbe,
+		xferforward.Request{Origin: origin}, deadline)
+	var refusal *xferforward.Refusal
+	if !errors.As(err, &refusal) || refusal.Kind != proto.CodeReplyTooLarge {
+		t.Fatalf("oversize forwarding reply reached the client as %v; want the typed %s refusal "+
+			"(a timeout here is the silent bare-Respond shape)", err, proto.CodeReplyTooLarge)
+	}
+	if elapsed := time.Since(start); elapsed >= budget {
+		t.Fatalf("typed refusal arrived only after the client's whole budget (%s)", elapsed)
+	}
+	sawError := false
+	for _, lv := range rec.levels() {
+		sawError = sawError || lv == slog.LevelError
+	}
+	if !sawError {
+		t.Fatal("oversize forwarding reply produced no ERROR log")
 	}
 }

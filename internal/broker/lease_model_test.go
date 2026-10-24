@@ -21,12 +21,11 @@ package broker
 //   - Time is the INJECTED clock (Config.Now), which B3 made the lease path honour end to end;
 //     heartbeats are written at model time, so "the predecessor has been silent for 11s" is one
 //     Advance(11s), not an 11-second test. The probe budgets are real wall-clock waits inside NATS
-//     Request. The BACKGROUND budget (3s) is replaced through the backgroundProbeBudgetOverride seam
-//     in the random walk only — the two B5 scenarios run at the real budget because their timing is
-//     the point. With the seam a "silent subscriber" step (interest on the name that never answers:
-//     a dying process the server has not reaped) costs ~70ms, so the walk can afford the one event
-//     that forces the background probe, the verdict cache and the silence rule. The first version
-//     excluded it and ran the background probe zero times in 480 steps (internal review L2-F1).
+//     Request and use the production background budget. Shortening it to 45ms made a healthy local
+//     responder indistinguishable from a dead holder during a loaded race run (S5 integration,
+//     seed 44). Silent-subscriber steps still force the background probe, verdict cache and
+//     silence rule; cleanup joins their workers before closing the real bus. The first version
+//     excluded them and ran the background probe zero times in 480 steps (internal review L2-F1).
 //   - registerNode's side effect (the nodes row / heartbeat the real handler writes after a grant)
 //     is replayed by the model after EVERY grant, because adjudicateLease alone reads that row and
 //     never writes it. For a suffixed grant the contested register itself writes nothing (broker.go:
@@ -89,12 +88,14 @@ package broker
 import (
 	"fmt"
 	"math/rand"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/proto"
+	"github.com/LinZiyang666/tether/internal/testharness"
 	"github.com/nats-io/nats.go"
 )
 
@@ -154,18 +155,21 @@ func newLeaseModel(t *testing.T) *leaseModel {
 	b, _, url := leaseBrokerWithBus(t)
 	clock := &leaseClock{t: time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)}
 	b.cfg.Now = clock.Now
+	// origin: hot-update S5 integration I5 / docs/testing-standards.md T1, T6
+	// A register can finish inline while an earlier background probe is still
+	// waiting. Join that worker before leaseBrokerWithBus closes its bus and DB.
+	t.Cleanup(func() {
+		if !testharness.WaitFor(t, backgroundProbeBudget+time.Second, 10*time.Millisecond, func() bool {
+			busy := false
+			b.probeInFlight.Range(func(_, _ any) bool { busy = true; return false })
+			return !busy
+		}) {
+			t.Error("lease model background probe did not finish before teardown")
+		}
+	})
 	return &leaseModel{t: t, b: b, url: url, clock: clock,
 		live: map[string]*nats.Conn{}, liveName: map[string]string{}, name: map[string]string{},
 		lastRegister: map[string]time.Time{}}
-}
-
-// newFastLeaseModel is newLeaseModel with the background probe budget shortened through the seam
-// (restored on Cleanup). Used by the random walk only; the B5 scenarios run at the real budget.
-func newFastLeaseModel(t *testing.T) *leaseModel {
-	t.Helper()
-	backgroundProbeBudgetOverride.Store(int64(inlineProbeGrace * 3))
-	t.Cleanup(func() { backgroundProbeBudgetOverride.Store(0) })
-	return newLeaseModel(t)
 }
 
 func (m *leaseModel) trace(format string, args ...any) {
@@ -317,7 +321,7 @@ func (m *leaseModel) silentSubscriber() func() {
 }
 
 // silentThenRegister is the walk's B5-shaped step: silent interest appears, `inst` registers into
-// it (inline probe times out → background probe under the seam's budget → verdict cached), and the
+// it (inline probe times out → background probe → verdict cached), and the
 // interest is removed while that probe is in flight. Returns the granted name.
 func (m *leaseModel) silentThenRegister(inst string) string {
 	m.t.Helper()
@@ -330,10 +334,20 @@ func (m *leaseModel) silentThenRegister(inst string) string {
 	return m.register(inst)
 }
 
-// waitBackgroundProbe blocks (wall clock) until a background probe launched just now has certainly
-// finished and stored its verdict, whatever budget is in force.
+// waitBackgroundProbe observes both publication and worker completion. A full
+// budget sleep needlessly waits after an early answer and cannot prove the
+// publication happened on a slow host.
+// origin: hot-update S5 plan §8 / docs/testing-standards.md T1, T7
 func (m *leaseModel) waitBackgroundProbe() {
-	time.Sleep(effectiveBackgroundProbeBudget() + 2*inlineProbeGrace + 300*time.Millisecond)
+	m.t.Helper()
+	key := leaseKey("lab", leaseModelBase)
+	if !testharness.WaitFor(m.t, effectiveBackgroundProbeBudget()+2*inlineProbeGrace+time.Second, time.Millisecond, func() bool {
+		_, cached := m.b.probeCache.Load(key)
+		_, busy := m.b.probeInFlight.Load(key)
+		return cached && !busy
+	}) {
+		m.fail("background probe did not publish its verdict and finish")
+	}
 }
 
 // deadPredecessor seeds a nodes row whose last beat is older than the grace: "the previous holder
@@ -570,9 +584,18 @@ func TestLeaseModelReplayWindowWhenTheIncumbentSubscribesLate(t *testing.T) {
 // Random walk.
 
 func TestLeaseModelRandomSequencesHoldTheInvariants(t *testing.T) {
-	// plan B3's 60×20. Each silent step costs ~70ms of wall clock at the seam's budget (at most one
-	// per sequence); every other step is milliseconds; a fresh broker + embedded NATS per sequence
-	// is the rest. ~8s on the maintainer's box.
+	// origin: hot-update S10 plan §11.1 / TEST-BUDGET
+	if runIsolatedBrokerTest(t) {
+		return
+	}
+	beforeG, beforeFD := runtime.NumGoroutine(), testharness.FDCount()
+	// origin: hot-update S5 integration I5 / docs/testing-standards.md T1, T6
+	// A live answer beyond the former test-only budget must still prevent a
+	// collision, just as it does with the production three-second budget.
+	for round := 0; round < 5; round++ {
+		t.Run(fmt.Sprintf("delayed-answer-%d", round), func(t *testing.T) { exerciseLeaseModelDelayedProbe(t) })
+	}
+	// plan B3's 60×20, including at most one silent-subscriber step per seed.
 	const sequences, steps = 60, 20
 	advances := []time.Duration{100 * time.Millisecond, time.Second, 3 * time.Second,
 		leaseGrantWindow + time.Second, probeTTL + time.Second}
@@ -583,62 +606,81 @@ func TestLeaseModelRandomSequencesHoldTheInvariants(t *testing.T) {
 	// emissions are the wrong measure: 480 steps emitted crash ~70 times and closed a live
 	// connection 5 times, because a random instance is rarely eligible. The generator therefore
 	// offers each state-dependent event to the instances in random order and takes the first that
-	// is eligible. Subtests run sequentially.
+	// is eligible. Each seed owns its DB, bus, clock and model; bounded batches
+	// may run concurrently without sharing product state. Each batch joins all
+	// subtest cleanups before the leak assertions below.
 	effects := map[string]int{}
-	for seed := int64(1); seed <= sequences; seed++ {
-		t.Run(fmt.Sprintf("seed=%d", seed), func(t *testing.T) {
-			m := newFastLeaseModel(t)
-			m.seed = seed
-			r := rand.New(rand.NewSource(seed))
-			usedSilent := false
-			defer func() {
-				for inst, c := range m.live {
-					if c != nil {
-						c.Close()
-						delete(m.live, inst)
+	// origin: hot-update S5 plan §8 / docs/testing-standards.md T4, T6
+	// Keep real production probe budgets. Six independent fixtures overlap their
+	// waits without starting sixty embedded servers together in a matrix worker.
+	const batchSize = 6
+	var effectsMu sync.Mutex
+	for first := int64(1); first <= sequences; first += batchSize {
+		t.Run(fmt.Sprintf("seeds-%d", first), func(t *testing.T) {
+			for seed := first; seed < first+batchSize && seed <= sequences; seed++ {
+				t.Run(fmt.Sprintf("seed=%d", seed), func(t *testing.T) {
+					t.Parallel()
+					localEffects := map[string]int{}
+					defer func() {
+						effectsMu.Lock()
+						defer effectsMu.Unlock()
+						for kind, count := range localEffects {
+							effects[kind] += count
+						}
+					}()
+					m := newLeaseModel(t)
+					m.seed = seed
+					r := rand.New(rand.NewSource(seed))
+					usedSilent := false
+					defer func() {
+						for inst, c := range m.live {
+							if c != nil {
+								c.Close()
+								delete(m.live, inst)
+							}
+						}
+					}()
+					// candidates returns the instances in a seeded random order.
+					candidates := func() []string {
+						out := append([]string(nil), leaseModelInstances...)
+						r.Shuffle(len(out), func(i, j int) { out[i], out[j] = out[j], out[i] })
+						return out
 					}
-				}
-			}()
-			// candidates returns the instances in a seeded random order.
-			candidates := func() []string {
-				out := append([]string(nil), leaseModelInstances...)
-				r.Shuffle(len(out), func(i, j int) { out[i], out[j] = out[j], out[i] })
-				return out
-			}
-			firstEligible := func(kind string, try func(string) bool) {
-				for _, inst := range candidates() {
-					if try(inst) {
-						effects[kind]++
-						return
+					firstEligible := func(kind string, try func(string) bool) {
+						for _, inst := range candidates() {
+							if try(inst) {
+								localEffects[kind]++
+								return
+							}
+						}
+						localEffects[kind+"-ineligible"]++
 					}
-				}
-				effects[kind+"-ineligible"]++
-			}
-			for i := 0; i < steps; i++ {
-				switch p := r.Intn(100); {
-				case p < 30:
-					inst := leaseModelInstances[r.Intn(len(leaseModelInstances))]
-					if _, b5 := m.registerAndCheck(inst); b5 {
-						effects["b5-skip"]++
-						return
+					for i := 0; i < steps; i++ {
+						switch p := r.Intn(100); {
+						case p < 30:
+							inst := leaseModelInstances[r.Intn(len(leaseModelInstances))]
+							if _, b5 := m.registerAndCheck(inst); b5 {
+								localEffects["b5-skip"]++
+								return
+							}
+							localEffects["register"]++
+						case p < 50:
+							firstEligible("subscribe", m.subscribe)
+						case p < 62:
+							firstEligible("crash", m.crash)
+						case p < 77:
+							firstEligible("beat", m.beat)
+						case p < 85 && !usedSilent:
+							// One silent step opens the cache / silence-rule paths for the sequence.
+							usedSilent = true
+							m.silentThenRegister(leaseModelInstances[r.Intn(len(leaseModelInstances))])
+							localEffects["silent"]++
+						default:
+							m.advance(advances[r.Intn(len(advances))])
+							localEffects["advance"]++
+						}
 					}
-					effects["register"]++
-				case p < 50:
-					firstEligible("subscribe", m.subscribe)
-				case p < 62:
-					firstEligible("crash", m.crash)
-				case p < 77:
-					firstEligible("beat", m.beat)
-				case p < 85 && !usedSilent:
-					// At most one per sequence: the step is ~70ms of wall clock, and one is enough
-					// to open the cache / silence-rule paths for the rest of the sequence.
-					usedSilent = true
-					m.silentThenRegister(leaseModelInstances[r.Intn(len(leaseModelInstances))])
-					effects["silent"]++
-				default:
-					m.advance(advances[r.Intn(len(advances))])
-					effects["advance"]++
-				}
+				})
 			}
 		})
 	}
@@ -649,4 +691,21 @@ func TestLeaseModelRandomSequencesHoldTheInvariants(t *testing.T) {
 		}
 	}
 	t.Logf("walk effects: %v", effects)
+	testharness.AssertNoGoroutineLeak(t, "lease model probe lifetime", beforeG)
+	testharness.AssertNoFDLeak(t, "lease model probe lifetime", beforeFD, 2)
+}
+
+// origin: hot-update S5 integration I5 / docs/testing-standards.md T1
+func exerciseLeaseModelDelayedProbe(t *testing.T) {
+	t.Helper()
+	m := newLeaseModel(t)
+	m.register(testInstanceA)
+	// Two former 45ms budgets model a scheduling delay that is comfortably
+	// within the production budget. The first inline request queues ahead of
+	// the background request on the real NATS subscription.
+	claimProbeResponder(t, m.url, "lab", leaseModelBase, testInstanceA, 6*inlineProbeGrace)
+	m.advance(leaseSubscribeSettle + time.Second)
+	if name := m.register(testInstanceB); name == leaseModelBase {
+		m.fail("I1 violated: a delayed live holder lost its name to a second instance")
+	}
 }

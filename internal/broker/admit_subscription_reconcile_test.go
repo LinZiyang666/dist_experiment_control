@@ -4,6 +4,8 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -17,7 +19,7 @@ import (
 // Every other test in this batch starts from a list the TEST wrote down. admit_test.go compares
 // the spec table against verb strings typed into itself; admit_ordering_test.go parses the
 // handler files; ingress_characterization_test.go builds its own subjects and subscribes its own
-// callback, bypassing broker.go's subscription table entirely.
+// callback, bypassing the broker subscription tables entirely.
 //
 // So the one thing none of them can see is a verb that is SUBSCRIBED but never gated. Rename the
 // `.expose-rm.req` subscription, or add a new session-scoped ctl verb whose handler forgets
@@ -29,7 +31,7 @@ import (
 // fresh nodes row." The gate is the system's only runtime revocation point for 24h auth_callout
 // JWTs, so a verb that skips it has no other backstop.
 //
-// This test therefore derives the truth from broker.go's actual subscription literal and requires
+// This test therefore derives the truth from the broker owners' actual subscription literals and requires
 // every session-scoped ctl verb to be either gated by a verbSpec or explicitly listed below with
 // a reason.
 
@@ -62,17 +64,18 @@ var ungatedSubscriptionLeaves = map[string]string{
 	"register":       "agent, not a session member: IsActive is the FIFTH check and runs AFTER proto_mismatch. Hoisting it would reclassify a proto-skewed agent as session_not_found_or_deleting and hide the one string that says 'reinstall, do not upgrade'.",
 }
 
-// TestEverySubscribedVerbIsGatedOrExempt reconciles broker.go's subscription table against the
+// TestEverySubscribedVerbIsGatedOrExempt reconciles the broker subscription tables against the
 // verbSpec table.
+// origin: S7 internal review BROKER-REDS F1; hot-update S8 plan §2.2 / §7.2
 func TestEverySubscribedVerbIsGatedOrExempt(t *testing.T) {
 	leaves := subscribedCtlVerbs(t)
 	if len(leaves) < 12 {
-		t.Fatalf("extracted only %d session-scoped subscription leaf/leaves from broker.go — the "+
+		t.Fatalf("extracted only %d session-scoped subscription leaf/leaves from the broker owners — the "+
 			"scan is broken, and a broken scan reports every verb gated", len(leaves))
 	}
 
 	gated := map[string]bool{}
-	for _, s := range []verbSpec{execSpec, runSpec, killSpec, exposeSpec, exposeRmSpec, upgradeSpec} {
+	for _, s := range []verbSpec{execSpec, runSpec, killSpec, exposeSpec, exposeRmSpec, upgradeSpec, upgradeTxSpec, processResumeSpec, processResumeAttachSpec} {
 		gated[s.verb] = true
 	}
 
@@ -82,7 +85,7 @@ func TestEverySubscribedVerbIsGatedOrExempt(t *testing.T) {
 		}
 		reason, exempt := ungatedSubscriptionLeaves[leaf]
 		if !exempt {
-			t.Errorf("broker.go subscribes %q but nothing gates it: there is no verbSpec for it and "+
+			t.Errorf("the broker owners subscribe %q but nothing gates it: there is no verbSpec for it and "+
 				"no entry in ungatedSubscriptionLeaves.\n"+
 				"A session-scoped verb reachable on the wire with no session/membership check has no "+
 				"backstop — auth_callout JWTs live 24h with no revocation list, and this gate is the "+
@@ -104,7 +107,7 @@ func TestEverySubscribedVerbIsGatedOrExempt(t *testing.T) {
 	}
 	for leaf := range ungatedSubscriptionLeaves {
 		if !present[leaf] {
-			t.Errorf("ungatedSubscriptionLeaves exempts %q, which broker.go no longer subscribes — "+
+			t.Errorf("ungatedSubscriptionLeaves exempts %q, which the broker owners no longer subscribe — "+
 				"delete it", leaf)
 		}
 	}
@@ -112,14 +115,14 @@ func TestEverySubscribedVerbIsGatedOrExempt(t *testing.T) {
 	// And every gated verb must actually BE subscribed, else a spec is pointing at nothing.
 	for verb := range gated {
 		if !present[verb] {
-			t.Errorf("verbSpec %q has no subscription in broker.go — either the subject was renamed "+
+			t.Errorf("verbSpec %q has no subscription in the broker owners — either the subject was renamed "+
 				"(in which case the verb is now unreachable) or the spec is dead", verb)
 		}
 	}
 }
 
 // subscribedCtlVerbs extracts the session-scoped ctl verb from every subscription subject in
-// broker.go's table. Two shapes carry them:
+// the broker owners' tables. Two shapes carry them:
 //
 //	…s.*.cmd.by.*.node.*.<verb>.req      — the per-node command family
 //	…ctrl.by.*.s.*.<verb…>.req           — the session-scoped ctl family (verb may be dotted)
@@ -128,10 +131,26 @@ func TestEverySubscribedVerbIsGatedOrExempt(t *testing.T) {
 // not ingress commands and are skipped.
 func subscribedCtlVerbs(t *testing.T) []string {
 	t.Helper()
-	fset := token.NewFileSet()
-	f, err := parser.ParseFile(fset, "broker.go", nil, 0)
-	if err != nil {
-		t.Fatalf("parse broker.go: %v", err)
+	// Keep the original owner and include the extracted controller. The shared
+	// cold/image business table now lives in reexec.go, rather than broker.go.
+	// origin: hot-update S6 plan §6.3 / HARDGATE-A
+	var files []*ast.File
+	for _, dir := range []string{".", "../brokercontrol"} {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, entry := range entries {
+			if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".go") || strings.HasSuffix(entry.Name(), "_test.go") {
+				continue
+			}
+			path := filepath.Join(dir, entry.Name())
+			file, err := parser.ParseFile(token.NewFileSet(), path, nil, 0)
+			if err != nil {
+				t.Fatalf("parse %s: %v", path, err)
+			}
+			files = append(files, file)
+		}
 	}
 
 	var out []string
@@ -143,38 +162,40 @@ func subscribedCtlVerbs(t *testing.T) []string {
 		}
 	}
 
-	ast.Inspect(f, func(n ast.Node) bool {
-		lit, ok := n.(*ast.BasicLit)
-		if !ok || lit.Kind != token.STRING {
-			return true
-		}
-		s, err := strconv.Unquote(lit.Value)
-		if err != nil || !strings.HasSuffix(s, ".req") {
-			return true
-		}
-		body := strings.TrimSuffix(s, ".req")
-		switch {
-		case strings.Contains(body, ".cmd.by.*.node.*."):
-			add(body[strings.LastIndex(body, ".node.*.")+len(".node.*."):])
-		case strings.Contains(body, ".ctrl.by.*.s.*."):
-			leaf := body[strings.Index(body, ".ctrl.by.*.s.*.")+len(".ctrl.by.*.s.*."):]
-			// `transfer.*.finalize` -> `finalize`; `proxy.sub.create` -> `proxy.sub`.
-			leaf = strings.ReplaceAll(leaf, "*.", "")
-			if strings.HasPrefix(leaf, "transfer") {
-				leaf = leaf[strings.LastIndex(leaf, ".")+1:]
-			} else if strings.HasPrefix(leaf, "proxy.sub") {
-				leaf = "proxy.sub"
+	for _, file := range files {
+		ast.Inspect(file, func(n ast.Node) bool {
+			lit, ok := n.(*ast.BasicLit)
+			if !ok || lit.Kind != token.STRING {
+				return true
 			}
-			add(leaf)
-		case strings.Contains(body, ".node.*.register"):
-			add("register")
-		case strings.Contains(body, ".ctrl.by.*.session."):
-			// `session.create` / `session.list` / `session.*.rm`
-			leaf := body[strings.Index(body, ".ctrl.by.*.session.")+len(".ctrl.by.*."):]
-			add(strings.ReplaceAll(leaf, "*.", ""))
-		}
-		return true
-	})
+			s, err := strconv.Unquote(lit.Value)
+			if err != nil || !strings.HasSuffix(s, ".req") {
+				return true
+			}
+			body := strings.TrimSuffix(s, ".req")
+			switch {
+			case strings.Contains(body, ".cmd.by.*.node.*."):
+				add(body[strings.LastIndex(body, ".node.*.")+len(".node.*."):])
+			case strings.Contains(body, ".ctrl.by.*.s.*."):
+				leaf := body[strings.Index(body, ".ctrl.by.*.s.*.")+len(".ctrl.by.*.s.*."):]
+				// `transfer.*.finalize` -> `finalize`; `proxy.sub.create` -> `proxy.sub`.
+				leaf = strings.ReplaceAll(leaf, "*.", "")
+				if strings.HasPrefix(leaf, "transfer") {
+					leaf = leaf[strings.LastIndex(leaf, ".")+1:]
+				} else if strings.HasPrefix(leaf, "proxy.sub") {
+					leaf = "proxy.sub"
+				}
+				add(leaf)
+			case strings.Contains(body, ".node.*.register"):
+				add("register")
+			case strings.Contains(body, ".ctrl.by.*.session."):
+				// `session.create` / `session.list` / `session.*.rm`
+				leaf := body[strings.Index(body, ".ctrl.by.*.session.")+len(".ctrl.by.*."):]
+				add(strings.ReplaceAll(leaf, "*.", ""))
+			}
+			return true
+		})
+	}
 	return out
 }
 
@@ -182,6 +203,7 @@ func subscribedCtlVerbs(t *testing.T) []string {
 // an extractor that silently matched nothing would report every subscribed verb gated.
 func TestSubscriptionScanSelfCheck(t *testing.T) {
 	leaves := subscribedCtlVerbs(t)
+	t.Logf("unique subscribed ctl verbs across broker and brokercontrol: %d", len(leaves))
 	got := map[string]bool{}
 	for _, l := range leaves {
 		got[l] = true
@@ -191,6 +213,7 @@ func TestSubscriptionScanSelfCheck(t *testing.T) {
 	for _, want := range []string{
 		"exec",           // .cmd.by.*.node.*.<verb>.req
 		"expose-rm",      // same shape, hyphenated verb
+		"process-resume", // reliable process operations
 		"ps",             // .ctrl.by.*.s.*.<verb>.req
 		"caps",           // same shape
 		"finalize",       // .ctrl.by.*.s.*.transfer.*.<verb>.req

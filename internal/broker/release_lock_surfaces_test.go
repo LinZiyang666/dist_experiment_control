@@ -53,7 +53,7 @@ func TestExternalReviewUpgradeLockFreezesExistingMembershipOps(t *testing.T) {
 		t.Fatalf("set upgrade lock: %v", err)
 	}
 
-	admin.driveInFlightOperations()
+	admin.DriveInFlightOperations()
 	got, _ := cluster.OperationByID(n.RODB(), "op-existing-join")
 	if got == nil || got.OpState != cluster.OpStateRosterCommitted {
 		t.Fatalf("upgrade lock must freeze existing membership op at ROSTER_COMMITTED, got %+v", got)
@@ -71,7 +71,7 @@ func TestExternalReviewSocketStatusSurfacesPeerJSUnavailable(t *testing.T) {
 		t.Fatalf("AddNode: %v", err)
 	}
 	admin.SetJSUnavailFn(func() bool { return false })
-	admin.healthPoll = func() map[string]proto.ClusterHealthResp {
+	admin.HealthPoll = func() map[string]proto.ClusterHealthResp {
 		return map[string]proto.ClusterHealthResp{
 			"brk-a": {NodeID: "brk-a", JetStreamUnavailable: true},
 		}

@@ -205,6 +205,10 @@ func TestMeshPeerTriples(t *testing.T) {
 // must never report AlreadyDone nor fall through to the Stage-B restart, either of which would carry a stale
 // single-node JS meta into the 1->2 grow and wedge it.
 func TestPerformGrowCutoverRefusesRecoveredResidue(t *testing.T) {
+	// origin: hot-update S10 plan §11.1 / TEST-BUDGET
+	if runIsolatedBrokerTest(t) {
+		return
+	}
 	b := newCutoverTestBroker(t)
 	b.cfg.Logger = silentLogger()
 	n, _ := d7SingleNode(t, "brk-a")

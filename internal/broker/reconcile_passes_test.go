@@ -3,14 +3,13 @@ package broker
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
+	"sort"
+	"strings"
 	"sync"
 	"testing"
 	"time"
-
-	"errors"
-	"sort"
-	"strings"
 
 	"github.com/LinZiyang666/tether/internal/cluster"
 	"github.com/LinZiyang666/tether/internal/jsstream"
@@ -19,6 +18,7 @@ import (
 	"github.com/LinZiyang666/tether/internal/proto"
 	"github.com/LinZiyang666/tether/internal/storage"
 	"github.com/LinZiyang666/tether/internal/testharness"
+	"github.com/LinZiyang666/tether/internal/xfertrack"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 )
@@ -55,12 +55,7 @@ var passEpoch = time.Date(2026, 7, 18, 10, 0, 0, 0, time.UTC)
 
 func passTestDB(t *testing.T) *sql.DB {
 	t.Helper()
-	db, err := storage.Open(":memory:")
-	if err != nil {
-		t.Fatalf("storage.Open: %v", err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
-	return db
+	return openDB(t)
 }
 
 // seedLivenessFixture installs one session and three nodes whose last heartbeat
@@ -1168,18 +1163,18 @@ func TestPassXferOrphanReapIdempotence(t *testing.T) {
 // process that deletes in-flight tier-B payloads every five minutes.
 func TestXferOrphanReapLiveTransferGuard(t *testing.T) {
 	tr := newTransferTracker()
-	if code := tr.put(&transferEntry{transferID: "t1", sid: "lab", bucket: "xfer-lab"}); code != "" {
+	if code := putLegacyTransfer(tr, xfertrack.NewLegacyEntry(xfertrack.LegacyRecord{TransferID: "t1", SID: "lab", Bucket: "xfer-lab"})); code != "" {
 		t.Fatalf("put: %s", code)
 	}
-	active := tr.activeOBJStreams()
+	active := tr.ActiveOBJStreams()
 	if _, ok := active["OBJ_xfer-lab"]; !ok {
 		t.Fatalf("a live transfer's bucket must appear in the reaper's exclusion set, got %v", active)
 	}
 
 	// And once it finishes, the bucket stops being protected — otherwise the
 	// reaper could never collect anything and #58 would be "fixed" into a no-op.
-	tr.remove(tr.get("t1"))
-	if _, ok := tr.activeOBJStreams()["OBJ_xfer-lab"]; ok {
+	tr.Remove(tr.Get("t1"))
+	if _, ok := tr.ActiveOBJStreams()["OBJ_xfer-lab"]; ok {
 		t.Fatal("a completed transfer must leave the exclusion set, or the reaper can never collect")
 	}
 }
@@ -1256,7 +1251,7 @@ func TestXferOrphanReapPeriodicSafety(t *testing.T) {
 	put(liveStore, "in-flight-1")
 	// Register the transfer EXACTLY as the push/pull prepare handlers do: the
 	// entry carries its bucket and is in the tracker for the whole transfer.
-	if code := b.transfers.put(&transferEntry{transferID: "t-live", sid: "live-sess", bucket: "xfer-live-sess"}); code != "" {
+	if code := putLegacyTransfer(b.transfers, xfertrack.NewLegacyEntry(xfertrack.LegacyRecord{TransferID: "t-live", SID: "live-sess", Bucket: "xfer-live-sess"})); code != "" {
 		t.Fatalf("tracker put: %s", code)
 	}
 
@@ -1285,7 +1280,7 @@ func TestXferOrphanReapPeriodicSafety(t *testing.T) {
 	}
 
 	// --- drift: the transfer finishes and its object becomes collectable ---
-	b.transfers.remove(b.transfers.get("t-live"))
+	b.transfers.Remove(b.transfers.Get("t-live"))
 	if err := runPass(t, b, "xfer-orphan-reap", clk.advance(5*time.Minute)); err != nil {
 		t.Fatalf("post-completion tick: %v", err)
 	}
@@ -1357,7 +1352,7 @@ func TestXferCrossHomeGCSkipsBusyBucket(t *testing.T) {
 	seedHomedNode(t, db, "split", "sp1", "srv-A", "node-A")
 	seedHomedNode(t, db, "split", "sp2", "srv-B", "node-B")
 	putXferOrphan(ctx, t, js, "xfer-split", "obj")
-	if code := b.transfers.put(&transferEntry{transferID: "obj", sid: "split", nid: "sp1", verb: "pull", tier: "b", bucket: "xfer-split", startedAt: time.Now()}); code != "" {
+	if code := putLegacyTransfer(b.transfers, xfertrack.NewLegacyEntry(xfertrack.LegacyRecord{TransferID: "obj", SID: "split", NID: "sp1", Verb: "pull", Tier: "b", Bucket: "xfer-split", StartedAt: time.Now()})); code != "" {
 		t.Fatalf("put live: %s", code)
 	}
 
@@ -1770,18 +1765,18 @@ func TestXferReapAfterRestartPreservesLedgerBackedLiveObject(t *testing.T) {
 
 	// Persist exactly the record the prepare path writes, then model the restarted process by leaving
 	// its new in-memory tracker empty. At +3m this transfer is still within its >=5m budget.
-	b.writeXferInflight(&transferEntry{
-		transferID: "tid-restart-live",
-		sid:        "restart-live",
-		nid:        "agent-1",
-		verb:       "push",
-		tier:       "b",
-		bucket:     "xfer-restart-live",
-		path:       "/dst",
-		size:       int64(len(payload)),
-		startedAt:  now,
-	})
-	if b.transfers.get("tid-restart-live") != nil {
+	b.writeXferInflight(xfertrack.NewLegacyEntry(xfertrack.LegacyRecord{
+		TransferID: "tid-restart-live",
+		SID:        "restart-live",
+		NID:        "agent-1",
+		Verb:       "push",
+		Tier:       "b",
+		Bucket:     "xfer-restart-live",
+		Path:       "/dst",
+		Size:       int64(len(payload)),
+		StartedAt:  now,
+	}))
+	if b.transfers.Get("tid-restart-live") != nil {
 		t.Fatal("restart fixture is invalid: the new process tracker must be empty")
 	}
 

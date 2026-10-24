@@ -53,6 +53,7 @@ func itoa(i int) string {
 func newTestAgent(t *testing.T, mounts []byte, dead map[string]bool) *Agent {
 	t.Helper()
 	a, err := New(Config{
+		Home:                 t.TempDir(),
 		NATSURL:              "nats://127.0.0.1:4222",
 		SID:                  "lab",
 		NID:                  "lab-1",

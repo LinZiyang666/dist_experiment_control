@@ -35,7 +35,7 @@ import (
 // not gated by anything in this file.
 
 func newSkewTestBackend() (*clusterAdminBackend, *ClusterAdmin) {
-	admin := &ClusterAdmin{logger: slog.Default(), issuedNonces: map[string]bool{}}
+	admin := &ClusterAdmin{Logger: slog.Default(), IssuedNonces: map[string]bool{}}
 	return &clusterAdminBackend{admin: admin}, admin
 }
 
@@ -57,7 +57,7 @@ func TestVersionSkewRejectBeforeNonceBurn(t *testing.T) {
 	}
 	// The single-use nonce must NOT have been burned by a rejected joiner — it is still claimable,
 	// so the operator can re-run `cluster add` with the SAME token after reinstalling the joiner.
-	if !admin.claimJoinNonce(nonce) {
+	if !admin.ClaimJoinNonce(nonce) {
 		t.Fatal("a version-skew reject must NOT burn the nonce (gate runs before claimJoinNonce)")
 	}
 }

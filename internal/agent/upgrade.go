@@ -1,325 +1,155 @@
-// Agent side of architecture J.4 (b) — `tether node upgrade`.
-//
-// Pre-conditions enforced by the broker (see broker/upgrade.go):
-// owner-only, URL allowlist, sha256 sanity, proto match. This file
-// re-checks the URL allowlist on the agent side as defense in
-// depth (J.4 § 安全约束: "agent 收到 url 后本地再验一次白名单"),
-// then downloads, verifies, and atomically replaces the running
-// binary. Restart is the supervisor's job (systemd unit Restart=
-// on-failure / setsid wrapper); architecture J.4 step 5 says the
-// agent disconnects NATS so the new process's G.1 reconcile picks
-// up the slack.
+// Agent upgrade entry adapters and register writers. Authorized cuts use the
+// S8 engine; v1 marker projection stays isolated from the transaction journal.
+// origin: hot-update S8 plan §3.3 / §4.2 / §11.2 P14.
 package agent
 
 import (
-	"archive/tar"
-	"bytes"
-	"compress/gzip"
 	"context"
-	"crypto/rand"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"fmt"
-	"io"
-	"net/http"
 	"os"
-	"os/exec"
-	"path/filepath"
-	"strings"
-	"syscall"
+	"runtime"
 	"time"
 
+	"github.com/LinZiyang666/tether/internal/agentboot"
+	"github.com/LinZiyang666/tether/internal/agentimage"
+	"github.com/LinZiyang666/tether/internal/agentupgrade"
+	"github.com/LinZiyang666/tether/internal/agentupgradeport"
+	"github.com/LinZiyang666/tether/internal/binaryupgrade"
+	"github.com/LinZiyang666/tether/internal/brokermaint"
+	"github.com/LinZiyang666/tether/internal/execsession"
+	"github.com/LinZiyang666/tether/internal/handoff"
+	"github.com/LinZiyang666/tether/internal/procrequest"
 	"github.com/LinZiyang666/tether/internal/proto"
+	"github.com/LinZiyang666/tether/internal/tunnel"
+	"github.com/LinZiyang666/tether/internal/upgradebudget"
+	"github.com/LinZiyang666/tether/internal/upgradelock"
+	"github.com/LinZiyang666/tether/internal/upgradetx"
+	"github.com/LinZiyang666/tether/internal/xfercontract"
+
 	"github.com/nats-io/nats.go"
 )
 
-// upgradeMaxTarballBytes caps the upgrade download size. v1 tether
-// release tarballs are ~10MiB; 64MiB gives 6× headroom while
-// preventing a malicious or misconfigured URL from OOM-ing the
-// agent (audit Sec F1: io.ReadAll has no size limit, `--all`
-// could OOM the entire fleet at once).
-const upgradeMaxTarballBytes = 64 * 1024 * 1024
-
-// defaultAgentURLAllowlist is the agent-side defense-in-depth
-// allowlist used when Config.UpgradeURLAllowlist is empty; the broker
-// ALWAYS double-gates the same allowlist, so this is belt-and-
-// suspenders for an attacker who somehow reached the forwarded
-// subject directly.
-var defaultAgentURLAllowlist = []string{
-	"https://github.com/LinZiyang666/dist_experiment_control/releases/",
-}
-
-// upgradeFetchTimeout bounds the HTTP GET round-trip. v1 ships
-// ~10MB binaries; 30s covers reasonable broadband + connection setup.
-const upgradeFetchTimeout = 30 * time.Second
-
 func (a *Agent) handleUpgradeForwarded(nc *nats.Conn, msg *nats.Msg) {
 	if msg.Reply == "" {
-		a.cfg.Logger.Warn("agent: upgrade.req.forwarded without Reply")
 		return
 	}
 	var req proto.UpgradeForwardedReq
 	if err := json.Unmarshal(msg.Data, &req); err != nil {
-		a.replyUpgradeForwarded(msg, proto.UpgradeForwardedResp{
-			Code: "json_parse", Error: err.Error(),
-		})
+		a.replyUpgradeForwarded(msg, proto.UpgradeForwardedResp{Code: "json_parse", Error: err.Error()})
 		return
 	}
-
-	// G5 #13: a co-located broker-host agent RE-EXECS the already-staged shared binary — it does NOT
-	// download/install (it cannot write the root-owned bin dir; staging is the privileged precondition).
 	if req.ReExecOnly {
-		a.handleReExecOnly(msg, req)
+		a.handleReExecOnly(msg, req, nc)
 		return
 	}
-	if leasedInstanceRefusesUpgrade(a) {
-		a.replyUpgradeForwarded(msg, proto.UpgradeForwardedResp{
-			Code:  "clone_family_upgrade_unsupported",
-			Error: "this process runs under an assigned lease name; rebuild the shared image instead of remotely replacing its upgrade-domain binary",
-		})
-		return
-	}
-
-	// origin: upgrade-safety internal review S2. One install at a time: the
-	// forwarded-message handler runs one goroutine per message, and the
-	// pending-marker entry gate below only sees markers that have already
-	// been WRITTEN — a second install arriving while the first is still
-	// downloading/smoking would pass the gate and clobber the prev slot.
-	if !a.upgradeInstallMu.TryLock() {
-		a.replyUpgradeForwarded(msg, proto.UpgradeForwardedResp{
-			Code:  "upgrade_in_progress",
-			Error: "another upgrade install is running on this agent right now; retry after it finishes",
-		})
-		return
-	}
-	defer a.upgradeInstallMu.Unlock()
-	// External review F1: the in-process TryLock above cannot exclude a
-	// SIBLING AGENT PROCESS sharing this binary path — the host-wide flock
-	// can. Non-blocking for the same reason as the TryLock: a loser replies
-	// upgrade_in_progress instead of queueing behind a ~35s download.
-	exePathForLock, lockErr := a.upgradeExePath()
-	if lockErr != nil {
-		a.replyUpgradeForwarded(msg, proto.UpgradeForwardedResp{Code: "self_path", Error: lockErr.Error()})
-		return
-	}
-	installErr := withUpgradeFileLock(exePathForLock, false, func() error {
-		a.handleUpgradeInstallLocked(msg, req, exePathForLock)
-		return nil
-	})
-	if errors.Is(installErr, errUpgradeLockBusy) {
-		a.replyUpgradeForwarded(msg, proto.UpgradeForwardedResp{
-			Code:  "upgrade_in_progress",
-			Error: "another agent process on this host is installing an upgrade of the shared binary; retry after it finishes",
-		})
-	} else if installErr != nil {
-		a.replyUpgradeForwarded(msg, proto.UpgradeForwardedResp{Code: "install_failed", Error: installErr.Error()})
-	}
+	a.handleUpgradeInstallLocked(msg)
 }
 
 func leasedInstanceRefusesUpgrade(a *Agent) bool {
 	return nidOf(a) != a.cfg.NID
 }
 
-// handleUpgradeInstallLocked is the install pipeline body, entered holding
-// BOTH the in-process install mutex and the host-wide upgrade flock.
-func (a *Agent) handleUpgradeInstallLocked(msg *nats.Msg, req proto.UpgradeForwardedReq, exePath string) {
-	// upgrade-safety plan §3.1 install entry gate: a pending marker means a
-	// prior upgrade staged its binary but has not committed or rolled back —
-	// installing over it would clobber the only known-good binary (the prev
-	// slot). Bounded: pending resolves at the register deadline, and a STALE
-	// pending marker (deadline passed with no process alive to resolve it —
-	// e.g. a failed install flip) stops blocking here so the operator can
-	// simply retry. A corrupt marker is idle (loud, never a block).
-	if m, merr := readUpgradeMarker(upgradeMarkerPath(exePath)); merr != nil {
-		a.cfg.Logger.Warn("agent: upgrade marker unreadable — treating as idle", "err", merr)
-	} else if m != nil && m.State == upgradeStatePending && a.upgradeNow().Before(m.Deadline) {
-		a.replyUpgradeForwarded(msg, proto.UpgradeForwardedResp{
-			Code: "upgrade_in_progress",
-			Error: fmt.Sprintf("an upgrade to %s is pending its register deadline (%s); retry after it commits or rolls back",
-				m.NewVersion, m.Deadline.UTC().Format(time.RFC3339)),
-		})
-		return
-	}
-
-	allow := a.cfg.UpgradeURLAllowlist
-	if len(allow) == 0 {
-		allow = defaultAgentURLAllowlist
-	}
-	if !urlAllowed(req.URL, allow) {
-		a.cfg.Logger.Warn("agent: upgrade URL rejected by local allowlist", "url", req.URL)
-		a.replyUpgradeForwarded(msg, proto.UpgradeForwardedResp{
-			Code:  "url_not_allowed_local",
-			Error: req.URL,
-		})
-		return
-	}
-
-	body, err := fetchURL(req.URL, upgradeFetchTimeout)
-	if err != nil {
-		// origin: line-2 §12 Y2. One code became three, because the three do not share a remedy: a
-		// non-2xx mirror and an oversize tarball will fail identically on every retry, while a
-		// transport or read error is exactly the kind that clears. Reporting all three as
-		// `download_failed` sent an unclassified code (exit 70), which docs/usage.md §9.13 instructs
-		// automation to retry — so `tether node upgrade` against a typo'd URL retried forever.
-		//
-		// Three literal branches rather than a `code` variable: the wire-code coverage gate resolves
-		// codes statically, so a variable here would become an "unresolved site" needing an exemption —
-		// and an exemption that can be avoided by writing the code out should not exist.
-		switch {
-		case errors.Is(err, ErrUpgradeHTTPStatus):
-			a.replyUpgradeForwarded(msg, proto.UpgradeForwardedResp{
-				Code: "download_http_status", Error: err.Error(),
-			})
-		case errors.Is(err, ErrUpgradeHTTPRetryable):
-			// origin: external review M1. Its own code rather than folding into download_failed: an
-			// operator reading "transport or read failure" for a 503 would look at the network, and the
-			// fleet loop needs to tell "skip this node" from "the mirror is down for everyone".
-			a.replyUpgradeForwarded(msg, proto.UpgradeForwardedResp{
-				Code: "download_http_retryable", Error: err.Error(),
-			})
-		case errors.Is(err, ErrUpgradeTooLarge):
-			a.replyUpgradeForwarded(msg, proto.UpgradeForwardedResp{
-				Code: "download_too_large", Error: err.Error(),
-			})
-		default:
-			a.replyUpgradeForwarded(msg, proto.UpgradeForwardedResp{
-				Code: "download_failed", Error: err.Error(),
-			})
-		}
-		return
-	}
-	got := sha256OfBytes(body)
-	if got != strings.ToLower(req.SHA256) {
-		a.cfg.Logger.Warn("agent: upgrade sha256 mismatch",
-			"want", req.SHA256, "got", got, "url", req.URL)
-		a.replyUpgradeForwarded(msg, proto.UpgradeForwardedResp{
-			Code:  "sha256_mismatch",
-			Error: fmt.Sprintf("got %s want %s", got, req.SHA256),
-		})
-		return
-	}
-
-	newVersion, err := a.installNewBinary(body, exePath)
-	if err != nil {
-		// Literal branches rather than a code variable — the wire-code
-		// coverage gate resolves codes statically (same shape as the
-		// fetchURL split above).
-		if errors.Is(err, errUpgradeEpochMismatch) {
-			// external review F5: a cross-epoch ARTIFACT is the same refusal
-			// as a cross-epoch peer — reinstall, never `node upgrade`. The
-			// disk is untouched (the smoke gate runs before any mutation).
-			a.replyUpgradeForwarded(msg, proto.UpgradeForwardedResp{
-				Code: "proto_bump_requires_reinstall", Error: err.Error(),
-			})
-			return
-		}
-		if errors.Is(err, errUpgradeSmokeFailed) {
-			a.replyUpgradeForwarded(msg, proto.UpgradeForwardedResp{
-				Code: "smoke_failed", Error: err.Error(),
-			})
-			return
-		}
-		a.replyUpgradeForwarded(msg, proto.UpgradeForwardedResp{
-			Code: "install_failed", Error: err.Error(),
-		})
-		return
-	}
-
-	a.cfg.Logger.Info("agent: upgrade installed; re-execing into new binary",
-		"new_version", newVersion, "exe", exePath)
-	a.replyUpgradeForwarded(msg, proto.UpgradeForwardedResp{
-		OK: true, BinaryReplaced: true, NewVersion: newVersion,
-	})
-
-	// Step 5 of J.4: in-place process replacement via syscall.Exec.
-	// The old NATS connection drops automatically (kernel closes
-	// fds across exec); the new binary runs as the SAME PID, so
-	// systemd / setsid-nohup never see the old agent die — there's
-	// nothing to "restart". G.1 reconcile then runs against the
-	// broker from the new binary's first register.
-	//
-	// We DON'T fall back to os.Exit + supervisor: clean exits don't
-	// trigger Restart=on-failure (agent stays down) and the
-	// non-systemd setsid-nohup path has no supervisor at all.
-	// Tests pin UpgradeNoExit=true so the in-process harness
-	// doesn't replace the go-test binary.
-	a.reExecInPlace(exePath)
+// handleUpgradeInstallLocked preserves the old method surface as an explicit
+// refusal. Its envelope cannot authorize the transaction install pipeline.
+func (a *Agent) handleUpgradeInstallLocked(msg *nats.Msg) {
+	// origin: hot-update S8 plan §3.3 / §7.2. The old envelope carries no
+	// target-issued grant. A new agent cannot download, flip or cut from it;
+	// the authorized transaction endpoint owns those effects and their lease.
+	a.replyUpgradeForwarded(msg, proto.UpgradeForwardedResp{Code: "upgrade_deferred", Error: "a target-issued upgrade transaction is required"})
 }
 
-// handleReExecOnly (G5 #13) is the co-located-agent leg of a `cluster upgrade`: the shared binary is
-// already staged on disk, so the agent SKIPS download/install and only re-execs. SHA256, when set, is
-// the expected ON-DISK BINARY digest — the agent refuses to re-exec a stale/unstaged image.
-func (a *Agent) handleReExecOnly(msg *nats.Msg, req proto.UpgradeForwardedReq) {
-	exePath := a.cfg.UpgradeExecutablePath
-	if exePath == "" {
-		var err error
-		exePath, err = os.Executable()
-		if err != nil {
-			a.replyUpgradeForwarded(msg, proto.UpgradeForwardedResp{Code: "self_path", Error: err.Error()})
-			return
-		}
-	}
-	// Stage-C M7: after a rename-replace staging the running inode is gone, so os.Executable() can return
-	// the path with a " (deleted)" suffix — trim it or both the sha hash AND the syscall.Exec would target
-	// a nonexistent path. (The broker reload path already trims this; the agent leg must too.)
-	exePath = strings.TrimSuffix(exePath, " (deleted)")
-	// External-review doubt (symmetry with the broker reload primitive): the sha guard is MANDATORY. An
-	// unguarded re-exec would launch whatever is on disk; every legitimate trigger threads the staged digest,
-	// so fail-closed on an empty digest rather than skipping the check.
-	if req.SHA256 == "" {
-		a.replyUpgradeForwarded(msg, proto.UpgradeForwardedResp{Code: "sha256_required",
-			Error: "re-exec requires sha256 (the staged-binary digest guard) — refusing an unguarded re-exec"})
-		return
-	}
-	got, err := sha256OfFile(exePath)
-	if err != nil {
-		a.replyUpgradeForwarded(msg, proto.UpgradeForwardedResp{Code: "self_path", Error: err.Error()})
-		return
-	}
-	if got != strings.ToLower(req.SHA256) {
-		a.replyUpgradeForwarded(msg, proto.UpgradeForwardedResp{Code: "sha256_mismatch",
-			Error: fmt.Sprintf("on-disk binary %s != staged target %s (staging did not land)", got, req.SHA256)})
-		return
-	}
-	a.cfg.Logger.Info("agent: re-exec-only into the staged on-disk binary", "exe", exePath)
-	a.replyUpgradeForwarded(msg, proto.UpgradeForwardedResp{OK: true})
-	a.reExecInPlace(exePath)
+// handleReExecOnly refuses grantless execution of staged bytes. Root supply
+// does not replace the canonical journal, recorded prev or inherited lease.
+func (a *Agent) handleReExecOnly(msg *nats.Msg, _ proto.UpgradeForwardedReq, _ ...*nats.Conn) {
+	// origin: hot-update S8 plan §3.3 / §5.2. Root staging supplies bytes,
+	// not execution authority. The same transaction, prev proof and long OFD
+	// lease are mandatory for shared-binary re-exec and writable installs.
+	a.replyUpgradeForwarded(msg, proto.UpgradeForwardedResp{Code: "upgrade_deferred", Error: "staged re-exec requires a target-issued upgrade transaction"})
 }
 
-// reExecInPlace replaces this agent process image with the on-disk binary at exePath (same PID; the old
-// NATS conn drops as the kernel closes fds across exec). A tiny delay lets the OK reply drain first.
-//
-// On exec failure with a PENDING upgrade marker (the `node upgrade` path), this process — the OLD image,
-// the only surviving copy of the old code — restores the prev slot IN PLACE and keeps running (plan §3.2
-// F3). It must NOT exit: os.Exit would hand a clean-exit to Restart=on-failure (agent stays down) and the
-// setsid-nohup path has no supervisor at all, while the rollback code needed at next boot would be living
-// inside a binary that just proved it cannot exec. Without a pending marker (the ReExecOnly / cluster
-// upgrade leg, which stages no marker) the old exit-non-zero contract is preserved unchanged.
-// Tests pin UpgradeNoExit so the in-process harness does not replace the go-test binary.
-func (a *Agent) reExecInPlace(exePath string) {
-	if a.cfg.UpgradeNoExit {
+// reExecInPlace owns the cut latch until exec or abandon. An exec error
+// thaws the original owners BEFORE any disk recovery; even the untracked
+// cluster leg stays alive, since systemd stop would kill its live children.
+// origin: hot-update S3 plan §2.2 / Q3.
+func (a *Agent) reExecInPlace(exePath string, cut *imageCut, tracked bool) {
+	if _, err := readUpgradeMarker(upgradeMarkerPath(exePath)); err != nil || a.cfg.Upgrade != nil {
+		if cut != nil && cut.abandon(a) == nil && cut.releaseAdmission != nil {
+			cut.releaseAdmission()
+		}
+		a.cfg.Logger.Error("agent: legacy re-exec refused a transaction journal")
 		return
 	}
+
+	if a.cfg.UpgradeNoExit && a.cfg.UpgradeExecFn == nil {
+		if cut != nil {
+			_ = cut.abandon(a)
+			if cut.releaseAdmission != nil {
+				cut.releaseAdmission()
+			}
+		}
+		return
+	}
+	expected := captureUpgradeReport(a)
 	go func() {
-		time.Sleep(100 * time.Millisecond)
-		argv := append([]string(nil), os.Args...)
-		argv[0] = exePath
-		// execEnv, not os.Environ: carry the instance lineage across the
-		// re-exec so the new image continues THIS instance. With a bare
-		// environment the post-exec process would mint a fresh id, contest the
-		// name its own predecessor still holds, and get suffixed — i.e.
-		// `node upgrade` would rename every node it upgraded.
-		if err := syscall.Exec(exePath, argv, execEnv()); err != nil {
-			a.cfg.Logger.Error("agent: re-exec into the new binary failed", "err", err, "exe", exePath)
-			if a.recoverFromFailedExec(exePath, err) {
+		if cut != nil && cut.releaseAdmission != nil {
+			defer cut.releaseAdmission()
+		}
+		var err error
+		if cut != nil {
+			if a.cfg.UpgradeCutObserver != nil {
+				a.cfg.UpgradeCutObserver(cut.frozen.Bundle())
+			}
+			prepared, prepareErr := prepareImageCut(a, cut, func(b agentimage.Bundle) error {
+				// Keep the fresh bundle and candidate pin explicit at the
+				// final callback; the prev pin is independently checked too.
+				// origin: hot-update S5 plan §5.2 / T35.
+				if len(cut.readers) == 0 {
+					return errImageABIUnsupported
+				}
+				if err := agentimage.VerifyCapabilitySHA(exePath, cut.readers[0]); err != nil {
+					return err
+				}
+				if err := agentupgradeport.VerifyPrevReader(exePath, cut.readers); err != nil {
+					return err
+				}
+				return agentimage.CheckBundleCapabilities(b, cut.readers...)
+			})
+			err = prepareErr
+			if prepareErr == nil {
+				execsession.LogPTYImage(a.cfg.Logger, "cut", cut.generation, cut.frozen.Bundle().Runtime)
+				argv := append([]string(nil), os.Args...)
+				argv[0] = exePath
+				// A pathname changed after preparation cannot inherit the probe.
+				err = checkUpgradeCutReaders(exePath, cut.frozen.Bundle(), cut.readers)
+				if err == nil && cut.legacy {
+					err = a.upgradeExec(exePath)
+				} else if err == nil && a.cfg.UpgradeExecFn != nil {
+					err = a.cfg.UpgradeExecFn(exePath)
+				} else if err == nil {
+					err = prepared.Exec(exePath, argv, execEnv())
+				}
+				_ = prepared.Close()
+			}
+		} else {
+			err = a.upgradeExec(exePath)
+		}
+		if cut != nil {
+			if thawErr := cut.abandon(a); thawErr != nil {
+				// origin: hot-update S5 plan §5.4. A failed fresh grant leaves
+				// SS pending and admission closed, but the local thaw succeeded.
+				// The tracked disk transaction must still restore the old binary;
+				// otherwise a failed exec leaves a pending marker without an owner.
+				if tracked && errors.Is(thawErr, errUpgradeImageRecovery) {
+					recoverCapturedExec(a, exePath, expected, err)
+				}
 				return
 			}
-			a.cfg.Logger.Error("agent: re-exec failed with no pending upgrade marker; exiting non-zero for supervisor restart",
-				"exe", exePath)
-			os.Exit(1)
 		}
+		if tracked && recoverCapturedExec(a, exePath, expected, err) {
+			return
+		}
+		a.cfg.Logger.Error("agent: re-exec failed with no pending marker; staying alive on the thawed image", "err", err, "exe", exePath)
 	}()
 }
 
@@ -329,34 +159,12 @@ func (a *Agent) reExecInPlace(exePath string) {
 // slot in place and keep running (reexec=false: we already ARE the restored
 // code). Returns true when a pending marker was found and handled; false
 // means this exec was not a marker-tracked upgrade (the ReExecOnly leg) and
-// the caller keeps its historical exit-non-zero contract.
+// the caller stays alive on the thawed image.
 func (a *Agent) recoverFromFailedExec(exePath string, execErr error) bool {
-	a.upgradeMu.Lock()
-	defer a.upgradeMu.Unlock()
-	handled := false
-	// Host-wide flock (external review F1): exclude sibling processes from
-	// the marker/prev/dst read-modify-write.
-	lerr := withUpgradeFileLock(exePath, true, func() error {
-		m, merr := readUpgradeMarker(upgradeMarkerPath(exePath))
-		if merr != nil || m == nil || m.State != upgradeStatePending {
-			//nolint:nilerr // The closure's error return propagates LOCK failures only; a corrupt
-			// marker is by contract "idle" (loud elsewhere, never a block) and means: nothing to recover.
-			return nil
-		}
-		executeRollback(exePath, m, fmt.Sprintf("syscall.Exec of the new binary failed: %v", execErr),
-			a.cfg.Logger, false, nil)
-		handled = true
-		return nil
-	})
-	if lerr != nil {
-		// We cannot safely prove that this was the untracked re-exec-only
-		// path without the lock. Keep the only known-live old process rather
-		// than exit and risk leaving an unsupervised node permanently down.
-		a.cfg.Logger.Error("agent: re-exec recovery: host-wide lock unavailable; keeping the old process alive",
-			"err", lerr)
-		return true
-	}
-	return handled
+	return recoverCapturedExec(a, exePath, captureUpgradeReport(a), execErr)
+}
+func recoverCapturedExec(a *Agent, exePath string, expected *upgradeMarker, execErr error) bool {
+	return agentupgrade.RecoverLegacyExec(legacyAgentPort(a), exePath, expected, execErr)
 }
 
 func (a *Agent) replyUpgradeForwarded(msg *nats.Msg, resp proto.UpgradeForwardedResp) {
@@ -367,397 +175,61 @@ func (a *Agent) replyUpgradeForwarded(msg *nats.Msg, resp proto.UpgradeForwarded
 	_ = msg.Respond(body)
 }
 
-// urlAllowed mirrors broker.URLAllowed; duplicated locally so the
-// agent package doesn't import broker (would be a layering
-// violation: agent is a leaf in production deployments). Empty
-// allow → reject.
-func urlAllowed(url string, allow []string) bool {
-	if len(allow) == 0 {
-		return false
-	}
-	for _, p := range allow {
-		if p == "" {
-			continue
-		}
-		if strings.HasPrefix(url, p) {
-			return true
-		}
-	}
-	return false
-}
+// Historical smoke sentinel alias; binaryupgrade now owns this refusal.
+// errUpgradeSmokeFailed marks a smoke-gate refusal (upgrade-safety plan
+// §3.1): the sha-verified artifact could not exec or printed no parsable
+// release tag. The artifact is bad for every node — maps to the
+// `smoke_failed` wire code, which aborts a fleet rollout.
 
-// fetchURL downloads body bytes via HTTP GET with a hard timeout
-// AND a hard size cap. The cap defends against a malicious URL
-// (broker compromise, MITM on a non-https mirror) that would
-// otherwise stream gigabytes into the agent's memory; with `--all`
-// fan-out, that could OOM every agent in a session at once.
-// Returns an error for any non-2xx, transport failure, or oversize
-// response.
-// origin: line-2 §12 Y2. fetchURL's four failure modes used to arrive at the caller as one
-// indistinguishable error, which the caller reported as the single code `download_failed`. Two of the
-// four can never succeed on a retry — a 404 mirror URL and a tarball over the size ceiling — and
-// docs/usage.md §9.13 tells automation to retry the class they landed in. These sentinels let the
-// caller say which one happened, so the ones that are physically hopeless stop being retried forever.
-// THE STATUS SPACE SPLITS IN TWO, NOT ONE. origin: line-2 INDEPENDENT EXTERNAL REVIEW M1.
-//
-// The first version of this split wrapped EVERY non-2xx in ErrUpgradeHTTPStatus, mapped that to
-// download_http_status / exit 64, and taught `node upgrade --all` to abort the whole fleet on it. That is
-// correct for 404 (a typo'd --url is wrong on every node) and wrong for 408, 421, 425, 429, 500, 502,
-// 503 and 504, all of which can clear with no operator change at all — a different connection, an
-// explicit retry request, a mirror restart, a rate limit, or a load balancer draining.
-//
-// So the increment that existed to STOP collapsing distinct retry semantics into one code did exactly
-// that, one layer down, and its own comment said "non-2xx ... Not retryable" as if the status space had
-// one member. A fleet rollout hitting a 503 on node 1 aborted the remaining N-1 nodes and told automation
-// never to retry.
-//
-// The boundary is a NAMED SET, not `status/100`: retryability is a policy statement about specific codes,
-// and `5xx` alone would sweep in 501 Not Implemented (a mirror that will never serve this) while missing
-// 408, 421, 425 and 429 entirely.
 var (
-	// ErrUpgradeHTTPStatus is a PERMANENT non-2xx: the URL or the mirror is wrong and will be wrong on
-	// every node. 404, 403, 401, 410, 501… Not retryable.
-	ErrUpgradeHTTPStatus = errors.New("upgrade: mirror returned a permanent non-2xx status")
-	// ErrUpgradeHTTPRetryable is a TRANSIENT non-2xx — see upgradeRetryableStatuses. The artifact and the
-	// URL are fine; the mirror is not available right now.
-	ErrUpgradeHTTPRetryable = errors.New("upgrade: mirror is temporarily unavailable")
-	// ErrUpgradeTooLarge means the body exceeded upgradeMaxTarballBytes. Not retryable — the same URL
-	// will be the same size next time.
-	ErrUpgradeTooLarge = errors.New("upgrade: tarball exceeds the size ceiling")
-	// errUpgradeSmokeFailed marks a smoke-gate refusal (upgrade-safety plan
-	// §3.1): the sha-verified artifact could not exec or printed no parsable
-	// release tag. The artifact is bad for every node — maps to the
-	// `smoke_failed` wire code, which aborts a fleet rollout.
-	errUpgradeSmokeFailed = errors.New("upgrade: staged binary failed the smoke gate")
+	ErrUpgradeHTTPStatus    = binaryupgrade.ErrUpgradeHTTPStatus
+	ErrUpgradeHTTPRetryable = binaryupgrade.ErrUpgradeHTTPRetryable
+	ErrUpgradeTooLarge      = binaryupgrade.ErrUpgradeTooLarge
+	// errRunningImageDiffers is the prev-slot admissibility refusal (hot-update
+	// S3 plan §2.1): the on-disk binary is neither this running image nor the
+	// candidate, so no rollback could safely hand it an image. The text is the
+	// operator-facing `install_failed` Error verbatim.
+	errRunningImageDiffers = agentimage.ErrRunningImageDiffers
 )
 
-// upgradeRetryableStatuses are the HTTP statuses that can succeed later without anyone changing the
-// request. Enumerated rather than expressed as a range so that adding one is a decision someone makes,
-// and so 501 (permanent) does not ride in on "5xx".
-var upgradeRetryableStatuses = map[int]bool{
-	http.StatusRequestTimeout:      true, // 408 — the mirror gave up waiting; the next attempt may not
-	http.StatusMisdirectedRequest:  true, // 421 — RFC 9110 permits retry over a different connection
-	http.StatusTooEarly:            true, // 425 — RFC 8470 defines this specifically to trigger a retry
-	http.StatusTooManyRequests:     true, // 429 — rate limited, explicitly a "later" signal
-	http.StatusInternalServerError: true, // 500 — mirror-side fault, routinely transient
-	http.StatusBadGateway:          true, // 502 — upstream restarting behind a proxy
-	http.StatusServiceUnavailable:  true, // 503 — draining / maintenance; the canonical retry status
-	http.StatusGatewayTimeout:      true, // 504 — upstream slow, not absent
-}
-
-func fetchURL(url string, timeout time.Duration) ([]byte, error) {
-	client := &http.Client{Timeout: timeout}
-	//nolint:noctx // Reached from a nats.go MsgHandler (func(*nats.Msg)) -- there is no ctx to thread,
-	// and the download is bounded by client.Timeout above. Inline rather than a config exclusion
-	// because a path+text rule would exempt every future Client.Get in this file too (measured).
-	resp, err := client.Get(url)
-	if err != nil {
-		return nil, fmt.Errorf("http get: %w", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode/100 != 2 {
-		if upgradeRetryableStatuses[resp.StatusCode] {
-			// Retry-After, when the mirror sends one, is the only part of this the operator cannot
-			// re-derive. Surfaced in the message rather than parsed into a policy: this agent does not
-			// schedule the retry, the caller does.
-			if ra := resp.Header.Get("Retry-After"); ra != "" {
-				return nil, fmt.Errorf("%w: %s (Retry-After: %s)", ErrUpgradeHTTPRetryable, resp.Status, ra)
-			}
-			return nil, fmt.Errorf("%w: %s", ErrUpgradeHTTPRetryable, resp.Status)
-		}
-		return nil, fmt.Errorf("%w: %s", ErrUpgradeHTTPStatus, resp.Status)
-	}
-	// LimitReader + 1 trick: read maxN+1 bytes; if the read
-	// returned exactly maxN+1 bytes the actual stream is larger
-	// than maxN. Anything <= maxN is fine.
-	body, err := io.ReadAll(io.LimitReader(resp.Body, upgradeMaxTarballBytes+1))
-	if err != nil {
-		return nil, fmt.Errorf("read body: %w", err)
-	}
-	if int64(len(body)) > upgradeMaxTarballBytes {
-		return nil, fmt.Errorf("%w: > %d bytes", ErrUpgradeTooLarge, upgradeMaxTarballBytes)
-	}
-	return body, nil
+// installPolicy carries the image-cut checks of the `node upgrade` path. The
+// install primitive is also driven directly by the durability and lock-order
+// tests, which run from the test binary and pass no policy.
+type installPolicy struct {
+	candidateABI *int                       // receives the candidate's declared image ABI
+	readers      *[]agentimage.Capabilities // target and actual rollback reader, SHA-bound
+	runningSHA   string                     // non-empty: enforce prev ∈ {running image, candidate}
 }
 
 func sha256OfBytes(b []byte) string {
-	sum := sha256.Sum256(b)
-	return hex.EncodeToString(sum[:])
+	return agentupgradeport.SHA256OfBytes(b)
 }
 
-// sha256OfFile streams the hex sha256 of a file on disk (G5 #13 re-exec-only: verify the staged binary
-// before re-execing it, without loading the whole binary into memory).
 func sha256OfFile(path string) (string, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return "", err
-	}
-	defer func() { _ = f.Close() }()
-	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(h.Sum(nil)), nil
+	return agentimage.SHA256OfFile(path)
 }
 
-// installNewBinary stages and atomically installs the `tether` binary
-// contained in the just-downloaded gzipped tar. The release tarball
-// layout (build/goreleaser.yaml § archives) carries a single file
-// named `tether` at the archive root plus README/LICENSE; we
-// extract just `tether` into a sibling tmp file, chmod +x, then
-// (upgrade-safety plan §3.1) run the SMOKE GATE, hardlink the current
-// binary into the prev slot, write the pending marker, and finally
-// rename onto dst. Rename is atomic on the same fs; running
-// processes keep their open inode handle (the new binary only
-// loads on the next exec), so this is safe to do while the agent
-// is still serving the upgrade reply. dst itself is IN PLACE at every
-// interruption point — the prev slot is a hardlink plus a single
-// rename, never a remove-then-replace window (plan §10.2: the
-// two-rename variant would strand a crashed host on ENOENT).
-//
-// Uses archive/tar + compress/gzip directly (audit Sec F1: shelling
-// out to host tar opens path-traversal exposure under non-GNU tar
-// implementations). Each tar header.Name is checked: must be
-// exactly "tether" — anything with a path separator, leading slash,
-// or "..", or any other filename, is refused.
-//
-// Returns the release tag the smoke gate parsed out of `<staged> version` —
-// GUARANTEED non-empty and in the same format the new binary will report as
-// ReleaseVersion on register (ctl --wait compares the two). A failure
-// wrapping errUpgradeSmokeFailed means the artifact is bad everywhere and the
-// disk was untouched; any other failure is a local IO problem
-// (install_failed).
-func (a *Agent) installNewBinary(tarball []byte, dst string) (string, error) {
-	tmpDir, err := os.MkdirTemp(filepath.Dir(dst), ".tether-upgrade-*")
-	if err != nil {
-		return "", fmt.Errorf("mkdir tmp: %w", err)
+func (a *Agent) installNewBinary(tarball []byte, dst string, policy ...installPolicy) (string, error) {
+	var pol installPolicy
+	if len(policy) > 0 {
+		pol = policy[0]
 	}
-	defer func() { _ = os.RemoveAll(tmpDir) }()
-
-	binPath := filepath.Join(tmpDir, "tether")
-	if err := extractTetherBinary(tarball, binPath); err != nil {
+	if _, err := readUpgradeMarker(upgradeMarkerPath(dst)); err != nil {
 		return "", err
 	}
-
-	// Smoke gate: the staged binary must exec and answer `version` with a
-	// parsable release tag BEFORE anything on disk changes. Catches wrong
-	// arch, truncation, and not-a-tether-binary — the failure classes that
-	// used to be discovered only by syscall.Exec, after the flip.
-	newVersion, err := smokeVersion(binPath)
-	if err != nil {
-		return "", fmt.Errorf("staged binary failed the smoke gate (disk unchanged): %w: %w", errUpgradeSmokeFailed, err)
-	}
-
-	// Prev slot: hardlink the CURRENT binary aside (same dir ⇒ same fs ⇒
-	// zero-copy; a hardlink shares the old inode, so the later rename of the
-	// new binary over dst cannot touch it). Some filesystems refuse links —
-	// fall back to a copy. Old prev from a previous upgrade is replaced.
-	prevPath := upgradePrevPath(dst)
-	prevSHA, err := sha256OfFile(dst)
-	if err != nil {
-		return "", fmt.Errorf("hash current binary: %w", err)
-	}
-	newSHA, err := sha256OfFile(binPath)
-	if err != nil {
-		return "", fmt.Errorf("hash staged binary: %w", err)
-	}
-	var upgradeNonce [16]byte
-	if _, err := rand.Read(upgradeNonce[:]); err != nil {
-		return "", fmt.Errorf("generate upgrade transaction id: %w", err)
-	}
-	if err := os.Remove(prevPath); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return "", fmt.Errorf("clear old prev slot: %w", err)
-	}
-	if err := os.Link(dst, prevPath); err != nil {
-		if cerr := copyFile(dst, prevPath); cerr != nil {
-			return "", fmt.Errorf("prev slot: link failed (%v) and copy failed: %w", err, cerr)
-		}
-	}
-	// F6 ordered durability: the prev slot's directory entry must be on
-	// stable storage BEFORE the marker that references it exists — a power
-	// cut between marker and prev would otherwise leave a rollback promise
-	// with nothing to roll back to.
-	if err := syncDirE(filepath.Dir(dst)); err != nil {
-		_ = os.Remove(prevPath)
-		return "", fmt.Errorf("sync dir after prev slot: %w", err)
-	}
-
-	// Marker BEFORE the flip: if the flip below fails, the error path clears
-	// it back to a terminal state; if that clearing is itself lost (process
-	// death mid-install), the pending marker goes stale at the deadline and
-	// the install entry gate stops honoring it.
-	deadline := a.upgradeNow().Add(upgradeRegisterDeadline)
-	marker := &upgradeMarker{
-		State:       upgradeStatePending,
-		PrevSHA:     prevSHA,
-		NewSHA:      newSHA,
-		PrevVersion: proto.ReleaseVersion,
-		NewVersion:  newVersion,
-		Deadline:    deadline,
-		BootBudget:  upgradeBootBudget,
-		// external review F1: pin the upgrade to the instance `node upgrade
-		// <nid>` targeted — a co-hosted sibling must neither claim nor clear
-		// it. UpgradeID is also the process-local boot proof, so it must be
-		// unique even for rapid same-artifact retries.
-		TargetSID: a.cfg.SID,
-		TargetNID: a.cfg.NID,
-		// Stamp WHICH instance started this upgrade. TargetNID is the basename
-		// and every clone of one image shares it, so without this the marker
-		// cannot tell the upgrading instance from its siblings — and the first
-		// sibling to boot would report this upgrade's outcome and clear the
-		// marker out from under the instance that actually ran it.
-		TargetInstance: a.instanceID,
-		UpgradeID:      hex.EncodeToString(upgradeNonce[:]),
-	}
-	// The caller holds the host-wide flock, which serializes this marker write
-	// against commit/watchdog in this process and every sibling process. Do
-	// not take upgradeMu here: those transitions take upgradeMu before the
-	// flock, and reversing that order here creates an ABBA deadlock.
-	markerPath := upgradeMarkerPath(dst)
-	werr := writeUpgradeMarker(markerPath, marker)
-	if werr != nil {
-		// external re-review F11: writeUpgradeMarker can fail AFTER its
-		// rename landed (the directory-fsync step) — the transaction is
-		// aborting, but a visible pending marker would make this healthy
-		// old process reject every retry as upgrade_in_progress until the
-		// 120s deadline. Compensate under the same locks (host flock is
-		// held by the caller): remove whatever landed and re-sync.
-		if landed, rerr := readUpgradeMarker(markerPath); rerr == nil && landed != nil &&
-			landed.UpgradeID == marker.UpgradeID {
-			_ = os.Remove(markerPath)
-			syncDir(filepath.Dir(markerPath))
-		}
-	}
-	if werr != nil {
-		_ = os.Remove(prevPath)
-		syncDir(filepath.Dir(prevPath))
-		return "", fmt.Errorf("write upgrade marker: %w", werr)
-	}
-	if err := os.Rename(binPath, dst); err != nil {
-		// dst is untouched (the rename failed) — record the aborted attempt
-		// so the entry gate does not block on a flip that never happened.
-		marker.State = upgradeStateRolledBack
-		marker.Detail = fmt.Sprintf("install aborted before the flip: %v", err)
-		werr := writeUpgradeMarker(markerPath, marker)
-		if werr != nil {
-			a.cfg.Logger.Warn("agent: could not record aborted install; pending marker will go stale at its deadline", "err", werr)
-		}
-		_ = os.Remove(prevPath)
-		return "", fmt.Errorf("atomic rename: %w", err)
-	}
-	// F6: make the flip itself durable. Past this point the transaction is
-	// complete on stable storage; a failure here is logged, not unwound —
-	// the runtime state (reply, re-exec) matches the disk either way.
-	if err := syncDirE(filepath.Dir(dst)); err != nil {
-		a.cfg.Logger.Warn("agent: dir fsync after the flip failed — a power cut may resurface the old binary (marker converges it at boot)", "err", err)
-	}
-	return newVersion, nil
+	return upgradeStore().Install(tarball, dst, binaryupgrade.InstallInputs{
+		CandidateABI: pol.candidateABI, Readers: pol.readers, RunningSHA: pol.runningSHA,
+		Now: a.upgradeNow, Generation: func() uint64 { return a.imageGeneration + 1 },
+		SID: a.cfg.SID, NID: a.cfg.NID, InstanceID: a.instanceID, Logger: a.cfg.Logger,
+		CheckCandidate: func(reader agentimage.Capabilities) error { return checkCandidateABI(a, reader) },
+	})
 }
 
-// copyFile is the prev-slot fallback for filesystems that refuse hardlinks.
 func copyFile(src, dst string) error {
-	in, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = in.Close() }()
-	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o755)
-	if err != nil {
-		return err
-	}
-	_, cpErr := io.Copy(out, in)
-	chmodErr := out.Chmod(0o755) // fd-chmod before the fsync (F6): OpenFile's mode is umask-clipped
-	syncErr := syncFile(out)     // S13: the prev slot must survive a power cut — it IS the rollback
-	closeErr := out.Close()
-	if cpErr != nil {
-		return cpErr
-	}
-	if chmodErr != nil {
-		return chmodErr
-	}
-	if syncErr != nil {
-		return syncErr
-	}
-	return closeErr
+	return agentimage.CopyBinary(src, dst, syncFile)
 }
 
-// extractTetherBinary scans the gzipped tar for a single file
-// entry literally named "tether" and writes its contents to
-// outPath. Refuses any other path. Refuses files larger than
-// upgradeMaxTarballBytes (defense in depth — the network read is
-// already capped, but a maliciously-crafted small tar could
-// declare a huge file size).
-//
-// outPath is opened with O_EXCL | O_NOFOLLOW so a local attacker
-// can't race a symlink swap into the tmp dir between MkdirTemp
-// and our open (audit shard 02 F2). MkdirTemp uses 0700 by
-// default on Linux but a non-root local who already owns the
-// containing directory could pre-plant.
-func extractTetherBinary(tarball []byte, outPath string) error {
-	gz, err := gzip.NewReader(bytes.NewReader(tarball))
-	if err != nil {
-		return fmt.Errorf("gzip open: %w", err)
-	}
-	defer func() { _ = gz.Close() }()
-	tr := tar.NewReader(gz)
-	for {
-		hdr, err := tr.Next()
-		if errors.Is(err, io.EOF) {
-			return fmt.Errorf("tarball missing tether binary entry")
-		}
-		if err != nil {
-			return fmt.Errorf("tar read: %w", err)
-		}
-		// Strict allowlist: the literal name "tether" and nothing
-		// else. base()-ing or filepath.Clean()-ing first would
-		// silently accept "./tether", "subdir/tether", or worse,
-		// "../something".
-		if hdr.Name != "tether" {
-			continue
-		}
-		// archive/tar collapses the legacy TypeRegA into TypeReg
-		// since Go 1.11; one check suffices.
-		if hdr.Typeflag != tar.TypeReg {
-			return fmt.Errorf("tether entry has wrong type: %v", hdr.Typeflag)
-		}
-		if hdr.Size > upgradeMaxTarballBytes {
-			return fmt.Errorf("tether entry too large: %d bytes", hdr.Size)
-		}
-		f, err := os.OpenFile(outPath,
-			os.O_CREATE|os.O_WRONLY|os.O_TRUNC|os.O_EXCL|syscall.O_NOFOLLOW, 0o600)
-		if err != nil {
-			return fmt.Errorf("create binary: %w", err)
-		}
-		_, err = io.CopyN(f, tr, hdr.Size)
-		// chmod on the SAME fd, BEFORE the fsync (external review F6): a
-		// chmod after the sync would leave the executable bit unpersisted —
-		// after a power cut the new dst exists but cannot exec, which no
-		// rollback path detects.
-		chmodErr := f.Chmod(0o755)
-		// fsync before the later rename onto the live binary path (internal
-		// review S13): a post-rename power cut must not leave a truncated
-		// dst — that is the one artifact the rollback machinery cannot fix.
-		syncErr := syncFile(f)
-		closeErr := f.Close()
-		if err != nil {
-			return fmt.Errorf("write binary: %w", err)
-		}
-		if chmodErr != nil {
-			return fmt.Errorf("chmod binary: %w", chmodErr)
-		}
-		if syncErr != nil {
-			return fmt.Errorf("sync binary: %w", syncErr)
-		}
-		if closeErr != nil {
-			return fmt.Errorf("close binary: %w", closeErr)
-		}
-		return nil
-	}
-}
-
-// upgradeSmokeTimeout bounds the smoke gate's `version` probe. A healthy
-// static binary answers in milliseconds; 5s absorbs a cold page cache.
-const upgradeSmokeTimeout = 5 * time.Second
+const upgradeSmokeTimeout = agentimage.VersionProbeTimeout
 
 // errUpgradeEpochMismatch marks a smoke-gate refusal because the CANDIDATE
 // binary belongs to a different ProtoVersion epoch (external review F5): the
@@ -765,68 +237,410 @@ const upgradeSmokeTimeout = 5 * time.Second
 // nothing about the downloaded bytes. Installing a cross-epoch binary would
 // smuggle an epoch change past `proto_bump_requires_reinstall`, and the new
 // process would be exactly rejected by every same-epoch broker.
-var errUpgradeEpochMismatch = errors.New("upgrade: staged binary belongs to a different proto epoch")
 
-// smokeOutputCap bounds how much of the candidate's stdout we will hold
-// (external review 疑惑 2): a hostile/broken candidate spraying output must
-// not OOM the agent. The real line is <100 bytes.
-const smokeOutputCap = 64 * 1024
+const smokeOutputCap = agentimage.VersionOutputLimit
 
-// smokeVersion is the smoke gate (upgrade-safety plan §3.1): run
-// `<staged> version` and STRICTLY parse its first non-empty line against the
-// frozen format `tether <release> (proto v<N>)` (proto.VersionLine — the
-// cross-version seam both emitter and this parser derive from). Refuses on
-// exec failure, unparsable output, or an epoch N different from this
-// agent's own ProtoVersion (external review F5). The returned tag is
-// normalized to EXACTLY what the new binary reports as ReleaseVersion on
-// register — ctl's --wait equality check depends on that (pinned by test).
-func smokeVersion(binPath string) (string, error) {
-	// ctx-none: reached from a nats.go MsgHandler (func(*nats.Msg)) — no ctx
-	// to thread; the probe is bounded by its own timeout.
-	ctx, cancel := context.WithTimeout(context.Background(), upgradeSmokeTimeout)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, binPath, "version")
-	// 疑惑 2 hardening: cap captured output, and don't let an inherited pipe
-	// (a candidate that forks children) hold Wait open past the timeout.
-	var buf bytes.Buffer
-	cmd.Stdout = &capWriter{w: &buf, n: smokeOutputCap}
-	cmd.WaitDelay = 2 * time.Second
-	if err := cmd.Run(); err != nil {
-		return "", fmt.Errorf("exec `version` on the staged binary: %w", err)
-	}
-	for _, line := range strings.Split(buf.String(), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		fields := strings.Fields(line)
-		// Frozen shape: exactly `tether <release> (proto v<N>)`.
-		if len(fields) != 4 || fields[0] != "tether" || fields[2] != "(proto" || !strings.HasSuffix(fields[3], ")") {
-			return "", fmt.Errorf("staged binary's version line %q is not `tether <release> (proto vN)`", line)
-		}
-		epoch := strings.TrimSuffix(fields[3], ")")
-		if epoch != proto.SubjectVersionToken {
-			return "", fmt.Errorf("%w: candidate reports %q, this agent is %q — an epoch change must go through reinstall",
-				errUpgradeEpochMismatch, epoch, proto.SubjectVersionToken)
-		}
-		return fields[1], nil
-	}
-	return "", fmt.Errorf("staged binary printed no version line")
+func smokeVersion(binPath string, candidateABI ...*int) (string, error) {
+	return agentupgradeport.SmokeVersion(binPath, candidateABI...)
 }
 
-// capWriter drops bytes past n (the parser only needs the first line).
-type capWriter struct {
-	w *bytes.Buffer
-	n int
+// smokeVersionImageABI preserves the S3 release/ABI API for older callers.
+func smokeVersionImageABI(binPath string) (string, int, error) {
+	release, capabilities, err := smokeVersionCapabilities(binPath)
+	return release, capabilities.ABI, err
 }
 
-func (c *capWriter) Write(p []byte) (int, error) {
-	if room := c.n - c.w.Len(); room > 0 {
-		if len(p) > room {
-			c.w.Write(p[:room])
-		} else {
-			c.w.Write(p)
-		}
-	}
-	return len(p), nil
+func smokeVersionCapabilities(binPath string) (string, agentimage.Capabilities, error) {
+	return agentimage.ProbeCapabilities(binPath, agentboot.RunVersionProbe)
 }
+
+func checkUpgradeCutReaders(exePath string, b agentimage.Bundle, readers []agentimage.Capabilities) error {
+	return agentupgradeport.CheckCutReaders(exePath, b, readers)
+}
+
+// initPTYUpgradeAdmission runs before runtime callbacks can admit requests.
+// A marker for a sibling is not authority over this agent's PTYs. Once armed,
+// only the durable commit path can release the restriction; MarkReady cannot.
+// origin: hot-update S4 plan §5.2 / T31.
+func initPTYUpgradeAdmission(a *Agent) error {
+	exePath, err := a.upgradeExePath()
+	if err != nil {
+		return err
+	}
+	m, err := readUpgradeMarker(upgradeMarkerPath(exePath))
+	if err != nil {
+		return err
+	}
+	if m == nil || m.State != upgradeStatePending || !a.markerTargetsThisAgent(m) {
+		return nil
+	}
+	a.gate.mu.Lock()
+	a.gate.ptyBlocked = true
+	a.gate.ptyUpgradeID = m.UpgradeID
+	a.gate.flowBlocked, a.gate.ssBlocked = true, true
+	// Fail closed before reading the SHA-bound rollback reader, including a
+	// probe error. Only transfer creation is gated; retained settlement runs.
+	// origin: hot-update S7 plan §8.4 / P21
+	a.gate.transferBlocked = true
+	a.gate.domainUpgradeID = m.UpgradeID
+	a.gate.mu.Unlock()
+	previous, err := previousImageCapabilities(exePath, m)
+	if err != nil {
+		return err
+	}
+	// origin: hot-update S5 plan §5.2 / T36. The actual prev's SHA-bound
+	// capabilities independently release each new-domain restriction.
+	a.gate.mu.Lock()
+	if a.gate.domainUpgradeID == m.UpgradeID {
+		a.gate.flowBlocked = agentimage.CheckDomains(previous, []string{"exec-v1", "flow-v1"}) != nil
+		a.gate.ssBlocked = agentimage.CheckDomains(previous, []string{"exec-v1", "ss-v1"}) != nil
+		a.gate.transferBlocked = agentimage.CheckDomains(previous, []string{"exec-v1", xfercontract.Version}) != nil
+	}
+	a.gate.mu.Unlock()
+	// A rollback reader without pty-v1 is not an error of this boot: the
+	// restriction armed above simply stays until the durable commit releases it.
+	if agentimage.CheckDomains(previous, []string{"exec-v1", "pty-v1"}) == nil {
+		// A capable rollback reader needs no pending restriction, including an
+		// older marker without a transaction ID. This is established before any
+		// subscription; later releases still require durable commit ownership.
+		a.gate.mu.Lock()
+		if a.gate.ptyUpgradeID == m.UpgradeID {
+			a.gate.ptyBlocked = false
+			a.gate.ptyUpgradeID = ""
+		}
+		a.gate.mu.Unlock()
+	}
+	return nil
+}
+
+func ptyAdmissionPending(a *Agent, upgradeID string) bool {
+	a.gate.mu.Lock()
+	defer a.gate.mu.Unlock()
+	return upgradeID != "" && a.gate.ptyBlocked && a.gate.ptyUpgradeID == upgradeID
+}
+
+// P8 wires this into Config.PTYAdmission. It protects create, never probe:
+// hiding PTYVersion would send a new ctl into the forbidden legacy fallback.
+func checkPTYUpgradeAdmission(a *Agent) error {
+	a.gate.mu.Lock()
+	defer a.gate.mu.Unlock()
+	if a.gate.ptyBlocked {
+		return procrequest.ErrBusy
+	}
+	return nil
+}
+
+func releasePTYUpgradeAdmission(a *Agent, upgradeID string) {
+	a.gate.mu.Lock()
+	defer a.gate.mu.Unlock()
+	if upgradeID != "" && a.gate.ptyUpgradeID == upgradeID {
+		a.gate.ptyBlocked = false
+		a.gate.ptyUpgradeID = ""
+	}
+}
+
+// A legacy marker is probed through the same bounded, isolated supervisor.
+// A stored declaration with a mismatching SHA is corrupt, not a cache miss.
+// executeRollback independently rechecks PrevSHA immediately before rename.
+// origin: hot-update S4 plan §5.2 / T30 / T46.
+func previousImageCapabilities(exePath string, m *upgradeMarker) (agentimage.Capabilities, error) {
+	caps := agentimage.Capabilities{ABI: m.PrevImageABI, Domains: append([]string(nil), m.PrevImageDomains...), SHA256: m.PrevSHA}
+	return agentimage.PreviousCapabilities(upgradePrevPath(exePath), caps, m.PrevImageSHA256, smokeVersionCapabilities)
+}
+
+const ssStateUnrepresentable = "ss_state_unrepresentable"
+
+// Keep the public composition contract as the upgrade reason source of truth.
+// origin: hot-update S5 internal review rv-authority-7
+
+func flowImageOwnerReady(a *Agent) bool {
+	adapter, ok := a.cfg.ExposeAdapter.(*TunnelExposeAdapter)
+	return ok && adapter.client != nil && !adapter.client.FlowCensus().Unsupported
+}
+
+// Census covers metadata as well as sockets. The legacy adapter fallback is
+// deliberately limited to the known production implementation: an arbitrary
+// adapter's SessionCount cannot prove it has no hidden listener or FD.
+// origin: hot-update S5 plan §7.3 / lead Q2 / T35 / T37.
+func flowUpgradeCensus(a *Agent) tunnel.Census {
+	if a.cfg.ExposeAdapter == nil {
+		return includeUpgradeRehomes(a, tunnel.Census{})
+	}
+	if adapter, ok := a.cfg.ExposeAdapter.(interface{ FlowCensus() tunnel.Census }); ok {
+		c := adapter.FlowCensus()
+		// A census without the corresponding composition owner is still
+		// unknown responsibility, even if the adapter claims zero actors.
+		if !flowImageOwnerReady(a) {
+			c.Unsupported = true
+		}
+		return includeUpgradeRehomes(a, c)
+	}
+	if adapter, ok := a.cfg.ExposeAdapter.(*TunnelExposeAdapter); ok {
+		// origin: hot-update S5 plan §7.3 / T37. An incompletely initialized
+		// adapter cannot supply an ownership proof.
+		if adapter.client == nil {
+			return tunnel.Census{Unsupported: true}
+		}
+		c := adapter.client.FlowCensus()
+		if !c.Unsupported {
+			return includeUpgradeRehomes(a, c)
+		}
+		adapter.mu.RLock()
+		n := len(adapter.localFor)
+		adapter.mu.RUnlock()
+		n = max(n, adapter.SessionCount())
+		return includeUpgradeRehomes(a, tunnel.Census{Legacy: n})
+	}
+	// Unknown adapters still expose their installed count for the admission
+	// handover: sample it after admission, while retaining the refusal flag.
+	// origin: hot-update S5 plan §7.3 / T37
+	c := tunnel.Census{Unsupported: true}
+	if counter, ok := a.cfg.ExposeAdapter.(interface{ SessionCount() int }); ok {
+		c.Legacy = counter.SessionCount()
+	}
+	return c
+}
+
+func hasFlowUpgradeState(a *Agent) bool {
+	c := flowUpgradeCensus(a)
+	return c.Unsupported || c.Owned+c.Legacy+c.Admission+c.Rehome+c.Retained > 0
+}
+
+func hasSSUpgradeState(a *Agent) bool {
+	if a.proxy == nil {
+		return false
+	}
+	a.proxy.mu.Lock()
+	retained := a.proxy.srv != nil || a.proxy.publicPort != 0 || a.proxy.localPort != 0 ||
+		a.proxy.token != "" || a.proxy.gen != 0 || a.proxy.epoch != 0 || a.proxy.needsReestablish || a.proxy.digestApplied
+	a.proxy.mu.Unlock()
+	// origin: hot-update S5 plan §7.2 / T35. Ordering and fired cleanup are
+	// responsibilities even after the last listener/server was removed.
+	a.flcMu.Lock()
+	retained = retained || a.flcTimer != nil || a.proxy.flcState.DeadlineBootNS != 0 || a.proxy.flcState.Fired || a.proxy.flcState.CleanupPending
+	a.flcMu.Unlock()
+	a.proxyDrainMu.Lock()
+	retained = retained || a.proxyDispatchN != 0
+	a.proxyDrainMu.Unlock()
+	return retained
+}
+
+func checkSSImageState(a *Agent) error {
+	return agentupgradeport.CheckSSImageState(hasSSUpgradeState(a) || a.gate.count(gateSS) != 0, func() error {
+		_, err := snapshotProxyCutUntil(a, time.Now().Add(upgradebudget.SafePointWait))
+		return err
+	})
+}
+
+func requiredUpgradeDomains(a *Agent) []string {
+	return agentupgradeport.RequiredRuntimeDomains(a.processRuntime, hasFlowUpgradeState(a), hasSSUpgradeState(a), transferImageWorker(a) != nil)
+}
+
+// These guards must run before journal/accept/listener/keyset side effects;
+// probe capability stays visible while a pending old reader blocks creation.
+// origin: hot-update S5 plan §5.2 / T36.
+func checkFlowUpgradeAdmission(a *Agent) error {
+	a.gate.mu.Lock()
+	defer a.gate.mu.Unlock()
+	if a.gate.closed || a.gate.flowBlocked {
+		return procrequest.ErrBusy
+	}
+	return nil
+}
+
+func checkSSUpgradeAdmission(a *Agent) error {
+	a.gate.mu.Lock()
+	defer a.gate.mu.Unlock()
+	if a.gate.closed || a.gate.ssBlocked {
+		return procrequest.ErrBusy
+	}
+	return nil
+}
+
+func flowSSAdmissionPending(a *Agent, upgradeID string) bool {
+	a.gate.mu.Lock()
+	defer a.gate.mu.Unlock()
+	return upgradeID != "" && a.gate.domainUpgradeID == upgradeID && (a.gate.flowBlocked || a.gate.ssBlocked || a.gate.transferBlocked)
+}
+
+func releaseFlowSSUpgradeAdmission(a *Agent, upgradeID string) {
+	a.gate.mu.Lock()
+	defer a.gate.mu.Unlock()
+	if upgradeID != "" && a.gate.domainUpgradeID == upgradeID {
+		a.gate.flowBlocked, a.gate.ssBlocked = false, false
+		// Called only after the durable marker write, never by MarkReady or
+		// a visible committed rename whose directory sync still failed.
+		// origin: hot-update S7 plan §8.4 / P21
+		a.gate.transferBlocked = false
+		a.gate.domainUpgradeID = ""
+	}
+}
+
+// The caller keeps the exact report identity across the network wait.
+// origin: hot-update S8 plan §3.3 / M11.
+func registerAgent(ctx context.Context, a *Agent, nc *nats.Conn, delivery **upgradeMarker) (proto.NodeRegisterResp, error) {
+	req := proto.NodeRegisterReq{
+		ProtoVersion:              proto.ProtoVersion,
+		ReleaseVersion:            proto.ReleaseVersion,
+		NID:                       nidOf(a),
+		OS:                        runtime.GOOS,
+		Arch:                      runtime.GOARCH,
+		BootID:                    readBootID(),
+		BrokerImageMaintenance:    brokermaint.Capability,
+		BrokerImageMaintenanceKey: agentMaintenanceKey(a),
+		// P13: this build implements proxy-v1. S8 FIX-DESCRIBE: upgrade-tx-v1
+		// only while a transaction endpoint is bound (agentupgradeport.RegisterCapabilities).
+		Capabilities: agentupgradeport.RegisterCapabilities(a.upgradeEndpoint),
+		// InstanceID identifies THIS process run so the broker can tell an
+		// incumbent reconnecting from a second process presenting the same
+		// baked credential. A non-empty value IS the capability advertisement —
+		// deliberately NOT a second Capabilities token, which would change the
+		// register body of every single-agent device for no benefit.
+		InstanceID: a.instanceID,
+		// LeasedNID tells the broker we are running under an assigned lease
+		// name rather than our configured basename; it folds into the existing
+		// nodes.proxy_capable expression so an ephemeral instance never holds a
+		// public egress port.
+		LeasedNID: nidOf(a) != a.cfg.NID,
+		// Consumed with Swap: it is only meaningful on the FIRST register after
+		// an adoption. Carrying it further would let a much later register claim
+		// processes under a name this agent no longer has any relationship to.
+		PreviousNID: previousNIDOnce(a),
+		// The root of this agent's credential family, stated rather than left to
+		// be parsed out of NID. Without it the broker folds a device the
+		// operator named `gpu-02` into the `gpu` family and offers its clone
+		// `gpu-03` — a name in a different family that this agent's binding does
+		// not cover. (external review F2)
+		ConfiguredNID: a.cfg.NID,
+		// D6 §6.5: self-report the DETERMINISTIC nats server_name we are connected
+		// to (NOT the volatile NUID) so the leader can bridge it to a home broker.
+		// "" on a single-node bus → inert. ConnectedServerName reflects the actual
+		// connected server, updated across reconnects (drives §7.4 rehome).
+		ServerID: nc.ConnectedServerName(),
+		// C1: report our cached signed-roster generation so the leader can flag a
+		// sustained-behind agent (agent_roster_stale). 0 ⇒ pre-C1 / no cache. Advisory.
+		RosterGen: a.cachedRosterGen(),
+		// #78: the proxy.participate opt-out. Capabilities stays untouched —
+		// nodeHasProxyCap falls back to a release-version check when the
+		// token is absent, so omitting CapProxyV1 could NOT express opt-out.
+		ProxyOptOut: a.cfg.ProxyOptOut,
+	}
+	// upgrade-safety plan §3.1: the first register after a `node upgrade`
+	// carries the outcome (this one IS the health check-in when pending);
+	// empty strings on every ordinary register keep the wire byte-identical.
+	expectedIncarnation := agentIncarnation(a)
+	marker := captureUpgradeReport(a)
+	req.UpgradeState, req.UpgradeDetail = upgradeReportForMarker(a, marker)
+	if delivery != nil {
+		*delivery = marker
+	}
+	subject := proto.SubjNodeRegister(a.cfg.SID, nidOf(a))
+
+	return agentupgrade.Register(ctx, nc, agentupgrade.RegisterPort{
+		Request: req, Subject: subject, Logger: a.cfg.Logger, Timeout: a.cfg.RegisterTimeout,
+		RetryInitial: a.cfg.RegisterRetryInitial, RetryMax: a.cfg.RegisterRetryMax, WaitBackoff: waitBackoff,
+		Marshal: func(req proto.NodeRegisterReq) ([]byte, error) { return marshalAuthorityRegister(a, req) },
+		Snapshot: func(req *proto.NodeRegisterReq) func(proto.NodeRegisterResp) {
+			receipt := a.courier.registerReceipt()
+			req.LocalProcesses, req.LocalPorts = a.buildLocalSnapshot()
+			processes := req.LocalProcesses
+			return func(resp proto.NodeRegisterResp) { a.courier.onRegisterSuccess(receipt, processes, resp) }
+		},
+		Authority: func(body []byte) error { return checkRegisterAuthority(a, expectedIncarnation, body) },
+		Connected: func(server, url string, resp proto.NodeRegisterResp) {
+			rememberConnectedBroker(a, nc, server, url, resp)
+		},
+		Revoke: func(code string) { revokeSessionWorkloads(a, code) }, SessionGone: errSessionGone,
+	})
+}
+func upgradeReportForMarker(a *Agent, m *upgradeMarker) (string, string) {
+	return agentupgrade.LegacyReport(legacyAgentPort(a), m)
+}
+func commitCapturedUpgradeReport(a *Agent, reported string, expected *upgradeMarker) {
+	agentupgrade.CommitLegacyReport(legacyAgentPort(a), reported, expected)
+}
+
+func watchdogCapturedUpgrade(a *Agent, exePath string, expected *upgradeMarker) rollbackResult {
+	return rollbackResult(agentupgrade.WatchdogLegacy(legacyAgentPort(a), exePath, expected))
+}
+
+// ProbeUpgradeControl is the runtime observer's fresh control-evidence port.
+// The runtime still independently proves running SHA, scope and resource census.
+func ProbeUpgradeControl(a *Agent, nonce string) error {
+	nc, ctx := a.controlReady.Load(), a.loadRunCtx()
+	if nc == nil || ctx == nil || a.cfg.Upgrade == nil {
+		return &upgradetx.Error{Code: upgradetx.CodeUnsettled, Detail: "agent control subscriptions are not ready"}
+	}
+	return probeAgentControl(ctx, a, nc, nonce)
+}
+
+func marshalAuthorityRegister(a *Agent, req proto.NodeRegisterReq) ([]byte, error) {
+	req.Incarnation = agentIncarnation(a)
+	return marshalAgentTransferRegister(a, req)
+}
+
+func captureUpgradeReport(a *Agent) *upgradeMarker {
+	exe, err := a.upgradeExePath()
+	if err != nil {
+		return nil
+	}
+	marker, _ := readUpgradeMarker(upgradeMarkerPath(exe))
+	return marker
+}
+
+// The port borrows existing locks and preserves admission/rollback ownership.
+// origin: hot-update S8 plan §3.3 / §12.1 / P14.
+func legacyAgentPort(a *Agent) agentupgrade.LegacyPort {
+	return agentupgrade.LegacyPort{
+		SID: a.cfg.SID, NID: a.cfg.NID, InstanceID: a.instanceID, BootProof: a.upgradeBootProofID,
+		ExePath: a.upgradeExePath, RunningSHA: a.runningImageSHA, Mu: &a.upgradeMu,
+		Store: upgradeStore(), Logger: a.cfg.Logger, Stop: &a.upgradeWatchdogStop,
+		RollbackInFlight: &a.rollbackInFlight, Now: a.upgradeNow, Exec: a.upgradeExec,
+		NoExit: a.cfg.UpgradeNoExit, CustomExec: a.cfg.UpgradeExecFn != nil,
+		AdmissionPending: func(id string) bool { return ptyAdmissionPending(a, id) || flowSSAdmissionPending(a, id) },
+		ReleaseAdmission: func(id string) { releasePTYUpgradeAdmission(a, id); releaseFlowSSUpgradeAdmission(a, id) },
+		ImagePhase: func() agentboot.Phase {
+			if a.image == nil {
+				return agentboot.PhaseNone
+			}
+			return a.image.Phase()
+		},
+		RollbackImage: func(path string, m *upgradeMarker, reason string, retry bool) bool {
+			return bool(rollbackCurrentImage(a, path, m, reason, retry))
+		},
+	}
+}
+
+// agentRuntimeHost is the agent's half of the S8 RuntimePort. Every callback
+// is a package function over the existing owners; Agent gains no method.
+// origin: hot-update S8 plan §2.2 / §6.1 / §11.2 P14 P17; S8 FIX-AGENTWIRE
+func agentRuntimeHost(a *Agent, ports *UpgradeDependencies) agentupgradeport.Host {
+	return withTransferCensus(a, agentupgradeport.Host{
+		Key: ports.Key, Journal: ports.Store, Inherited: ports.Cut,
+		Owner:      func() (upgradetx.Owner, error) { return agentupgrade.ProcessOwner(a.instanceID) },
+		RunningSHA: a.runningImageSHA,
+		Source: func(sha string) (string, agentimage.Capabilities, error) {
+			return agentupgradeport.SourceReader(a.cfg.UpgradeRunningImagePath, sha, smokeVersionCapabilities)
+		},
+		Probe:     smokeVersionCapabilities,
+		Candidate: func(c agentimage.Capabilities) error { return checkCandidateABI(a, c) },
+		Deferrals: func() []agentimage.DeferredError { return transactionDeferrals(a) },
+		Required:  func() []string { return requiredUpgradeDomains(a) },
+		Snapshot:  func() (execsession.Image, agentimage.CourierState, error) { return transactionSnapshot(a) },
+		Freeze: func(readers []agentimage.Capabilities) (agentupgradeport.Image, error) {
+			return freezeTransaction(a, readers)
+		},
+		Exec: func(path string, prepared *handoff.Prepared) error { return execTransaction(a, path, prepared) },
+		Lease: func(ctx context.Context, key upgradetx.Key) (upgradelock.Lease, error) {
+			return agentupgrade.AcquireCurrentLease(ctx, a.cfg.Upgrade, key)
+		},
+		Stage:       func() upgradetx.CutStage { return a.image.CutStage() },
+		Control:     func(nonce string) error { return ProbeUpgradeControl(a, nonce) },
+		Incarnation: func() string { return agentIncarnation(a) },
+		StaleAfter:  transactionCutBudget,
+	})
+}
+
+// transactionCutBudget is how long a frozen, unactivated S8 cut may hold
+// business; tests shorten it to observe the stand-alone thaw.
+var transactionCutBudget = upgradebudget.ComponentHandover

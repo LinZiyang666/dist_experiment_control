@@ -33,6 +33,8 @@ type TunnelExposeAdapter struct {
 	opSem    chan struct{}
 	mu       sync.RWMutex
 	localFor map[int]int // publicPort → localPort
+	started  bool        // constructor binding is permitted only before Start
+	stop     context.CancelFunc
 }
 
 // acquireOp takes the adapter's op lock or gives up when ctx ends first.
@@ -63,7 +65,7 @@ var (
 )
 
 // NewTunnelExposeAdapter wires a tunnel.Client at brokerAddr and
-// returns the adapter. Caller MUST call Start(ctx) once before any
+// returns the dormant adapter. Run calls Start(ctx) before any
 // AddProxy / RemoveProxy.
 func NewTunnelExposeAdapter(brokerAddr, sid, nid string, logger *slog.Logger) *TunnelExposeAdapter {
 	a := &TunnelExposeAdapter{
@@ -75,9 +77,58 @@ func NewTunnelExposeAdapter(brokerAddr, sid, nid string, logger *slog.Logger) *T
 	return a
 }
 
+// SessionCount is the upgrade preflight's strict expose-session census.
+// origin: hot-update S3 plan §4.1.
+func (a *TunnelExposeAdapter) SessionCount() int { return a.client.SessionCount() }
+
 // Start anchors the underlying tunnel.Client to ctx.
 func (a *TunnelExposeAdapter) Start(ctx context.Context) {
-	a.client.Start(ctx)
+	// origin: hot-update S5 plan §7.1 — Run and the restored activation hook
+	// share this entry point. Starting twice would create two lifetime closers.
+	a.mu.Lock()
+	if a.started {
+		a.mu.Unlock()
+		return
+	}
+	a.started = true
+	client := a.client
+	lifetime, stop := context.WithCancel(ctx)
+	a.stop = stop
+	a.mu.Unlock()
+	client.Start(lifetime)
+}
+
+// Cancelling the parent-owned adapter never follows a NATS session rebuild.
+// Taking the cancel function under mu and invoking it outside mu prevents
+// cleanup from joining a callback while holding the adapter's lookup lock.
+// origin: hot-update S5 plan §7.1 / §7.2
+func stopExposeAdapter(a *Agent) {
+	if adapter, ok := a.cfg.ExposeAdapter.(*TunnelExposeAdapter); ok {
+		adapter.mu.Lock()
+		stop := adapter.stop
+		adapter.mu.Unlock()
+		if stop != nil {
+			stop()
+		}
+	}
+}
+
+// adoptRestoredClient keeps the original raw/replay owner and its sealed local
+// mappings. A running adapter may have outstanding lookups, so replacement is
+// refused rather than allowing an old supervisor to close the imported client.
+// origin: hot-update S5 plan §7.1 / TestBootstrapFlowRestoreStartsNoWorkers
+func (a *TunnelExposeAdapter) adoptRestoredClient(client *tunnel.Client) error {
+	if client == nil {
+		return fmt.Errorf("tunnel adapter: missing restored client")
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.started {
+		return fmt.Errorf("tunnel adapter: restored binding after Start")
+	}
+	a.client = client
+	a.localFor = make(map[int]int)
+	return nil
 }
 
 // SetNID updates the name presented on the tunnel REGISTER line.
@@ -116,14 +167,24 @@ func (a *TunnelExposeAdapter) AddProxy(ctx context.Context, p PortToken) error {
 	}
 	defer a.releaseOp()
 
+	oldLocal, oldErr := a.lookupLocal(p.Port)
 	a.setLocal(p.Port, p.LocalPort)
 	// D6 §7.5: dial THIS expose's home (p.HomeBrokerAddr, "" ⇒ the Client's single
 	// --tunnel-addr fallback) at its home epoch, pinned by the directive's certs.
 	// A clustered home (non-empty addr) with no pins returns ErrHomePinsRequired;
 	// the caller (replay) defers until a register/expose reply re-delivers them.
 	if err := a.client.OpenHome(ctx, p.Port, p.LocalPort, p.Token, p.HomeBrokerAddr, p.Epoch, p.CertPins); err != nil {
-		a.deleteLocal(p.Port)
+		if oldErr == nil {
+			a.setLocal(p.Port, oldLocal)
+		} else {
+			a.deleteLocal(p.Port)
+		}
 		return fmt.Errorf("tunnel adapter AddProxy: %w", err)
+	}
+	if local, ok := a.client.LocalPort(p.Port); ok {
+		a.setLocal(p.Port, local)
+	} else {
+		a.deleteLocal(p.Port)
 	}
 	return nil
 }
@@ -166,9 +227,19 @@ func (a *TunnelExposeAdapter) RemoveProxy(_ string, publicPort int) error {
 
 func (a *TunnelExposeAdapter) lookupLocal(publicPort int) (int, error) {
 	a.mu.RLock()
-	defer a.mu.RUnlock()
-	if local, ok := a.localFor[publicPort]; ok {
+	local, ok := a.localFor[publicPort]
+	client := a.client
+	a.mu.RUnlock()
+	if ok {
 		return local, nil
+	}
+	// The imported client already owns the sealed endpoint's local mapping;
+	// state.json replay cannot substitute a new target or a new business socket.
+	// origin: hot-update S5 plan §7.1
+	if client != nil {
+		if local, ok := client.LocalPort(publicPort); ok {
+			return local, nil
+		}
 	}
 	return 0, fmt.Errorf("tunnel adapter: no local mapping for public port %d", publicPort)
 }

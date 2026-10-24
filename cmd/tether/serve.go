@@ -1,32 +1,35 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
+	"github.com/LinZiyang666/tether/internal/agentboot"
 	"github.com/LinZiyang666/tether/internal/auth"
 	"github.com/LinZiyang666/tether/internal/broker"
+	"github.com/LinZiyang666/tether/internal/brokerimage"
 	"github.com/LinZiyang666/tether/internal/serveconf"
 	"github.com/LinZiyang666/tether/internal/storage"
+	"github.com/LinZiyang666/tether/internal/upgradecli"
+	"github.com/LinZiyang666/tether/internal/upgradecli/legacy"
 	"github.com/spf13/cobra"
 )
 
-// defaultUpgradeURLPrefix matches the GitHub release URL that
-// install.sh and goreleaser produce; keeping it here (rather than in
-// serveconf) so a self-hosted distribution can override via yaml or
-// flag without recompiling. Architecture J.4: "默认
-// https://github.com/<org>/tether/releases/".
-const defaultUpgradeURLPrefix = "https://github.com/LinZiyang666/dist_experiment_control/releases/"
+// The default upgrade URL prefix and its precedence moved verbatim to
+// internal/upgradecli/allowlist.go (hot-update S8 plan §11.2 P19 slim move).
 
 func newServeCmd() *cobra.Command {
 	var (
@@ -60,7 +63,19 @@ func newServeCmd() *cobra.Command {
 		Use:   "serve",
 		Short: "Run broker daemon (NATS subscriber + node state machine)",
 		Args:  cobra.NoArgs,
-		RunE: func(cmd *cobra.Command, args []string) error {
+		RunE: func(cmd *cobra.Command, args []string) (runErr error) {
+			// origin: hot-update S6 plan §4.1 / T03
+			// Keep S3 W1 cleanup and ordinary agent recovery, but never open
+			// a production broker store after losing an inherited dispatch.
+			if img := agentboot.Current(); img != nil && img.Phase() == agentboot.PhaseLost {
+				return fmt.Errorf("broker: refusing cold start after unreadable dispatch")
+			}
+			if brokerBoot != nil {
+				data, err := brokerimage.BootConfigBytes(os.Args)
+				if err != nil || brokerBoot.CheckConfig(data, os.Args) != nil {
+					return brokerimage.ErrImage
+				}
+			}
 			fileCfg, err := serveconf.Load(configPath)
 			if err != nil {
 				return err
@@ -161,9 +176,19 @@ func newServeCmd() *cobra.Command {
 			// second pool that also runs migrations is a locking/corruption hazard). Decide
 			// the mode from the on-disk raft state BEFORE touching the DB; only single mode
 			// opens it here (broker.Run re-points b.cfg.DB to node.RODB() in cluster mode).
-			clusterMode, err := broker.DetectClusterMode(clusterDataDir)
-			if err != nil {
-				return err
+			// Configuration probes derive defaults from the requested mode, without
+			// opening the live Bolt store. Recoverable-state checks belong to real
+			// startup, after the reader probe has exited; only a daemon checks
+			// initialized state.
+			// origin: hot-update S6 plan §3.1 / T06; internal review rv-writer-5 / rv-fd-7
+			clusterMode := clusterDataDir != ""
+			if !configCheck {
+				if brokerBoot == nil {
+					clusterMode, err = broker.DetectClusterMode(clusterDataDir)
+					if err != nil {
+						return err
+					}
+				}
 			}
 			// C3: in cluster mode the per-broker topology reconciler manages the live nats.conf. Default
 			// the path so a standard install converges automatically; an operator can override or set it
@@ -194,29 +219,10 @@ func newServeCmd() *cobra.Command {
 			// config-check (as it is in cluster mode); the exit is after the pure
 			// validators, before broker.New / listeners.
 			var db *sql.DB
-			if !clusterMode && !configCheck {
-				db, err = storage.Open(dbPath)
-				if err != nil {
-					return err
-				}
-				defer func() { _ = db.Close() }()
-			}
 
-			// Upgrade allowlist precedence: explicit
-			// --upgrade-url-allow > yaml > built-in default. The
-			// built-in default points at this binary's own GitHub
-			// release prefix so `tether node upgrade` works out of
-			// the box; operators who self-host artifacts override
-			// via yaml or flag.
-			allow := upgradeURLAllow
-			if !cmd.Flags().Changed("upgrade-url-allow") {
-				switch {
-				case len(fileCfg.Broker.Upgrade.URLAllow) > 0:
-					allow = fileCfg.Broker.Upgrade.URLAllow
-				case len(allow) == 0:
-					allow = []string{defaultUpgradeURLPrefix}
-				}
-			}
+			// Upgrade allowlist precedence: explicit --upgrade-url-allow > yaml >
+			// built-in default (upgradecli.BrokerUpgradeAllow documents why).
+			allow := upgradecli.BrokerUpgradeAllow(cmd.Flags().Changed("upgrade-url-allow"), upgradeURLAllow, fileCfg.Broker.Upgrade.URLAllow)
 
 			// h1 F: --log-file (or broker.yaml observability.log_file) points
 			// slog at an in-process size-capped rotating file. Binary default
@@ -236,8 +242,18 @@ func newServeCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			// origin: hot-update S8 plan §5.2 / §11.2 P19 — cold broker boot follows
+			// its registered selector; the config path and data dir are its identity.
+			// S8 FIX-DESCRIBE R4: a registered broker binds its journal (Config.Upgrade).
+			// S8 BROKER-EXPORTER R-11: a restored image's S8 adjunct is verified here.
+			plan, err := upgradecli.BrokerBoot(clusterDataDir, dbPath, configPath, brokerBoot != nil || agentboot.Current() != nil, configCheck, logger)
+			upgradeDeps, depsErr := upgradecli.BrokerDependencies(plan, brokerBoot)
+			if err = errors.Join(err, depsErr); err != nil {
+				return upgradeExit("serve canonical boot", err)
+			}
 
 			cfg := broker.Config{
+				TransferFactory:      broker.ServeTransferFactory,
 				NATSURL:              natsURL,
 				DB:                   db,
 				Logger:               logger,
@@ -266,6 +282,7 @@ func newServeCmd() *cobra.Command {
 				NatsServerBin:        natsServerBin,
 				AlertWebhookURL:      alertWebhookURL,
 				DiskCheckInterval:    diskCheckInterval,
+				Upgrade:              upgradeDeps,
 			}
 
 			authSeedsSource := effectiveAuthSeedsDir(authSeedsDir, clusterMode, clusterSecrets)
@@ -302,18 +319,59 @@ func newServeCmd() *cobra.Command {
 				return nil
 			}
 
+			// origin: hot-update S6 plan §1.2 / §2.1 / T03
+			// Only a cold single launch opens here, after all pure validation.
+			// Image failure must retain salvage, never migrate or cold-open.
+			if err := broker.ValidateConfig(cfg); err != nil {
+				return err
+			}
+			if runtime.GOOS == "linux" && dbPath != ":memory:" {
+				cfg.ImageRun, err = broker.NewImageRun(os.Args, brokerBoot)
+				if err != nil {
+					return err
+				}
+			}
+			var store brokerimage.StoreOwner
+			if !clusterMode && brokerBoot == nil && dbPath == ":memory:" {
+				// In-memory stores remain cold-capable and explicitly image-ineligible.
+				// origin: hot-update S6 plan §3.1 / lead D3
+				cfg.DB, err = storage.Open(dbPath)
+				if err != nil {
+					return err
+				}
+				defer func() { runErr = errors.Join(runErr, cfg.DB.Close()) }()
+			} else if !clusterMode && brokerBoot == nil {
+				if err := brokerimage.InstallColdSingleStoreSupport(); err != nil {
+					return err
+				}
+				// Single mode has no independent DataDir flag. Let the store
+				// owner derive it from the canonical DB path, including file:
+				// URIs; filepath.Dir on the raw DSN would split the lock domain.
+				store, db, err = brokerimage.OpenSingleStore(brokerimage.SingleStoreConfig{
+					DBPath: dbPath, Registry: storage.DefaultDriverRegistry(),
+				})
+				// A partial opener's nonnil owner also needs terminal cleanup.
+				defer func() {
+					if store != nil {
+						runErr = errors.Join(runErr, brokerimage.CloseStoreOwner(store))
+					}
+				}()
+				if err != nil {
+					return err
+				}
+				cfg.DB, cfg.SingleStore = db, store
+			}
 			b, err := broker.New(cfg)
 			if err != nil {
 				return err
 			}
+			// Run owns terminal cleanup from entry; InstallCurrent transfers it
+			// to the current slot before any image replacement.
+			// This defer is constructor-failure cleanup only, never a DB owner
+			// captured across exec-error reopen or ACTIVE rollback.
 
 			ctx, stop := signal.NotifyContext(cmd.Context(), syscall.SIGINT, syscall.SIGTERM)
 			defer stop()
-			// G5 #13: a cancellable run context so an in-broker RequestReExec (the reload admin-op) can
-			// unwind Run through its ordered shutdown, then trampoline into the freshly-staged on-disk binary.
-			runCtx, cancel := context.WithCancel(ctx)
-			defer cancel()
-			b.SetReloadTrigger(cancel)
 
 			authMode := "off (dev / P2-style)"
 			if cfg.AuthCallout != nil {
@@ -323,11 +381,9 @@ func newServeCmd() *cobra.Command {
 				"tether serve: NATS=%s DB=%s auth_callout=%s\n(press Ctrl-C to quit)\n",
 				natsURL, dbPath, authMode)
 
-			if err := b.Run(runCtx); err != nil && !errors.Is(err, context.Canceled) {
+			store = nil // Run owns terminal cleanup from entry, including startup errors.
+			if err := b.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 				return err
-			}
-			if b.ReExecRequested() {
-				return reExecBrokerInPlace(cmd) // G5 #13: syscall.Exec the on-disk binary, same PID
 			}
 			return nil
 		},
@@ -383,21 +439,6 @@ func resolveManifestListen(cur string, clusterMode, flagChanged bool) string {
 		return defaultManifestListen
 	}
 	return cur
-}
-
-// reExecBrokerInPlace (G5 #13) replaces this process image with the on-disk binary at the SAME path the
-// daemon was started from — the freshly-STAGED target. syscall.Exec preserves the PID, so systemd
-// Type=simple sees no exit (structurally immune to the #23 clean-exit trap). It only returns on FAILURE,
-// in which case it yields a non-zero-exit error so Restart=always (G1) revives with the new binary.
-func reExecBrokerInPlace(cmd *cobra.Command) error {
-	exe, err := os.Executable()
-	if err != nil {
-		return &ExitError{Class: exitInternal, Err: fmt.Errorf("broker re-exec: resolve executable: %w", err)}
-	}
-	exe = strings.TrimSuffix(exe, " (deleted)") // the running inode was replaced on disk by staging
-	_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "broker: re-exec into %s (same PID, new binary)\n", exe)
-	err = syscall.Exec(exe, os.Args, os.Environ()) // returns ONLY on failure
-	return &ExitError{Class: exitInternal, Err: fmt.Errorf("broker re-exec failed: %w", err)}
 }
 
 // pickFlagOrYaml returns flagVal when the user explicitly passed the
@@ -541,11 +582,46 @@ func readPrivateSeedFile(dir, name string) ([]byte, error) {
 	return body, nil
 }
 
-// subURLBase derives the public origin printed in P13 subscription URLs from
-// the broker's public host. https is assumed (Caddy terminates TLS on :443).
 func subURLBase(publicHost string) string {
-	if publicHost == "" || publicHost == "localhost" {
-		return ""
+	return legacy.BrokerSubURLBase(publicHost)
+}
+
+// The reader protocol is offline and shares serve's real pure validators. It
+// never installs store adapters or reaches broker.New; config-check uses a
+// discard logger and performs only configuration/auth seed reads.
+// origin: hot-update S6 plan §3.1 / T06 / §12.1 P22
+func newBrokerImagePreflightCmd() *cobra.Command {
+	return &cobra.Command{
+		Use: brokerimage.PreflightProbeCommand, Hidden: true, Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			request, err := brokerimage.DecodeProbeRequest(cmd.InOrStdin())
+			if err != nil {
+				return err
+			}
+			supported, err := storage.SupportedMigrations()
+			if err != nil {
+				return brokerimage.ErrImage
+			}
+			reply, err := brokerimage.ReaderProbe(request, supported, validateBrokerProbeConfig)
+			if err != nil {
+				return err
+			}
+			return json.NewEncoder(cmd.OutOrStdout()).Encode(reply)
+		},
 	}
-	return "https://" + publicHost
+}
+
+func validateBrokerProbeConfig(config []byte, args []string) error {
+	if len(args) < 2 || args[1] != "serve" {
+		return brokerimage.ErrImage
+	}
+	bytesOnDisk, err := brokerimage.BootConfigBytes(args)
+	if err != nil || !bytes.Equal(bytesOnDisk, config) {
+		return brokerimage.ErrImage
+	}
+	serve := newServeCmd()
+	serve.SetOut(io.Discard)
+	serve.SetErr(io.Discard)
+	serve.SetArgs(append(append([]string(nil), args[2:]...), "--config-check=true"))
+	return serve.Execute()
 }

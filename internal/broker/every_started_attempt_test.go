@@ -18,6 +18,7 @@ import (
 	"github.com/LinZiyang666/tether/internal/schema"
 	"github.com/LinZiyang666/tether/internal/serveconf"
 	"github.com/LinZiyang666/tether/internal/xferaudit"
+	"github.com/LinZiyang666/tether/internal/xfertrack"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 )
@@ -59,10 +60,15 @@ func (b *blockingJS) observed() []time.Duration {
 	return out
 }
 
+// newProvisionBroker binds the real configuration owner (bindProvisionOwner): a raw handle is not a
+// config writer, so provisioning through it is refused as owner-recovering before any attempt starts.
 func newProvisionBroker(js jetstream.JetStream) *Broker {
 	b := &Broker{transfers: newTransferTracker()}
 	b.cfg = Config{Logger: silentLogger(), Now: time.Now}
 	setBrokerJS(b, js)
+	if err := bindProvisionOwner(b, js); err != nil {
+		panic(err) // static fixture identity; only a broken constructor contract reaches this
+	}
 	return b
 }
 
@@ -77,6 +83,10 @@ func newProvisionBroker(js jetstream.JetStream) *Broker {
 // The invariant is therefore per-attempt, not per-count: whatever the budget allows, every attempt
 // that IS started gets a full one.
 func TestG67EveryStartedAttemptGetsAFullBudget(t *testing.T) {
+	// origin: hot-update S10 plan §11.1 / TEST-BUDGET
+	if runIsolatedBrokerTest(t) {
+		return
+	}
 	js := &blockingJS{}
 	b := newProvisionBroker(js)
 
@@ -136,6 +146,10 @@ func TestG67ProvisionConstantsAreSelfConsistent(t *testing.T) {
 // handler is the nats.go callback) — it asserts the AMPLIFIER stays bounded, which is what makes
 // widening the budget a decision someone has to justify rather than a one-constant edit.
 func TestG67HeadOfLineLatencyIsBounded(t *testing.T) {
+	// origin: hot-update S10 plan §11.1 / TEST-BUDGET
+	if runIsolatedBrokerTest(t) {
+		return
+	}
 	js := &blockingJS{}
 	b := newProvisionBroker(js)
 
@@ -173,6 +187,10 @@ func TestG67HeadOfLineLatencyIsBounded(t *testing.T) {
 // bucket_create_failed, which cmd/tether leaves unmapped => exit 70 ("a tether fault you should
 // report"). Both told the operator a JetStream verdict about a JetStream that was never asked.
 func TestG67AbortedProvisionIsRetriableAndNotAJetStreamVerdict(t *testing.T) {
+	// origin: hot-update S10 plan §11.1 / TEST-BUDGET
+	if runIsolatedBrokerTest(t) {
+		return
+	}
 	for _, tc := range []struct {
 		name     string
 		mkParent func() (context.Context, context.CancelFunc)
@@ -240,6 +258,10 @@ func TestG67AbortedProvisionIsRetriableAndNotAJetStreamVerdict(t *testing.T) {
 // MaxStore = -1 deliberately — it is reproducing production, not asserting its own premise.
 
 func TestG67SizingTimeoutCannotMoveTheAdmissionDecision(t *testing.T) {
+	// origin: hot-update S10 plan §11.1 / TEST-BUDGET
+	if runIsolatedBrokerTest(t) {
+		return
+	}
 	// PRODUCTION SHAPE: the ACCOUNT limit is unlimited, so the ceiling comes from statfs.
 	slow := &slowAccountInfoJS{delay: xferSizingTimeout * 3, maxStore: -1}
 	b := newProvisionBroker(slow)
@@ -368,6 +390,10 @@ func TestG67PullHandlerRepliesTransientCodeOnStall(t *testing.T) {
 // Background(). With Background() a broker shutdown no longer aborts provisioning — every in-flight
 // push adds up to the full budget to `systemctl restart` — and the whole Aborted branch becomes dead.
 func TestG67HandlersPassRunCtxNotBackground(t *testing.T) {
+	// origin: hot-update S10 plan §11.1 / TEST-BUDGET
+	if runIsolatedBrokerTest(t) {
+		return
+	}
 	nc, actor, b := pushWiringBroker(t, &blockingJS{})
 	ctx, cancel := context.WithCancel(context.Background())
 	b.runCtx = ctx
@@ -456,10 +482,10 @@ func TestStagedTerminalReplayDetectsPriorCommitOnARealLedger(t *testing.T) {
 		t.Fatalf("commit the real terminal: %v", err)
 	}
 	// 2. The crash window: the ledger still carries the staged terminal because the unlink never ran.
-	e := &transferEntry{transferID: "tid-real-ledger", sid: "sess", nid: "n1", verb: "push", tier: "a",
-		bucket: "OBJ_xfer-sess", path: "/dst", startedAt: now.Add(-transferTimeoutTierA - xferStrandedSlack - time.Minute)}
+	e := xfertrack.NewLegacyEntry(xfertrack.LegacyRecord{TransferID: "tid-real-ledger", SID: "sess", NID: "n1", Verb: "push", Tier: "a",
+		Bucket: "OBJ_xfer-sess", Path: "/dst", StartedAt: now.Add(-transferTimeoutTierA - xferStrandedSlack - time.Minute)})
 	b.writeXferInflight(e)
-	if staged, _ := b.stageXferInflightTerminal(e.transferID, terminal); !staged {
+	if staged, _ := b.stageXferInflightTerminal(b.transfers.Record(e).TransferID, terminal); !staged {
 		t.Fatal("staging the terminal must succeed when a ledger dir exists")
 	}
 
@@ -474,7 +500,7 @@ func TestStagedTerminalReplayDetectsPriorCommitOnARealLedger(t *testing.T) {
 			"— the audit would then carry two rows for one transfer, which is the contradiction the "+
 			"re-review's F1 counter-example pins", emitted)
 	}
-	if _, err := os.Stat(filepath.Join(dir, "xfer-inflight", xferInflightFilename(e.transferID))); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(dir, "xfer-inflight", xferInflightFilename(b.transfers.Record(e).TransferID))); !os.IsNotExist(err) {
 		t.Fatal("once the prior commit is detected the ledger must be dropped, or every pass re-checks it forever")
 	}
 }

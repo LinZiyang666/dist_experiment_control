@@ -48,7 +48,9 @@ func TestPhaseFluidityLifecycleFailedJoinSurvivesLeaderRestart(t *testing.T) {
 	dir := t.TempDir()
 	n := pfRestartableNode(t, "pf-leader", dir, true)
 	admin := NewClusterAdmin(n, nil)
-	admin.caughtUpFn = func(string, uint64) (bool, error) { return false, nil }
+	// The controller owns these seams after extraction to brokercontrol.
+	// origin: hot-update S6 plan §9.3 / HARDGATE-A
+	admin.CaughtUpFn = func(string, uint64) (bool, error) { return false, nil }
 
 	// stage a failed join (unreachable joiner → CATCHING_UP nonvoter).
 	bundle, _ := makeJoinBundle(t, "pf-joiner", "10.0.0.50:7400", "pf-nonce")
@@ -57,9 +59,9 @@ func TestPhaseFluidityLifecycleFailedJoinSurvivesLeaderRestart(t *testing.T) {
 		t.Fatalf("StartJoinOperation: %v", err)
 	}
 	for i := 0; i < 8; i++ {
-		admin.driveInFlightOperations()
+		admin.DriveInFlightOperations()
 	}
-	if sub, _ := admin.readSubstrate("pf-joiner"); !sub.inRaft || sub.isVoter || sub.phase != phaseCatchingUp {
+	if sub, _ := admin.ReadSubstrate("pf-joiner"); !sub.InRaft || sub.IsVoter || sub.Phase != phaseCatchingUp {
 		t.Fatalf("setup did not stage a nonvoter/CATCHING_UP: %+v", sub)
 	}
 
@@ -74,16 +76,16 @@ func TestPhaseFluidityLifecycleFailedJoinSurvivesLeaderRestart(t *testing.T) {
 	t.Cleanup(func() { _ = n.Shutdown() })
 	admin = NewClusterAdmin(n, nil)
 	// Adversarial: even if the joiner now "reports" caught-up, an ABORTED op must never be promoted.
-	admin.caughtUpFn = func(string, uint64) (bool, error) { return true, nil }
+	admin.CaughtUpFn = func(string, uint64) (bool, error) { return true, nil }
 
 	for i := 0; i < 4; i++ {
-		admin.driveInFlightOperations()
+		admin.DriveInFlightOperations()
 	}
-	sub, err := admin.readSubstrate("pf-joiner")
+	sub, err := admin.ReadSubstrate("pf-joiner")
 	if err != nil {
 		t.Fatalf("readSubstrate post-restart: %v", err)
 	}
-	if sub.isVoter {
+	if sub.IsVoter {
 		t.Fatalf("aborted join was promoted to voter AFTER a leader restart: %+v", sub)
 	}
 	if err := admin.RemoveNode("pf-joiner", false); err != nil {

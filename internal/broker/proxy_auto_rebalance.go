@@ -115,11 +115,22 @@ func (b *Broker) driveAutoRebalanceOnReturn(returned, downNow []string) {
 	// A10: gatesClear drives ONLY the fire decision, which can only happen when a node's dwell is satisfied
 	// (the arm has pending work). In the common steady state (no returns, empty pending) skip the three DB
 	// reads entirely — tick never consults gatesClear then, so a false value is indistinguishable.
+	// origin: hot-update S6 plan §7.2 / T43
+	// Suppress only this maintained home's pending return. A simultaneous real
+	// return on another home still advances, and no global pending map is reset.
+	ordinary := make([]string, 0, len(returned))
+	for _, home := range returned {
+		if proxyHomeMaintained(b, home) {
+			continue
+		}
+		ordinary = append(ordinary, home)
+	}
 	gatesClear := false
-	if len(returned) > 0 || len(b.autoRebalanceArm.pending) > 0 {
+	if len(ordinary) > 0 || len(b.autoRebalanceArm.pending) > 0 {
 		gatesClear = len(downNow) == 0 && !forceSingleActive(b.cfg.DB) && b.noInflightOps() && !b.recentProxyRehome()
 	}
-	if !b.autoRebalanceArm.tick(returned, b.proxyHomeHealthy, gatesClear) {
+	if !tickHomeReturns(&b.autoRebalanceArm, ordinary, b.proxyHomeHealthy,
+		func(home string) bool { return proxyHomeMaintained(b, home) }, gatesClear) {
 		return
 	}
 	rep, err := b.rebalanceProxyHomes(false)
@@ -159,4 +170,31 @@ func (b *Broker) recentProxyRehome() bool {
 		return true
 	}
 	return n > 0
+}
+
+// tickHomeReturns pauses the maintained subset without presenting those nodes
+// as healthy and without clearing the unrelated pending set when it fires.
+// origin: hot-update S6 plan §7.2 / T43
+func tickHomeReturns(arm *autoRebalanceArm, returned []string, stillUp, maintained func(string) bool, gatesClear bool) bool {
+	held := map[string]int{}
+	for home, left := range arm.pending {
+		if maintained(home) {
+			held[home] = left
+			delete(arm.pending, home)
+		}
+	}
+	ordinary := make([]string, 0, len(returned))
+	for _, home := range returned {
+		if !maintained(home) {
+			ordinary = append(ordinary, home)
+		}
+	}
+	fire := arm.tick(ordinary, stillUp, gatesClear)
+	if arm.pending == nil {
+		arm.pending = map[string]int{}
+	}
+	for home, left := range held {
+		arm.pending[home] = left
+	}
+	return fire
 }

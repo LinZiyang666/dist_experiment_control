@@ -7,10 +7,14 @@ import (
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/cluster"
+	"github.com/LinZiyang666/tether/internal/infrarepair"
 	"github.com/LinZiyang666/tether/internal/node"
 	"github.com/LinZiyang666/tether/internal/port"
 	"github.com/LinZiyang666/tether/internal/proc"
+	"github.com/LinZiyang666/tether/internal/proto"
 	"github.com/LinZiyang666/tether/internal/session"
+	"github.com/LinZiyang666/tether/internal/upgradeauthority"
+	"github.com/LinZiyang666/tether/internal/xferauth"
 )
 
 // h1 B1 GC bounds. gcChunkRows caps the keyset baked into ONE raft entry
@@ -38,11 +42,9 @@ const (
 // still-catching-up FSM view (same gate the xfer reaper uses). Propose errors
 // return to the registry, whose per-pass backoff is the damper.
 func gcProposeChunks(b *Broker, pass string, plan func(db *sql.DB) (*cluster.Command, int, error)) error {
-	if b.cl == nil || b.cl.node == nil {
-		return nil // cluster wiring not up yet (boot window)
-	}
-	if !b.reaperCaughtUp() {
-		return nil
+	// Nil cluster wiring is the boot window; short-circuit keeps it ahead of reaperCaughtUp.
+	if b.cl == nil || b.cl.node == nil || !b.reaperCaughtUp() {
+		return nil // cluster wiring not up yet (boot window), or a still-catching-up view
 	}
 	return gcDrain(b.cfg.Logger, pass, b.cl.node.Propose, plan)
 }
@@ -126,20 +128,12 @@ func (b *Broker) registerCoreReconcilePasses() {
 	// Idempotent path: node.ReconcileStates (a level-triggered UPDATE keyed on
 	// last_seen vs. StaleAfter/OfflineAfter — running it twice in a row is a
 	// no-op).
-	r.register("node-states", b.cfg.ReconcileInterval, authorityAny, func(_ context.Context, now time.Time) error {
+	r.register("node-states", b.cfg.ReconcileInterval, authorityAny, func(_ context.Context, now time.Time) error { // Behavior-equivalence: the pre-R7 body LOGGED and continued. It
+		// must keep doing so — returning the error here would earn the pass
+		// exponential backoff and change its cadence, breaking the very
+		// equivalence this rewrite has to prove.
 		n, err := node.ReconcileStates(b.livenessDB(), now, b.cfg.StaleAfter, b.cfg.OfflineAfter)
-		if err != nil {
-			// Behavior-equivalence: the pre-R7 body LOGGED and continued. It
-			// must keep doing so — returning the error here would earn the pass
-			// exponential backoff and change its cadence, breaking the very
-			// equivalence this rewrite has to prove.
-			b.cfg.Logger.Warn("broker: reconcile failed", "err", err)
-			return nil
-		}
-		if n > 0 {
-			b.cfg.Logger.Info("broker: state transitions", "count", n)
-		}
-		return nil
+		return reportReconcileCount(b, "state transitions", "count", true, n, err)
 	})
 
 	// --- pass 2/4: OFFLINE-node port revocation (the LEADER-ONLY shape) ---
@@ -192,30 +186,11 @@ func (b *Broker) registerCoreReconcilePasses() {
 	//
 	// Idempotent path: single mode proc.GCExited (cutoff-bounded DELETE);
 	// cluster mode keyed DELETE + re-asserted status guard (replay no-ops).
-	r.register("proc-gc", b.cfg.ProcGCInterval, authorityLeader, func(_ context.Context, now time.Time) error {
-		if b.clusterMode {
-			return gcProposeChunks(b, "proc-gc", func(db *sql.DB) (*cluster.Command, int, error) {
-				return proc.PlanGCExited(db, now.Add(-b.cfg.ProcRetention), gcChunkRows)
-			})
-		}
-		db, ok := b.singleWriter()
-		if !ok {
-			// Unreachable given the mode branch above — which is exactly why it returns the
-			// named error rather than nil. If the two ever disagree, a silent nil means
-			// `processes` rows accumulate forever and nobody finds out; the reconciler logs a
-			// returned error, so the contradiction becomes visible instead of a slow leak.
-			return singleWriteRefusal()
-		}
-		cutoff := now.Add(-b.cfg.ProcRetention)
-		n, err := proc.GCExited(db, cutoff)
-		if err != nil {
-			b.cfg.Logger.Warn("broker: proc gc", "err", err)
-			return nil
-		}
-		if n > 0 {
-			b.cfg.Logger.Info("broker: proc gc", "deleted", n, "cutoff", cutoff)
-		}
-		return nil
+	r.register("proc-gc", b.cfg.ProcGCInterval, authorityLeader, func(_ context.Context, now time.Time) error { // Unreachable given the mode branch above — which is exactly why it returns the
+		// named error rather than nil. If the two ever disagree, a silent nil means
+		// `processes` rows accumulate forever and nobody finds out; the reconciler logs a
+		// returned error, so the contradiction becomes visible instead of a slow leak.
+		return runRetentionPass(b, "proc gc", now.Add(-b.cfg.ProcRetention), proc.GCExited, proc.PlanGCExited)
 	})
 
 	// --- pass 5: port-allocation history retention GC (h1 B1) ---
@@ -227,25 +202,7 @@ func (b *Broker) registerCoreReconcilePasses() {
 	// same single/cluster split as proc-gc; retention is the hardcoded
 	// portRetention (24h — no knob until someone asks; h1 plan Q4).
 	r.register("port-gc", b.cfg.ProcGCInterval, authorityLeader, func(_ context.Context, now time.Time) error {
-		if b.clusterMode {
-			return gcProposeChunks(b, "port-gc", func(db *sql.DB) (*cluster.Command, int, error) {
-				return port.PlanGCTerminated(db, now.Add(-portRetention), gcChunkRows)
-			})
-		}
-		db, ok := b.singleWriter()
-		if !ok {
-			return singleWriteRefusal()
-		}
-		cutoff := now.Add(-portRetention)
-		n, err := port.GCTerminated(db, cutoff)
-		if err != nil {
-			b.cfg.Logger.Warn("broker: port gc", "err", err)
-			return nil
-		}
-		if n > 0 {
-			b.cfg.Logger.Info("broker: port gc", "deleted", n, "cutoff", cutoff)
-		}
-		return nil
+		return runRetentionPass(b, "port gc", now.Add(-portRetention), port.GCTerminated, port.PlanGCTerminated)
 	})
 
 	// --- #58/P10: orphan xfer-object reaper, now actually periodic ---
@@ -278,15 +235,14 @@ func (b *Broker) registerCoreReconcilePasses() {
 	//
 	// Idempotent path: b.reconcileXferObjects (deleting an already-deleted
 	// object returns ErrObjectNotFound, which it swallows).
+	//
+	// GC IS A RECOVERY PRODUCER (S9 P18/P22): the whole pass holds one ObjectDelete
+	// permit, so a sealed recovery refuses it and Seal joins an admitted pass. A cold
+	// broker's unbound JetStream makes the permit a no-op.
+	// origin: hot-update S9 plan §4.3 / T49 / M24
 	r.register("xfer-orphan-reap", b.cfg.XferReapInterval, authorityAny, func(ctx context.Context, _ time.Time) error {
-		n, err := b.reconcileXferObjects(ctx)
-		if err != nil {
-			return err
-		}
-		if n > 0 {
-			b.cfg.Logger.Info("broker: orphan xfer objects reaped", "count", n)
-		}
-		return nil
+		n, err := infrarepair.RunLegacyValue(ctx, brokerJS(b), infrarepair.ObjectDelete, b.reconcileXferObjects)
+		return reportReconcileCount(b, "orphan xfer objects reaped", "count", false, n, err)
 	})
 
 	// #57 Lane B: finalize-on-recovery. On the same cadence, close any DANGLING in-flight-transfer start
@@ -295,13 +251,7 @@ func (b *Broker) registerCoreReconcilePasses() {
 	// routes through leader Apply and its content-reqID dedups. Shares the reap cadence (no new goroutine).
 	r.register("xfer-inflight-finalize", b.cfg.XferReapInterval, authorityAny, func(ctx context.Context, _ time.Time) error {
 		n, err := b.finalizeStrandedXfers(ctx)
-		if err != nil {
-			return err
-		}
-		if n > 0 {
-			b.cfg.Logger.Info("broker: finalized stranded in-flight transfers after a home restart", "count", n)
-		}
-		return nil
+		return reportReconcileCount(b, "finalized stranded in-flight transfers after a home restart", "count", false, n, err)
 	})
 
 	// --- #31: stale grow-lock reaper (the THIRD SHAPE: leader-only + backoff) ---
@@ -405,4 +355,66 @@ func seedCreatorsPass(b *Broker, now time.Time) error {
 			"session-create allow-list", "count", n)
 	}
 	return nil
+}
+
+// The S7 retry/abandonment oracle is unchanged; both callbacks retain the guard
+// captured before the authoritative tombstone rather than a later current SID.
+// origin: hot-update S8 plan §6.2 / P16
+func removeTombstonedSessionAuthority(b *Broker, guard upgradeauthority.Guard, retry, abandon bool) proto.SessionRmResp {
+	_, governed := sessionSettlementBarrier(b)
+	if retry && !governed {
+		return proto.SessionRmResp{Code: "already_deleting"}
+	}
+	b.pubSysEvent("session_deleting", map[string]any{"sid": guard.SID, "incarnation": guard.Incarnation})
+	parent := b.runCtx
+	if parent == nil {
+		parent = context.Background() // ctx-none: NATS handler before Run in isolated tests
+	}
+	ctx, cancel := context.WithTimeout(parent, 5*time.Second)
+	defer cancel()
+	d, err := transferPassDeadline(ctx)
+	if err != nil {
+		return proto.SessionRmResp{Code: "store_error"}
+	}
+	return xferauth.RemoveTombstonedSession(retry, governed, abandon,
+		func(abandon bool) error { return settleSessionDeadline(b, d, ctx.Done(), guard.SID, abandon) },
+		func() {
+			if err := cascadeSessionAuthority(b, d, ctx.Done(), guard); err != nil {
+				b.cfg.Logger.Warn("broker: session rm finalize failed; will resume on next boot", "sid", guard.SID, "err", err)
+			}
+		})
+}
+
+// Retention keeps the original writer and chunk limits; the shared body only
+// removes duplicated mode/error plumbing, not a write or its authority guard.
+// origin: hot-update S8 plan §6.2 / P16
+func runRetentionPass(b *Broker, pass string, cutoff time.Time, direct func(*sql.DB, time.Time) (int64, error), plan func(*sql.DB, time.Time, int) (*cluster.Command, int, error)) error {
+	if b.clusterMode {
+		return gcProposeChunks(b, pass, func(db *sql.DB) (*cluster.Command, int, error) { return plan(db, cutoff, gcChunkRows) })
+	}
+	db, ok := b.singleWriter()
+	if !ok {
+		return singleWriteRefusal()
+	}
+	n, err := direct(db, cutoff)
+	return reportReconcileCount(b, pass, "deleted", true, int(n), err)
+}
+
+func reportReconcileCount(b *Broker, message, field string, swallow bool, n int, err error) error {
+	if err != nil {
+		if !swallow {
+			return err
+		}
+		b.cfg.Logger.Warn("broker: "+message, "err", err)
+	} else if n > 0 {
+		b.cfg.Logger.Info("broker: "+message, field, n)
+	}
+	return nil
+}
+
+// Capture once at register admission; the guarded SQL writer compares again in
+// its own critical section. A request carrying an image never learns a new SID.
+// origin: hot-update S8 plan §6.2 / P16
+func captureRegisterAuthority(b *Broker, sid, nid string, req *proto.NodeRegisterReq) (upgradeauthority.Guard, error) {
+	return upgradeauthority.Capture(b.read().SQL(), upgradeauthority.RequestGuard(sid, nid, *req))
 }

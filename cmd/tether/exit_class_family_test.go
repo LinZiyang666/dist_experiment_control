@@ -208,10 +208,29 @@ func TestAlertAckWaitsAtLeastAsLongAsTheBrokerDoes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read alert_gate.go: %v", err)
 	}
-	if !strings.Contains(src, "nc.Request(proto.SubjCtrlAlertAck(actor), body, alertAckTimeout)") {
-		t.Error("ackAlert no longer passes alertAckTimeout to its Request.\n\n" +
+	if !strings.Contains(src, "cli.AckAlertWithin(context.Background(), nc, actor, dedupKey, alertAckTimeout)") {
+		t.Error("ackAlert no longer passes alertAckTimeout to its wire helper.\n\n" +
 			"Whatever budget it does pass is the one that decides whether the ctl outlives the " +
 			"broker's forward, and this test is checking the other one.")
+	}
+	// The helper move must preserve the original assertion all the way to IO.
+	// A forwarded argument is not proof if the leaf silently discards it.
+	// origin: hot-update S6 plan §8.2 / T36
+	wire, err := os.ReadFile("../../internal/cli/natsconn.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := strings.Index(string(wire), "func AckAlertWithin(")
+	if start < 0 {
+		t.Fatal("alert ack wire helper missing")
+	}
+	end := strings.Index(string(wire)[start:], "// RequestControlWithin")
+	if end < 0 {
+		t.Fatal("alert ack wire helper missing")
+	}
+	body := string(wire)[start : start+end]
+	if !strings.Contains(body, "context.WithTimeout(ctx, timeout)") || !strings.Contains(body, "RequestControlWithin(requestCtx, nc, proto.SubjCtrlAlertAck(actor)") {
+		t.Fatal("alert ack leaf discarded its forwarded deadline")
 	}
 }
 

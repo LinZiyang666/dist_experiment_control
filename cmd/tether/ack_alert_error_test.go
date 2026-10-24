@@ -119,7 +119,7 @@ func TestD8ReviewDestructiveGateCoverage(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if !strings.Contains(string(body), "gateDestructive(") {
+			if !strings.Contains(string(body), "gateDestructive(") && !strings.Contains(string(body), "gateDestructiveWithin(") {
 				t.Fatalf("%s has no gateDestructive call", tc.file)
 			}
 		})

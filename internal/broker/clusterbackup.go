@@ -23,7 +23,7 @@ func (b *clusterAdminBackend) handleBackup(req adminsock.Request) adminsock.Resp
 	if req.BackupPath == "" {
 		return adminsock.Response{Op: req.Op, Error: "backup requires --out <dir>", Code: adminsock.CodeBadRequest}
 	}
-	node := b.admin.node
+	node := b.admin.Node
 	selfID := node.SelfID()
 	bundleDir := req.BackupPath
 
@@ -83,7 +83,7 @@ func (b *clusterAdminBackend) handleBackup(req adminsock.Request) adminsock.Resp
 	}
 	m.Kind = clusteroffline.ManifestKindBackup
 	m.Mode = clusteroffline.ManifestModeCluster
-	m.CreatedAt = b.admin.now().UTC().Format(timeRFC3339Nano)
+	m.CreatedAt = b.admin.Now().UTC().Format(timeRFC3339Nano)
 	m.ToolVersion = proto.ReleaseVersion
 	// External-review F3: stamp the freshness provenance into the bundle so DR tooling can tell a
 	// leader snapshot from a (possibly-stale) follower snapshot.
@@ -105,7 +105,7 @@ func (b *clusterAdminBackend) handleBackup(req adminsock.Request) adminsock.Resp
 		bytes = st.Size()
 	}
 	ok = true
-	b.admin.logger.Info("cluster: online backup complete", "bundle", bundleDir, "self", selfID,
+	b.admin.Logger.Info("cluster: online backup complete", "bundle", bundleDir, "self", selfID,
 		"applied_index", m.AppliedIndex, "source_role", sourceRole)
 	return adminsock.Response{Op: req.Op, OK: true, Backup: &adminsock.BackupResult{
 		Path: bundleDir, Bytes: bytes, AppliedIndex: m.AppliedIndex, SelfID: selfID,

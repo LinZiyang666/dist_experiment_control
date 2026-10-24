@@ -46,6 +46,10 @@ func seedClusterNode(t *testing.T, b *Broker, nodeID, natsServer, tunnelAddr, ce
 // byte-equivalent pre-D6 path). A homed row decides on (home vs self) AND
 // (presented vs row epoch).
 func TestD6TunnelTokenLookupLadder(t *testing.T) {
+	// origin: hot-update S10 plan §11.1 / TEST-BUDGET
+	if runIsolatedBrokerTest(t) {
+		return
+	}
 	const self = "node-self"
 	cases := []struct {
 		name       string

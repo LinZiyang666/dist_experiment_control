@@ -2,12 +2,16 @@ package broker
 
 import (
 	"encoding/json"
+	"fmt"
+	"runtime"
 	"testing"
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/node"
+	"github.com/LinZiyang666/tether/internal/port"
 	"github.com/LinZiyang666/tether/internal/proto"
 	"github.com/LinZiyang666/tether/internal/session"
+	"github.com/LinZiyang666/tether/internal/testharness"
 	"github.com/nats-io/nats.go"
 )
 
@@ -40,7 +44,18 @@ func TestExternalReviewBrokerRefusesUnpersistedGeneration(t *testing.T) {
 	}
 }
 
+// origin: hot-update S5 plan §4.3 / §6.4 / T28
 func TestExternalReviewHeartbeatEscalatesPastRestoredAgentGeneration(t *testing.T) {
+	beforeG, beforeFD := runtime.NumGoroutine(), testharness.FDCount()
+	for round := 0; round < 5; round++ {
+		t.Run("round-"+fmt.Sprint(round), func(t *testing.T) { exerciseExternalReviewHeartbeatEscalatesPastRestoredAgentGeneration(t) })
+	}
+	testharness.AssertNoGoroutineLeak(t, "proxy heartbeat repair", beforeG)
+	testharness.AssertNoFDLeak(t, "proxy heartbeat repair", beforeFD, 2)
+}
+
+func exerciseExternalReviewHeartbeatEscalatesPastRestoredAgentGeneration(t *testing.T) {
+	t.Helper()
 	nc, _, sid, b := proxyTestBroker(t)
 	if err := node.Register(b.cfg.DB, node.RegisterInput{
 		SID: sid, NID: "lab-1", ProtoVersion: proto.ProtoVersion,
@@ -49,6 +64,11 @@ func TestExternalReviewHeartbeatEscalatesPastRestoredAgentGeneration(t *testing.
 		t.Fatal(err)
 	}
 	if _, err := session.SetProxyEnabled(b.cfg.DB, sid, true); err != nil {
+		t.Fatal(err)
+	}
+	// origin: hot-update S5 plan §4.3 / §6.4 / T28
+	// Enabled repairs require an allocation from the same authority snapshot.
+	if _, err := port.AllocateProxy(b.cfg.DB, sid, "lab-1", b.cfg.PortAllocCfg()); err != nil {
 		t.Fatal(err)
 	}
 	epoch, err := session.BumpProxyEpoch(b.cfg.DB, sid)
@@ -62,6 +82,9 @@ func TestExternalReviewHeartbeatEscalatesPastRestoredAgentGeneration(t *testing.
 	// Model a broker restored from an older DB snapshot while an agent still
 	// holds a generation issued before the restore.
 	b.proxyGen = 100
+	if _, err := b.cfg.DB.Exec(`UPDATE proxy_meta SET generation=100 WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
 	const agentGen int64 = 200
 
 	ch := make(chan *nats.Msg, 1)

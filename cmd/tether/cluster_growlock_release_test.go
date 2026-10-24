@@ -53,6 +53,10 @@ func serveLeaderHealth(t *testing.T, nc *nats.Conn, actor, leader string) {
 // the third succeeds. The CLI must converge and report success — the whole point of
 // retrying is that the overwhelmingly common failure here is transient.
 func TestReleaseGrowLockRetriesTransientFailure(t *testing.T) {
+	// origin: hot-update S10 plan L17 / §11.1 / POLISH-B
+	if runIsolatedBinaryTest(t) {
+		return
+	}
 	fastGrowLockBackoff(t)
 	url := startCLIExternalReviewNATS(t)
 	nc, err := nats.Connect(url)
@@ -100,6 +104,10 @@ func TestReleaseGrowLockRetriesTransientFailure(t *testing.T) {
 // TestReleaseGrowLockFailsNonZero: every attempt is refused. The CLI must surface a
 // non-zero exit class, not a warning and rc=0.
 func TestReleaseGrowLockFailsNonZero(t *testing.T) {
+	// origin: hot-update S10 plan L17 / §11.1 / POLISH-B
+	if runIsolatedBinaryTest(t) {
+		return
+	}
 	fastGrowLockBackoff(t)
 	url := startCLIExternalReviewNATS(t)
 	nc, err := nats.Connect(url)

@@ -6,9 +6,12 @@ package agent
 
 import (
 	"context"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"io"
 	"log/slog"
-	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -128,12 +131,64 @@ func TestRegisterReqCarriesProxyOptOut(t *testing.T) {
 	// real register needs NATS + an identity), and it would silently turn
 	// the opt-out into an agent-local-only belt — the broker would keep
 	// allocating ports for a node that never dials.
-	src, err := os.ReadFile("agent.go")
+	//
+	// origin: hot-update S8 plan §12.1 / P14 source move; S8 FIX-FIXTURES. The
+	// request literal moved from Agent.register in agent.go to registerAgent.
+	// Find that builder by name in every production file and require the field
+	// inside its NodeRegisterReq literal, so a later move cannot retire this
+	// pin through a stale file name or a matching comment left behind.
+	files, err := filepath.Glob("*.go")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(src), "ProxyOptOut: a.cfg.ProxyOptOut") {
+	builders, wired := 0, false
+	for _, file := range files {
+		if strings.HasSuffix(file, "_test.go") {
+			continue
+		}
+		f, err := parser.ParseFile(token.NewFileSet(), file, nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", file, err)
+		}
+		for _, decl := range f.Decls {
+			fn, ok := decl.(*ast.FuncDecl)
+			if !ok || fn.Recv != nil || fn.Name.Name != "registerAgent" || fn.Body == nil {
+				continue
+			}
+			builders++
+			ast.Inspect(fn.Body, func(n ast.Node) bool {
+				lit, ok := n.(*ast.CompositeLit)
+				if !ok || !optOutSelector(lit.Type, "proto", "NodeRegisterReq") {
+					return true
+				}
+				for _, elt := range lit.Elts {
+					kv, ok := elt.(*ast.KeyValueExpr)
+					if !ok {
+						continue
+					}
+					if key, isIdent := kv.Key.(*ast.Ident); isIdent && key.Name == "ProxyOptOut" {
+						value, isSel := kv.Value.(*ast.SelectorExpr)
+						wired = wired || isSel && value.Sel.Name == "ProxyOptOut" && optOutSelector(value.X, "a", "cfg")
+					}
+				}
+				return true
+			})
+		}
+	}
+	if builders != 1 {
+		t.Fatalf("found %d registerAgent request builders, want exactly 1", builders)
+	}
+	if !wired {
 		t.Fatal("register() no longer wires Config.ProxyOptOut into NodeRegisterReq — " +
 			"the broker-side fold (nodes.proxy_capable) would never see the opt-out")
 	}
+}
+
+func optOutSelector(expr ast.Expr, x, sel string) bool {
+	s, ok := expr.(*ast.SelectorExpr)
+	if !ok || s.Sel.Name != sel {
+		return false
+	}
+	id, ok := s.X.(*ast.Ident)
+	return ok && id.Name == x
 }

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -553,7 +554,16 @@ func runHistoryFollow(ctx context.Context, cons jetstream.Consumer, out io.Write
 // available by `tether history --kind call | jq .` style pipes.
 func printAuditEntry(w io.Writer, subject string, data []byte) {
 	var raw map[string]any
-	if err := json.Unmarshal(data, &raw); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	err := decoder.Decode(&raw)
+	if err == nil {
+		var trailing any
+		if tailErr := decoder.Decode(&trailing); tailErr != io.EOF {
+			err = fmt.Errorf("unexpected trailing JSON data: %v", tailErr)
+		}
+	}
+	if err != nil {
 		_, _ = fmt.Fprintf(w, "[malformed audit: %v] %s\n", err, string(data))
 		return
 	}

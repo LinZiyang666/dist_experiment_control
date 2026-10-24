@@ -168,6 +168,13 @@ func TestADestructiveOpBlocksWhenTheHealthProbeCannotBeMade(t *testing.T) {
 					"the second one is a deployment problem, and proceeding through it is how a " +
 					"`session rm` lands on a cluster that has lost quorum.")
 			}
+			// The shared helper reports a typed permission failure. Preserve the
+			// old gate's authorization exit class after moving its wire logic.
+			// origin: hot-update S6 plan §8.2 / T33
+			if tc.wantBlock && err != nil && classifyExit(err) != exitNoPerm {
+				t.Fatalf("refused health inbox lost authorization exit: %v", err)
+			}
+
 			if !tc.wantBlock && err != nil {
 				t.Fatalf("the destructive gate blocked a healthy N=1 deployment: %v.\n\n"+
 					"At N=1 no broker subscribes the health subject, the probe legitimately returns "+

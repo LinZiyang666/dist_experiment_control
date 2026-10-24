@@ -34,7 +34,7 @@ func TestForceSingleFinalizeLadderIsAlwaysTerminal(t *testing.T) {
 	} {
 		if !cluster.ValidOpState(s) {
 			t.Errorf("%s is not in validOpStates — PlanClusterOpTransition would refuse to bake a "+
-				"transition into it, and the op would be stranded one state earlier", s)
+				"Transition into it, and the op would be stranded one state earlier", s)
 		}
 	}
 	if !cluster.ValidOpKind(cluster.OpKindForceSingleFinalize) {
@@ -43,7 +43,7 @@ func TestForceSingleFinalizeLadderIsAlwaysTerminal(t *testing.T) {
 	// The budget is derived from the drive cadence, not a hand-picked wall-clock number.
 	if opForceSingleFinalizeBudget != 12*observeTickInterval {
 		t.Errorf("the finalize budget must stay derived from observeTickInterval (the op advances once "+
-			"per tick); got %s", opForceSingleFinalizeBudget)
+			"per Tick); got %s", opForceSingleFinalizeBudget)
 	}
 	if opForceSingleFinalizeBudget <= 0 {
 		t.Fatal("a non-positive budget would make every finalize op terminate before its first attempt")
@@ -98,8 +98,8 @@ func TestOperatorAbortIsEnumIndependent(t *testing.T) {
 //
 // Mutation: move the finalize early-return below clearOpAttempts — reddens.
 func TestConfirmOpRefusesFinalizeWithoutClearingItsBudget(t *testing.T) {
-	a := &ClusterAdmin{opAttempts: map[opAttemptKey]int{{opID: "op-fs", step: "prune"}: 4}}
-	err := a.confirmOpKindGuard(&cluster.Operation{
+	a := &ClusterAdmin{OpAttempts: map[opAttemptKey]int{{OpID: "op-fs", Step: "prune"}: 4}}
+	err := a.ConfirmOpKindGuard(&cluster.Operation{
 		OpID: "op-fs", Kind: cluster.OpKindForceSingleFinalize, OpState: cluster.OpStateFSPrunePending,
 	})
 	if err == nil {
@@ -108,7 +108,7 @@ func TestConfirmOpRefusesFinalizeWithoutClearingItsBudget(t *testing.T) {
 	if !strings.Contains(err.Error(), "cluster ops show") {
 		t.Errorf("the refusal should point at the command that DOES tell the operator something (%q)", err)
 	}
-	if got := a.opAttempts[opAttemptKey{opID: "op-fs", step: "prune"}]; got != 4 {
+	if got := a.OpAttempts[opAttemptKey{OpID: "op-fs", Step: "prune"}]; got != 4 {
 		t.Fatalf("the guard itself mutated the retry budget (attempts %d, want 4)", got)
 	}
 }
@@ -128,12 +128,12 @@ func TestConfirmOpRefusesFinalizeWithoutClearingItsBudget(t *testing.T) {
 //
 // Mutation: move a.clearOpAttempts(opID) above the guard in ConfirmOp — reddens.
 func TestConfirmOpGuardRunsBeforeClearOpAttempts(t *testing.T) {
-	src, err := os.ReadFile("cluster_operation_controller.go")
+	src, err := os.ReadFile("../brokercontrol/cluster_operation_controller.go")
 	if err != nil {
 		t.Fatalf("read source: %v", err)
 	}
 	fset := token.NewFileSet()
-	f, perr := parser.ParseFile(fset, "cluster_operation_controller.go", src, 0)
+	f, perr := parser.ParseFile(fset, "../brokercontrol/cluster_operation_controller.go", src, 0)
 	if perr != nil {
 		t.Fatalf("parse: %v", perr)
 	}
@@ -153,11 +153,11 @@ func TestConfirmOpGuardRunsBeforeClearOpAttempts(t *testing.T) {
 				return true
 			}
 			switch sel.Sel.Name {
-			case "confirmOpKindGuard":
+			case "ConfirmOpKindGuard":
 				if guardLine == 0 {
 					guardLine = fset.Position(call.Pos()).Line
 				}
-			case "clearOpAttempts":
+			case "ClearOpAttempts":
 				if clearLine == 0 {
 					clearLine = fset.Position(call.Pos()).Line
 				}
@@ -170,7 +170,7 @@ func TestConfirmOpGuardRunsBeforeClearOpAttempts(t *testing.T) {
 			"calls that are no longer there, so a clean result would mean nothing", guardLine, clearLine)
 	}
 	if guardLine > clearLine {
-		t.Errorf("ConfirmOp calls clearOpAttempts (line %d) BEFORE confirmOpKindGuard (line %d). The "+
+		t.Errorf("ConfirmOp calls ClearOpAttempts (line %d) BEFORE ConfirmOpKindGuard (line %d). The "+
 			"refusal then returns an error while the retry budget has already been reset, so a caller "+
 			"looping on `cluster ops confirm` keeps a force-single finalize op alive indefinitely.",
 			clearLine, guardLine)
@@ -327,12 +327,12 @@ func TestForceSingleFinalizeOpIsRenderedWithItsOwnRemedy(t *testing.T) {
 //
 // Mutation: delete the default branch, or the OpKindForceSingleFinalize case — reddens.
 func TestDriveOneHandlesEveryOpKind(t *testing.T) {
-	src, err := os.ReadFile("cluster_operation_controller.go")
+	src, err := os.ReadFile("../brokercontrol/cluster_operation_drive.go")
 	if err != nil {
 		t.Fatalf("read source: %v", err)
 	}
 	fset := token.NewFileSet()
-	f, perr := parser.ParseFile(fset, "cluster_operation_controller.go", src, 0)
+	f, perr := parser.ParseFile(fset, "../brokercontrol/cluster_operation_drive.go", src, 0)
 	if perr != nil {
 		t.Fatalf("parse: %v", perr)
 	}
@@ -340,7 +340,7 @@ func TestDriveOneHandlesEveryOpKind(t *testing.T) {
 	hasDefault := false
 	for _, d := range f.Decls {
 		fd, ok := d.(*ast.FuncDecl)
-		if !ok || fd.Name.Name != "driveOne" || fd.Body == nil {
+		if !ok || fd.Name.Name != "DriveOne" || fd.Body == nil {
 			continue
 		}
 		ast.Inspect(fd.Body, func(n ast.Node) bool {
@@ -371,17 +371,17 @@ func TestDriveOneHandlesEveryOpKind(t *testing.T) {
 		})
 	}
 	if len(kinds) == 0 {
-		t.Fatal("SELF-CHECK FAILED: no `switch op.Kind` found in driveOne — the scanner is looking for " +
+		t.Fatal("SELF-CHECK FAILED: no `switch op.Kind` found in DriveOne — the scanner is looking for " +
 			"a shape that no longer exists, so a clean result would mean nothing")
 	}
 	for _, want := range []string{"OpKindJoin", "OpKindRetire", "OpKindForceSingleFinalize"} {
 		if !kinds[want] {
-			t.Errorf("driveOne has no case for cluster.%s — an op of that kind is created but never "+
-				"advanced, so it stays non-terminal and assertNoActiveOp fences its target forever", want)
+			t.Errorf("DriveOne has no case for cluster.%s — an op of that kind is created but never "+
+				"advanced, so it stays non-terminal and AssertNoActiveOp fences its target forever", want)
 		}
 	}
 	if !hasDefault {
-		t.Error("driveOne's kind switch has no default. An op kind this binary does not know then falls " +
+		t.Error("DriveOne's kind switch has no default. An op kind this binary does not know then falls " +
 			"through silently and stays non-terminal FOREVER — which is exactly what a rollback past " +
 			"the release that added a kind produces, and it fences that node's membership plane.")
 	}
@@ -452,12 +452,12 @@ func TestUpgradeLockStillFreezesJoinAndRetire(t *testing.T) {
 // Both are properties of ONE function body, so an AST assertion over that body is the check that can
 // actually fail. (Verified: each mutation below reddens the corresponding test.)
 func TestFinalizeNeverExitsToBlocked(t *testing.T) {
-	src, err := os.ReadFile("force_single_finalize.go")
+	src, err := os.ReadFile("../brokercontrol/force_single_finalize.go")
 	if err != nil {
 		t.Fatalf("read source: %v", err)
 	}
 	fset := token.NewFileSet()
-	f, perr := parser.ParseFile(fset, "force_single_finalize.go", src, 0)
+	f, perr := parser.ParseFile(fset, "../brokercontrol/force_single_finalize.go", src, 0)
 	if perr != nil {
 		t.Fatalf("parse: %v", perr)
 	}
@@ -486,19 +486,19 @@ func TestFinalizeNeverExitsToBlocked(t *testing.T) {
 	}
 	if len(blocked) > 0 {
 		t.Errorf("the force-single finalize ladder reaches cluster.OpStateBlocked at %v. A non-terminal "+
-			"op fences the target's membership plane via assertNoActiveOp, and an operator standing over "+
+			"op fences the target's membership plane via AssertNoActiveOp, and an operator standing over "+
 			"a freshly force-singled survivor has no peer to confirm against — that is strictly worse "+
 			"than today's \"ghosts plus a loud log line, and `recovery node remove` still works\".", blocked)
 	}
 }
 
 func TestUnknownKindDefaultFailsClosedWithoutMutating(t *testing.T) {
-	src, err := os.ReadFile("cluster_operation_controller.go")
+	src, err := os.ReadFile("../brokercontrol/cluster_operation_drive.go")
 	if err != nil {
 		t.Fatalf("read source: %v", err)
 	}
 	fset := token.NewFileSet()
-	f, perr := parser.ParseFile(fset, "cluster_operation_controller.go", src, 0)
+	f, perr := parser.ParseFile(fset, "../brokercontrol/cluster_operation_drive.go", src, 0)
 	if perr != nil {
 		t.Fatalf("parse: %v", perr)
 	}
@@ -506,7 +506,7 @@ func TestUnknownKindDefaultFailsClosedWithoutMutating(t *testing.T) {
 	var mutators []string
 	for _, d := range f.Decls {
 		fd, ok := d.(*ast.FuncDecl)
-		if !ok || fd.Name.Name != "driveOne" || fd.Body == nil {
+		if !ok || fd.Name.Name != "DriveOne" || fd.Body == nil {
 			continue
 		}
 		ast.Inspect(fd.Body, func(n ast.Node) bool {
@@ -532,7 +532,7 @@ func TestUnknownKindDefaultFailsClosedWithoutMutating(t *testing.T) {
 						switch sel.Sel.Name {
 						case "Error", "Warn":
 							logs = true
-						case "Propose", "transition", "PlanClusterOpAbort", "PlanClusterOpTransition", "setPhase":
+						case "Propose", "Transition", "PlanClusterOpAbort", "PlanClusterOpTransition", "SetPhase":
 							mutators = append(mutators, sel.Sel.Name)
 						}
 						return true
@@ -543,15 +543,15 @@ func TestUnknownKindDefaultFailsClosedWithoutMutating(t *testing.T) {
 		})
 	}
 	if !sawDefault {
-		t.Fatal("SELF-CHECK FAILED: driveOne's kind switch has no default clause for the scanner to " +
+		t.Fatal("SELF-CHECK FAILED: DriveOne's kind switch has no default clause for the scanner to " +
 			"inspect — TestDriveOneHandlesEveryOpKind covers its absence; this test needs it present")
 	}
 	if !logs {
-		t.Error("driveOne's unknown-kind default is silent. A fenced membership plane with no log line " +
+		t.Error("DriveOne's unknown-kind default is silent. A fenced membership plane with no log line " +
 			"is indistinguishable from a healthy cluster until someone tries a join or a retire.")
 	}
 	if len(mutators) > 0 {
-		t.Errorf("driveOne's unknown-kind default MUTATES replicated state (%v). It must fail closed: "+
+		t.Errorf("DriveOne's unknown-kind default MUTATES replicated state (%v). It must fail closed: "+
 			"this binary has just admitted it does not understand the operation, so it cannot know what "+
 			"substrate the op left behind — on a rollback or a mixed-version window, auto-aborting "+
 			"destroys the only durable record driving a newer release's workflow and hands the "+

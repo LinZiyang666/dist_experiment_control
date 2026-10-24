@@ -30,16 +30,24 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"sync"
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/auth"
+	"github.com/LinZiyang666/tether/internal/brokerimage"
+	"github.com/LinZiyang666/tether/internal/controlbudget"
+	"github.com/LinZiyang666/tether/internal/infraattach"
 	"github.com/LinZiyang666/tether/internal/jsstream"
 	"github.com/LinZiyang666/tether/internal/node"
 	"github.com/LinZiyang666/tether/internal/proto"
 	"github.com/LinZiyang666/tether/internal/schema"
 	"github.com/LinZiyang666/tether/internal/session"
 	"github.com/LinZiyang666/tether/internal/xferaudit"
+	"github.com/LinZiyang666/tether/internal/xferauth"
+	"github.com/LinZiyang666/tether/internal/xferbucket"
+	"github.com/LinZiyang666/tether/internal/xfercontract"
+	"github.com/LinZiyang666/tether/internal/xfercontrol"
+	"github.com/LinZiyang666/tether/internal/xferserve"
+	"github.com/LinZiyang666/tether/internal/xfertrack"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 )
@@ -80,31 +88,8 @@ const (
 // instead, which is both exact and free of deployment surface.
 const xferCrossHomeReapAge = 3 * transferTimeoutTierB
 
-// xferCrossHomeExtraFor is the EXTRA grace an object of this size earns on top of whatever base floor
-// is in effect: exactly the amount by which its watchdog budget exceeds the fixed tier floor.
-//
-// It is an INCREMENT, not an absolute floor, and that is the whole design. Two things would break if
-// it returned an absolute value:
-//
-//   - the serveconf knob (broker.cluster.xfer_cross_home_reap_age) and the deploy-tier drill that
-//     COMPRESSES it would stop working — a drill that sets the floor to seconds so it can observe a
-//     reap would find every small object pinned for 15 minutes instead;
-//   - every small object would inherit the worst object's grace, on precisely the small-disk brokers
-//     that can least afford holding garbage.
-//
-// As an increment, an object whose budget is the plain tier floor earns nothing (behaviour byte-for-
-// byte unchanged, drill seam intact), while a 2 GiB object earns the ~29 extra minutes its own budget
-// bought. size<=0 (unknown) earns nothing, which is the fail-SAFE direction only because the base
-// floor already covers the tier floor with its historical margin.
-func xferCrossHomeExtraFor(size int64) time.Duration {
-	if size <= 0 {
-		return 0
-	}
-	if extra := proto.XferBudget("b", size, proto.XferPushLegs) - transferTimeoutTierB; extra > 0 {
-		return extra
-	}
-	return 0
-}
+// xferCrossHomeExtraFor delegates the cap0 grace increment to its sizing owner.
+func xferCrossHomeExtraFor(size int64) time.Duration { return xferserve.LegacyCrossHomeExtra(size) }
 
 // transferMaxBytes is the GLOBAL hard upper bound for one tier-B transfer (2 GiB). On a small-disk
 // broker the per-session bucket ceiling (xferBucketMaxBytes, G6 #21) can be LOWER, and the push
@@ -140,373 +125,34 @@ const (
 	xferBucketCap         = proto.XferMaxBytes + xferBucketChunkMargin
 )
 
-// xferReserveFor is what the NON-xfer JetStream streams reserve on this broker: the single global
-// events stream plus one history stream PER SESSION, each multiplied by the replica factor.
-//
-// The replica multiply is not decoration. nats-server charges the account-level reservation as
-// Replicas*MaxBytes (jetstream_api.go tieredReservation) while the server-level one is un-multiplied
-// (jetstream.go, js.storeReserved += cfg.MaxBytes). The two levels genuinely disagree; sizing against
-// the LOOSER of them would hand a 3-replica cluster a bucket the account check then refuses. Production
-// is force-single N=1 so both agree there — which is precisely why this would have shipped un-noticed.
-//
-// This replaces a hand-copied 2 GiB constant that was correct only at exactly one session and one
-// replica. The inputs are now the exported jsstream constants, so editing either one there cannot
-// silently falsify the arithmetic here.
+// xferReserveFor delegates the cap0 sizing policy to its leaf owner.
 func xferReserveFor(sessions, replicas int) int64 {
-	if sessions < 1 {
-		sessions = 1
-	}
-	if replicas < 1 {
-		replicas = 1
-	}
-	if int64(sessions) > (math.MaxInt64-jsstream.EventsMaxBytes)/jsstream.HistoryMaxBytesPerSession {
-		return math.MaxInt64
-	}
-	perReplica := jsstream.EventsMaxBytes + int64(sessions)*jsstream.HistoryMaxBytesPerSession
-	if int64(replicas) > math.MaxInt64/perReplica {
-		return math.MaxInt64
-	}
-	return int64(replicas) * perReplica
+	return xferserve.LegacyReserveFor(sessions, replicas)
 }
 
-// transferTrackerMaxEntries caps the in-memory tracker map so a fast
-// attacker spamming push.req / pull.req can't OOM the broker before
-// the per-tier watchdog reaps stale entries. At the worst case
-// (1024 entries * ~200 bytes/entry) the cap holds memory under
-// ~200 KiB. New requests past the cap are rejected with
-// `too_many_in_flight` so callers get a clean error instead of silent
-// slowdown. Audit shard P11 F2.
-//
-// batch C: the EXHAUSTION WINDOW changed. This comment used to derive the bound from a "5-min Tier-B
-// timeout"; with a size-derived budget an entry can now live up to proto.XferTierBMaxBudget (35m08s),
-// so a client declaring the maximum size and then sending nothing holds a slot ~6.8x longer than
-// before. That is accepted rather than defended against: only a session MEMBER can reach this path,
-// and a member already has unrestricted `run`/`exec` (per the documented boundary in docs/usage.md),
-// so a member wanting to exhaust a broker has far more direct options.
-//
-// 2026-09-02 prerelease audit (BT-F5) CORRECTS THE PARAGRAPH ABOVE, which twice asserted the byte
-// count was "unchanged" and therefore still ~200 KiB. It was not: the per-entry size depended on
-// strings the broker accepted at any length. The bound below is what makes the arithmetic true, and
-// it is now enforced rather than assumed.
-const transferTrackerMaxEntries = 1024
+// The registry and its historical guards/comments live in xfertrack. These
+// aliases retain the broker's adapter signatures without a second entry map.
+// origin: hot-update S7 plan §5.1 / L13 / P22
+type transferEntry = xfertrack.LegacyEntry
+type transferTracker = xfertrack.LegacyTracker
+type abandonRefusal = xfertrack.LegacyRefusal
 
-// transferIDMaxLen / transferPathMaxLen / transferSHA256Len bound the three strings a
-// transfer request hands the broker to KEEP.
-//
-// origin: prerelease audit broker-transfer/BT-F5. The comment on
-// transferTrackerMaxEntries above derives a ~200 KiB memory bound from
-// "1024 entries * ~200 bytes/entry", and re-derived it during batch C as "the
-// (unchanged) byte count". It was never true: path and transfer_id arrive verbatim on
-// the wire and the broker checked only that they were NON-EMPTY, so one request could
-// carry up to max_payload and the real bound was 1024 * max_payload.
-//
-// The cost is not only resident bytes. Wherever a ledger directory resolves — which
-// since #57 is single-broker installs too, not only cluster mode (round 2, F-T6) —
-// every put() writes the same
-// strings to disk through temp+write+fsync+rename+fsync(dir), and push.req / pull.req
-// are plain nats.go callbacks with no goroutine wrapper, so the whole broker's
-// transfer path is serialized behind that fsync. A large payload is therefore
-// head-of-line blocking for every other transfer, not just memory.
-//
-// The values are generous on purpose — they are a sanity CEILING, not a policy. 4096
-// is the longest path any supported filesystem accepts (PATH_MAX), 128 comfortably
-// holds a ULID or a UUID, and a hex SHA-256 is 64 characters.
-//
-// The digest is bounded by its maximum, NOT required to be exactly 64. Bounding
-// memory is this gate's whole job; whether the digest is the RIGHT one is decided by
-// the receiver, which recomputes it over the delivered bytes and refuses on mismatch.
-// Adding a format contract here would reject requests the receiver would have caught
-// anyway, and would do it in a place no one would think to look.
-const (
-	transferPathMaxLen   = 4096
-	transferIDMaxLen     = 128
-	transferSHA256MaxLen = 64
-)
-
-// transferRequestBounds validates the three unbounded-by-default strings. It returns
-// the request_invalid detail, or "" when the request is within bounds. Shared by the
-// push and pull handlers because the tracker they both feed is one map: bounding only
-// one of them would leave the bound unreached.
-func transferRequestBounds(transferID, path, sha string) string {
-	if len(transferID) > transferIDMaxLen {
-		return fmt.Sprintf("transfer_id length %d > %d", len(transferID), transferIDMaxLen)
-	}
-	if len(path) > transferPathMaxLen {
-		return fmt.Sprintf("path length %d > %d", len(path), transferPathMaxLen)
-	}
-	if len(sha) > transferSHA256MaxLen {
-		return fmt.Sprintf("sha256 length %d > %d", len(sha), transferSHA256MaxLen)
-	}
-	return ""
+func newTransferTracker() *transferTracker { return xfertrack.NewLegacyTracker() }
+func transferRequestBounds(id, path, sha string) string {
+	return xfertrack.LegacyRequestBounds(id, path, sha)
 }
-
-// xferRecentlyReapedTTL bounds how long the tracker remembers that it reaped a transfer id. Long
-// enough for the receiver's real completion to arrive after a watchdog fire (that is the whole point
-// — the receiver was still working), short enough that the set cannot grow without bound.
-const xferRecentlyReapedTTL = 10 * time.Minute
-
-// transferEntry is the broker's in-memory tracking record for one
-// in-flight transfer. Keyed by transfer_id in transferTracker.entries.
-type transferEntry struct {
-	transferID string
-	sid        string
-	nid        string
-	actor      string // NATS user nkey public key
-	actorFP    string // sha-256 fingerprint
-	verb       string // push | pull
-	tier       string // a | b
-	bucket     string // empty for tier A
-	path       string
-	size       int64
-	startedAt  time.Time
-	cancel     context.CancelFunc // cancels the timeout watchdog
-	finalized  bool               // set under tracker.mu when audit complete|failed already written
-	// committed is set under tracker.mu when a push-commit has been FORWARDED to the receiver. From that
-	// moment the agent owns the terminal (its ev.transfer), so a creator-side finalize{failed} must be
-	// refused; before it, the creator is the only party that can know the upload was abandoned.
-	// origin: simcluster-speed 0a (drill 67) — a ctl whose ObjectStore.Put failed had no way to
-	// release its slot, so the per-bucket serialisation refused every later tier-B push of the session
-	// with too_many_in_flight until the watchdog reaped the entry at its full budget.
-	committed bool
+func inFlightRefusalText(id, code, blocker string) string {
+	return xfertrack.LegacyRefusalText(id, code, blocker)
 }
-
-// transferTracker is a process-wide registry. Long-lived, attached to
-// Broker. All transferEntry reads/writes hold tracker.mu.
-type transferTracker struct {
-	mu      sync.Mutex
-	entries map[string]*transferEntry
-	// reaped (batch C) remembers ids the WATCHDOG terminated, with the time it happened. It exists so
-	// a receiver's genuine completion arriving after the budget expired can be LOGGED rather than
-	// dropped in silence — that silence is the last step of "the file landed but the audit says
-	// failed". Bounded by an opportunistic sweep on insert plus xferRecentlyReapedTTL.
-	reaped map[string]time.Time
-}
-
-func newTransferTracker() *transferTracker {
-	return &transferTracker{entries: map[string]*transferEntry{}, reaped: map[string]time.Time{}}
-}
-
-// markReaped records that the watchdog (not a normal finalize) ended this transfer.
-func (t *transferTracker) markReaped(id string, now time.Time) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if t.reaped == nil {
-		t.reaped = map[string]time.Time{}
-	}
-	for k, at := range t.reaped {
-		if now.Sub(at) >= xferRecentlyReapedTTL {
-			delete(t.reaped, k)
-		}
-	}
-	t.reaped[id] = now
-}
-
-// recentlyReaped reports whether the watchdog ended this transfer within the retention window.
-func (t *transferTracker) recentlyReaped(id string) bool {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	at, ok := t.reaped[id]
-	return ok && time.Since(at) < xferRecentlyReapedTTL
-}
-
-func (t *transferTracker) get(id string) *transferEntry {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	return t.entries[id]
-}
-
-// put inserts an entry. Returns "" on success, else the response Code
-// the caller must reject the request with. A transfer_id already in
-// flight is never overwritten: the original entry's watchdog stays
-// armed on that id, so replacing the entry would let the stale
-// watchdog claim and reap the replacement mid-transfer.
-func (t *transferTracker) put(e *transferEntry) string {
-	code, _ := t.putWithBlocker(e)
-	return code
-}
-
-// putWithBlocker is put plus, for a per-bucket refusal, the transfer_id that holds the bucket — the
-// ONE piece of information that makes the refusal actionable. "retry shortly or use a fresh transfer
-// id" was the advice for both refusal shapes, and for the bucket shape the second half is false: the
-// slot is keyed on the bucket, so a fresh id is refused identically. An operator reading drill 67's
-// twelve refusals had no way to see that they were all waiting on the same abandoned upload.
-func (t *transferTracker) putWithBlocker(e *transferEntry) (code, blocker string) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if _, exists := t.entries[e.transferID]; exists {
-		return "transfer_id_in_flight", e.transferID
-	}
-	// The bucket is per session and intentionally sized for one maximum object plus overhead.
-	// Serialize tier-B use of the same bucket so two valid objects cannot race into DiscardNew.
-	// Tier A (empty bucket) and different sessions remain concurrent.
-	if e.bucket != "" {
-		for _, live := range t.entries {
-			if live.bucket == e.bucket {
-				return "too_many_in_flight", live.transferID
-			}
-		}
-	}
-	if len(t.entries) >= transferTrackerMaxEntries {
-		return "too_many_in_flight", ""
-	}
-	t.entries[e.transferID] = e
-	return "", ""
-}
-
-// inFlightRefusalText renders the operator-facing reason for a put refusal. code is what putWithBlocker
-// returned; blocker is the holding transfer_id when the refusal is the per-bucket serialisation.
-func inFlightRefusalText(transferID, code, blocker string) string {
-	if code == "too_many_in_flight" && blocker != "" {
-		return fmt.Sprintf("transfer %s rejected (%s): another tier-B transfer %s is in flight in this session's bucket; "+
-			"wait for it to finish or be reaped at its budget — a fresh transfer id is refused the same way",
-			transferID, code, blocker)
-	}
-	return fmt.Sprintf("transfer %s rejected (%s); retry shortly or use a fresh transfer id", transferID, code)
-}
-
-// remove deletes the entry. It used to return it; nothing ever read the result, and a returned
-// value nobody reads reads like a handle somebody is holding.
-//
-// Identity-bound like the claims (external review round 3 R3-F1, main-process follow-through): only
-// the exact entry the caller holds is deleted, never whatever the id maps to now. Every production
-// remove follows a successful claim on the same entry, and a claimed entry cannot be replaced
-// (put refuses a live id), so a by-id delete was safe by a two-step argument — this makes it safe by
-// construction, and leaves put (refuses duplicates) and get (the preview) as the only by-id paths.
-func (t *transferTracker) remove(expected *transferEntry) {
-	if expected == nil {
-		return
-	}
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if t.entries[expected.transferID] == expected {
-		delete(t.entries, expected.transferID)
-	}
-}
-
-// claimFinalize atomically marks the expected entry as finalized iff:
-//   - the map still holds that exact entry, AND
-//   - it hasn't already been finalized.
-//
-// First caller wins; later callers receive ok=false and MUST NOT write
-// a second audit row / delete the transfer object twice.
-//
-// The returned *transferEntry MAY be non-nil even when ok=false
-// (entry exists but was already claimed) — callers can use the entry
-// for an idempotent OK reply, but must not mutate it. The fields used
-// for caller-side validation (sid, nid, actor, verb, tier, bucket,
-// path) are immutable after put(), so they may be read without
-// holding tracker.mu.
-//
-// Audit shard P11 F1: previous markFinalized + per-handler
-// `entry.finalized = false` "unclaim" pattern was racy because the
-// unclaim happened outside tracker.mu. The new contract is
-// validate-then-claim: callers validate immutable fields on expected before
-// claiming. The identity check under the lock preserves that authorization
-// even if a completed transfer's id is reused while validation is in flight.
-// It also fences stale watchdogs and cleanup callbacks out of the new entry.
-func (t *transferTracker) claimFinalize(expected *transferEntry) (e *transferEntry, ok bool) {
-	if expected == nil {
-		return nil, false
-	}
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	e = t.entries[expected.transferID]
-	if e != expected {
-		return nil, false
-	}
-	if e.finalized {
-		return e, false
-	}
-	e.finalized = true
-	return e, true
-}
-
-// markCommitted hands the expected push to the receiver. It reports false when the entry was
-// removed, replaced or already finalized (the watchdog won), in which case the caller must
-// not forward — the receiver would Get an object whose terminal audit is already written.
-func (t *transferTracker) markCommitted(expected *transferEntry) bool {
-	if expected == nil {
-		return false
-	}
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	e := t.entries[expected.transferID]
-	if e != expected || e.finalized {
-		return false
-	}
-	e.committed = true
-	return true
-}
-
-// abandonRefusal is why claimAbandonedPush did not claim: the entry is gone, already finalized (a
-// concurrent finalize / the watchdog won — the caller answers idempotent OK), not a push, a push the
-// receiver already owns (committed), or a tier-A push (never the creator's to end).
-type abandonRefusal int
 
 const (
-	abandonClaimed   abandonRefusal = iota
-	abandonNoEntry                  // the expected entry is no longer tracked (removed or replaced)
-	abandonFinalized                // someone else claimed the terminal first
-	abandonNotPush                  // a pull — claimFinalize's job
-	abandonCommitted                // the commit was forwarded; the receiver's ev.transfer is the terminal
-	abandonTierA                    // tier-A: the receiver owned the terminal from the first byte
+	abandonClaimed   = xfertrack.LegacyClaimed
+	abandonNoEntry   = xfertrack.LegacyNoEntry
+	abandonFinalized = xfertrack.LegacyFinalized
+	abandonNotPush   = xfertrack.LegacyNotPush
+	abandonCommitted = xfertrack.LegacyCommitted
+	abandonTierA     = xfertrack.LegacyTierA
 )
-
-// claimAbandonedPush is claimFinalize restricted to a push whose creator gave up BEFORE commit: the
-// entry must still be the validated preview, a push, TIER B, not yet committed, not yet finalized. The checks and the claim happen
-// under one lock so a push-commit racing in cannot slip between "not committed" and "finalized" —
-// whichever of markCommitted / claimAbandonedPush takes the mutex first wins, and the other sees it.
-// The refusal reason is the entry's state AS READ UNDER THAT LOCK: the caller words its reply from it,
-// and reading the flags from the preview pointer afterwards would race markCommitted's write (internal
-// review round 1 R6-F3).
-//
-// The tier is the TRACKED one (stamped from the validated push.req when the entry was created), never
-// the finalize body's: a tier-A push has no commit phase — its bytes went to the receiving agent in the
-// push.req itself, so `committed` is false for its whole life, and without this check the creator's
-// finalize{failed} claimed the terminal of a transfer the agent was in the middle of landing — audit
-// said failed, the tracker was gone, and the agent's real terminal then found no entry (external review
-// F2). Only tier B has a pre-commit window in which the creator is the only party who can know the
-// upload was abandoned.
-func (t *transferTracker) claimAbandonedPush(expected *transferEntry) (*transferEntry, abandonRefusal) {
-	if expected == nil {
-		return nil, abandonNoEntry
-	}
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	e := t.entries[expected.transferID]
-	switch {
-	case e != expected:
-		return nil, abandonNoEntry
-	case e.finalized:
-		return e, abandonFinalized
-	case e.verb != "push":
-		return e, abandonNotPush
-	case e.committed:
-		return e, abandonCommitted
-	case e.tier != "b":
-		return e, abandonTierA
-	}
-	e.finalized = true
-	return e, abandonClaimed
-}
-
-// activeOBJStreams returns a snapshot of the in-flight bucket names.
-// Used by the boot reconciler to distinguish "stream is owned by an
-// active in-process transfer" (keep) from "orphan from a previous
-// broker that crashed" (delete). After a restart entries is empty so
-// EVERY OBJ_xfer-* stream is considered orphan — which is correct
-// because the in-memory state-machine is lost on crash.
-func (t *transferTracker) activeOBJStreams() map[string]struct{} {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	out := map[string]struct{}{}
-	for _, e := range t.entries {
-		if e.bucket != "" {
-			out["OBJ_"+e.bucket] = struct{}{}
-		}
-	}
-	return out
-}
 
 // ensureXferBucket lazily creates the per-session bucket xfer-<sid>
 // (backing stream OBJ_xfer-<sid>) on first use. Idempotent: returns OK
@@ -596,99 +242,22 @@ func (b *Broker) activeSessionCount(ctx context.Context) int {
 // emit MaxBytes<=0, which nats treats as UNLIMITED) when the store cannot even fit the floor.
 func (b *Broker) xferBucketMaxBytes(ctx context.Context) (int64, error) {
 	limits := xferStoreLimitsFor(ctx, b)
-	sessions := b.activeSessionCount(ctx)
-	replicas := b.xferTargetReplicas()
-	maxBytes := int64(xferBucketCap)
-	if limits.account > 0 {
-		accountMax, err := xferMaxBytesForCeiling(limits.account, sessions, replicas)
-		if err != nil {
-			return 0, fmt.Errorf("account limit: %w", err)
-		}
-		if accountMax < maxBytes {
-			maxBytes = accountMax
-		}
-	}
-	if limits.server > 0 {
-		serverMax, err := xferMaxBytesForCeiling(limits.server, sessions, 1)
-		if err != nil {
-			return 0, fmt.Errorf("server store estimate: %w", err)
-		}
-		if serverMax < maxBytes {
-			maxBytes = serverMax
-		}
-	}
-	return maxBytes, nil
+	return xferserve.LegacyBucketLimit(limits.account, limits.server, b.activeSessionCount(ctx), b.xferTargetReplicas())
 }
 
 // errXferStoreTooSmall marks the G6 #21 sizing refusal as a PERMANENT condition: a disk that cannot
 // hold the tier-B floor is not a stall, so the #67 bounded provisioning retry must make ZERO create
 // attempts against it. Wrapped (never re-worded) by xferMaxBytesForCeiling.
-var errXferStoreTooSmall = errors.New("js store too small for tier-B")
+var errXferStoreTooSmall = xfercontrol.ErrLegacyStoreTooSmall
 
-// xferMaxBytesForCeiling is the pure sizing clamp, split out for testing.
-//
-// ceiling<=0 (unknown JS store limit) ⇒ the cap, which is now one max-size transfer plus margin
-// rather than the legacy 8 GiB — an unknown ceiling is no longer a licence to reserve 8 GiB.
-// Otherwise: take what is left after the non-xfer streams' reservation, keep three quarters of it,
-// and never ask for more than one max-size transfer needs. Too small for the floor ⇒ refuse (never
-// MaxBytes<=0, which nats treats as UNLIMITED → a worse silent re-brick).
-//
-// NOTE ON WHAT `ceiling` IS: it is the CONFIGURED JetStream store limit (AccountInfo.Limits.MaxStore),
-// NOT "space still unreserved". The reserve is subtracted HERE, exactly once. Passing an
-// already-reduced number in would double-count and turn a working small-disk broker into a PERMANENT
-// errXferStoreTooSmall refusal — on racknerd's shape that is the difference between a 2 GiB bucket and
-// a hard "tier-B is impossible here". drill 21-smalldisk-tierb would catch it at deploy tier.
+// xferMaxBytesForCeiling delegates the cap0 sizing policy to its leaf owner.
 func xferMaxBytesForCeiling(ceiling int64, sessions, replicas int) (int64, error) {
-	if ceiling <= 0 {
-		return xferBucketCap, nil // unknown ceiling → cap (never <=0/unlimited)
-	}
-	reserve := xferReserveFor(sessions, replicas)
-	avail := ceiling - reserve
-	if avail < xferBucketFloor {
-		need := int64(math.MaxInt64)
-		if reserve <= math.MaxInt64-int64(xferBucketFloor) {
-			need = reserve + int64(xferBucketFloor)
-		}
-		// G67: wrapped in a SENTINEL so the #67 provisioning path can prove this refusal is
-		// PERMANENT via errors.Is rather than by matching prose. Without a structural handle, the
-		// "permanent set" tests would pass with the entire permanent branch deleted, because the
-		// classifier's default is already permanent.
-		return 0, fmt.Errorf("%w: js store ceiling=%d bytes, need >= %d (reserved by events+history "+
-			"for %d session(s) at %d replica(s) = %d, plus the %d floor)",
-			errXferStoreTooSmall,
-			ceiling, need, sessions, replicas, reserve, int64(xferBucketFloor))
-	}
-	maxBytes := avail / 4 * 3 // 0.75 of what's left, integer-safe
-	if maxBytes < xferBucketFloor {
-		maxBytes = xferBucketFloor
-	}
-	hi := int64(xferBucketCap)
-	if avail < hi {
-		hi = avail
-	}
-	if maxBytes > hi {
-		maxBytes = hi
-	}
-	return maxBytes, nil
+	return xferserve.LegacyMaxBytesForCeiling(ceiling, sessions, replicas)
 }
 
-// xferPayloadLimit converts a backing stream limit into the largest payload that can be admitted.
-// MaxBytes includes existing objects and JetStream's chunk/message overhead; neither is payload the
-// new transfer can use. A non-positive MaxBytes is JetStream's unlimited form, so only the global
-// transfer cap applies in that case.
+// xferPayloadLimit delegates the cap0 sizing policy to its leaf owner.
 func xferPayloadLimit(bucketMax int64, used uint64) int64 {
-	if bucketMax <= 0 {
-		return int64(proto.XferMaxBytes)
-	}
-	available := bucketMax - int64(xferBucketChunkMargin)
-	if available <= 0 || used >= uint64(available) {
-		return 0
-	}
-	available -= int64(used)
-	if available > int64(proto.XferMaxBytes) {
-		available = int64(proto.XferMaxBytes)
-	}
-	return available
+	return xferserve.LegacyPayloadLimit(bucketMax, used)
 }
 
 // ensureXferBucketSized is ensureXferBucket with a PRE-COMPUTED disk-aware ceiling (A11): the tier-B push
@@ -697,6 +266,12 @@ func xferPayloadLimit(bucketMax int64, used uint64) int64 {
 // does not cache). The too-small refusal is short-circuited by the CALLER (provisionXferBucket) and
 // never reaches here — the sizeErr parameter that used to re-check it was dead and was removed.
 func ensureXferBucketSizedWithLimit(ctx context.Context, b *Broker, sid string, targetReplicas int, maxBytes int64) (string, int64, error) {
+	// Continuation sends only an intent patch to the configuration owner. It
+	// must never fall through to a local full-config writer during recovery.
+	// origin: hot-update S7 plan §2.1 / M14 / P22
+	if b.cfg.TransferFactory != nil || b.transferRuntime.Load() != nil {
+		return provisionBrokerTransferBucket(ctx, b, sid, targetReplicas, maxBytes)
+	}
 	if brokerJS(b) == nil {
 		return "", 0, fmt.Errorf("jetstream_unavailable")
 	}
@@ -714,7 +289,7 @@ func ensureXferBucketSizedWithLimit(ctx context.Context, b *Broker, sid string, 
 	// Only an authoritative not-found reaches create. A timeout or leader error is retried by the
 	// bounded provisioning loop; treating it as absence would issue a misleading create request.
 	if stream, err := brokerJS(b).Stream(ctx, xferBackingStream(sid)); err == nil {
-		if err := raiseXferReplicas(ctx, brokerJS(b), bucket, targetReplicas); err != nil {
+		if err := raiseXferReplicas(ctx, brokerTransferConfigJS(b), bucket, targetReplicas); err != nil {
 			return "", 0, err
 		}
 		si, err := stream.Info(ctx)
@@ -722,7 +297,7 @@ func ensureXferBucketSizedWithLimit(ctx context.Context, b *Broker, sid string, 
 			return "", 0, fmt.Errorf("xfer bucket info %s: %w", bucket, err)
 		}
 		b.convergeOversizedXferBucket(ctx, sid, bucket, si, maxBytes, targetReplicas)
-		return bucket, xferPayloadLimit(si.Config.MaxBytes, si.State.Bytes), nil
+		return xferserve.LegacyBucketCapacity(bucket, si.Config.MaxBytes, si.State.Bytes)
 	} else if !errors.Is(err, jetstream.ErrStreamNotFound) {
 		return "", 0, fmt.Errorf("xfer bucket lookup %s: %w", bucket, err)
 	}
@@ -733,13 +308,13 @@ func ensureXferBucketSizedWithLimit(ctx context.Context, b *Broker, sid string, 
 		Storage:  jetstream.FileStorage,
 		Replicas: targetReplicas, // D5 §6.4/§9: replicasFor(nVoters); live callers pass jsstream.ReplicasSingle
 	}
-	if _, err := brokerJS(b).CreateObjectStore(ctx, cfg); err != nil {
+	if _, err := brokerTransferConfigJS(b).CreateObjectStore(ctx, cfg); err != nil {
 		if errors.Is(err, jetstream.ErrBucketExists) ||
 			errors.Is(err, jetstream.ErrStreamNameAlreadyInUse) {
 			// Exists: RAISE-ONLY reconcile toward target (D5 §9, R-18). Idempotent +
 			// retriable on a not-yet-ready meta-group (ErrMetaGroupNotReady). Still reachable when
 			// the lookup above failed transiently and the bucket really does exist.
-			if err := raiseXferReplicas(ctx, brokerJS(b), bucket, targetReplicas); err != nil {
+			if err := raiseXferReplicas(ctx, brokerTransferConfigJS(b), bucket, targetReplicas); err != nil {
 				return "", 0, err
 			}
 			stream, serr := brokerJS(b).Stream(ctx, xferBackingStream(sid))
@@ -750,11 +325,11 @@ func ensureXferBucketSizedWithLimit(ctx context.Context, b *Broker, sid string, 
 			if serr != nil {
 				return "", 0, fmt.Errorf("xfer bucket info after create race %s: %w", bucket, serr)
 			}
-			return bucket, xferPayloadLimit(si.Config.MaxBytes, si.State.Bytes), nil
+			return xferserve.LegacyBucketCapacity(bucket, si.Config.MaxBytes, si.State.Bytes)
 		}
 		return "", 0, fmt.Errorf("create_bucket: %w%s", err, b.xferStoreAccounting(ctx, err, maxBytes))
 	}
-	return bucket, xferPayloadLimit(maxBytes, 0), nil
+	return xferserve.LegacyBucketCapacity(bucket, maxBytes, 0)
 }
 
 // jsErrCodeStorageExceeded is the JetStream API code for "insufficient storage resources available"
@@ -839,7 +414,7 @@ func (b *Broker) convergeOversizedXferBucket(ctx context.Context, sid, bucket st
 		// configuration alone", never "assume it is safe".
 		return
 	}
-	if _, live := b.transfers.activeOBJStreams()[xferBackingStream(sid)]; live {
+	if _, live := b.transfers.ActiveOBJStreams()[xferBackingStream(sid)]; live {
 		b.cfg.Logger.Info("broker: deferring xfer bucket shrink (transfer in flight)",
 			"sid", sid, "bucket", bucket, "current_max_bytes", cur, "target", target)
 		return
@@ -860,10 +435,18 @@ func (b *Broker) convergeOversizedXferBucket(ctx context.Context, sid, bucket st
 	if replicas < 1 {
 		replicas = targetReplicas
 	}
-	cfg := objectStoreConfigFromStream(bucket, info.Config)
+	// Copy the backing stream configuration: ObjectStoreConfig cannot carry
+	// Duplicates, so rebuilding through the SDK would erase the recovery seal.
+	// origin: hot-update S7 plan §2.1 / M14
+	cfg := info.Config
 	cfg.MaxBytes = target
 	cfg.Replicas = replicas
-	if _, err := brokerJS(b).UpdateObjectStore(ctx, cfg); err != nil {
+	// Name the repaired stream here rather than trusting the INFO echo: only an
+	// OBJ_xfer-* name reaches the coordinator's proof-gated Shrink (fresh INFO
+	// bytes AND its own empty live-transfer census); any other name bypasses it.
+	// origin: hot-update S7 plan §2.1 / lead decision on authoritative shrink proof
+	cfg.Name = xferBackingStream(sid)
+	if _, err := brokerTransferConfigJS(b).UpdateStream(ctx, cfg); err != nil {
 		b.cfg.Logger.Warn("broker: xfer bucket shrink failed (continuing with the existing bucket)",
 			"sid", sid, "bucket", bucket, "current_max_bytes", cur, "target", target, "err", err)
 		return
@@ -899,22 +482,10 @@ func (b *Broker) xferAccountIsOverCommitted(ctx context.Context) bool {
 	return reserved > uint64(info.Limits.MaxStore)
 }
 
+// The unused compatibility adapter is retired; xferserve owns this preservation.
 // objectStoreConfigFromStream preserves every ObjectStoreConfig field represented by the backing
 // stream. UpdateObjectStore treats omitted fields as zero values; rebuilding only MaxBytes and
 // Replicas would silently erase operator description, TTL, placement, compression and metadata.
-func objectStoreConfigFromStream(bucket string, cfg jetstream.StreamConfig) jetstream.ObjectStoreConfig {
-	return jetstream.ObjectStoreConfig{
-		Bucket:      bucket,
-		Description: cfg.Description,
-		TTL:         cfg.MaxAge,
-		MaxBytes:    cfg.MaxBytes,
-		Storage:     cfg.Storage,
-		Replicas:    cfg.Replicas,
-		Placement:   cfg.Placement,
-		Compression: cfg.Compression == jetstream.S2Compression,
-		Metadata:    cfg.Metadata,
-	}
-}
 
 // xferBackingStream is the JetStream stream that backs the per-session object-store
 // bucket (nats.go names it "OBJ_<bucket>"). Reading its StreamInfo gives the per-peer
@@ -923,7 +494,7 @@ func objectStoreConfigFromStream(bucket string, cfg jetstream.StreamConfig) jets
 func xferBackingStream(sid string) string { return "OBJ_" + proto.XferBucketName(sid) }
 
 // raiseXferReplicas raises an existing object-store bucket's replica factor toward
-// target via UpdateObjectStore (D5 §9, R-18). Raise-only (the configured Replicas <
+// target via a full StreamConfig update (D5 §9, R-18). Raise-only (the configured Replicas <
 // target check); the meta-group readiness gate is the UpdateObjectStore rejection
 // classified to jsstream.ErrMetaGroupNotReady (retriable), mirroring the stream path.
 func raiseXferReplicas(ctx context.Context, js jetstream.JetStream, bucket string, target int) error {
@@ -958,9 +529,11 @@ func raiseXferReplicas(ctx context.Context, js jetstream.JetStream, bucket strin
 		// already handle.
 		return jsstream.ErrMetaGroupNotReady
 	}
-	cfg := objectStoreConfigFromStream(bucket, streamCfg)
+	// Keep the complete stream configuration, including the dedupe horizon.
+	// origin: hot-update S7 plan §2.1 / M14
+	cfg := streamCfg
 	cfg.Replicas = target
-	if _, err := js.UpdateObjectStore(ctx, cfg); err != nil {
+	if _, err := xferbucket.Guard(js).UpdateStream(ctx, cfg); err != nil {
 		if jsstream.IsMetaGroupNotReady(err) {
 			return jsstream.ErrMetaGroupNotReady
 		}
@@ -988,108 +561,31 @@ func XferReplicaState(ctx context.Context, js jetstream.JetStream, sid string, t
 
 // deleteXferObject removes one transfer's object from the per-session
 // bucket. Missing-object is OK (idempotent). The bucket itself
-// survives — it's per-session, not per-transfer.
+// survives — it's per-session, not per-transfer. The delete is an S9 P18
+// ObjectDelete producer; its body moved verbatim to infraattach.DeleteObject.
 func (b *Broker) deleteXferObject(ctx context.Context, sid, transferID string) error {
 	if brokerJS(b) == nil || transferID == "" {
 		return nil
 	}
-	store, err := brokerJS(b).ObjectStore(ctx, proto.XferBucketName(sid))
-	if err != nil {
-		if errors.Is(err, jetstream.ErrBucketNotFound) ||
-			errors.Is(err, jetstream.ErrStreamNotFound) {
-			return nil
-		}
-		return err
-	}
-	if err := store.Delete(ctx, transferID); err != nil &&
-		!errors.Is(err, jetstream.ErrObjectNotFound) {
-		return err
-	}
-	return nil
+	return infraattach.DeleteObject(ctx, brokerJS(b), proto.XferBucketName(sid), transferID)
 }
 
-// watchdogBudget is the duration startTransferWatchdog ACTUALLY arms.
-//
-// origin: batch-c internal review tests-F5. It is a named function so a test can assert the value the
-// watchdog uses rather than re-deriving proto.XferBudget(...) and comparing that to itself. The tests
-// that restated the formula stayed green when the real arm site was changed to cover one leg instead
-// of two — i.e. they could not see the very defect they were written for.
-//
-// The budget is derived from the declared size and covers BOTH object-store crossings, because the
-// watchdog is armed before the prepare is even forwarded. e.size is 0 on the pull path
-// (proto.PullPrepareReq carries no size — permanent decision N5), which yields the historical flat
-// floor rather than a zero budget.
-func watchdogBudget(e *transferEntry) time.Duration {
-	return proto.XferBudget(e.tier, e.size, proto.XferPushLegs)
-}
+// The single-mode already-confirmed branch still owns cleanup and both ledger
+// rows. An ACK is not retirement, and a failed purge must preserve that work.
+// origin: hot-update S7 plan §5.1 / T21
 
-// startTransferWatchdog arms a per-tier timeout. If the receiver-side
-// finalization signal does not arrive in time, the watchdog writes a
-// synthetic audit failed + reclaims the bucket. The returned cancel
-// is stored on the entry so a successful finalize stops the watchdog.
+// Watchdog ownership moved with the registry. The adapter only joins the
+// explicit legacy lifetime to normal broker shutdown; v1 byte deadlines and
+// retained settlement belong to the continuation tracker.
+// origin: hot-update S7 plan §5.1 / L13 / P22
 func (b *Broker) startTransferWatchdog(parent context.Context, e *transferEntry) context.CancelFunc {
-	ctx, cancel := context.WithCancel(parent)
-	d := watchdogBudget(e)
-	go func() {
-		// defer, not a call after the select, so that EVERY exit releases the child
-		// context — including the two early returns below and any added later.
-		//
-		// origin: prerelease audit broker-transfer/BT-F1. The comment at the
-		// finalizeTransfer call below used to say cancelling here is a no-op. That is
-		// true of closing ctx.Done() and false of the thing that actually leaks: a
-		// child context stays in its PARENT's children map until it is cancelled, and
-		// the parent here is b.runCtx, which lives as long as the broker process. So
-		// every timed-out transfer left a cancelCtx that nothing could ever collect.
-		// cancel is idempotent, so this does not conflict with entry.cancel being
-		// called elsewhere on the ordinary paths.
-		defer cancel()
-		t := time.NewTimer(d)
-		defer t.Stop()
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-		}
-		ent, ok := b.transfers.claimFinalize(e)
-		if !ok || ent == nil {
-			return
-		}
-		// batch C: the push arm used to write "agent_no_responders", which is a WRONG ATTRIBUTION —
-		// the agent may have been reachable and transferring the whole time; what ran out was the
-		// broker's budget. It is also the code the CLI classifies as EX_TEMPFAIL with the hint "the
-		// agent isn't reachable on NATS; check it's running and connected", sending an operator to
-		// debug connectivity that was never broken. The genuine no-responders emitters (expose,
-		// upgrade, the cluster upgrade trigger) keep that code; only this one changes.
-		code := proto.CodeTransferBudgetExceeded
-		if ent.verb == "pull" {
-			code = "ctl_disconnect"
-		}
-		b.transfers.markReaped(ent.transferID, b.cfg.Now())
-		b.finalizeTransfer(ent, schema.AuditTransfer{
-			V: schema.AuditSchemaVersion, Kind: "failed", Verb: ent.verb,
-			Ts: b.cfg.Now(), Session: ent.sid, Node: ent.nid,
-			ActorNkey: ent.actor, ActorFp: ent.actorFP,
-			TransferID: ent.transferID, Path: ent.path, Tier: ent.tier,
-			Bucket: ent.bucket, DurationMs: msSince(ent.startedAt, b.cfg.Now()),
-			Code:  code,
-			Error: fmt.Sprintf("broker watchdog: no %s finalization within %s", ent.verb, d),
-		}, false) // false: the watchdog owns entry.cancel — see the deferred cancel above
-		b.cfg.Logger.Warn("broker: transfer watchdog fired",
-			"transfer_id", ent.transferID, "verb", ent.verb, "tier", ent.tier,
-			"code", code)
-	}()
-	return cancel
-}
-
-func msSince(t0, t1 time.Time) int64 {
-	if t0.IsZero() {
-		return 0
+	var stopped <-chan struct{}
+	if parent != nil {
+		stopped = parent.Done()
 	}
-	d := t1.Sub(t0)
-	if d < 0 {
-		d = 0
-	}
-	return d.Milliseconds()
+	return b.transfers.StartWatchdog(e, xfertrack.LegacyWatchdogHooks{
+		Now: b.cfg.Now, Logger: b.cfg.Logger, Finalize: b.finalizeTransfer, Stopped: stopped,
+	})
 }
 
 // pubAuditTransfer marshals + publishes one AuditTransfer row to
@@ -1110,10 +606,16 @@ func msSince(t0, t1 time.Time) int64 {
 // commitSyntheticTransferTerminal already derived exactly this id for its own single-mode
 // publish; having only ONE of the two paths dedup was the whole of the residual, because
 // the id has to match the OTHER publish to be worth anything.
-func (b *Broker) pubAuditTransfer(rec schema.AuditTransfer) {
+func (b *Broker) pubAuditTransfer(rec schema.AuditTransfer) error {
+	// A canonical cap0 row has one exact writer, the transfer-subject CAS; a MsgID
+	// window would let a late duplicate in after it expired.
+	// origin: hot-update S7 plan §5.2 / L12 (S7 integration oplegacy F2)
+	if schema.TransferContinuation(rec) {
+		return legacyTransferLedger(b).Exact(rec)
+	}
 	payload, err := json.Marshal(rec)
 	if err != nil {
-		return
+		return err
 	}
 	msgID, ierr := xferaudit.TransferRecordReqID(rec)
 	if ierr != nil {
@@ -1123,16 +625,19 @@ func (b *Broker) pubAuditTransfer(rec schema.AuditTransfer) {
 		// act without an id of its own, so nothing downstream is misled.
 		b.cfg.Logger.Warn("broker: audit.transfer dedup id",
 			"err", ierr, "sid", rec.Session, "tid", rec.TransferID)
-		if perr := b.publishAudit(proto.SubjAuditTransfer(rec.Session), payload); perr != nil {
+		perr := b.publishAudit(proto.SubjAuditTransfer(rec.Session), payload)
+		if perr != nil {
 			b.cfg.Logger.Warn("broker: audit.transfer pub",
 				"err", perr, "sid", rec.Session, "tid", rec.TransferID)
 		}
-		return
+		return errors.Join(ierr, perr)
 	}
 	if err := publishAuditDeduped(b, proto.SubjAuditTransfer(rec.Session), payload, msgID); err != nil {
 		b.cfg.Logger.Warn("broker: audit.transfer pub",
 			"err", err, "sid", rec.Session, "tid", rec.TransferID)
+		return err
 	}
+	return nil
 }
 
 // emitTransferAudit routes one transfer-audit record. In production
@@ -1149,11 +654,19 @@ func (b *Broker) emitTransferAudit(rec schema.AuditTransfer) {
 // the record is durably committed (cluster mode: the raft forward returned nil; single mode: the core
 // publish is the record). It never runs on a give-up.
 func (b *Broker) emitTransferAuditWithCommit(rec schema.AuditTransfer, onCommitted func()) {
-	if b.transferAuditSink != nil {
+	// A canonical cap0 row (its admission START) is published by its origin's exact writer in both
+	// modes; see emitStagedTransferTerminal for why it never rides the Raft forward.
+	// origin: hot-update S7 plan §5.2 / §9 / L12 (S7 integration oplegacy F2)
+	if b.transferAuditSink != nil && !schema.TransferContinuation(rec) {
 		b.transferAuditSink(rec, onCommitted)
 		return
 	}
-	b.pubAuditTransfer(rec)
+	// A failed single-mode publish leaves the outbox owned. The old void
+	// helper discarded this error and retired the only recoverable decision.
+	// origin: hot-update S7 plan §5.2 / T21
+	if err := b.pubAuditTransfer(rec); err != nil {
+		return
+	}
 	if onCommitted != nil {
 		onCommitted()
 	}
@@ -1176,6 +689,17 @@ func (b *Broker) emitTransferAuditWithCommit(rec schema.AuditTransfer, onCommitt
 // The reviewer also noted the previous pin (TestXferInflightTerminalDropsLedger) used a no-op sink and
 // therefore froze the WRONG order as green; it now drives a blocking sink.
 func (b *Broker) emitTerminalTransferAudit(rec schema.AuditTransfer, transferID string) {
+	emitStagedTransferTerminal(b, rec, transferID, nil)
+}
+
+// emitStagedTransferTerminal is emitTerminalTransferAudit carrying the admission START the live entry
+// retained. A canonical cap0 row (START retained) is published and retired only by its origin's exact
+// writer — START first, then the first staged TERMINAL — in single AND cluster mode: it never rides the
+// Raft forward, so a mixed-version leader can neither strip its identity nor publish a second, plain
+// copy that the exact writer would then have to refuse for ever. A refusal leaves both rows for the
+// finalize pass. Every other row keeps the pre-S7 commit-then-unlink path below unchanged.
+// origin: hot-update S7 plan §4 / §5.1 / §5.2 / §9 / L12 (S7 integration oplegacy F2)
+func emitStagedTransferTerminal(b *Broker, rec schema.AuditTransfer, transferID string, start *schema.AuditTransfer) {
 	// RE-REVIEW F1: STAGE the decided terminal into the ledger BEFORE forwarding it. The first fix only
 	// delayed the unlink until after the commit, which left the symmetric window open — a process killed
 	// after the commit but before the unlink came back to a START-ONLY ledger, and recovery then GUESSED
@@ -1185,7 +709,7 @@ func (b *Broker) emitTerminalTransferAudit(rec schema.AuditTransfer, transferID 
 	// Staging first makes recovery a REPLAY of the same bytes instead of a guess: identical record ⇒
 	// identical reqID ⇒ the replicated dedup ledger collapses it. Both windows are now closed by one
 	// invariant: the ledger holds the exact row that must exist, until that row is known to exist.
-	staged, applicable := b.stageXferInflightTerminal(transferID, rec)
+	row, staged, applicable := legacyTransferLedger(b).Stage(transferID, rec, start)
 	// ROUND-4 RE-REVIEW: what makes suppression safe is that RECOVERY STILL HOLDS THIS EXACT TERMINAL —
 	// and that is now a property of the staging attempt itself, not a guess about the past. Staging falls
 	// back to a sibling outbox directory, so "unstaged" no longer means "the primary directory hiccuped";
@@ -1204,6 +728,12 @@ func (b *Broker) emitTerminalTransferAudit(rec schema.AuditTransfer, transferID 
 			"only terminal outright",
 			"transfer_id", transferID, "kind", rec.Kind)
 	}
+	if row.Start != nil {
+		if legacyTransferLedger(b).Confirmed(row) {
+			b.removeXferInflight(transferID)
+		}
+		return
+	}
 	b.emitTransferAuditWithCommit(rec, func() { b.removeXferInflight(transferID) })
 }
 
@@ -1219,14 +749,31 @@ func (b *Broker) handlePushReq(nc *nats.Conn, msg *nats.Msg) {
 		b.replyPushErr(msg, "subject_malformed", msg.Subject)
 		return
 	}
+	if serveTransferCarrier(b, msg, sid, actor, nid, verb) {
+		return // capable continuation (S7 production activation)
+	}
 	fp, err := auth.FingerprintFromActor(actor)
 	if err != nil {
 		b.replyPushErr(msg, "actor_invalid", err.Error())
 		return
 	}
+	// A continuation is retained original-owner work; it never reaches the
+	// one-shot legacy tracker/forward below, with or without an installed graph.
+	// origin: hot-update S7 plan §6.3 / §7 / INTEG-D outer adapter
+	if handleBrokerTransferCarrier(b, msg, sid, actor, fp, nid, verb) {
+		return
+	}
 	if !b.transferHomeGate(sid, nid) {
 		return // not this agent's home (or home unresolved): stay silent, the home answers (§9 D8)
 	}
+	// Admission covers provisioning BEFORE tracker insertion. Counting only
+	// tracker entries leaves a window in which a create could finish after seal.
+	// origin: hot-update S6 plan §5 / T45
+	if !beginBrokerTransfer(b) {
+		b.replyPushErr(msg, codeXferBrokerRestarting, "broker image cut has fenced transfer creation")
+		return
+	}
+	defer endBrokerTransfer(b)
 	if err := b.transferGate(sid, fp, nid); err != "" {
 		b.replyPushErr(msg, err, "")
 		return
@@ -1321,13 +868,23 @@ func (b *Broker) handlePushReq(nc *nats.Conn, msg *nats.Msg) {
 		return
 	}
 
-	entry := &transferEntry{
-		transferID: req.TransferID, sid: sid, nid: nid,
-		actor: actor, actorFP: fp, verb: "push", tier: req.Tier,
-		bucket: req.Bucket, path: req.Path, size: req.Size,
-		startedAt: b.cfg.Now(),
-	}
-	if code, blocker := b.transfers.putWithBlocker(entry); code != "" {
+	// The cap0 admission identity is retained here, before the tracker, ledger and forward, or never:
+	// a terminal binds to this START's nonce and cannot mint one after its outcome is known.
+	// origin: hot-update S7 plan §4 / §5.1 / L12 (S7 integration oplegacy F2)
+	start, retained := legacyTransferLedger(b).Admit(schema.AuditTransfer{
+		V: schema.AuditSchemaVersion, Kind: "start", Verb: "push",
+		Ts: b.cfg.Now(), Session: sid, Node: nid,
+		ActorNkey: actor, ActorFp: fp,
+		TransferID: req.TransferID, Path: req.Path,
+		Size: req.Size, SHA256: req.SHA256, Tier: req.Tier, Bucket: req.Bucket,
+	})
+	entry := xfertrack.NewLegacyEntry(xfertrack.LegacyRecord{
+		TransferID: req.TransferID, SID: sid, NID: nid,
+		Actor: actor, ActorFP: fp, Verb: "push", Tier: req.Tier,
+		Bucket: req.Bucket, Path: req.Path, Size: req.Size,
+		StartedAt: start.Ts, Start: retained,
+	})
+	if code, blocker := b.transfers.Put(entry); code != "" {
 		// Duplicate id, per-bucket serialisation, or in-flight cap reached. Per-session bucket
 		// survives across transfers, so no bucket cleanup needed here.
 		b.replyPushErr(msg, code, inFlightRefusalText(req.TransferID, code, blocker))
@@ -1336,16 +893,10 @@ func (b *Broker) handlePushReq(nc *nats.Conn, msg *nats.Msg) {
 	// #57 Lane B: persist the durable in-flight ledger BEFORE forwarding, so a home crash between here and a
 	// terminal is recovered into a synthetic terminal audit (not a dangling start row).
 	b.writeXferInflight(entry)
-	entry.cancel = b.startTransferWatchdog(b.runCtx, entry)
+	b.transfers.SetCancel(entry, b.startTransferWatchdog(b.runCtx, entry))
 
 	// Audit start (plan §Audit "start written from broker-accepted prepare").
-	b.emitTransferAudit(schema.AuditTransfer{
-		V: schema.AuditSchemaVersion, Kind: "start", Verb: "push",
-		Ts: entry.startedAt, Session: sid, Node: nid,
-		ActorNkey: actor, ActorFp: fp,
-		TransferID: req.TransferID, Path: req.Path,
-		Size: req.Size, SHA256: req.SHA256, Tier: req.Tier, Bucket: req.Bucket,
-	})
+	b.emitTransferAudit(start)
 
 	// R7a ORDERING GUARD (do not remove — it is load-bearing for the PERIODIC orphan reaper).
 	// The reaper (#58) used to run once at boot; it now runs on every reconcile sweep, so "delete objects
@@ -1356,7 +907,7 @@ func (b *Broker) handlePushReq(nc *nats.Conn, msg *nats.Msg) {
 	// above the put(), or adding a path that writes an object before registering, would silently turn the
 	// reaper into a data-loss loop. So the convention is now a PRECONDITION: refuse to forward a prepare
 	// the tracker does not already know about, rather than trust that nobody reorders these lines.
-	if b.transfers.get(entry.transferID) == nil {
+	if b.transfers.Get(b.transfers.Record(entry).TransferID) == nil {
 		b.replyPushErr(msg, "internal_error",
 			"transfer prepare would be forwarded to the agent before its tracker entry exists — "+
 				"the periodic orphan reaper could delete the upload mid-flight (R7a ordering guard)")
@@ -1393,14 +944,29 @@ func (b *Broker) handlePullReq(nc *nats.Conn, msg *nats.Msg) {
 		b.replyPullErr(msg, "subject_malformed", msg.Subject)
 		return
 	}
+	if serveTransferCarrier(b, msg, sid, actor, nid, verb) {
+		return // capable continuation (S7 production activation)
+	}
 	fp, err := auth.FingerprintFromActor(actor)
 	if err != nil {
 		b.replyPullErr(msg, "actor_invalid", err.Error())
 		return
 	}
+	// origin: hot-update S7 plan §6.3 / §7 / INTEG-D outer adapter
+	if handleBrokerTransferCarrier(b, msg, sid, actor, fp, nid, verb) {
+		return
+	}
 	if !b.transferHomeGate(sid, nid) {
 		return // not this agent's home (or home unresolved): stay silent, the home answers (§9 D8)
 	}
+	// Admission covers provisioning BEFORE tracker insertion. Counting only
+	// tracker entries leaves a window in which a create could finish after seal.
+	// origin: hot-update S6 plan §5 / T45
+	if !beginBrokerTransfer(b) {
+		b.replyPullErr(msg, codeXferBrokerRestarting, "broker image cut has fenced transfer creation")
+		return
+	}
+	defer endBrokerTransfer(b)
 	if err := b.transferGate(sid, fp, nid); err != "" {
 		b.replyPullErr(msg, err, "")
 		return
@@ -1460,14 +1026,23 @@ func (b *Broker) handlePullReq(nc *nats.Conn, msg *nats.Msg) {
 		return
 	}
 
-	entry := &transferEntry{
-		transferID: req.TransferID, sid: sid, nid: nid,
-		actor: actor, actorFP: fp, verb: "pull",
-		tier:   "b", // optimistic; finalize.req body may say "a" — we delete the per-transfer object regardless
-		bucket: bucket, path: req.Path,
-		startedAt: b.cfg.Now(),
-	}
-	if code, blocker := b.transfers.putWithBlocker(entry); code != "" {
+	// The pull START keeps its unresolved "?" tier; only its terminal names the tier the agent chose.
+	// origin: hot-update S7 plan §4 / §5.1 / L12 (S7 integration oplegacy F2)
+	start, retained := legacyTransferLedger(b).Admit(schema.AuditTransfer{
+		V: schema.AuditSchemaVersion, Kind: "start", Verb: "pull",
+		Ts: b.cfg.Now(), Session: sid, Node: nid,
+		ActorNkey: actor, ActorFp: fp,
+		TransferID: req.TransferID, Path: req.Path,
+		Tier: "?", Bucket: bucket,
+	})
+	entry := xfertrack.NewLegacyEntry(xfertrack.LegacyRecord{
+		TransferID: req.TransferID, SID: sid, NID: nid,
+		Actor: actor, ActorFP: fp, Verb: "pull",
+		Tier:   "b", // optimistic; finalize.req body may say "a" — we delete the per-transfer object regardless
+		Bucket: bucket, Path: req.Path,
+		StartedAt: start.Ts, Start: retained,
+	})
+	if code, blocker := b.transfers.Put(entry); code != "" {
 		// Per-session bucket survives across transfers; nothing to
 		// reap on this rejection.
 		b.replyPullErr(msg, code, inFlightRefusalText(req.TransferID, code, blocker))
@@ -1475,15 +1050,9 @@ func (b *Broker) handlePullReq(nc *nats.Conn, msg *nats.Msg) {
 	}
 	// #57 Lane B: durable in-flight ledger BEFORE forwarding (see handlePushReq).
 	b.writeXferInflight(entry)
-	entry.cancel = b.startTransferWatchdog(b.runCtx, entry)
+	b.transfers.SetCancel(entry, b.startTransferWatchdog(b.runCtx, entry))
 
-	b.emitTransferAudit(schema.AuditTransfer{
-		V: schema.AuditSchemaVersion, Kind: "start", Verb: "pull",
-		Ts: entry.startedAt, Session: sid, Node: nid,
-		ActorNkey: actor, ActorFp: fp,
-		TransferID: req.TransferID, Path: req.Path,
-		Tier: "?", Bucket: bucket,
-	})
+	b.emitTransferAudit(start)
 
 	fwd := &nats.Msg{
 		Subject: proto.SubjCmdForwarded(sid, nid, verb),
@@ -1511,9 +1080,16 @@ func (b *Broker) handlePushCommitReq(nc *nats.Conn, msg *nats.Msg) {
 		b.replyCommitErr(msg, "subject_malformed", msg.Subject)
 		return
 	}
+	if serveTransferCarrier(b, msg, sid, actor, nid, verb) {
+		return // capable continuation (S7 production activation)
+	}
 	fp, err := auth.FingerprintFromActor(actor)
 	if err != nil {
 		b.replyCommitErr(msg, "actor_invalid", err.Error())
+		return
+	}
+	// origin: hot-update S7 plan §6.3 / §7 / INTEG-D outer adapter
+	if handleBrokerTransferCarrier(b, msg, sid, actor, fp, nid, verb) {
 		return
 	}
 	var req proto.TransferCommitReq
@@ -1521,7 +1097,7 @@ func (b *Broker) handlePushCommitReq(nc *nats.Conn, msg *nats.Msg) {
 		b.replyCommitErr(msg, "json_parse", err.Error())
 		return
 	}
-	entry := b.transfers.get(req.TransferID)
+	entry := b.transfers.Get(req.TransferID)
 	if entry == nil {
 		// Tracker miss. In clustered mode (selfID!="") this broker is NOT the transfer's
 		// origin — every broker receives this broadcast subject, so a non-owner MUST stay
@@ -1536,7 +1112,7 @@ func (b *Broker) handlePushCommitReq(nc *nats.Conn, msg *nats.Msg) {
 	// audit transfer F5: the transfer_id is a shared key — cross-check it belongs to THIS
 	// subject's (sid,nid) so a valid actor cannot drive a push-commit against another session's
 	// transfer (consistency with handleEvTransfer's sid/nid guard).
-	if entry.sid != sid || entry.nid != nid {
+	if b.transfers.Record(entry).SID != sid || b.transfers.Record(entry).NID != nid {
 		b.replyCommitErr(msg, "not_owner_or_creator", "")
 		return
 	}
@@ -1544,11 +1120,11 @@ func (b *Broker) handlePushCommitReq(nc *nats.Conn, msg *nats.Msg) {
 		b.replyCommitErr(msg, err, "")
 		return
 	}
-	if entry.actor != actor || entry.verb != "push" {
+	if b.transfers.Record(entry).Actor != actor || b.transfers.Record(entry).Verb != "push" {
 		b.replyCommitErr(msg, "not_owner_or_creator", "")
 		return
 	}
-	if entry.tier != "b" {
+	if b.transfers.Record(entry).Tier != "b" {
 		b.replyCommitErr(msg, "tier_invalid", "push-commit requires tier b")
 		return
 	}
@@ -1557,7 +1133,7 @@ func (b *Broker) handlePushCommitReq(nc *nats.Conn, msg *nats.Msg) {
 	// only its ev.transfer may end this transfer (a creator finalize{failed} is refused from here on).
 	// A false return means the watchdog already reaped it — forwarding would let the agent Get an
 	// object whose failed audit is on disk, so answer the way handleEvTransfer would.
-	if !b.transfers.markCommitted(entry) {
+	if !b.transfers.MarkCommitted(entry) {
 		b.replyCommitErr(msg, "transfer_unknown", req.TransferID)
 		return
 	}
@@ -1595,7 +1171,7 @@ func (b *Broker) handleEvTransfer(msg *nats.Msg) {
 	// immutable after put(), so reading them via the lookup snapshot
 	// without holding tracker.mu is safe. claimFinalize is the only
 	// state-mutating call.
-	preview := b.transfers.get(transferID)
+	preview := b.transfers.Get(transferID)
 	if preview == nil {
 		// batch C: THIS is where a late completion is dropped, not the !claimed branch below —
 		// finalizeTransfer already called transfers.remove, so a watchdog-reaped transfer is simply
@@ -1603,7 +1179,7 @@ func (b *Broker) handleEvTransfer(msg *nats.Msg) {
 		// file landed on disk but the audit says failed", so say it out loud when we know we just
 		// reaped this id. Unknown ids (a replay, a foreign broker's transfer) stay quiet: they are
 		// routine and would drown the signal.
-		if b.transfers.recentlyReaped(transferID) {
+		if b.transfers.RecentlyReaped(transferID) {
 			b.cfg.Logger.Warn("broker: receiver reported a transfer AFTER the broker's budget expired and "+
 				"the terminal audit was already written — the audit says failed; the file may well be on "+
 				"disk at the destination",
@@ -1611,40 +1187,28 @@ func (b *Broker) handleEvTransfer(msg *nats.Msg) {
 		}
 		return // unknown transfer; ignore
 	}
-	if preview.sid != sid || preview.nid != nid {
+	if b.transfers.Record(preview).SID != sid || b.transfers.Record(preview).NID != nid {
 		b.cfg.Logger.Warn("broker: ev.transfer sid/nid mismatch",
-			"want_sid", preview.sid, "got_sid", sid,
-			"want_nid", preview.nid, "got_nid", nid)
+			"want_sid", b.transfers.Record(preview).SID, "got_sid", sid,
+			"want_nid", b.transfers.Record(preview).NID, "got_nid", nid)
 		return
 	}
-	entry, claimed := b.transfers.claimFinalize(preview)
+	entry, claimed := b.transfers.ClaimFinalize(preview)
 	if !claimed {
 		// Already finalized by watchdog or another caller. Don't
 		// double-write audit / double-delete the transfer object.
 		return
 	}
 
-	rec := schema.AuditTransfer{
-		V: schema.AuditSchemaVersion, Kind: kind, Verb: entry.verb,
-		Ts: b.cfg.Now(), Session: entry.sid, Node: entry.nid,
-		ActorNkey: entry.actor, ActorFp: entry.actorFP,
-		TransferID: entry.transferID, Path: entry.path,
-		Tier: entry.tier, Bucket: entry.bucket,
-		Bytes: ev.Bytes, DurationMs: ev.DurationMs,
-	}
-	if kind == "failed" {
-		rec.Code = ev.Code
-		rec.Error = ev.Error
-	}
-	b.emitTerminalTransferAudit(rec, entry.transferID)
-	_ = b.deleteXferObject(context.Background(), entry.sid, entry.transferID)
-	if entry.cancel != nil {
-		entry.cancel()
-	}
-	b.transfers.remove(entry)
+	// This receiver event is the cap0 decision; the builder binds it to the START the entry retained.
+	// The old agent publishes it to the old ctl directly, so the broker never emits a second event.
+	// origin: hot-update S7 plan §4 / §9 / L12 (S7 integration oplegacy F2)
+	b.finalizeTransfer(entry, xfertrack.LegacyTerminal(b.transfers.Record(entry), xfertrack.LegacyOutcome{
+		Kind: kind, Ts: b.cfg.Now(), Bytes: ev.Bytes, DurationMs: ev.DurationMs, Code: ev.Code, Error: ev.Error,
+	}), true)
 	// F1: the ledger is dropped by emitTerminalTransferAudit's COMMIT callback, not here.
 	b.cfg.Logger.Info("broker: ev.transfer handled",
-		"transfer_id", transferID, "kind", kind, "verb", entry.verb)
+		"transfer_id", transferID, "kind", kind, "verb", b.transfers.Record(entry).Verb)
 }
 
 // cleanupEntry is used on the unhappy paths inside the prepare
@@ -1652,18 +1216,13 @@ func (b *Broker) handleEvTransfer(msg *nats.Msg) {
 // bucket + cancels the watchdog. Idempotent: if a watchdog or
 // finalize handler already claimed the entry, this is a no-op.
 func (b *Broker) cleanupEntry(entry *transferEntry, code, errMsg string) {
-	ent, claimed := b.transfers.claimFinalize(entry)
+	ent, claimed := b.transfers.ClaimFinalize(entry)
 	if !claimed || ent == nil {
 		return
 	}
-	b.finalizeTransfer(ent, schema.AuditTransfer{
-		V: schema.AuditSchemaVersion, Kind: "failed", Verb: ent.verb,
-		Ts: b.cfg.Now(), Session: ent.sid, Node: ent.nid,
-		ActorNkey: ent.actor, ActorFp: ent.actorFP,
-		TransferID: ent.transferID, Path: ent.path,
-		Tier: ent.tier, Bucket: ent.bucket,
-		Code: code, Error: errMsg,
-	}, true)
+	b.finalizeTransfer(ent, xfertrack.LegacyTerminal(b.transfers.Record(ent), xfertrack.LegacyOutcome{
+		Kind: "failed", Ts: b.cfg.Now(), Code: code, Error: errMsg,
+	}), true)
 }
 
 // finalizeTransfer performs the terminal disposal shared by the watchdog and
@@ -1685,13 +1244,20 @@ func (b *Broker) cleanupEntry(entry *transferEntry, code, errMsg string) {
 //     unless the synthetic terminal was durably COMMITTED (the #57 M1
 //     invariant) — its delete is conditional where these two are unconditional,
 //     so merging them would invert the guarantee.
+//
+// The receiver-event and creator-finalize handlers ran this exact disposal
+// (emit, delete, cancel, remove) inline; they now call it so that every live
+// terminal carries the entry's retained START to the exact-history owner. Their
+// records are still assembled separately (xfertrack.LegacyTerminal).
+// origin: hot-update S7 plan §4 / §5.1 / L12 (S7 integration oplegacy F2)
 func (b *Broker) finalizeTransfer(ent *transferEntry, rec schema.AuditTransfer, cancelEntry bool) {
-	b.emitTerminalTransferAudit(rec, ent.transferID)
-	_ = b.deleteXferObject(context.Background(), ent.sid, ent.transferID)
-	if cancelEntry && ent.cancel != nil {
-		ent.cancel()
+	record := b.transfers.Record(ent)
+	emitStagedTransferTerminal(b, rec, record.TransferID, record.Start)
+	_ = b.deleteXferObject(context.Background(), record.SID, record.TransferID)
+	if cancelEntry {
+		b.transfers.CancelWatchdog(ent)
 	}
-	b.transfers.remove(ent)
+	b.transfers.Remove(ent)
 	// F1: the ledger is dropped by emitTerminalTransferAudit's COMMIT callback, not here.
 }
 
@@ -1810,6 +1376,8 @@ func (b *Broker) handleCapsReq(msg *nats.Msg) {
 		JetStreamReady: brokerJS(b) != nil,
 		BrokerRelease:  proto.ReleaseVersion,
 		BrokerProto:    proto.ProtoVersion,
+		// origin: hot-update S7 plan §9 / INTEG-D capability compatibility
+		TransferVersion: brokerTransferVersion(b),
 	}
 	if nc := b.nc.Load(); nc != nil {
 		resp.MaxPayload = nc.MaxPayload()
@@ -1846,6 +1414,9 @@ func (b *Broker) handleFinalizeReq(msg *nats.Msg) {
 		b.replyFinalize(msg, proto.TransferFinalizeResp{OK: false, Code: "subject_malformed"})
 		return
 	}
+	if serveWriterRetirement(b, msg, actor, sid, transferID) {
+		return
+	}
 	fp, err := auth.FingerprintFromActor(actor)
 	if err != nil {
 		b.replyFinalize(msg, proto.TransferFinalizeResp{OK: false, Code: "actor_invalid", Error: err.Error()})
@@ -1872,7 +1443,7 @@ func (b *Broker) handleFinalizeReq(msg *nats.Msg) {
 	// claim. This avoids the previous "claim, then unclaim on
 	// validation failure" race where the unclaim happened outside
 	// tracker.mu.
-	preview := b.transfers.get(transferID)
+	preview := b.transfers.Get(transferID)
 	if preview == nil {
 		// Tracker miss: SILENT in clustered mode (not this broker's transfer — a non-owner
 		// must not race-answer transfer_unknown before the real home, §9 D8); reply in
@@ -1889,11 +1460,11 @@ func (b *Broker) handleFinalizeReq(msg *nats.Msg) {
 	// audit transfer F5: cross-check the transfer belongs to THIS subject's sid (the transfer_id
 	// is a shared key) so a valid actor cannot finalize another session's transfer — consistency
 	// with handleEvTransfer's sid/nid guard.
-	if preview.sid != sid {
+	if b.transfers.Record(preview).SID != sid {
 		b.replyFinalize(msg, proto.TransferFinalizeResp{OK: false, Code: "not_owner_or_creator"})
 		return
 	}
-	if preview.actor != actor {
+	if b.transfers.Record(preview).Actor != actor {
 		// Foreign-actor finalize: leave entry untouched so the real
 		// owner / watchdog handles it.
 		b.replyFinalize(msg, proto.TransferFinalizeResp{OK: false, Code: "not_owner_or_creator"})
@@ -1921,11 +1492,11 @@ func (b *Broker) handleFinalizeReq(msg *nats.Msg) {
 		claimed bool
 	)
 	switch {
-	case preview.verb == "pull":
-		entry, claimed = b.transfers.claimFinalize(preview)
-	case preview.verb == "push" && fin.Kind == "failed":
+	case b.transfers.Record(preview).Verb == "pull":
+		entry, claimed = b.transfers.ClaimFinalize(preview)
+	case b.transfers.Record(preview).Verb == "push" && fin.Kind == "failed":
 		var why abandonRefusal
-		entry, why = b.transfers.claimAbandonedPush(preview)
+		entry, why = b.transfers.ClaimAbandonedPush(preview)
 		switch why {
 		case abandonClaimed:
 			claimed = true
@@ -1964,36 +1535,281 @@ func (b *Broker) handleFinalizeReq(msg *nats.Msg) {
 	// Resolve tier. For a PULL the ctl-supplied body wins over the optimistic "b" we stamped at
 	// pull.req time (tier-A pulls have an empty bucket). A push's tier was validated at push.req and
 	// is the tracked one; the body does not get a vote (F2).
-	tier := entry.tier
-	if entry.verb == "pull" && (fin.Tier == "a" || fin.Tier == "b") {
+	tier := b.transfers.Record(entry).Tier
+	if b.transfers.Record(entry).Verb == "pull" && (fin.Tier == "a" || fin.Tier == "b") {
 		tier = fin.Tier
 	}
 
-	rec := schema.AuditTransfer{
-		V: schema.AuditSchemaVersion, Kind: fin.Kind, Verb: entry.verb,
-		Ts: b.cfg.Now(), Session: entry.sid, Node: entry.nid,
-		ActorNkey: entry.actor, ActorFp: entry.actorFP,
-		TransferID: entry.transferID, Path: entry.path,
-		Tier: tier, Bucket: entry.bucket,
-		Bytes: fin.Bytes, DurationMs: fin.DurationMs,
-	}
-	if fin.Kind == "failed" {
-		rec.Code = fin.Code
-		rec.Error = fin.Error
-	}
-	b.emitTerminalTransferAudit(rec, entry.transferID)
-	_ = b.deleteXferObject(context.Background(), entry.sid, entry.transferID)
-	if entry.cancel != nil {
-		entry.cancel()
-	}
-	b.transfers.remove(entry)
+	// The reply follows the staged decision and its single-mode exact settlement attempt; a history
+	// failure is retained ledger responsibility, never a rewrite of the receiver's landed outcome.
+	// origin: hot-update S7 plan §4 / §9 / L12 (S7 integration oplegacy F2)
+	b.finalizeTransfer(entry, xfertrack.LegacyTerminal(b.transfers.Record(entry), xfertrack.LegacyOutcome{
+		Kind: fin.Kind, Tier: tier, Ts: b.cfg.Now(), Bytes: fin.Bytes, DurationMs: fin.DurationMs, Code: fin.Code, Error: fin.Error,
+	}), true)
 	// F1: the ledger is dropped by emitTerminalTransferAudit's COMMIT callback, not here.
 
 	b.replyFinalize(msg, proto.TransferFinalizeResp{OK: true})
 	b.cfg.Logger.Info("broker: creator finalize handled",
-		"transfer_id", transferID, "verb", entry.verb, "kind", fin.Kind, "tier", tier)
+		"transfer_id", transferID, "verb", b.transfers.Record(entry).Verb, "kind", fin.Kind, "tier", tier)
 }
 
 func (b *Broker) replyFinalize(msg *nats.Msg, resp proto.TransferFinalizeResp) {
 	b.replyJSON(msg, resp)
+}
+
+// transferAdmissionGate joins prepare/provision/create handlers while allowing
+// already-created transfers to progress to their terminal ACK. The changed
+// channel is a condition broadcast, so a timeout never consumes a completion.
+// origin: hot-update S6 plan §5 / T45
+type transferAdmissionGate = brokerimage.StoreAdmission
+
+func beginBrokerTransfer(b *Broker) bool { return b.transferAdmission.Begin() }
+func endBrokerTransfer(b *Broker)        { b.transferAdmission.End() }
+
+// FenceBrokerTransfers is the ControlOwner transfer adapter. Its successful
+// zero receipt includes both live tracker entries and unresolved durable rows.
+// A read error is unknown, never an empty fleet. The caller resumes on refusal.
+func FenceBrokerTransfers(b *Broker, deadline controlbudget.Deadline) (uint32, error) {
+	if err := b.transferAdmission.Fence(deadline); err != nil {
+		return 0, err
+	}
+	ids := map[string]struct{}{}
+	if b.transfers == nil {
+		return 0, fmt.Errorf("broker: transfer tracker is missing")
+	}
+	if err := censusLegacyTransfers(b.transfers, ids); err != nil {
+		return 0, err
+	}
+	if err := censusBrokerTransferLedgers(b, ids); err != nil {
+		return 0, err
+	}
+	return uint32(len(ids)), nil
+}
+
+// censusBrokerTransferLedgers is intentionally read-only: reload admission must
+// not quarantine/delete a record to make an unknown transfer appear absent.
+// Even a staged terminal still belongs to its commit/recovery owner until unlink.
+// origin: hot-update S6 plan §5 / T45
+func censusBrokerTransferLedgers(b *Broker, ids map[string]struct{}) error {
+	return brokerimage.TransferLedgerCensus([]string{b.xferInflightDir(), b.xferTerminalOutboxDir()}, ids, func(path string) (string, error) {
+		rec, err := readXferInflight(path)
+		return rec.TransferID, err
+	})
+}
+
+// ResumeBrokerTransfers opens only creation admission, never resets the tracker.
+func ResumeBrokerTransfers(b *Broker) { b.transferAdmission.Resume() }
+
+// This read-only legacy census is separate from the frozen v1 TrackerManager.
+// An owner without a census cannot prove the absence needed by the S6 cut.
+// origin: hot-update S7 plan §5.1 / §8.4 / P22
+func censusLegacyTransfers(tracker interface {
+	Get(string) *xfertrack.LegacyEntry
+}, ids map[string]struct{}) error {
+	view, ok := tracker.(interface{ TransferIDs() []string })
+	if !ok {
+		return fmt.Errorf("broker: legacy transfer census is unavailable")
+	}
+	for _, id := range view.TransferIDs() {
+		ids[id] = struct{}{}
+	}
+	return nil
+}
+
+// provisionBrokerTransferBucket leaves configuration serialization and horizon
+// validation with xferbucket. Admission uses the actual occupied stream bytes,
+// rather than assuming a successful seal means the bucket is empty.
+func provisionBrokerTransferBucket(ctx context.Context, b *Broker, sid string, replicas int, maxBytes int64) (string, int64, error) {
+	current := b.transferRuntime.Load()
+	if current == nil {
+		return "", 0, fmt.Errorf("%s: bucket coordinator is not installed", xfercontract.CodeOwnerRecovering)
+	}
+	deadline, err := transferPassDeadline(ctx)
+	if err != nil {
+		return "", 0, err
+	}
+	seal, err := brokerTransferBuckets(b).Apply(xfercontract.ConfigPatch{
+		Bucket: proto.XferBucketName(sid), Replicas: replicas, MaxBytes: maxBytes,
+		RecoveryHorizon: proto.XferTierBMaxBudget + 120*time.Second,
+		Duplicates:      proto.XferTierBMaxBudget + 120*time.Second,
+	}, deadline)
+	if err != nil {
+		// C5 survives the move behind the owner: its CREATE refused with 10047 still names the
+		// reserved-vs-used split. Any other refusal gains nothing and keeps its typed code.
+		// origin: docs/reviews/smalldisk-plan.md C5; S7 lead integration
+		if note := b.xferStoreAccounting(ctx, err, maxBytes); note != "" {
+			err = fmt.Errorf("%w%s", err, note)
+		}
+		return "", 0, err
+	}
+	stream, err := brokerJS(b).Stream(ctx, seal.Stream)
+	if err != nil {
+		return "", 0, err
+	}
+	info, err := stream.Info(ctx)
+	if err != nil {
+		return "", 0, err
+	}
+	// Keep the legacy small-disk repair decision on the owner path too: an existing reservation the
+	// store demonstrably cannot honour is reduced through the owner's proof-gated Shrink. Without
+	// this the repair is unreachable whenever an owner is installed, which is the only configuration
+	// in which a shrink can be proved at all. Admission then uses the smaller of seal and readback.
+	// origin: hot-update S7 plan §2.1 / lead decision on authoritative shrink proof
+	b.convergeOversizedXferBucket(ctx, sid, seal.Bucket, info, maxBytes, replicas)
+	return xferserve.LegacySealedBucketCapacity(seal, info)
+}
+
+// handleBrokerTransferRequest binds subject identity before any response and
+// selects the retained origin before consulting current-home liveness. The
+// controller then checks authority on every accepted continuation operation.
+// origin: hot-update S7 plan §6.1 / §6.3 / T39
+func handleBrokerTransferRequest(b *Broker, reg xfercontrol.Registration, msg *nats.Msg) {
+	if reg.Role == xfercontract.RoleAgent {
+		if graph := b.transferRuntime.Load(); graph != nil && graph.Link != nil {
+			serveAgentTransferRequest(b, reg, msg)
+		} else {
+			handleAgentTransferRequest(b, reg, msg)
+		}
+		return
+	}
+	actor, sid, nid, tid, op, ok := proto.ParseCtrlTransferRequest(msg.Subject)
+	if !ok || op != reg.Operation || !privateProcessReply(actor, msg.Reply) {
+		return
+	}
+	fp, err := auth.FingerprintFromActor(actor)
+	if err != nil {
+		return
+	}
+	scope := xfercontract.Identity{SID: sid, NID: nid, ActorFP: fp, TransferID: tid}
+	// A retained receiver may settle a transfer whose original ctl had another
+	// key. Principal checks that exact capsule after decoding subject scope.
+	// origin: hot-update S7 plan §6.4 / T31
+	if !reg.CurrentHome {
+		scope.ActorFP = ""
+	}
+	req, err := xfercontrol.DecodeWire(op, msg.Data, scope)
+	if err != nil {
+		return
+	} // malformed scope is not response authority
+	d, err := controlbudget.After(5 * time.Second)
+	if err != nil {
+		return
+	}
+	current := b.transferRuntime.Load()
+	// A standalone status names no Origin; only complete authority may fill it.
+	// origin: hot-update S7 plan §6.1 / INTEG-D standalone status
+	if req, ok = resolveTransferStatusOrigin(b, current, req, d); !ok {
+		return
+	}
+	if reg.CurrentHome {
+		if !b.transferHomeGate(sid, nid) {
+			return
+		}
+	} else if !transferOriginGate(b, req.Origin) {
+		return
+	}
+	resp := xfercontract.Response{Code: xfercontract.CodeOwnerRecovering, Error: xfercontract.CodeOwnerRecovering}
+	if current != nil {
+		authority, ok := current.Bindings.Authority.(xferauth.ControlAuthority)
+		if !ok {
+			return
+		}
+		who, authErr := authority.Principal(actor, req.Identity, d)
+		if authErr != nil {
+			resp.Code, resp.Error = xfercontract.CodeNotOwner, xfercontract.CodeNotOwner
+		} else {
+			// The original ctl's authenticated key names the receiving process for
+			// pull reservations. It cannot claim another principal's receiver slot.
+			if who.Role == xfercontract.RoleCTL {
+				who.InstanceID = actor
+			}
+			resp, err = current.Controller.Handle(req, who, d)
+			if errors.Is(err, xfercontrol.ErrNotOwner) {
+				return
+			}
+		}
+	}
+	wire, err := xfercontrol.WireResponse(op, resp)
+	if err == nil {
+		b.replyJSON(msg, attachTransferEvidence(current, req, resp, wire, d))
+	}
+}
+
+// brokerJS returns the live JetStream handle, or nil when JetStream is unavailable.
+//
+// A package-level function taking *Broker, not a method: the structural-budget ratchet
+// pins this type's method count exactly (the same reason replyLeaseVerdict is one).
+func brokerJS(b *Broker) jetstream.JetStream {
+	if h := b.jsp.Load(); h != nil {
+		return h.js
+	}
+	return nil
+}
+
+// setBrokerJS publishes the handle. Passing nil clears it.
+func setBrokerJS(b *Broker, js jetstream.JetStream) {
+	if js == nil {
+		b.jsp.Store(nil)
+		return
+	}
+	b.jsp.Store(&jsHandle{js: js})
+}
+
+// expiredPassErr is the reaper pass's final ctx.Err(), read only after the pass context's own expiry has
+// been delivered. The legacy List calls run on a child context with this SAME absolute deadline and their
+// own timer, so one can return before the parent's expiry callback has run: sampling ctx.Err() then said
+// nil, the registry recorded an expired sweep as a success and lost the stall evidence LQ3 requires (seen
+// only under the full-package race load). Once the deadline has passed the callback is due, so this join
+// is bounded; a pass that finished early never waits.
+// origin: hot-update S7 plan lead LQ3 / T30 (S7 integration oplegacy reaper race)
+func expiredPassErr(ctx context.Context) error {
+	if until, ok := ctx.Deadline(); ok && !time.Now().Before(until) {
+		<-ctx.Done()
+	}
+	return ctx.Err()
+}
+
+// SingleBrokerTransferConfig is the stable outer alias of the local environment.
+// origin: hot-update S7 plan §8.1 / INTEG-G responsibility move
+type SingleBrokerTransferConfig = xfercontrol.SingleConfig
+
+func NewSingleBrokerTransferFactory(cfg SingleBrokerTransferConfig) BrokerTransferFactory {
+	return NewBrokerTransferFactory(func(b *Broker, js jetstream.JetStream, _ controlbudget.Deadline) (xfercontrol.AssemblyConfig, error) {
+		ledger := func() xfercontract.LedgerPort {
+			if graph := b.transferRuntime.Load(); graph != nil {
+				return graph.Ledger
+			}
+			return nil
+		}
+		status := func(r xfercontract.StatusRequest, d controlbudget.Deadline) (xfercontract.Status, error) {
+			graph := b.transferRuntime.Load()
+			if graph == nil {
+				return xfercontract.Status{}, xferauth.ControlRefusal(xfercontract.CodeOwnerRecovering)
+			}
+			return graph.Tracker.Status(r, d)
+		}
+		return xfercontrol.SingleAssembly(cfg, js, b.clusterMode || b.selfID != "", &xfercontrol.AgentTransport{Conn: b.nc.Load, Agents: b.transferAgents.Lookup, Status: status}, ledger)
+	})
+}
+
+// The existing finalize subscription binds its actor to the NATS principal.
+// A retirement extension never falls through to legacy terminal selection.
+// origin: hot-update S7 plan §2.3 / FIX-TERM request 3
+func serveWriterRetirement(b *Broker, msg *nats.Msg, actor, sid, tid string) bool {
+	if !proto.TransferWriterRetirementMarked(msg.Data) {
+		return false
+	}
+	if !privateProcessReply(actor, msg.Reply) {
+		return true
+	}
+	d, err := controlbudget.After(5 * time.Second)
+	if err != nil {
+		return true
+	}
+	reply, handled, silent := xferserve.WriterRetirementRequest(brokerTransferIngress(b),
+		func(o xfercontract.Origin) bool { return transferOriginGate(b, o) }, actor, sid, tid, msg.Data, d)
+	if handled && !silent {
+		b.respondBytes(msg, reply)
+	}
+	return handled
 }

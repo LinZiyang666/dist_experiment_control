@@ -3,14 +3,19 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
 	"text/tabwriter"
 	"time"
 
+	"github.com/LinZiyang666/tether/internal/binaryupgrade"
 	"github.com/LinZiyang666/tether/internal/cli"
 	"github.com/LinZiyang666/tether/internal/proto"
+	"github.com/LinZiyang666/tether/internal/upgradebudget"
+	"github.com/LinZiyang666/tether/internal/upgradecli"
+	"github.com/LinZiyang666/tether/internal/upgradecli/legacy"
 	"github.com/nats-io/nats.go"
 	"github.com/spf13/cobra"
 )
@@ -22,7 +27,33 @@ func newNodeCmd() *cobra.Command {
 	}
 	root.AddCommand(newNodeUpgradeCmd())
 	root.AddCommand(newNodeLsCmd())
+	// origin: hot-update S8 plan §7.1 / DC06 — sibling verbs, never children of
+	// `node upgrade <nid>`, so a NID named status/wait/rollback stays addressable.
+	root.AddCommand(upgradecli.NodeTransactionCommands(nodeTxPorts())...)
 	return root
+}
+
+// nodeTxPorts supplies the cmd-owned edges of the S8 node transaction verbs:
+// the private-inbox ctl connection (a no-responder is provably not sent) and
+// the exit taxonomy. The target describes itself over upgrade.describe.
+// origin: hot-update S8 plan §7.1 / §11.2 P19; S8 FIX-DESCRIBE (request R1)
+func nodeTxPorts() upgradecli.NodePorts {
+	open := func(cmd *cobra.Command, verb, home, natsURL string) (*upgradecli.NodeSession, error) {
+		sid := cli.ReadCurrentSession(home)
+		if sid == "" {
+			return nil, fmt.Errorf("no active session — run `tether login -s <sid>` first")
+		}
+		id, err := cli.EnsureIdentity(home)
+		if err != nil {
+			return nil, err
+		}
+		nc, err := connectCtl(cmd, verb, home, cli.ResolveNATSURLFromHome(natsURL, cmd.Flags().Changed("nats-url"), home), id, nats.Name(cli.CtlNameForSession(sid)))
+		if err != nil {
+			return nil, err
+		}
+		return upgradecli.NewNodeSession(sid, id.PublicKey, id.Fingerprint, natsRequest(nc), nc.Close), nil
+	}
+	return upgradecli.NodePorts{Open: open, Exit: upgradeExit, DefaultHome: cli.DefaultHome(), Describe: upgradecli.DescribeNode, Fetch: binaryupgrade.FetchURL, Probe: probeUpgradeImage}
 }
 
 // newNodeLsCmd implements `tether node ls` — list every agent in the
@@ -46,7 +77,12 @@ func newNodeLsCmd() *cobra.Command {
 		Use:   "ls",
 		Short: "List agents (nodes) in the active session",
 		Args:  cobra.NoArgs,
-		RunE: func(cmd *cobra.Command, args []string) error {
+		RunE: func(cmd *cobra.Command, args []string) (resultErr error) {
+			admission, err := beginCtlAdmission(cmd)
+			if err != nil {
+				return err
+			}
+			defer finishCtlAdmission(admission, &resultErr)
 			sid := cli.ReadCurrentSession(home)
 			if sid == "" {
 				return fmt.Errorf("no active session — run `tether login -s <sid>` first")
@@ -64,10 +100,7 @@ func newNodeLsCmd() *cobra.Command {
 			defer nc.Close()
 
 			body, _ := json.Marshal(proto.NodeListReq{})
-			ctx, cancel := context.WithTimeout(cmd.Context(), 5*time.Second)
-			defer cancel()
-			respMsg, err := nc.RequestWithContext(ctx,
-				proto.SubjCtrlNodeList(id.PublicKey, sid), body)
+			respMsg, err := requestCtlWithin(cmd, nc, proto.SubjCtrlNodeList(id.PublicKey, sid), body, upgradebudget.RequestLatency)
 			if err != nil {
 				return fmt.Errorf("node ls: %w (broker unreachable on NATS)", err)
 			}
@@ -98,7 +131,9 @@ func newNodeLsCmd() *cobra.Command {
 				if err := emitJSON(out, nodeLsJSON{Schema: "node_ls", SchemaVersion: 1, Nodes: normSlice(shown)}); err != nil {
 					return err
 				}
-				withBanner(nc, id.PublicKey, true) // suppressed under --json
+				if err := withBannerWithin(cmd, nc, id.PublicKey, true); err != nil {
+					return err
+				} // suppressed under --json
 				return nil
 			}
 			now := time.Now()
@@ -132,7 +167,9 @@ func newNodeLsCmd() *cobra.Command {
 			if err := tw.Flush(); err != nil {
 				return err
 			}
-			withBanner(nc, id.PublicKey, false)
+			if err := withBannerWithin(cmd, nc, id.PublicKey, false); err != nil {
+				return err
+			}
 			return nil
 		},
 	}
@@ -153,6 +190,7 @@ func newNodeUpgradeCmd() *cobra.Command {
 		timeoutSec int
 		all        bool
 		wait       bool
+		tx         upgradecli.UpgradeOptions
 	)
 	cmd := &cobra.Command{
 		Use:   "upgrade <nid>|--all",
@@ -182,6 +220,15 @@ node (lexicographic) is the CANARY: it is always fully confirmed
 or rolls back, the remaining nodes are left untouched.`, proto.SubjectPrefix),
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// origin: hot-update S8 plan §5.2 / §7.1 / §11.2 P19 — the transaction
+			// forms address exactly one NID; the default form stays on the old wire.
+			if tx.TxID != "" || tx.PrepareOnly || tx.GrantOut != "" || tx.ArtifactReceipt != "" || tx.Interrupting {
+				if all || len(args) != 1 {
+					return usageErr("transaction upgrades address exactly one <nid> and exclude --all")
+				}
+				tx.URL, tx.SHA256 = urlFlag, shaFlag
+				return upgradecli.RunNodeUpgrade(cmd, nodeTxPorts(), args[0], home, natsURL, tx, time.Duration(timeoutSec)*time.Second)
+			}
 			if urlFlag == "" || shaFlag == "" {
 				return usageErr("--url and --sha256 are required")
 			}
@@ -268,6 +315,11 @@ or rolls back, the remaining nodes are left untouched.`, proto.SubjectPrefix),
 		"upgrade every ONLINE node in the active session (canary-first, then sequential)")
 	cmd.Flags().BoolVar(&wait, "wait", true,
 		"single-<nid> mode: poll until the node re-registers with the new release (COMMITTED) or the deadline passes; --all always confirms its canary regardless")
+	cmd.Flags().StringVar(&tx.TxID, "tx-id", "", "resume only the original transaction (with --artifact-receipt: Start it)")
+	cmd.Flags().BoolVar(&tx.PrepareOnly, "prepare-only", false, "obtain the target-issued inert grant only; requires --grant-out")
+	cmd.Flags().StringVar(&tx.GrantOut, "grant-out", "", "write the prepared grant here for `tether upgrade stage`")
+	cmd.Flags().StringVar(&tx.ArtifactReceipt, "artifact-receipt", "", "artifact receipt from `tether upgrade stage` for --tx-id")
+	cmd.Flags().BoolVar(&tx.Interrupting, "interrupting", false, "explicit non-hot first migration of a legacy agent (never counted hot)")
 	cmd.ValidArgsFunction = func(c *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
 		if len(args) > 0 || all {
 			return nil, cobra.ShellCompDirectiveNoFileComp
@@ -290,119 +342,48 @@ or rolls back, the remaining nodes are left untouched.`, proto.SubjectPrefix),
 func runUpgradeAll(cmd *cobra.Command, nc *nats.Conn,
 	sid, actor string, targets []string, urlFlag, shaFlag string, timeout time.Duration,
 ) error {
-	canary, rest := targets[0], targets[1:]
-	if len(rest) > 0 {
-		_, _ = fmt.Fprintf(cmd.OutOrStdout(),
-			"canary: %s (%d more node(s) held until it commits)\n", canary, len(rest))
-	}
-	// Baseline before dispatch (S11); failure holds the WHOLE fleet (F4) —
-	// a canary whose confirmation would be blind is no canary.
-	startRelease, err := captureReleaseBaseline(cmd, nc, sid, actor, canary)
-	if err != nil {
-		return fmt.Errorf("canary %s failed, %d node(s) untouched: %w", canary, len(rest), err)
-	}
-	newVersion, err := dispatchUpgrade(cmd, nc, sid, actor, canary, urlFlag, shaFlag, timeout)
-	if err != nil {
-		return fmt.Errorf("canary %s failed, %d node(s) untouched: %w", canary, len(rest), err)
-	}
-	if err := waitForUpgradeCommit(cmd, nc, sid, actor, canary, newVersion, startRelease); err != nil {
-		return fmt.Errorf("canary %s failed, %d node(s) untouched: %w", canary, len(rest), err)
-	}
-
-	// Fleet rollouts must distinguish transient from configuration errors:
-	//   - node_offline / agent_no_responders / upgrade_in_progress /
-	//     timeout: keep going; the operator will retry these later.
-	//   - everything else (not_owner / url_not_allowed / proto_bump /
-	//     sha256_invalid / smoke_failed): config bug, abort the rest of the
-	//     fleet so we don't fan-out a known-bad request.
-	var skipped, failed int
-	for _, nid := range rest {
-		_, err := dispatchUpgrade(cmd, nc, sid, actor, nid, urlFlag, shaFlag, timeout)
-		if err == nil {
-			continue
-		}
-		if isConfigError(err) {
-			return err
-		}
-		if isTransientError(err) {
-			_, _ = fmt.Fprintf(cmd.ErrOrStderr(),
-				"⚠ %s/%s skipped (transient): %v\n", sid, nid, err)
-			skipped++
-			continue
-		}
-		_, _ = fmt.Fprintf(cmd.ErrOrStderr(),
-			"✗ %s/%s failed: %v\n", sid, nid, err)
-		failed++
-	}
-	if failed > 0 {
-		return fmt.Errorf("upgrade --all: %d failed (%d transiently skipped)", failed, skipped)
-	}
-	if skipped > 0 {
-		_, _ = fmt.Fprintf(cmd.OutOrStdout(),
-			"(%d node(s) skipped due to transient errors — retry later)\n", skipped)
-	}
-	if len(rest) > 0 {
-		_, _ = fmt.Fprintf(cmd.OutOrStdout(),
-			"fleet dispatched; verify releases with `tether node ls`\n")
-	}
-	return nil
+	// The canary/fleet loop moved verbatim to legacy.RunLegacyFleet (S8 P19 slim move).
+	return legacy.RunLegacyFleet(cmd.OutOrStdout(), cmd.ErrOrStderr(), legacy.LegacyFleet{
+		Baseline: func(nid string) (string, error) { return captureReleaseBaseline(cmd, nc, sid, actor, nid) },
+		Dispatch: func(nid string) (string, error) {
+			return dispatchUpgrade(cmd, nc, sid, actor, nid, urlFlag, shaFlag, timeout)
+		},
+		Wait: func(nid, newVersion, start string) error {
+			return waitForUpgradeCommit(cmd, nc, sid, actor, nid, newVersion, start)
+		},
+		Transient: isTransientError, Config: isConfigError}, sid, targets)
 }
 
-// dispatchUpgrade fires one upgrade.req at (sid, nid) and reports the
-// broker's reply. Returns the smoke-gate-normalized release tag the agent
-// staged (empty from a pre-upgrade-safety agent) so callers can wait for the
-// matching re-register. Extracted so the --all loop can reuse it.
+// dispatchUpgrade fires one upgrade.req at (sid, nid); the body and its
+// legacy-NewVersion normalization moved verbatim to
+// legacy.DispatchLegacyUpgrade (S8 P19 slim move).
 func dispatchUpgrade(cmd *cobra.Command, nc *nats.Conn,
 	sid, actor, nid, url, sha256 string, timeout time.Duration,
 ) (string, error) {
-	body, _ := json.Marshal(proto.UpgradeReq{
-		URL:          url,
-		SHA256:       sha256,
-		ProtoVersion: proto.ProtoVersion,
-	})
-	ctx, cancel := context.WithTimeout(cmd.Context(), timeout)
-	defer cancel()
-	respMsg, err := nc.RequestWithContext(ctx,
-		proto.SubjCmdBy(sid, actor, nid, "upgrade"), body)
-	if err != nil {
-		return "", fmt.Errorf("upgrade %s/%s: %w (broker or agent unreachable on NATS)", sid, nid, err)
+	return legacy.DispatchLegacyUpgrade(cmd.Context(), natsRequest(nc), cmd.OutOrStdout(), brokerErrorMessage, sid, actor, nid, url, sha256, timeout)
+}
+
+// natsRequest adapts a ctl connection to the upgrade leaves' request port.
+func natsRequest(nc *nats.Conn) upgradecli.RequestFunc {
+	return func(ctx context.Context, subject string, body []byte) ([]byte, error) {
+		if nc == nil {
+			return nil, nats.ErrInvalidConnection
+		}
+		msg, err := nc.RequestWithContext(ctx, subject, body)
+		if err != nil {
+			return nil, err
+		}
+		return msg.Data, nil
 	}
-	var resp proto.UpgradeResp
-	if err := json.Unmarshal(respMsg.Data, &resp); err != nil {
-		return "", fmt.Errorf("decode reply for %s: %w (broker version skew?)", nid, err)
-	}
-	if !resp.OK {
-		return "", brokerErrorMessage(fmt.Sprintf("upgrade %s/%s", sid, nid), resp.Code, resp.Error)
-	}
-	// origin: internal review S3. A PRE-upgrade-safety agent (every deployed
-	// release up to and including the one before this shipped) fills
-	// NewVersion with the FULL first line of `tether version` — e.g.
-	// "tether v0.4.7 (proto v2)" — not the bare tag: its readVersionString
-	// was best-effort whole-line. Treating that as a comparable tag makes
-	// --wait's equality test unsatisfiable → every successful first-hop
-	// upgrade reads as ROLLED BACK and the canary aborts the whole fleet.
-	// Normalize defensively: anything with whitespace or without a leading
-	// "v" is legacy — drop to "" so --wait uses the release-changed fallback.
-	newVersion := resp.NewVersion
-	if newVersion != "" && (strings.ContainsAny(newVersion, " \t") || !strings.HasPrefix(newVersion, "v")) {
-		newVersion = ""
-	}
-	if newVersion != "" {
-		_, _ = fmt.Fprintf(cmd.OutOrStdout(),
-			"✔ %s/%s: staged (→ %s, smoke ok); agent re-exec in progress\n", sid, nid, newVersion)
-	} else {
-		_, _ = fmt.Fprintf(cmd.OutOrStdout(),
-			"✔ upgrade dispatched to %s/%s (agent re-exec in progress)\n", sid, nid)
-	}
-	return newVersion, nil
 }
 
 // upgradeWaitBudget bounds waitForUpgradeCommit's polling: the agent's own
-// register deadline is 120s (internal/agent upgradeRegisterDeadline — the
-// number in the "deadline 120s" line below), plus slack for the re-exec, the
-// reconnect backoff, and our 3s poll grain. A var, not a const, so the
-// timeout-path test does not have to sit through the real budget.
-var upgradeWaitBudget = 150 * time.Second
+// register deadline is 120s (upgradebudget.ComponentHandover, which
+// internal/agent's upgradeRegisterDeadline reads — the number in the
+// "deadline 120s" line below), plus slack for the re-exec, the reconnect
+// backoff, and our 3s poll grain. A var, not a const, so the timeout-path
+// test does not have to sit through the real budget.
+var upgradeWaitBudget = upgradebudget.ComponentHandover + 30*time.Second
 
 // upgradeWaitPoll is the node.list polling grain. A var (internal review
 // S30) so tests can tighten it instead of sleeping in 3s steps.
@@ -458,7 +439,9 @@ func waitForUpgradeCommit(cmd *cobra.Command, nc *nats.Conn, sid, actor, nid, ne
 			"upgrade %s/%s: UNCONFIRMED — same-tag re-push has no re-register proof (verify via agent/broker logs)",
 			sid, nid)}
 	}
-	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "  waiting for re-register (deadline 120s) …\n")
+	// The rendered bytes must stay "deadline 120s": drill 33's A1 arm greps
+	// this exact line, and the number is upgradebudget.ComponentHandover.
+	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "  waiting for re-register (deadline %ds) …\n", int(upgradebudget.ComponentHandover/time.Second))
 
 	deadline := time.Now().Add(upgradeWaitBudget)
 	lastSeen := startRelease
@@ -537,116 +520,27 @@ func captureReleaseBaseline(cmd *cobra.Command, nc *nats.Conn, sid, actor, nid s
 	return entry.ReleaseVersion, nil
 }
 
-// lookupNodeEntry fetches one node's row from the node.list RPC.
+// lookupNodeEntry fetches one node's row from the node.list RPC (body in upgradecli).
 func lookupNodeEntry(ctx context.Context, nc *nats.Conn, sid, actor, nid string) (proto.NodeListEntry, error) {
-	body, _ := json.Marshal(proto.NodeListReq{})
-	respCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	respMsg, err := nc.RequestWithContext(respCtx, proto.SubjCtrlNodeList(actor, sid), body)
-	if err != nil {
-		return proto.NodeListEntry{}, err
-	}
-	var nl proto.NodeListResp
-	if err := json.Unmarshal(respMsg.Data, &nl); err != nil {
-		return proto.NodeListEntry{}, err
-	}
-	if nl.Code != "" {
-		return proto.NodeListEntry{}, fmt.Errorf("node.list rejected: %s %s", nl.Code, nl.Error)
-	}
-	for _, n := range nl.Nodes {
-		if n.NID == nid {
-			return n, nil
-		}
-	}
-	return proto.NodeListEntry{}, fmt.Errorf("node %s not in node.list", nid)
+	return legacy.LookupNodeEntry(ctx, natsRequest(nc), sid, actor, nid)
 }
 
-// HOW `node upgrade --all` CLASSIFIES A PER-NODE FAILURE
-//
-// Two disjoint sets of WIRE CODES, matched EXACTLY against the code the error carries structurally
-// (ExitError.Code, set at the source by brokerErrorMessage), plus one narrow prose fallback for
-// errors that have no wire code at all.
-//
-// origin: line-2 external review 疑惑 #2. Both functions used to be
-// `strings.Contains(err.Error(), needle)` over the same code names — exactly what exitcode.go's own
-// comment forbids ("The classifier never string-sniffs prose for a class — that would make a
-// reworded message silently change a script's exit code"). The prose these matched is the
-// OPERATOR-FACING hint text from brokerCodeHints, which exists to be reworded; a hint that came to
-// mention "download_http_status" while explaining something else would silently turn a skip into a
-// fleet abort. Neither direction is safe: a false transient keeps rolling out a broken artifact, a
-// false config error halts a fleet over one bad box.
-//
-// The fallback is deliberately NOT the old full list. It holds only needles that can never arrive as
-// a wire code — Go's own transport/context prose — because for those there is nothing structural to
-// match and today's behaviour is all there is. Every code-bearing needle moved to exact matching.
+// HOW `node upgrade --all` CLASSIFIES A PER-NODE FAILURE: two disjoint wire-code sets plus a
+// codeless transport-prose fallback. The tables and their full rationale moved verbatim to
+// internal/upgradecli/legacy_node.go (S8 P19 slim move); these names keep the classifiers below.
 var (
-	// transientUpgradeCodes: "this specific node is unreachable right now". `--all` logs + skips these
-	// so a single OFFLINE box doesn't abort a fleet-wide rollout; the operator gets a final summary
-	// and can retry just the skipped subset.
-	transientUpgradeCodes = map[string]bool{
-		"node_offline":         true,
-		"node_not_found":       true,
-		"agent_no_responders":  true,
-		"agent_malformed_resp": true,
-		// origin: line-2 closure verification §6 B1. The other half of the Y2 split. These two really do
-		// clear on their own — a transport blip mid-download, and a PTY/fd/pty-count limit that frees as
-		// sessions close — so a fleet rollout should SKIP the node and keep going rather than counting it
-		// as a hard failure the operator has to interpret.
-		//
-		// pty_alloc_failed is here rather than in the config set for the same reason its exit class is 75:
-		// see internal/agent/run.go's ptyTransientErrnos. Its sibling pty_unavailable is deliberately in
-		// NEITHER set — a host with no /dev/ptmx is not transient, but it is also not a bad CALL, so
-		// aborting the whole fleet over one misconfigured box would be wrong. It stays a per-node failure.
-		"download_failed": true,
-		// origin: external review M1 — a mirror that is down or rate-limiting is exactly the case for
-		// skipping this node and continuing: the artifact is fine and the next node may well succeed.
-		"download_http_retryable": true,
-		"pty_alloc_failed":        true,
-		// origin: upgrade-safety plan §4 — a prior upgrade on THIS node is inside its register
-		// deadline; it self-resolves (commit or rollback) within that bound. Skip and retry later.
-		"upgrade_in_progress": true,
-	}
-	// configUpgradeCodes: the CALL itself is bad (not the target). Aborts `--all` because no other node
-	// will accept it either.
-	configUpgradeCodes = map[string]bool{
-		"not_owner":                     true,
-		"url_not_allowed":               true,
-		"sha256_invalid":                true,
-		"proto_bump_requires_reinstall": true,
-		"actor_invalid":                 true,
-		"session_not_found_or_deleting": true,
-		// origin: line-2 closure verification §6 B1, the review's self-declared most substantive item.
-		//
-		// The line-2 §12 Y2 split created these two codes precisely because `download_failed` was
-		// telling automation to retry a permanently-broken download forever. It fixed the EXIT CLASS
-		// (both → 64) and the hint text, and missed this list — a THIRD classification of the same
-		// codes, in the same package, reached by the one command Y2 was written to rescue.
-		//
-		// The consequence was worse than a wrong exit code. Neither code matched here nor in the
-		// transient set, so `node upgrade --all` counted the node as "✗ failed" and CARRIED ON —
-		// fanning a typo'd --url out to every remaining node in the fleet. Aborting on exactly that is
-		// what the comment above isConfigError's call site says this function is for.
-		//
-		// download_too_large is the same shape: the artifact is over the agent's ceiling, so it will be
-		// over the ceiling on node 2 through node N as well.
-		"download_http_status": true,
-		"download_too_large":   true,
-		// origin: upgrade-safety plan §4 — the sha-verified artifact failed the agent's pre-install
-		// smoke gate (cannot exec / no version line): wrong arch or truncated build, which is wrong for
-		// EVERY node. `--all` presumes a homogeneous fleet (one URL, one sha for all), so fanning it out
-		// after the first smoke failure would push a known-bad artifact at the remaining N-1 nodes.
-		"smoke_failed": true,
-	}
-	// transientCodelessNeedles: prose that can only come from Go's transport/context layer, which never
-	// carries a wire code. Consulted ONLY when the error carries no code — never as an override.
-	transientCodelessNeedles = []string{
-		"deadline exceeded",
-		"context canceled",
-	}
+	transientUpgradeCodes    = legacy.LegacyTransientCodes
+	configUpgradeCodes       = legacy.LegacyConfigCodes
+	transientCodelessNeedles = legacy.LegacyCodelessNeedles
 )
 
 // isTransientError reports whether `--all` should skip this node and keep going.
 func isTransientError(err error) bool {
+	// origin: hot-update S6 plan §9.1 / T36
+	var classified *ExitError
+	if errors.As(err, &classified) && classified.Class == exitUnsettled {
+		return false
+	}
 	if code := wireCodeOf(err); code != "" {
 		return transientUpgradeCodes[code]
 	}
@@ -665,54 +559,8 @@ func isConfigError(err error) bool {
 	return code != "" && configUpgradeCodes[code]
 }
 
-// listOnlineNIDs round-trips a node.list.req (architecture B.1
-// line 129) and returns the nids whose `nodes.status` is ONLINE.
-// Uses the dedicated node-enum RPC instead of process-derived
-// inference: a fresh agent that registered but never exec'd
-// shows up here AND can be upgrade target, which the older
-// ps-based heuristic missed.
-// It also reports how many ONLINE rows were EXCLUDED for running under an
-// assigned lease name, so the caller can say so out loud rather than silently
-// upgrading a smaller fleet than the operator expects.
+// listOnlineNIDs returns the ONLINE, non-leased nids and the leased count;
+// the body and its Q4 lease-exclusion rationale live in legacy.ListOnlineNIDs.
 func listOnlineNIDs(ctx context.Context, nc *nats.Conn, sid, actor string) ([]string, int, error) {
-	body, _ := json.Marshal(proto.NodeListReq{})
-	respCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	respMsg, err := nc.RequestWithContext(respCtx,
-		proto.SubjCtrlNodeList(actor, sid), body)
-	if err != nil {
-		return nil, 0, fmt.Errorf("upgrade --all: node.list lookup: %w", err)
-	}
-	var nl proto.NodeListResp
-	if err := json.Unmarshal(respMsg.Data, &nl); err != nil {
-		return nil, 0, fmt.Errorf("upgrade --all: node.list decode: %w", err)
-	}
-	if nl.Code != "" {
-		return nil, 0, fmt.Errorf("upgrade --all: node.list rejected: %s %s", nl.Code, nl.Error)
-	}
-	var out []string
-	var skippedLeased int
-	for _, n := range nl.Nodes {
-		if n.Status != "ONLINE" {
-			continue
-		}
-		// Q4: a LEASED instance is excluded from the fleet fan-out.
-		//
-		// Two concrete hazards, not a preference. (1) Upgrading one is
-		// meaningless: it runs the binary baked into its image and reverts on
-		// its next restart. (2) Targets are sorted lexicographically and
-		// targets[0] is the canary that gates the entire fleet — a leased
-		// instance can sort first, and if its pod recycles inside the wait
-		// budget the whole rollout aborts having upgraded nothing.
-		//
-		// Explicit upgrades of the leased row and its basename are refused too:
-		// shared-home clones may share one binary and rollback marker, so there is
-		// no honest per-instance remote-upgrade boundary.
-		if n.Leased {
-			skippedLeased++
-			continue
-		}
-		out = append(out, n.NID)
-	}
-	return out, skippedLeased, nil
+	return legacy.ListOnlineNIDs(ctx, natsRequest(nc), sid, actor)
 }

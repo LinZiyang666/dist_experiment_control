@@ -34,7 +34,7 @@ func TestC5GuardNoDirectProxyWrite(t *testing.T) {
 		// if someone wrote it; the cfg.DB form above is the precise forbidden pattern. The bare direct
 		// mutator "port.AllocateProxy(" is already forbidden above.
 	}
-	for _, file := range []string{"proxy_cluster_wire.go", "proxy_reconcile.go"} {
+	for _, file := range []string{"proxy_cluster_wire.go", "proxy_reconcile.go", "home.go"} {
 		src, err := os.ReadFile(file)
 		if err != nil {
 			t.Fatalf("read %s: %v", file, err)
@@ -49,17 +49,31 @@ func TestC5GuardNoDirectProxyWrite(t *testing.T) {
 	}
 }
 
-// TestC5GuardReaperWritesViaPropose asserts the reaper's allocation + rehome both go through
-// b.cl.node.Propose (the leader-local raft write), the token-correct path.
+// TestC5GuardReaperWritesViaPropose follows allocation and rehome through the
+// maintenance helpers to their concrete guarded planners. Both decisions must
+// still be made inside the leader's Propose closure after extraction.
+// origin: hot-update S6 plan §7.2 / T41
 func TestC5GuardReaperWritesViaPropose(t *testing.T) {
-	src, err := os.ReadFile("proxy_reconcile.go")
-	if err != nil {
-		t.Fatal(err)
-	}
-	text := string(src)
-	for _, want := range []string{"b.cl.node.Propose", "PlanAllocateProxy", "PlanReassignHome"} {
-		if !strings.Contains(text, want) {
-			t.Fatalf("proxy_reconcile.go: expected the reaper to use %q (raft-routed data plane)", want)
+	for _, check := range []struct {
+		file, function string
+		calls          []string
+	}{
+		{"proxy_reconcile.go", "allocateProxyAndPush", []string{"b.cl.node.Propose(func(db *sql.DB)", "planHomeAllocate(b, db,"}},
+		{"proxy_reconcile.go", "rehomeProxy", []string{"committedHomeMove(b, existing, target)"}},
+		{"home.go", "committedHomeMove", []string{"b.cl.node.Propose(func(db *sql.DB)", "planHomeReassign(b, db,"}},
+		{"home.go", "planHomeAllocate", []string{"guardHomeMutation(b, db,", "plans.Rotate(db, guard,", "plans.Allocate(db, guard,"}},
+		{"home.go", "planHomeReassign", []string{"guardHomeMutation(b, db,", "plans.Reassign(db, guard,"}},
+		{"home.go", "installHomeMaintenance", []string{"Reassign: port.PlanReassignHomeGuarded", "Allocate: port.PlanAllocateGuarded", "Rotate: port.PlanRotateAllocationGuarded"}},
+	} {
+		src, err := os.ReadFile(check.file)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body := funcBodyText(t, check.file, string(src), check.function)
+		for _, want := range check.calls {
+			if !strings.Contains(body, want) {
+				t.Errorf("%s:%s lost raft-routed guarded planner %q", check.file, check.function, want)
+			}
 		}
 	}
 }

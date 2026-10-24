@@ -97,6 +97,10 @@ func TestSessionCreateSucceedsAndDuplicateStillRejected(t *testing.T) {
 // write is genuinely durable. That the FSM really committed (asserted via the node's own RODB) proves
 // this is not a manufactured false success.
 func TestSessionCreateReportsSuccessWhenCommittedButNotYetVisible(t *testing.T) {
+	// origin: hot-update S10 plan §11.1 / TEST-BUDGET
+	if runIsolatedBrokerTest(t) {
+		return
+	}
 	n := newSingleVoterNode(t, "node-B")
 	admitSessionCreators(t, n, "fp-owner-A")
 

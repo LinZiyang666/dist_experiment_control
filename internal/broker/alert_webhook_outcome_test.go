@@ -73,7 +73,7 @@ func TestWebhookOutcomeCountersDistinguishTheThreeStates(t *testing.T) {
 
 			const events = 3
 			for i := 0; i < events; i++ {
-				p.deliverOneForTest(t)
+				deliverOneForTest(t, p)
 			}
 
 			st, iters, _ := p.Stats()
@@ -113,7 +113,7 @@ func TestWebhookDropsStayOutsideTheIterationSum(t *testing.T) {
 	p := newFakeTransportPoster(t, http.StatusOK, false, func() {})
 
 	// Fill the queue without draining it, then push one more.
-	for i := 0; i < cap(p.ch); i++ {
+	for i := 0; i < cap(p.Ch); i++ {
 		p.Post(WebhookEvent{DedupKey: "k", Transition: "raised"})
 	}
 	p.Post(WebhookEvent{DedupKey: "overflow", Transition: "raised"})
@@ -198,7 +198,7 @@ func TestWebhookOutcomeAndLoopBeatCannotExposeATornSnapshot(t *testing.T) {
 // origin: batch B2 independent external second re-review
 func TestWebhookPublishedIterationAndLastIterRemainOneState(t *testing.T) {
 	loops := newLoopSet()
-	loops.stats[webhookLoopName] = &loopStat{StartedAt: time.Now()}
+	loops.Stats[webhookLoopName] = &loopStat{StartedAt: time.Now()}
 
 	beatEntered := make(chan struct{})
 	releaseBeat := make(chan struct{})
@@ -271,8 +271,8 @@ func newFakeTransportPoster(t *testing.T, status int, transportErr bool, beat fu
 	if err != nil {
 		t.Fatal(err)
 	}
-	p.client = &http.Client{Transport: &fakeRoundTripper{status: status, fail: transportErr}, Timeout: time.Second}
-	p.beat = beat
+	p.Client = &http.Client{Transport: &fakeRoundTripper{status: status, fail: transportErr}, Timeout: time.Second}
+	p.Beat = beat
 	return p
 }
 
@@ -283,7 +283,7 @@ func newFakeTransportPoster(t *testing.T, status int, transportErr bool, beat fu
 // It calls the PRODUCTION recordOutcome rather than re-implementing "increment then beat". It used to
 // re-implement it, which meant these tests could stay green against a shape that had drifted — the same
 // self-check-tests-a-copy defect external review RB2-4 and RB2-1 both surfaced elsewhere in this batch.
-func (p *webhookPoster) deliverOneForTest(t *testing.T) {
+func deliverOneForTest(t *testing.T, p *webhookPoster) {
 	t.Helper()
-	p.recordOutcome(p.deliver(context.Background(), WebhookEvent{DedupKey: "k", Transition: "raised"}))
+	p.RecordOutcome(p.Deliver(context.Background(), WebhookEvent{DedupKey: "k", Transition: "raised"}))
 }

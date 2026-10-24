@@ -2,6 +2,8 @@ package broker
 
 import (
 	"encoding/json"
+	"fmt"
+	"runtime"
 	"testing"
 	"time"
 
@@ -9,6 +11,7 @@ import (
 	"github.com/LinZiyang666/tether/internal/port"
 	"github.com/LinZiyang666/tether/internal/proto"
 	"github.com/LinZiyang666/tether/internal/session"
+	"github.com/LinZiyang666/tether/internal/testharness"
 	"github.com/nats-io/nats.go"
 )
 
@@ -96,13 +99,33 @@ func registerCapableOnNode(t *testing.T, b *Broker, sid string) {
 	if _, err := session.SetProxyEnabled(b.cfg.DB, sid, true); err != nil {
 		t.Fatal(err)
 	}
+	// origin: hot-update S5 plan §4.3 / §6.4 / T28
+	// A repair must describe an existing exit, including in the no-storm control.
+	if _, err := port.AllocateProxy(b.cfg.DB, sid, "lab-1", b.cfg.PortAllocCfg()); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // TestRepairProxyNoStormWhenOnNotReadyAtSamePair: with proxy ON, the node
 // not-ready (tunnel self-healing), and the heartbeat reporting the EXACT
 // current (generation, epoch), repairProxy must push NOTHING — otherwise the
 // agent `default:` branch re-ACKs ready=true every heartbeat and flaps /sub.
+// origin: hot-update S5 plan §4.3 / §6.4 / T28
 func TestRepairProxyNoStormWhenOnNotReadyAtSamePair(t *testing.T) {
+	// origin: hot-update S10 plan §11.1 / TEST-BUDGET
+	if runIsolatedBrokerTest(t) {
+		return
+	}
+	beforeG, beforeFD := runtime.NumGoroutine(), testharness.FDCount()
+	for round := 0; round < 5; round++ {
+		t.Run("round-"+fmt.Sprint(round), func(t *testing.T) { exerciseRepairProxyNoStormWhenOnNotReadyAtSamePair(t) })
+	}
+	testharness.AssertNoGoroutineLeak(t, "proxy heartbeat repair", beforeG)
+	testharness.AssertNoFDLeak(t, "proxy heartbeat repair", beforeFD, 2)
+}
+
+func exerciseRepairProxyNoStormWhenOnNotReadyAtSamePair(t *testing.T) {
+	t.Helper()
 	nc, _, sid, b := proxyTestBroker(t)
 	registerCapableOnNode(t, b, sid)
 
@@ -140,7 +163,18 @@ func TestRepairProxyNoStormWhenOnNotReadyAtSamePair(t *testing.T) {
 // TestRepairProxyPushesOnGenEpochMismatch: a genuine epoch divergence (agent
 // behind) at not-ready still re-pushes — Fix D suppresses ONLY the not-ready-
 // only case, never a real mismatch.
+// origin: hot-update S5 plan §4.3 / §6.4 / T28
 func TestRepairProxyPushesOnGenEpochMismatch(t *testing.T) {
+	beforeG, beforeFD := runtime.NumGoroutine(), testharness.FDCount()
+	for round := 0; round < 5; round++ {
+		t.Run("round-"+fmt.Sprint(round), func(t *testing.T) { exerciseRepairProxyPushesOnGenEpochMismatch(t) })
+	}
+	testharness.AssertNoGoroutineLeak(t, "proxy heartbeat repair", beforeG)
+	testharness.AssertNoFDLeak(t, "proxy heartbeat repair", beforeFD, 2)
+}
+
+func exerciseRepairProxyPushesOnGenEpochMismatch(t *testing.T) {
+	t.Helper()
 	nc, _, sid, b := proxyTestBroker(t)
 	registerCapableOnNode(t, b, sid)
 

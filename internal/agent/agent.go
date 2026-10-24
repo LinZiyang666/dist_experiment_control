@@ -27,19 +27,26 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	mrand "math/rand/v2"
 	"net"
 	"os"
-	"runtime"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
 
+	"github.com/LinZiyang666/tether/internal/agentboot"
+	"github.com/LinZiyang666/tether/internal/agentimage"
+	"github.com/LinZiyang666/tether/internal/agentupgrade"
+	"github.com/LinZiyang666/tether/internal/agentupgradeport"
 	"github.com/LinZiyang666/tether/internal/auth"
 	"github.com/LinZiyang666/tether/internal/cli"
+	"github.com/LinZiyang666/tether/internal/controlbudget"
+	"github.com/LinZiyang666/tether/internal/drillobserve"
+	"github.com/LinZiyang666/tether/internal/execsession"
+	"github.com/LinZiyang666/tether/internal/filetransfer"
+	"github.com/LinZiyang666/tether/internal/infraattach"
+	"github.com/LinZiyang666/tether/internal/infratransport"
 	"github.com/LinZiyang666/tether/internal/natsinbox"
 	"github.com/LinZiyang666/tether/internal/port"
 	"github.com/LinZiyang666/tether/internal/proto"
@@ -47,16 +54,26 @@ import (
 	"github.com/LinZiyang666/tether/internal/pty"
 	"github.com/LinZiyang666/tether/internal/spawnsafe"
 	"github.com/LinZiyang666/tether/internal/tunnel"
+	"github.com/LinZiyang666/tether/internal/upgradeport"
+	"github.com/LinZiyang666/tether/internal/workload"
+
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
-	"github.com/nats-io/nkeys"
 )
 
 // Config wires the agent to its dependencies.
 type Config struct {
-	NATSURL string
-	SID     string
-	NID     string
+	// Infra is the installed P14–P18 client composition; absence cannot advertise S9.
+	// origin: hot-update S9 plan §4.5 / P23
+	Infra *infraattach.Config
+	// Upgrade supplies the canonical journal and captured bootstrap authority.
+	// origin: hot-update S8 plan §2.2 / §11.2 P14.
+	Upgrade *UpgradeDependencies
+	// origin: hot-update S7 plan §8.1 / P20. Outer wiring supplies the real leaf factory.
+	TransferWorker transferWorkerDependencies
+	NATSURL        string
+	SID            string
+	NID            string
 
 	// Identity, when non-nil, makes the agent CONNECT with nats.Nkey +
 	// Name "tether-agent:<sid>:<nid>" so the broker auth_callout can
@@ -106,13 +123,8 @@ type Config struct {
 	// RegisterRetryMax caps the inter-attempt backoff. Defaults to 2s.
 	RegisterRetryMax time.Duration
 
-	// UpgradeURLAllowlist is the agent-side defense-in-depth set
-	// of URL prefixes accepted by `tether node upgrade`. Empty →
-	// agent uses defaultAgentURLAllowlist (github.com/<org>/
-	// tether/releases/). Architecture J.4 § 安全约束 mandates
-	// the agent re-checks even though the broker already gated;
-	// belt and suspenders against attacker reaching the
-	// forwarded subject directly.
+	// UpgradeURLAllowlist is retained for transaction artifact preflight and
+	// legacy fixtures. Grantless forwarded requests never download or install.
 	UpgradeURLAllowlist []string
 
 	// UpgradeNoExit, when true, suppresses the os.Exit(0) call at
@@ -177,6 +189,18 @@ type Config struct {
 	// production it is empty and New consumes the proof recorded by the
 	// pre-Cobra BootUpgradeCheck for this process.
 	UpgradeBootProofID string
+
+	// BootImage injects a dispatched image in tests (agentboot.FromCut). In
+	// production it is nil and New claims the image the process was
+	// dispatched with (agentboot.Claim) — exactly one constructor per exec
+	// restores it; a second agent in the same process mints a fresh runtime.
+	BootImage *agentboot.Image
+
+	// UpgradeCutObserver, when set, sees every bundle a cut is about to
+	// dispatch (node upgrade, watchdog rollback, failed-before-control-ready
+	// re-dispatch). Tests only; the bundle carries the registry key and the
+	// observer must never print it.
+	UpgradeCutObserver func(agentimage.Bundle)
 
 	// ProxyFailClosedGrace (P13) is how long the agent may stay partitioned
 	// from NATS while still serving the embedded proxy before it proactively
@@ -283,6 +307,7 @@ type Config struct {
 // "verify the OS pid is still that triple" path.
 type procRec struct {
 	sess           *pty.Session
+	input          *legacyPTYInput
 	osPID          int
 	startTimeTicks int64
 	startedAt      time.Time
@@ -309,7 +334,21 @@ type procRec struct {
 }
 
 type Agent struct {
-	cfg Config
+	// One owner and one adapter survive every control-session rebuild.
+	// origin: hot-update S7 plan §4 / §11.2 / P20
+	transfers transferWorkerOwner
+	// P14 owns restore sequencing without adding another Agent method or file.
+	// origin: hot-update S5 plan §2 / L12 / L13
+	flowState    *flowRestoreState
+	replayBudget *workload.ReplayBudget // the single node reservation owner for exec, PTY and flow
+
+	cfg               Config
+	upgradeEndpoint   upgradeport.Endpoint
+	incarnation       atomic.Pointer[string]
+	controlReady      atomic.Pointer[nats.Conn]
+	upgradeWatchdogWG sync.WaitGroup
+	upgradeRequestWG  sync.WaitGroup
+	upgradeStopping   bool
 
 	// instanceID identifies THIS RUN of the agent process (see instance.go).
 	// Immutable for the process; carried across syscall.Exec through the
@@ -372,14 +411,17 @@ type Agent struct {
 	procs   map[string]*procRec
 	procsMu sync.Mutex
 
-	// execChildren tracks live `tether exec` OS children by pid so an admin EVICT
+	// workloads tracks live exec and PTY OS children by pid so an admin EVICT
 	// can reap them (#26). Unlike PTY `run` children (a.procs), a synchronous exec
-	// child is otherwise held only by the handler goroutine blocked in cmd.Wait —
+	// child used to be held only by the handler goroutine blocked in cmd.Wait —
 	// on a bare setsid-nohup deploy (no systemd cgroup) the daemon's self-exit
 	// then orphans the child into the host process table. Registered right after
-	// fork+exec, pruned when the synchronous handler returns.
-	execChildren   map[string]*os.Process
-	execChildrenMu sync.Mutex
+	// fork+exec, retained through exit delivery handoff. The manager is now the
+	// sole waiter and serializes signals against reap; reconnect snapshots also
+	// include these children. The procs map still owns PTY I/O and keepalive
+	// metadata, while its Session delegates wait/signal to this same manager.
+	workloads      workload.Manager
+	processRuntime *execsession.Runtime
 
 	// stateStore persists per-(sid, machine) data — currently the
 	// expose port_tokens table — to ~/.tether/agent/<sid>/state.json.
@@ -428,10 +470,30 @@ type Agent struct {
 	// whole download would starve the watchdog and the commit path.
 	upgradeInstallMu sync.Mutex
 
+	// Hot-update S3 (architecture §22.6). image is the dispatched image this
+	// process restored (nil on an ordinary start); imageGeneration is its
+	// generation (0 on an ordinary start) — the next cut exports +1.
+	// cutMu is the cut latch: held from Freeze until the exec (which never
+	// returns on success) or the abandon, so Run's deferred runtime Close can
+	// never discard an exported runtime under a cut that is about to fail
+	// and thaw (plan §2.5). gate is the admission gate the cut closes so no
+	// legacy exec/run/transfer/expose starts between the preflight and the
+	// exec (§4.0); rollbackInFlight keeps a second install out while a
+	// deferred rollback is still retrying (§2.6).
+	image            *agentboot.Image
+	imageGeneration  uint64
+	cutMu            sync.Mutex
+	gate             upgradeGate
+	rollbackInFlight atomic.Bool
+
 	// js is the JetStream context the agent uses for file-transfer
 	// Tier-B ObjectStore Put/Get. nil when the underlying nats-server
 	// has no JetStream — in that case push/pull tier-B handlers reply
 	// `jetstream_unavailable` and tier-A continues to work.
+	// Like runCtx, this binding changes on session rebuild while imported byte
+	// owners keep running. runCtxMu protects publication and snapshots only;
+	// NATS calls use the snapshot after releasing that lock.
+	// origin: S7 internal review CUT-CAPACITY F6
 	js jetstream.JetStream
 
 	// pushCommitCache remembers tier-B prep state between
@@ -538,6 +600,10 @@ type Agent struct {
 	// reconnected — agent.go ncBox pointer is stable across reconnects).
 	reconnectInFlight atomic.Bool
 
+	// origin: hot-update S4 plan §6.1. A proof cannot straddle a disconnect,
+	// reconnect or a new NATS session, even if the *Conn pointer is reused.
+	ptyHealthGeneration atomic.Uint64
+
 	// rehome (D6 §7.4) dedup: exactly ONE applyOneHome retry loop runs per public
 	// port regardless of how many reconnects fire (review A4 B1 — a flapping NATS
 	// link must not spawn an unbounded fan of concurrent same-port dials). rehomeWant
@@ -575,9 +641,15 @@ type Agent struct {
 	rosterGen    uint64               // monotone roster generation high-water mark
 	rosterURLs   []string             // learned client-dial URLs (VOTER-first), seed is unioned at dial time
 	cachedRoster *proto.ClusterRoster // C2: last accepted roster (persisted for boot re-verification)
-	seedGen      uint64               // C2: monotone seed_generation high-water mark
-	seedURLs     []string             // C2: learned client-dialable seed endpoints (cold-start floor)
-	cachedSeeds  *proto.SeedBundle    // C2: last accepted seed bundle (persisted for boot re-verification)
+	rosterRoute  *rosterRouteIdentity // runtime-only ingress identity, guarded by rosterMu
+	// origin: hot-update S6 plan §7.3 / T44. One connected route owns one
+	// fixed-expiry challenge/hold; the ended receipt prevents same-cut replay.
+	brokerMaintenance *agentMaintenanceHold // guarded by rosterMu
+	maintenanceNow    func() (int64, error) // BOOTTIME test seam, immutable while running
+	rosterRouteOrder  atomic.Uint64         // orders replies before taking rosterMu (including same-nc reconnects)
+	seedGen           uint64                // C2: monotone seed_generation high-water mark
+	seedURLs          []string              // C2: learned client-dialable seed endpoints (cold-start floor)
+	cachedSeeds       *proto.SeedBundle     // C2: last accepted seed bundle (persisted for boot re-verification)
 	// rosterRefreshNow is a coalescing edge trigger from signed-topology sys.events to the
 	// roster-only refresh loop. It closes the healthy-connection island window during consecutive
 	// retires; the periodic timer remains the loss-tolerant fallback.
@@ -698,6 +770,20 @@ var afterRehomeWantSettledHook atomic.Pointer[func(*Agent, int)]
 // Same race-safe atomic.Pointer pattern as afterRehomeWantSettledHook. nil ⇒ no hook.
 var afterSilenceEscapeHook atomic.Pointer[func(*Agent, string)]
 
+// afterEnqueueStartedHook (hot-update S1 review E3) is a test seam fired by
+// startExecPipes between enqueueStarted and AdoptDraining — the one instant
+// that proves the C-5 order: the started is already pending while the child
+// is not yet in the process table. Without an observation here, swapping the
+// two calls (the "natural" adopt-first reading) left every test green and
+// re-opened the G.1 false-orphan window. Same pattern as the hooks above.
+var afterEnqueueStartedHook atomic.Pointer[func(*Agent, string)]
+
+func fireAfterEnqueueStarted(a *Agent, pid string) {
+	if h := afterEnqueueStartedHook.Load(); h != nil {
+		(*h)(a, pid)
+	}
+}
+
 // fireAfterSilenceEscape invokes the test hook if installed (race-free load).
 func fireAfterSilenceEscape(a *Agent, avoidedHost string) {
 	if h := afterSilenceEscapeHook.Load(); h != nil {
@@ -721,10 +807,10 @@ func (a *Agent) onTunnelSessionState(publicPort int, up bool) {
 	if int64(publicPort) != a.proxyPublicPort.Load() {
 		return // not the proxy port — a regular expose flap, ignore
 	}
-	a.proxyTunnelUp.Store(up) // C5 M2: the heartbeat ProxyBound tracks this tunnel-liveness edge
-	if nc := a.ncBox.Load(); nc != nil {
-		a.pubProxyReady(nc, up)
-	}
+	// A planned cut retains the last real readiness through its bounded grace;
+	// unplanned drops and authoritative teardown still publish immediately.
+	// origin: hot-update S5 internal review rv-authority-6
+	applyProxyTunnelState(a, publicPort, up)
 }
 
 // New validates the config and returns an Agent not yet connected. Run
@@ -745,18 +831,10 @@ func New(cfg Config) (*Agent, error) {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
-	if cfg.HeartbeatInterval == 0 {
-		cfg.HeartbeatInterval = 5 * time.Second
-	}
-	if cfg.RegisterTimeout == 0 {
-		cfg.RegisterTimeout = 10 * time.Second
-	}
-	if cfg.RegisterRetryInitial == 0 {
-		cfg.RegisterRetryInitial = 100 * time.Millisecond
-	}
-	if cfg.RegisterRetryMax == 0 {
-		cfg.RegisterRetryMax = 2 * time.Second
-	}
+	cfg.HeartbeatInterval = defaultAgentDuration(cfg.HeartbeatInterval, 5*time.Second)
+	cfg.RegisterTimeout = defaultAgentDuration(cfg.RegisterTimeout, 10*time.Second)
+	cfg.RegisterRetryInitial = defaultAgentDuration(cfg.RegisterRetryInitial, 100*time.Millisecond)
+	cfg.RegisterRetryMax = defaultAgentDuration(cfg.RegisterRetryMax, 2*time.Second)
 	bootProofID := cfg.UpgradeBootProofID
 	if bootProofID == "" {
 		bootProofID = currentUpgradeBootProof()
@@ -766,7 +844,12 @@ func New(cfg Config) (*Agent, error) {
 	// this agent exactly as a pre-feature one, which is today's behaviour. An
 	// agent that refused to start because a random source hiccuped would be a
 	// strictly worse outcome than one that runs without lease arbitration.
+	// origin: hot-update S3 plan §1.7. Snapshot routing before either lineage
+	// variable is consumed; a later constructor failure must still re-dispatch it.
+	restored := strings.TrimSpace(os.Getenv(routingNIDEnv))
+	_ = os.Unsetenv(routingNIDEnv)
 	instanceID, err := mintInstanceID()
+	setExecLineage(instanceID, restored)
 	if err != nil {
 		cfg.Logger.Warn("agent: could not mint an instance id; lease arbitration disabled for this run", "err", err)
 		instanceID = ""
@@ -776,7 +859,6 @@ func New(cfg Config) (*Agent, error) {
 		instanceID:               instanceID,
 		upgradeBootProofID:       bootProofID,
 		procs:                    map[string]*procRec{},
-		execChildren:             map[string]*os.Process{},
 		canonAllowRoots:          CanonAllowRoots(cfg.AllowRoots),
 		transferMode:             resolveTransferMode(cfg.RootsConfigured, cfg.AllowRoots),
 		proxy:                    &proxyRuntime{}, // F2: lifetime-owned, created eagerly (no init race)
@@ -789,14 +871,8 @@ func New(cfg Config) (*Agent, error) {
 		rosterRefreshFailBackoff: defaultRosterRefreshFailBackoff,
 	}
 	a.courier = newProcCourier(a) // h1 C: lifetime-owned, eager like proxy
-	if a.transferMode == modeOpen {
-		// Posture-change signal: with no allow_roots configured, push/pull
-		// now reaches the whole filesystem (matching run/exec). Logged once
-		// at startup so an operator upgrading from the old empty==disabled
-		// default sees the change at the moment it takes effect.
-		cfg.Logger.Warn("file transfer: whole-filesystem reach (no file_transfer.allow_roots configured); " +
-			"set file_transfer.allow_roots to narrow, or allow_roots: [] to disable push/pull")
-	}
+	logAgentTransferPolicy(a)
+
 	if cfg.Home != "" {
 		a.stateStore = newStateStore(cfg.Home, cfg.SID)
 		a.rosterCacheStore = newRosterCacheStore(cfg.Home, cfg.SID) // C2: discovery cache in its own file
@@ -856,10 +932,8 @@ func New(cfg Config) (*Agent, error) {
 	// already adopted across its own re-exec — so the only legal values are the
 	// basename and `<basename>-NN`. Accepting any nid-shaped string would let a
 	// stray environment variable move an agent onto an unrelated device's name.
-	restored := strings.TrimSpace(os.Getenv(routingNIDEnv))
-	// Consumed for the same reason as the instance id: a managed child must not
-	// inherit it. See mintInstanceID.
-	_ = os.Unsetenv(routingNIDEnv)
+	// The routing variable was consumed above with the instance id so managed
+	// children cannot inherit either lineage variable. See mintInstanceID.
 	if restored != "" && acceptableLeaseName(a, restored) {
 		// RESUME, not adopt: this lineage already held the name before the
 		// re-exec, so there is no rename here and nothing to carry across one.
@@ -868,6 +942,31 @@ func New(cfg Config) (*Agent, error) {
 		resumeRoutingNID(a, restored)
 	}
 	setExecLineage(a.instanceID, nidOf(a))
+	// origin: hot-update S3 plan §3.1. Restore is the last fallible step: an
+	// import refusal must never register a freshly minted, empty process table.
+	img := cfg.BootImage
+	if img == nil {
+		img = agentboot.Claim()
+	}
+	if err := initAgentUpgrade(a, img); err != nil {
+		return nil, err
+	}
+	if img != nil {
+		if err := restoreImage(a, img); err != nil {
+			return nil, err
+		}
+	} else {
+		if err := configureAgentFlows(a); err != nil {
+			return nil, err
+		}
+		initProcessRuntime(a)
+		if lost := agentboot.Current(); lost != nil && lost.Phase() == agentboot.PhaseLost {
+			stampMarkerPhase(a, markerPhaseLost, 0, 0)
+		}
+	}
+	// Establish the PTY gate before Run can install any forwarded subscription.
+	// origin: hot-update S4 plan §2.2 / §7.1
+	refreshPTYAdmission(a)
 	return a, nil
 }
 
@@ -891,16 +990,55 @@ func (a *Agent) spawnTimeout() time.Duration {
 // parent-ctx cancel / admin evict ends the loop. The NATS connection is drained on each
 // session exit.
 func (a *Agent) Run(ctx context.Context) error {
+	// origin: hot-update S4 internal review rv-fd rv-fd-4
+	// Both the watchdog and the exit funnel own the partial-activation window.
+	watchCtx, stopWatch := context.WithCancel(ctx)
+	// upgrade-safety plan §3.1: while an upgrade marker is pending, this
+	// process must prove control-ready or recover before the absolute deadline
+	// — armed here, INSIDE the new binary, so the guarantee holds even on the
+	// unsupervised setsid-nohup path where no supervisor exists to help.
+	a.armUpgradeWatchdog(watchCtx)
+	// origin: hot-update S5 plan §7.1 — cleanup must cover the very first
+	// raw activation, including a carrier or authority failure before NATS.
+	defer a.cancelFailClosed()
+	// proxy-lifecycle: the SS server no longer hangs from any ctx, so agent exit must stop
+	// it explicitly. Registered AFTER cancelFailClosed so it runs BEFORE it (defers are
+	// LIFO): it latches agentExiting, which is what makes a fail-closed AfterFunc already
+	// in flight a no-op instead of a footprint-wiping race.
+	defer stopAgentTransfers(a) // origin: hot-update S7 plan §11.2 / P20
+	defer stopProxyOnRunExit(a)
+	defer stopRestoredFlows(a)
+	defer stopExposeAdapter(a)
+	if a.flowState != nil {
+		a.flowState.runCtx = ctx
+	}
+	defer func() {
+		stopWatch()
+		a.upgradeWatchdogWG.Wait()
+		a.proxyDrainMu.Lock()
+		a.upgradeStopping = true
+		a.proxyDrainMu.Unlock()
+		a.upgradeRequestWG.Wait()
+		stopBootProcessRuntime(ctx, a)
+	}()
+	if err := activateRunImage(ctx, a); err != nil {
+		return err
+	}
+	startExposeAdapter(ctx, a)
+	// ctx-root: the observation loop shares Run's watchdog cancellation on every exit.
+	// Capture this image's binding before starting the sampler; later cuts cannot
+	// relabel samples from the still-running image as its successor generation.
+	// origin: hot-update S10 plan §5.3 / P07
+	if drillobserve.Hook != nil {
+		go drillobserve.RunRuntimeSamples(watchCtx.Done(), drillobserve.RuntimeBinding{
+			Domain: "agent", InstanceID: a.instanceID, Generation: a.imageGeneration,
+		}, func() { execsession.ObserveRuntime(a.processRuntime) })
+	}
 	a.loadRosterCacheAtBoot() // seed the dial pool from state.json before the first connect
 	// h1 C: the proc-event courier outlives session rebuilds (it delivers on
 	// whatever conn a.ncBox currently holds), so it binds to the PARENT ctx —
 	// exactly one goroutine per agent lifetime (leak-gate covered).
 	go a.courier.run(ctx)
-	// upgrade-safety plan §3.1: while an upgrade marker is pending, this
-	// process must either register (commit) or roll back before the deadline
-	// — armed here, INSIDE the new binary, so the guarantee holds even on the
-	// unsupervised setsid-nohup path where no supervisor exists to help.
-	a.armUpgradeWatchdog(ctx)
 	// C2 §2.4 tier 2: at cold-start, asynchronously fetch the well-known manifest and adopt it (never
 	// blocks Run; best-effort; a no-op without a pin). Helps when the configured NATS endpoints are
 	// all dead but the HTTPS manifest is reachable; steady-state stays the NATS refresh loop.
@@ -911,12 +1049,6 @@ func (a *Agent) Run(ctx context.Context) error {
 	// — a disconnect within redialAfter of an operator stop would otherwise leave a timer that later
 	// fires fireRedial on a returned Run (and could perturb a NumGoroutine/fd leak-gate poll).
 	defer a.stopRedialWatchdog()
-	defer a.cancelFailClosed()
-	// proxy-lifecycle: the SS server no longer hangs from any ctx, so agent exit must stop
-	// it explicitly. Registered AFTER cancelFailClosed so it runs BEFORE it (defers are
-	// LIFO): it latches agentExiting, which is what makes a fail-closed AfterFunc already
-	// in flight a no-op instead of a footprint-wiping race.
-	defer stopProxyOnRunExit(a)
 	for {
 		rebuild, err := a.session(ctx)
 		// The dying session's defers have run (conn drained, subs gone); allow the next
@@ -932,7 +1064,7 @@ func (a *Agent) Run(ctx context.Context) error {
 		a.rebuilding.Store(false)
 		a.rebuildRequested.Store(false)
 		if err != nil {
-			return err
+			return runFailedBeforeControlReady(ctx, a, err)
 		}
 		if !rebuild || ctx.Err() != nil {
 			return ctx.Err()
@@ -947,6 +1079,25 @@ func (a *Agent) Run(ctx context.Context) error {
 		}
 		a.cfg.Logger.Info("agent: rebuilding NATS session on the freshest roster")
 	}
+}
+
+// handleSysEvent is the sys.events subscriber of one session (P9). It is a
+// named function rather than a closure inside session() so the three event
+// families it dispatches stay readable on their own and session() stays out
+// of the maintidx god-function register (hot-update S1 added the third
+// family); package-level rather than a method because Agent's method budget
+// is a ratchet (structural_budget_golden: 125) and this is plumbing, not
+// surface. cancelRun is the session's runCtx cancel: eviction ends the
+// session, the other two never do.
+func handleSysEvent(a *Agent, msg *nats.Msg, cancelRun func()) {
+	agentupgrade.HandleSystemEvent(msg.Data, agentupgrade.SystemEventPort{
+		SID: a.cfg.SID, NID: a.cfg.NID, Logger: a.cfg.Logger,
+		Refresh:    a.rosterRefreshNow,
+		Invalidate: func() { invalidateAgentMaintenance(a) },
+		Revoke:     func(reason string) { revokeSessionWorkloads(a, reason) },
+		Reap:       a.reapManagedChildren,
+		Cancel:     cancelRun,
+	})
 }
 
 // session runs one NATS connection's lifetime:
@@ -999,7 +1150,10 @@ func (a *Agent) session(ctx context.Context) (rebuild bool, err error) {
 		if ctx.Err() == nil && a.rebuildRequested.Load() {
 			intent = teardownRebuild
 		}
+		a.controlReady.CompareAndSwap(nc, nil)
 		fin.Do(intent)
+		// origin: hot-update S4 plan §9.1; P18. Observe completed teardown once.
+		a.processRuntime.LogPTYCarrier("carrier-lost", a.imageGeneration)
 		a.setSessionFinalizer(nil)
 	}()
 	// A parent cancellation must be able to enter the finalizer even if this session goroutine is
@@ -1008,6 +1162,7 @@ func (a *Agent) session(ctx context.Context) (rebuild bool, err error) {
 	stopParentTeardown := context.AfterFunc(ctx, func() { fin.Do(teardownShutdown) })
 	defer stopParentTeardown()
 
+	a.ptyHealthGeneration.Add(1)
 	a.ncBox.Store(nc) // publish nc for the lock-free tunnel session-state hook
 	// Snapshot the URL for teardown diagnostics only AFTER publishing the bounded finalizer. This
 	// observer takes nc.mu.RLock; an immediate reconnect can already hold nc.mu across an unbounded
@@ -1040,7 +1195,8 @@ func (a *Agent) session(ctx context.Context) (rebuild bool, err error) {
 	// built — a started that never landed makes G.1's orphan pass KILL the
 	// live process it describes. Bounded to one request timeout; best-effort.
 	a.courier.drainStarted(runCtx, nc)
-	resp, err := a.register(runCtx, nc)
+	var delivery *upgradeMarker
+	resp, err := a.register(runCtx, nc, &delivery)
 	if err != nil {
 		cancelRun()
 		return false, err
@@ -1054,11 +1210,13 @@ func (a *Agent) session(ctx context.Context) (rebuild bool, err error) {
 		return true, nil
 	}
 	// h1 C4: the register reply settles the courier's replay channel (pending
-	// exits ride the snapshot; clearance per onRegisterSuccess's rules).
-	a.courier.onRegisterSuccess(resp)
+	// exits ride the snapshot; register already settled exactly that request's
+	// events per onRegisterSuccess's rules).
 	// Connected + registered = healthy: cancel any fail-closed countdown a prior session's
 	// partition (preserved across a rebuild — see the conditional defer below) left armed.
 	// Parity with onNATSReconnect, which cancels it on a nats.go reconnect.
+	// origin: hot-update S4 plan §6.1 / §9.1; P18. Register retries are not restoration.
+	a.processRuntime.LogPTYCarrier("carrier-restored", a.imageGeneration)
 	a.cancelFailClosed()
 	a.cfg.Logger.Info("agent: registered",
 		"sid", a.cfg.SID, "nid", a.cfg.NID,
@@ -1068,14 +1226,9 @@ func (a *Agent) session(ctx context.Context) (rebuild bool, err error) {
 		"revoke_ports", len(resp.RevokePorts),
 	)
 
-	// JetStream client for file-transfer Tier-B. `jetstream.New` is
-	// pure client-side scaffolding (never errors), so we can stash
-	// the handle eagerly. We DON'T probe with AccountInfo here —
-	// the agent's perm template intentionally excludes
-	// `$JS.API.INFO`, so a probe would log a spurious perm
-	// violation on every agent start. Tier-B handlers surface a
-	// real JS-absent error via the Put/Get path itself.
-	a.js, _ = jetstream.New(nc)
+	if err := bindAgentTransferSession(a, nc); err != nil {
+		return false, err
+	}
 
 	subFwd, err := nc.Subscribe(
 		// Wildcard over verbs; derive the subject from the SSOT builder so the
@@ -1090,6 +1243,9 @@ func (a *Agent) session(ctx context.Context) (rebuild bool, err error) {
 			// (dispatchForwarded returns immediately after spawning).
 			a.proxyHandlerWG.Add(1)
 			defer a.proxyHandlerWG.Done()
+			if dispatchAgentUpgrade(a, nc, msg) || dispatchAgentMaintenance(a, nc, msg) {
+				return
+			}
 			a.dispatchForwarded(nc, msg)
 		},
 	)
@@ -1104,6 +1260,9 @@ func (a *Agent) session(ctx context.Context) (rebuild bool, err error) {
 	// budgeted closer goroutine, so poisoning bounds it like the close itself.
 	fin.addBoundedCleanup(func() { _ = subFwd.Unsubscribe() })
 
+	if err := bindAgentInfra(a, nc, fin); err != nil {
+		return false, err
+	}
 	if err := startSessionIntakes(runCtx, a, nc, fin); err != nil {
 		cancelRun()
 		return false, err
@@ -1130,37 +1289,7 @@ func (a *Agent) session(ctx context.Context) (rebuild bool, err error) {
 			a.cancelFailClosed()
 		}
 	}()
-	subEvict, err := nc.Subscribe(proto.SubjSysEvents, func(msg *nats.Msg) {
-		var ev struct {
-			Type string `json:"type"`
-			SID  string `json:"sid"`
-			NID  string `json:"nid"`
-		}
-		if err := json.Unmarshal(msg.Data, &ev); err != nil {
-			return
-		}
-		if strings.HasPrefix(ev.Type, "nats_topology_") {
-			// Events are only a wake-up hint: refreshRosterOnce still verifies the account-signed
-			// roster and its monotone generation. Coalesce a burst from multiple brokers.
-			select {
-			case a.rosterRefreshNow <- struct{}{}:
-			default:
-			}
-			return
-		}
-		if ev.Type != "agent_evicted" {
-			return
-		}
-		if ev.SID != a.cfg.SID || ev.NID != a.cfg.NID {
-			return
-		}
-		a.cfg.Logger.Info("agent: evicted by admin", "sid", ev.SID, "nid", ev.NID)
-		// #26: reap this node's managed OS children BEFORE the daemon self-exits. On a
-		// bare setsid-nohup host there is no systemd cgroup to reap them, so an evicted
-		// agent's exec/run children would otherwise linger in the host process table.
-		a.reapManagedChildren()
-		cancelRun()
-	})
+	subEvict, err := nc.Subscribe(proto.SubjSysEvents, func(msg *nats.Msg) { handleSysEvent(a, msg, cancelRun) })
 	if err != nil {
 		return false, fmt.Errorf("agent: subscribe sys.events: %w", err)
 	}
@@ -1189,6 +1318,13 @@ func (a *Agent) session(ctx context.Context) (rebuild bool, err error) {
 	// which the backoff gate would otherwise still suppress).
 	resetProxyDialBackoff(a)
 	a.applyProxyDirective(nc, resp.Proxy)
+
+	// origin: hot-update S8 plan §4.2 / M05. Registration alone leaves the
+	// upgrade pending: SUB, intake, events, reconciliation and proxy precede
+	// Flush and an external nonce request through the forwarded subscriber.
+	if err := finishAgentControlReady(runCtx, a, nc, delivery); err != nil {
+		return false, err
+	}
 
 	// C1 §D-4: pull a fresh signed roster on a jittered cadence (roster-only register → no raft
 	// write on the broker) so an online agent converges on a new broker set ≤5min. Bound to this
@@ -1225,7 +1361,17 @@ func (a *Agent) replayPortsFromState(ctx context.Context) {
 		return
 	}
 	for _, p := range sf.PortTokens {
-		if err := a.cfg.ExposeAdapter.AddProxy(ctx, p); err != nil {
+		// origin: hot-update S3 plan §4.0 / §4.1 (CC-4). A replay handshake
+		// is not yet in SessionCount; keep it admitted until AddProxy installs
+		// the session or finishes failing. The next image replays skipped rows.
+		release, admitted := a.gate.admit(gateExpose)
+		if !admitted {
+			a.cfg.Logger.Info("agent: skipping expose replay during image switch")
+			return
+		}
+		err := a.cfg.ExposeAdapter.AddProxy(ctx, p)
+		release()
+		if err != nil {
 			// D6 §7.7/R-22: a clustered expose (HomeBrokerAddr set) has NO cert
 			// pins on boot (pins are never persisted) → ErrHomePinsRequired. That
 			// is EXPECTED: defer — the first register reply re-delivers the home
@@ -1254,6 +1400,73 @@ func (a *Agent) replayPortsFromState(ctx context.Context) {
 // handshake) when the agent is configured to reach the broker through a proxy.
 const agentProxyDialTimeout = 10 * time.Second
 
+// The former buildOpts closure is now a package helper; its per-retry rebuilding
+// contract and original rationale remain unchanged.
+// buildOpts is a CLOSURE rather than a value computed once, because the
+// CONNECT name is baked into these options (nats.Name(cli.AgentName(sid,
+// nidOf(a)))) and the routing name can change mid-loop: an auth denial under
+// an assigned lease name drops the lease and retries as the basename. With
+// the options frozen above the loop, that retry would re-present the very
+// name auth_callout just refused — the degrade would be inert and a broker
+// rollback would still kill every leased agent.
+//
+// It returns TWO option sets. `live` is the one a real session is built from.
+// `probe` is for the throwaway attribution dials below and is deliberately
+// NOT the same slice — origin: prerelease audit round 2, AC-5. Dialling a
+// probe with the live set installed this session's DisconnectErr/Reconnect
+// callbacks at the CURRENT generation, so the generation guard could not
+// help: a probe connection dropped by a restarting broker armed
+// armFailClosed() and armRedialWatchdog() on behalf of a connection the
+// agent had already thrown away, and session() clears the watchdog BEFORE
+// connectNATS and never after — so that watchdog survived into the healthy
+// session this call was about to establish and could fire fireRedial on it.
+// origin: hot-update S10 lint L3a / maintidx connectNATS
+func agentConnectionOptions(ctx context.Context, a *Agent) (live []nats.Option, probe []nats.Option, err error) {
+	o := a.buildConnOptions()
+	// Proxy-aware dial. Injected here (the single connect call site) rather
+	// than in buildConnOptions, which has two returns and no merge point —
+	// so both the anonymous and nkey branches are covered. No-op when no
+	// proxy env set.
+	popts, perr := proxydial.Options(proxydial.OSEnv, agentProxyDialTimeout)
+	if perr != nil {
+		return nil, nil, perr
+	}
+	o = append(o, popts...)
+	// Derived BEFORE the tracker is appended, so the probe keeps the
+	// proxy-aware dialer (it must still reach the same servers by the same
+	// route) but does NOT share this session's connTracker — a probe's raw
+	// net.Conn has no business in the set a session teardown poisons.
+	probe = probeConnOptions(o)
+	// Production raw cancellation precedes every nc.mu operation. Legacy
+	// injected teardown dialers keep their explicit unsupported test path.
+	// origin: hot-update S9 plan §4.5 / T50
+	if a.cfg.TeardownDialFn == nil {
+		d, e := controlbudget.After(5 * time.Second)
+		if e != nil {
+			return nil, nil, e
+		}
+		var config infraattach.Config
+		if a.cfg.Infra != nil {
+			config = *a.cfg.Infra
+			config.Role = "control"
+		}
+		_, live, e = infraattach.Prepare(o, d, config)
+		return live, probe, e
+	}
+	// origin: gotcha #72 — wrap whatever dialer the options settled on (proxy-aware or default) in
+	// a connTracker, so the raw net.Conns behind this *nats.Conn stay reachable for poisoning when
+	// a teardown blows its budget. Appended LAST: nats.SetCustomDialer overwrites Options.CustomDialer,
+	// so this must be the final word, and the tracker forwards to the proxy dialer it replaced.
+	//
+	// Copied into its OWN slice rather than appended onto `o`: probe was derived from
+	// o a moment ago, and an append into o's spare capacity would put the tracker in a
+	// slice the probe set may share.
+	live = make([]nats.Option, 0, len(o)+1)
+	live = append(live, o...)
+	live = append(live, a.trackerDialOption(ctx, o))
+	return live, probe, nil
+}
+
 // connectNATS retries nats.Connect on transient failures (server not up
 // yet, DNS not yet resolvable, port closed) until ctx is canceled.
 //
@@ -1266,54 +1479,7 @@ const agentProxyDialTimeout = 10 * time.Second
 // Backoff reuses the same RegisterRetry knobs as register-retry — a single
 // pair of dials governs all transient-NATS-interaction backoff in v1.
 func (a *Agent) connectNATS(ctx context.Context) (*nats.Conn, error) {
-	// buildOpts is a CLOSURE rather than a value computed once, because the
-	// CONNECT name is baked into these options (nats.Name(cli.AgentName(sid,
-	// nidOf(a)))) and the routing name can change mid-loop: an auth denial under
-	// an assigned lease name drops the lease and retries as the basename. With
-	// the options frozen above the loop, that retry would re-present the very
-	// name auth_callout just refused — the degrade would be inert and a broker
-	// rollback would still kill every leased agent.
-	//
-	// It returns TWO option sets. `live` is the one a real session is built from.
-	// `probe` is for the throwaway attribution dials below and is deliberately
-	// NOT the same slice — origin: prerelease audit round 2, AC-5. Dialling a
-	// probe with the live set installed this session's DisconnectErr/Reconnect
-	// callbacks at the CURRENT generation, so the generation guard could not
-	// help: a probe connection dropped by a restarting broker armed
-	// armFailClosed() and armRedialWatchdog() on behalf of a connection the
-	// agent had already thrown away, and session() clears the watchdog BEFORE
-	// connectNATS and never after — so that watchdog survived into the healthy
-	// session this call was about to establish and could fire fireRedial on it.
-	buildOpts := func() (live []nats.Option, probe []nats.Option, err error) {
-		o := a.buildConnOptions()
-		// Proxy-aware dial. Injected here (the single connect call site) rather
-		// than in buildConnOptions, which has two returns and no merge point —
-		// so both the anonymous and nkey branches are covered. No-op when no
-		// proxy env set.
-		popts, perr := proxydial.Options(proxydial.OSEnv, agentProxyDialTimeout)
-		if perr != nil {
-			return nil, nil, perr
-		}
-		o = append(o, popts...)
-		// Derived BEFORE the tracker is appended, so the probe keeps the
-		// proxy-aware dialer (it must still reach the same servers by the same
-		// route) but does NOT share this session's connTracker — a probe's raw
-		// net.Conn has no business in the set a session teardown poisons.
-		probe = probeConnOptions(o)
-		// origin: gotcha #72 — wrap whatever dialer the options settled on (proxy-aware or default) in
-		// a connTracker, so the raw net.Conns behind this *nats.Conn stay reachable for poisoning when
-		// a teardown blows its budget. Appended LAST: nats.SetCustomDialer overwrites Options.CustomDialer,
-		// so this must be the final word, and the tracker forwards to the proxy dialer it replaced.
-		//
-		// Copied into its OWN slice rather than appended onto `o`: probe was derived from
-		// o a moment ago, and an append into o's spare capacity would put the tracker in a
-		// slice the probe set may share.
-		live = make([]nats.Option, 0, len(o)+1)
-		live = append(live, o...)
-		live = append(live, a.trackerDialOption(ctx, o))
-		return live, probe, nil
-	}
-	connOpts, probeOpts, perr := buildOpts()
+	connOpts, probeOpts, perr := agentConnectionOptions(ctx, a)
 	if perr != nil {
 		return nil, perr
 	}
@@ -1446,7 +1612,7 @@ func (a *Agent) connectNATS(ctx context.Context) (*nats.Conn, error) {
 				// NEXT failure by re-presenting the name that was already
 				// refused — and report a denial that says nothing about the
 				// basename the retry is actually using.
-				if rebuilt, rebuiltProbe, rerr := buildOpts(); rerr == nil {
+				if rebuilt, rebuiltProbe, rerr := agentConnectionOptions(ctx, a); rerr == nil {
 					connOpts, probeOpts = rebuilt, rebuiltProbe
 				}
 				a.cfg.Logger.Warn("agent: auth denied under the assigned lease name; retrying as the configured basename",
@@ -1506,30 +1672,9 @@ func (a *Agent) connectNATS(ctx context.Context) (*nats.Conn, error) {
 	}
 }
 
-// waitBackoff sleeps out one retry interval and doubles it, capped at max.
-//
-// Extracted from connectNATS' three identical copies — origin: prerelease audit round
-// 2. AC-2 added a fourth wait site and pushed the function's maintainability index to
-// 18; the repo's precedent for that (the `session` intake grouping) is to EXTRACT rather
-// than add an exemption, because a maintidx exemption is permanent and an extraction is
-// the thing the number was asking for.
-//
-// The pointer is the point: every caller's next wait must be longer than this one, and
-// three hand-written copies of "double it unless it is already at the cap" is exactly
-// the shape where one of them quietly stops doubling.
+// origin: hot-update S8 internal review FIX-AGENTSLIM.
 func waitBackoff(ctx context.Context, backoff *time.Duration, max time.Duration) error {
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-time.After(*backoff):
-	}
-	if *backoff < max {
-		*backoff *= 2
-		if *backoff > max {
-			*backoff = max
-		}
-	}
-	return nil
+	return agentupgrade.WaitBackoff(ctx, backoff, max)
 }
 
 // register loops, retrying on transient failures (no responders / per-attempt
@@ -1548,148 +1693,12 @@ func waitBackoff(ctx context.Context, backoff *time.Duration, max time.Duration)
 //
 // Returns the parsed NodeRegisterResp on success so the caller can apply
 // G.1 reconciliation directives.
-func (a *Agent) register(ctx context.Context, nc *nats.Conn) (proto.NodeRegisterResp, error) {
-	procs, ports := a.buildLocalSnapshot()
-	req := proto.NodeRegisterReq{
-		ProtoVersion:   proto.ProtoVersion,
-		ReleaseVersion: proto.ReleaseVersion,
-		NID:            nidOf(a),
-		OS:             runtime.GOOS,
-		Arch:           runtime.GOARCH,
-		BootID:         readBootID(),
-		LocalProcesses: procs,
-		LocalPorts:     ports,
-		Capabilities:   []string{proto.CapProxyV1}, // P13: this build implements proxy-v1
-		// InstanceID identifies THIS process run so the broker can tell an
-		// incumbent reconnecting from a second process presenting the same
-		// baked credential. A non-empty value IS the capability advertisement —
-		// deliberately NOT a second Capabilities token, which would change the
-		// register body of every single-agent device for no benefit.
-		InstanceID: a.instanceID,
-		// LeasedNID tells the broker we are running under an assigned lease
-		// name rather than our configured basename; it folds into the existing
-		// nodes.proxy_capable expression so an ephemeral instance never holds a
-		// public egress port.
-		LeasedNID: nidOf(a) != a.cfg.NID,
-		// Consumed with Swap: it is only meaningful on the FIRST register after
-		// an adoption. Carrying it further would let a much later register claim
-		// processes under a name this agent no longer has any relationship to.
-		PreviousNID: previousNIDOnce(a),
-		// The root of this agent's credential family, stated rather than left to
-		// be parsed out of NID. Without it the broker folds a device the
-		// operator named `gpu-02` into the `gpu` family and offers its clone
-		// `gpu-03` — a name in a different family that this agent's binding does
-		// not cover. (external review F2)
-		ConfiguredNID: a.cfg.NID,
-		// D6 §6.5: self-report the DETERMINISTIC nats server_name we are connected
-		// to (NOT the volatile NUID) so the leader can bridge it to a home broker.
-		// "" on a single-node bus → inert. ConnectedServerName reflects the actual
-		// connected server, updated across reconnects (drives §7.4 rehome).
-		ServerID: nc.ConnectedServerName(),
-		// C1: report our cached signed-roster generation so the leader can flag a
-		// sustained-behind agent (agent_roster_stale). 0 ⇒ pre-C1 / no cache. Advisory.
-		RosterGen: a.cachedRosterGen(),
-		// #78: the proxy.participate opt-out. Capabilities stays untouched —
-		// nodeHasProxyCap falls back to a release-version check when the
-		// token is absent, so omitting CapProxyV1 could NOT express opt-out.
-		ProxyOptOut: a.cfg.ProxyOptOut,
+func (a *Agent) register(ctx context.Context, nc *nats.Conn, captured ...**upgradeMarker) (proto.NodeRegisterResp, error) {
+	var delivery **upgradeMarker
+	if len(captured) != 0 {
+		delivery = captured[0]
 	}
-	// upgrade-safety plan §3.1: the first register after a `node upgrade`
-	// carries the outcome (this one IS the health check-in when pending);
-	// empty strings on every ordinary register keep the wire byte-identical.
-	req.UpgradeState, req.UpgradeDetail = a.upgradeRegisterReport()
-	payload, err := json.Marshal(req)
-	if err != nil {
-		return proto.NodeRegisterResp{}, fmt.Errorf("agent: marshal register: %w", err)
-	}
-	subject := proto.SubjNodeRegister(a.cfg.SID, nidOf(a))
-
-	backoff := a.cfg.RegisterRetryInitial
-	for attempt := 1; ; attempt++ {
-		if err := ctx.Err(); err != nil {
-			return proto.NodeRegisterResp{}, err
-		}
-
-		reqCtx, cancel := context.WithTimeout(ctx, a.cfg.RegisterTimeout)
-		msg, err := nc.RequestWithContext(reqCtx, subject, payload)
-		cancel()
-
-		if err == nil {
-			var resp proto.NodeRegisterResp
-			switch {
-			case json.Unmarshal(msg.Data, &resp) != nil:
-				// Garbled reply — treat as transient (broker bug or
-				// concurrent partial deploy). Retry.
-				a.cfg.Logger.Warn("agent: register reply parse failed; retrying",
-					"attempt", attempt)
-			case resp.OK:
-				if attempt > 1 {
-					a.cfg.Logger.Info("agent: register succeeded after retry",
-						"attempts", attempt)
-				}
-				// Register success is the upgrade commit point (plan §3.1):
-				// promote a pending marker to committed / clear the terminal
-				// record this very register delivered. Mutex-racing the
-				// deadline watchdog — the loser of that race no-ops.
-				//
-				// A CONTESTED REPLY IS NOT A REGISTER. external review F4: it
-				// carries OK, but by construction it did NOT register — no
-				// registerNode, no reconcile, no AcceptedProcesses — it is a
-				// verdict telling this agent to come back under another name.
-				// Committing on it disarms the rollback watchdog before the
-				// agent has proved it can run: if the assigned name then fails
-				// to authenticate or rebuild, the node is permanently offline on
-				// a binary that was never health-checked, and `node upgrade`
-				// reported success. The real register under the assigned name is
-				// moments away and commits then.
-				if resp.Lease == nil {
-					a.commitUpgradeAfterRegister(req.UpgradeState)
-				}
-				return resp, nil
-			case resp.Code == proto.CodeLeaderUnavailable:
-				// audit M2 / write-forward F3: a leadership race (raft failover / election) is
-				// TRANSIENT, not a config error — retry with backoff instead of exiting the agent
-				// process. break exits the switch and falls through to the backoff sleep below.
-				a.cfg.Logger.Warn("agent: register hit a transient leader failover; retrying",
-					"attempt", attempt, "next_backoff", backoff)
-			case resp.Code == proto.CodeReplyTooLarge:
-				// h1 A2 (plan critique-4 MAJOR): an oversize register REPLY is a
-				// broker-side bug, not this agent's config. Pre-h1 the oversize
-				// reply was silently dropped and register self-healed via the
-				// timeout/retry path; letting it fall into the authoritative-reject
-				// default below would instead EXIT the agent — converting a
-				// self-healing condition into fleet-node death. Keep the
-				// self-healing shape: retry with backoff.
-				a.cfg.Logger.Warn("agent: register reply exceeded broker max_payload (broker bug); retrying",
-					"attempt", attempt, "next_backoff", backoff, "detail", resp.Error)
-			default:
-				// Authoritative reject from broker. Don't retry; the operator
-				// must fix config (proto, nid uniqueness, etc.).
-				return proto.NodeRegisterResp{}, fmt.Errorf("agent: register rejected (code=%s): %s",
-					resp.Code, resp.Error)
-			}
-		} else {
-			// Parent ctx canceled mid-request — exit cleanly.
-			if ctx.Err() != nil {
-				return proto.NodeRegisterResp{}, ctx.Err()
-			}
-			a.cfg.Logger.Warn("agent: register attempt failed; retrying",
-				"attempt", attempt, "err", err, "next_backoff", backoff)
-		}
-
-		// Sleep with backoff, but wake immediately on context cancel.
-		select {
-		case <-ctx.Done():
-			return proto.NodeRegisterResp{}, ctx.Err()
-		case <-time.After(backoff):
-		}
-		if backoff < a.cfg.RegisterRetryMax {
-			backoff *= 2
-			if backoff > a.cfg.RegisterRetryMax {
-				backoff = a.cfg.RegisterRetryMax
-			}
-		}
-	}
+	return registerAgent(ctx, a, nc, delivery)
 }
 
 // loadStateBounded reads state.json. When the agent Home is on a hangable
@@ -1772,32 +1781,17 @@ func (a *Agent) boundedHomeRead(loadFn func() (*StateFile, error), why string) (
 }
 
 // buildLocalSnapshot collects the agent's view of "what is live right
-// now" for G.1 reconciliation. Procs come from a.procs (the live PTY
-// session map; non-PTY exec children are sync and not registered, so
-// after a restart they are missing — broker correctly treats those as
-// missed-exit). StartedAt + StartTimeTicks make up two thirds of the
+// now" for G.1 reconciliation. Procs come from the PTY table, the ordinary
+// exec ownership table, and the courier's retained exits. Historically only
+// PTYs were included, so reconnecting a live agent misclassified an ordinary
+// exec as a missed exit. A real process crash still loses its in-memory table.
+// StartedAt + StartTimeTicks make up two thirds of the
 // G.1 (boot_id, pid, start_time_ticks) triple; broker compares
 // against processes.start_time_ticks for PID-reuse defense. Ports
 // come from state.json (raw token → SHA256 hex matches port.HashToken
 // so the broker can join on token_hash).
 func (a *Agent) buildLocalSnapshot() ([]proto.LocalProcess, []proto.LocalPort) {
-	a.procsMu.Lock()
-	procs := make([]proto.LocalProcess, 0, len(a.procs))
-	for pid, rec := range a.procs {
-		procs = append(procs, proto.LocalProcess{
-			PID:            pid,
-			State:          "running",
-			StartedAt:      rec.startedAt,
-			StartTimeTicks: rec.startTimeTicks,
-		})
-	}
-	a.procsMu.Unlock()
-	// h1 C4: pending (undelivered) exits ride the snapshot as State:"exited"
-	// rows — the register round-trip is the courier's replay channel, so one
-	// reconnect settles every exit a broker outage dropped, with the REAL rc
-	// instead of G.1's -1. No pid appears twice: unregisterProc precedes the
-	// exit enqueue (see enqueueExit's documented gap).
-	procs = append(procs, a.courier.pendingExitSnapshot()...)
+	procs := localProcessSnapshot(a)
 
 	var ports []proto.LocalPort
 	// AN INSTANCE RUNNING UNDER A LEASE OWNS NOTHING IN state.json.
@@ -1909,6 +1903,15 @@ func (a *Agent) applyHomeDirectives(ctx context.Context, ha *proto.HomeAssignmen
 		return // adapter has no tunnel (in-process test) — nothing to rehome
 	}
 	for _, d := range ha.Directives {
+		// origin: hot-update S3 plan §4.0 / §4.1 (CC-4). Admission precedes
+		// publishing work to the asynchronous opener. A new worker owns it
+		// through retries and successor handoffs; the broker re-pushes skips.
+		release, admitted := a.gate.admit(gateExpose)
+		if !admitted {
+			a.cfg.Logger.Info("agent: skipping expose home directives during image switch")
+			return
+		}
+		invalidateMaintenanceForHome(a, d)
 		a.rehomeMu.Lock()
 		// Record the freshest directive for this port (a stale lower-epoch
 		// directive never overwrites a newer want). A >= compare keeps a SAME-epoch
@@ -1920,11 +1923,12 @@ func (a *Agent) applyHomeDirectives(ctx context.Context, ha *proto.HomeAssignmen
 		}
 		if a.rehomeRunning[d.PublicPort] {
 			a.rehomeMu.Unlock()
+			release()
 			continue // an existing loop will pick up the freshest want
 		}
 		a.rehomeRunning[d.PublicPort] = true
 		a.rehomeMu.Unlock()
-		go a.applyOneHome(ctx, applier, d.PublicPort)
+		go a.applyOneHome(ctx, applier, d.PublicPort, release)
 	}
 }
 
@@ -1937,7 +1941,9 @@ func (a *Agent) applyHomeDirectives(ctx context.Context, ha *proto.HomeAssignmen
 // elapses (catch_up_stalled — give up until the next reconnect; never collapse
 // to terminal). On success it persists the home addr+epoch (monotone). On exit
 // it clears the running flag under lock, re-checking that no newer want arrived.
-func (a *Agent) applyOneHome(ctx context.Context, applier homeApplier, port int) {
+// release owns the caller's expose admission until the entire retry/successor
+// chain finishes, so a cut cannot mistake an asynchronous dial for idle state.
+func (a *Agent) applyOneHome(ctx context.Context, applier homeApplier, port int, release func()) {
 	const (
 		base    = 500 * time.Millisecond
 		maxWait = 30 * time.Second
@@ -1972,7 +1978,11 @@ func (a *Agent) applyOneHome(ctx context.Context, applier homeApplier, port int)
 		}
 		a.rehomeMu.Unlock()
 		if restart {
-			go a.applyOneHome(restartCtx, applier, port)
+			// The successor continues already-admitted work. Releasing first
+			// would leave its pending dial invisible to the cut's census.
+			go a.applyOneHome(restartCtx, applier, port, release)
+		} else {
+			release()
 		}
 	}()
 	sleep := base
@@ -2136,31 +2146,21 @@ func (a *Agent) openHomeFromState(ctx context.Context, d proto.HomeDirective) (o
 	return openPortAbsent, nil // removed from state.json — nothing to open
 }
 
-// jitterDur returns a full-jitter sleep in (0, d] to de-synchronize a fleet
-// retrying after a shared home failover.
-func jitterDur(d time.Duration) time.Duration {
-	if d <= 0 {
-		return 0
-	}
-	return time.Duration(mrand.Int64N(int64(d)) + 1)
-}
+// origin: hot-update S8 internal review FIX-AGENTSLIM.
+func jitterDur(d time.Duration) time.Duration { return agentupgrade.JitterDuration(d) }
 
 // killOrphanProcess sends SIGTERM, waits 5s, then escalates to SIGKILL
-// if the session is still registered. Only reachable for PTY sessions
-// (those are the only ones tracked in a.procs); v1 has no path to kill
-// non-PTY exec children by their broker-assigned ULID after restart.
-// In practice DropProcesses on a fresh-start agent is empty (a.procs
-// is empty so we never claimed those pids), so this kill path is
-// exercised only when a.procs has entries the broker doesn't know
-// about — which can't happen in a single-broker deployment but is
-// defensible as a "agent connected to the wrong broker by accident".
+// if the task is still owned. Historically only the PTY table participated;
+// ordinary exec now appears in G.1 too, so the corresponding DropProcesses
+// action must use the same ownership union. Broker bundle rollback is one
+// real source of such orphans, including on a single-broker deployment.
 func (a *Agent) killOrphanProcess(ctx context.Context, pid string) {
-	rec, ok := a.lookupProc(pid)
-	if !ok {
+	err := signalManagedProcess(a, pid, syscall.SIGTERM)
+	if errors.Is(err, workload.ErrUnknown) || errors.Is(err, workload.ErrExited) {
 		return
 	}
 	a.cfg.Logger.Info("agent: kill orphan", "pid", pid)
-	if err := rec.sess.Signal(syscall.SIGTERM); err != nil {
+	if err != nil {
 		a.cfg.Logger.Warn("agent: kill orphan SIGTERM", "err", err, "pid", pid)
 	}
 	// Audit shard 01 F4: the SIGKILL escalation goroutine used to
@@ -2173,15 +2173,21 @@ func (a *Agent) killOrphanProcess(ctx context.Context, pid string) {
 		case <-ctx.Done():
 			return
 		case <-time.After(5 * time.Second):
-			if r, still := a.lookupProc(pid); still {
-				_ = r.sess.Signal(syscall.SIGKILL)
-			}
+			_ = signalManagedProcess(a, pid, syscall.SIGKILL)
 		}
 	}()
 }
 
 func (a *Agent) heartbeatLoop(ctx context.Context, nc *nats.Conn) error {
 	subject := proto.SubjNodeHeartbeat(a.cfg.SID, nidOf(a))
+	// Reconciliation after REGISTER consumes part of the broker's liveness
+	// window. Publish the actual ready state before starting the periodic
+	// clock; waiting one whole interval can mark this restored agent STALE.
+	// origin: hot-update S5 plan §9.2 / T48 / DRILL-RUN 75.W
+	reapProxyCorpseOnHeartbeat(a, nc)
+	if err := nc.Publish(subject, heartbeatPayload(a, time.Now())); err != nil {
+		a.cfg.Logger.Warn("agent: heartbeat publish", "err", err)
+	}
 	ticker := time.NewTicker(a.cfg.HeartbeatInterval)
 	defer ticker.Stop()
 	for {
@@ -2206,15 +2212,20 @@ func (a *Agent) heartbeatLoop(ctx context.Context, nc *nats.Conn) error {
 			// unready AND (0,0), neither early return holds, and the keyset push that rebuilds
 			// us finally goes out.
 			reapProxyCorpseOnHeartbeat(a, nc)
-			pgen, pepoch := a.proxyGenEpoch()
-			payload, _ := json.Marshal(proto.HeartbeatPayload{
-				Ts: t.UTC(), ProxyGeneration: pgen, ProxyEpoch: pepoch, ProxyBound: a.proxyBound(),
-			})
-			if err := nc.Publish(subject, payload); err != nil {
+			// Bound abandoned exec results on an idle node too (S1 §3.6): the
+			// sweep otherwise only runs when a new create arrives.
+			sweepProcessRuntime(a)
+			if err := nc.Publish(subject, heartbeatPayload(a, t)); err != nil {
 				a.cfg.Logger.Warn("agent: heartbeat publish", "err", err)
 			}
 		}
 	}
+}
+
+// origin: hot-update S8 internal review FIX-AGENTSLIM.
+func heartbeatPayload(a *Agent, at time.Time) []byte {
+	pgen, pepoch := a.proxyGenEpoch()
+	return agentupgradeport.HeartbeatPayload(at, pgen, pepoch, a.proxyBound())
 }
 
 // AgentPingInterval / AgentMaxPingsOut are the agent's NATS liveness probe: a PING every interval,
@@ -2289,7 +2300,12 @@ func (a *Agent) buildConnOptions() []nats.Option {
 			if a.sessionGen.Load() != gen {
 				return
 			}
-			a.stopRedialWatchdog() // a successful reconnect means we are NOT stuck
+			a.ptyHealthGeneration.Add(1)
+			// A successful reconnect means we are NOT stuck, and it ends the partition: both
+			// timers the disconnect handler below armed are disarmed HERE, on nats.go's
+			// serialized callback queue, BEFORE the single-flight — never in the pass goroutine,
+			// which a dropped reconnect never starts (h100 stale fail-closed countdown).
+			disarmPartitionTimers(a)
 			// audit xx-concurrency F4: single-flight — drop a reconnect that arrives while a
 			// prior onNATSReconnect is still running so a flapping link cannot fan out unbounded
 			// concurrent re-register goroutines. The in-flight pass already re-registers against
@@ -2303,61 +2319,22 @@ func (a *Agent) buildConnOptions() []nats.Option {
 		}),
 		// B1 fail-closed: arm the SS-teardown countdown on disconnect. C1 §D-1 L3: also arm the
 		// stuck-reconnect watchdog so a dead boot pool triggers a rebuild on the freshest roster.
-		nats.DisconnectErrHandler(func(_ *nats.Conn, _ error) {
+		nats.DisconnectErrHandler(func(_ *nats.Conn, err error) {
 			// AC-F2, same reasoning as the reconnect handler: a retired session's
 			// disconnect must not arm this session's countdown or watchdog.
 			if a.sessionGen.Load() != gen {
 				return
 			}
+			if err != nil {
+				a.cfg.Logger.Warn("agent: NATS disconnected", "error", err)
+			}
+			a.ptyHealthGeneration.Add(1)
 			a.armFailClosed()
 			a.armRedialWatchdog()
 		}),
 	}
 
-	if a.cfg.Identity == nil {
-		// Anonymous fallback: name with `/` separators is intentional
-		// — it does NOT match parseRole's `tether-agent:<sid>:<nid>`
-		// format, so a misconfigured prod broker (auth_callout ON,
-		// Identity nil) fails CONNECT immediately rather than landing
-		// on an unintended role.
-		opts = append(opts, nats.Name(fmt.Sprintf("tether-agent/%s/%s", a.cfg.SID, nidOf(a))))
-		return opts
-	}
-
-	id := a.cfg.Identity
-	seed := append([]byte(nil), id.Seed...)
-	sigCB := func(nonce []byte) ([]byte, error) {
-		kp, err := nkeys.FromSeed(seed)
-		if err != nil {
-			return nil, fmt.Errorf("agent: nkey from seed: %w", err)
-		}
-		defer kp.Wipe()
-		return kp.Sign(nonce)
-	}
-	opts = append(opts,
-		// The CONNECT name carries the ROUTING name: auth_callout mints
-		// PermissionsForAgent from exactly this string, so an instance running
-		// under a lease must present the lease name or its JWT would grant the
-		// basename's subjects instead of its own. The three-field grammar is
-		// unchanged — a fourth segment would fold into parseRole's SplitN and
-		// be rejected by ValidateNID on any older broker, turning a rolling
-		// upgrade into a hard auth denial.
-		nats.Name(cli.AgentName(a.cfg.SID, nidOf(a))),
-		nats.Nkey(id.PublicKey, sigCB),
-		// THE PRIVATE REPLY INBOX IS NOT SET HERE — see auth.InboxPrefixFor. The register
-		// reply carries the tunnel token and every subscriber PSK, so it must not land on
-		// a subject every other connection on the account may subscribe to
-		// (origin: prerelease audit proto-auth-acl/L1-F1) — but the inbox now lives under
-		// its own top-level root, which a PRE-CUTOVER broker grants no reach to at all.
-		// So the options are added at the DIAL, by natsinbox.Connect, which probes once
-		// and falls back to the shared space when the broker is older than this agent.
-		// That is the {old broker × new agent} quadrant, and on a real fleet it is what a
-		// broker rollback looks like from six already-upgraded machines.
-	)
-	if a.cfg.PIN != "" {
-		opts = append(opts, nats.Token(a.cfg.PIN))
-	}
-	return opts
+	return agentupgrade.AppendIdentityOptions(opts, a.cfg.SID, nidOf(a), a.cfg.Identity, a.cfg.PIN)
 }
 
 // dialAgentNATS is the agent's one dial, adding the private reply inbox and falling
@@ -2386,8 +2363,8 @@ func dialAgentNATS(a *Agent, dial string, opts []nats.Option) (*nats.Conn, error
 		// CONNECT marker are one unit, and the pairing gate is right to refuse them
 		// separately even here. There is no probe and no fallback on this branch — an
 		// anonymous connection could not pass an auth_callout, so no grant can be refused.
-		return nats.Connect(dial,
-			append(opts, natsinbox.InboxConnectOptions("anon:"+a.cfg.SID+"/"+nidOf(a))...)...)
+		nc, err := nats.Connect(dial, append(opts, natsinbox.InboxConnectOptions("anon:"+a.cfg.SID+"/"+nidOf(a))...)...)
+		return finishAgentInfraDial(nc, err)
 	}
 	nc, sharedInbox, err := natsinbox.Connect(dial, a.cfg.Identity.PublicKey, opts)
 	if err != nil {
@@ -2400,90 +2377,13 @@ func dialAgentNATS(a *Agent, dial string, opts []nats.Option) (*nats.Conn, error
 			"are readable by any other connection on this deployment until then",
 			"inbox_root", auth.InboxRoot)
 	}
-	return nc, nil
+	return finishAgentInfraDial(nc, nil)
 }
 
-// isAuthFailure detects nats-server auth-rejection messages. These come
-// across as plain `error` strings (not typed) — match on the substrings
-// nats-server emits for the relevant cases (auth_callout deny, expired
-// JWT, account mismatch). We deliberately keep the substring set small;
-// anything else is treated as transient and retried.
-func isAuthFailure(err error) bool {
-	if err == nil {
-		return false
-	}
-	msg := err.Error()
-	for _, needle := range []string{
-		"Authorization Violation",
-		"authorization violation",
-		"nats: Authorization",
-	} {
-		if strings.Contains(msg, needle) {
-			return true
-		}
-	}
-	return false
-}
+func isAuthFailure(err error) bool { return agentupgrade.IsAuthFailure(err) }
 
-// attributeDialFailure re-dials each URL of a MULTI-URL pool separately, once, to find
-// out whether any of them actually refused the credential.
-//
-// It returns the auth error when one is found, and nil otherwise (leaving the caller's
-// original error in place). nats.Connect's pooled error is the last one it happened to
-// see, so a genuine authorization violation on one server is routinely reported as
-// ErrNoServers — and every decision downstream that asks "was this an auth failure"
-// then answers no.
-//
-// ONLY on an already-failed pooled connect, and only when there is more than one URL:
-// the healthy path never reaches it, and a single-URL pool has nothing to disambiguate.
-//
-// THE GATE IS "not already an auth error", NOT "is ErrNoServers" — origin:
-// prerelease audit round 2, AC-1. The first version keyed on ErrNoServers and
-// carried a `// already attributed` comment that was simply false for every
-// other error. nats.go only rewrites the pooled error to ErrNoServers when the
-// last dial failed with "connection refused" (nats.go@v1.52.0 connect()); the
-// ordinary down-broker outcome — host unreachable, firewall DROP, partition —
-// is `i/o timeout`, and on that the function returned nil on its first line and
-// the denial stayed hidden exactly as it was before AC-F3. It was also
-// order-dependent: the same fleet attributed correctly or not depending on
-// where in the pool the denying broker happened to sit.
-//
-// `opts` must be the PROBE option set (probeConnOptions), never the live one.
 func attributeDialFailure(dial string, poolErr error, opts []nats.Option, log *slog.Logger) error {
-	if isAuthFailure(poolErr) {
-		return nil // already attributed: the pooled error IS the denial
-	}
-	urls := strings.Split(dial, ",")
-	if len(urls) < 2 {
-		return nil
-	}
-	// BOUNDED, and it says so when it truncates. Each probe that reaches a live
-	// broker costs a full auth_callout decision — an argon2id verify against the
-	// broker's process-wide PIN budget — so an agent flapping against a large
-	// roster must not turn one failed connect into an unbounded fan-out of them.
-	if len(urls) > maxAttributionProbes {
-		log.Warn("agent: attributing a pooled dial failure over only the first brokers of a larger pool",
-			"probed", maxAttributionProbes, "pool", len(urls),
-			"why", "each probe costs the broker a full auth decision")
-		urls = urls[:maxAttributionProbes]
-	}
-	for _, u := range urls {
-		u = strings.TrimSpace(u)
-		if u == "" {
-			continue
-		}
-		nc, err := nats.Connect(u, opts...)
-		if err == nil {
-			// It works in isolation; nothing to attribute. Close it rather than
-			// returning it — the caller's retry owns connection construction.
-			nc.Close()
-			continue
-		}
-		if isAuthFailure(err) {
-			return err
-		}
-	}
-	return nil
+	return agentupgrade.AttributeDialFailure(dial, poolErr, opts, log, maxAttributionProbes)
 }
 
 // leaseDegradeAfterDenials is how many consecutive auth denials an
@@ -2507,81 +2407,112 @@ const maxAttributionProbes = 4
 // caller already knows about.
 const attributeProbeTimeout = 3 * time.Second
 
-// probeConnOptions derives a THROWAWAY option set from a live one.
-// origin: prerelease audit round 2, AC-5.
-//
-// nats.Option values are applied in order and later ones overwrite earlier
-// ones, so appending is how a field is un-set. Four things must go:
-//
-//   - the lifecycle callbacks, because they close over this session's
-//     generation and would run armFailClosed / armRedialWatchdog on behalf of a
-//     connection nobody will ever use;
-//   - reconnection, because a probe that succeeds is closed immediately and a
-//     probe that fails must report that, not retry into the background;
-//   - RetryOnFailedConnect, for the same reason — it turns "refused" into a
-//     connection object that reports its error later, which is precisely the
-//     signal this probe exists to read synchronously;
-//   - the connect timeout is shortened, since one failed pooled connect now
-//     costs several of these in series.
-//
-// The identity options are deliberately KEPT. An attribution probe that does
-// not present the credential proves nothing about whether the credential is
-// refused, which is the only question being asked.
 func probeConnOptions(live []nats.Option) []nats.Option {
-	o := append([]nats.Option(nil), live...)
-	return append(o,
-		nats.ReconnectHandler(nil),
-		nats.DisconnectErrHandler(nil),
-		nats.ClosedHandler(nil),
-		nats.DiscoveredServersHandler(nil),
-		nats.NoReconnect(),
-		nats.RetryOnFailedConnect(false),
-		nats.Timeout(attributeProbeTimeout),
-	)
+	return agentupgrade.ProbeConnOptions(live, attributeProbeTimeout)
 }
 
-// readBootID returns the Linux per-boot UUID, or "" on non-Linux / error.
-// Used in P8's reconciliation (architecture G.1) for PID-reuse detection;
-// recorded already in P2 so the column is never NULL once populated.
-func readBootID() string {
-	b, err := os.ReadFile("/proc/sys/kernel/random/boot_id")
+func readBootID() string { return agentupgrade.ReadBootID() }
+
+func readStartTimeTicks(osPID int) (int64, error) { return agentupgrade.ReadStartTimeTicks(osPID) }
+
+const agentTransferMaxBytes = int64(proto.XferMaxBytes)
+
+const pushCommitCacheMaxEntries = filetransfer.LegacyPrepareCapacity
+
+// origin: hot-update S8 plan §6.1 / §11.2 P14 P17; S8 FIX-AGENTWIRE. The
+// carried adjunct is verified before Restore takes a descriptor; the agent
+// then supplies its own runtime port and, for that cut, its registry.
+func initAgentUpgrade(a *Agent, img *agentboot.Image) error {
+	// origin: S8 FIX-DESCRIBE (P19 request R3). The journal owner is this
+	// lineage; a carried cut cannot be verified without that journal.
+	opened, imported, err := openAndImportUpgrade(a, img)
+	bootTransactionPorts.Store(opened)
 	if err != nil {
-		return ""
+		return &ImageRestoreError{Summary: img.Summary(), Err: err}
 	}
-	return strings.TrimSpace(string(b))
+	ports, endpoint, incarnation, err := agentupgrade.BindRuntime(imported, a.cfg.SID, a.cfg.NID, uint32(os.Geteuid()),
+		func(d *UpgradeDependencies) agentupgradeport.Host { return agentRuntimeHost(a, d) })
+	if err != nil {
+		return err
+	}
+	a.cfg.Upgrade, a.upgradeEndpoint = ports, endpoint
+	if incarnation != "" {
+		a.incarnation.Store(&incarnation)
+	}
+	return nil
 }
 
-// readStartTimeTicks returns /proc/<pid>/stat field 22 (the kernel-
-// stamped boot tick when this process started), the third leg of the
-// architecture G.1 PID-reuse triple. Returns 0 on any failure
-// (non-Linux, /proc not mounted, pid disappeared between fork and
-// read, etc.) — the broker treats 0 as "agent could not capture",
-// which falls back to the no-triple-check accept path. Parsing the
-// stat line correctly requires honoring the comm (bytes 2..end-of-")")
-// because comm can contain spaces or close-parens; we slice from the
-// LAST ')' so a process named "weird ) name" parses cleanly.
-func readStartTimeTicks(osPID int) (int64, error) {
-	if osPID <= 0 {
-		return 0, fmt.Errorf("agent: invalid os pid %d", osPID)
+func dispatchAgentUpgrade(a *Agent, nc *nats.Conn, msg *nats.Msg) bool {
+	if msg.Subject != proto.SubjCmdForwarded(a.cfg.SID, nidOf(a), "upgrade-tx") {
+		return false
 	}
-	b, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", osPID))
+	if msg.Reply == "" {
+		return true
+	}
+	a.proxyDrainMu.Lock()
+	if a.proxyDraining || a.upgradeStopping {
+		a.proxyDrainMu.Unlock()
+		return true
+	}
+	a.upgradeRequestWG.Add(1)
+	a.proxyDrainMu.Unlock()
+	ports, endpoint, ctx := a.cfg.Upgrade, a.upgradeEndpoint, a.loadRunCtx()
+	go func() { defer a.upgradeRequestWG.Done(); agentupgrade.ReplyWire(ctx, ports, endpoint, nc, msg) }()
+	return true
+}
+
+func agentMaintenanceDigest(value any) string {
+	body, _ := json.Marshal(value) // frozen scalar structs cannot fail JSON encoding
+	return sha256OfBytes(body)
+}
+
+// finishAgentInfraDial commits only transport admission; normal REGISTER is
+// still performed by session, and live data owners are never canceled here.
+// origin: hot-update S9 plan §4.5 / T50
+func finishAgentInfraDial(nc *nats.Conn, err error) (*nats.Conn, error) {
+	d, clockErr := controlbudget.After(5 * time.Second)
+	err = errors.Join(err, clockErr)
+	if err == nil {
+		err = infraattach.Finish(nc, d)
+	}
+	if err != nil && nc != nil {
+		nc.Close()
+		return nil, err
+	}
+	return nc, err
+}
+
+// Retirement ends the replaceable carrier, never the agent's task/flow roots.
+// The raw owner joins before any subscription cleanup takes nc.mu.
+// origin: hot-update S9 plan §4.5 / T50 / M25
+func finalizeAgentInfraConn(a *Agent, nc *nats.Conn, cancel context.CancelFunc, cleanups []func()) bool {
+	client := infraattach.For(nc)
+	if client == nil {
+		return false
+	}
+	if cancel != nil {
+		cancel()
+	}
+	d, err := controlbudget.After(5 * time.Second)
+	if err == nil {
+		err = client.Close(d)
+	}
 	if err != nil {
-		return 0, err
+		a.cfg.Logger.Error("agent: infra transport retirement incomplete", "err", err)
 	}
-	line := string(b)
-	rp := strings.LastIndexByte(line, ')')
-	if rp < 0 || rp+1 >= len(line) {
-		return 0, fmt.Errorf("agent: malformed /proc/%d/stat", osPID)
+	for _, cleanup := range cleanups {
+		cleanup()
 	}
-	rest := strings.Fields(line[rp+1:])
-	// rest[0] is field 3 (state); field 22 is rest[19].
-	if len(rest) < 20 {
-		return 0, fmt.Errorf("agent: /proc/%d/stat too short (%d fields after comm)",
-			osPID, len(rest))
-	}
-	ticks, err := strconv.ParseInt(rest[19], 10, 64)
-	if err != nil {
-		return 0, fmt.Errorf("agent: parse start_time_ticks: %w", err)
-	}
-	return ticks, nil
+	return true
+}
+
+func intentName(i teardownIntent) string {
+	return infratransport.RecoveryIntentName(i == teardownShutdown)
+}
+
+// A retired NC can retain a sealed cohort duty. Consult the domain owner too,
+// so replacing ncBox cannot hide live S9 state from the image scanner's roots.
+// origin: hot-update S9 plan §7.3 / T50
+func agentInfraPending(a *Agent) bool {
+	return infraattach.For(a.ncBox.Load()).Pending() || (a.cfg.Infra != nil && a.cfg.Infra.Busy != nil && a.cfg.Infra.Busy())
 }

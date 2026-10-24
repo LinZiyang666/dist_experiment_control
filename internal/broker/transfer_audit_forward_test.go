@@ -3,6 +3,7 @@ package broker
 import (
 	"errors"
 	"runtime"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -21,6 +22,8 @@ func d8AuditRec(kind string) schema.AuditTransfer {
 func TestD8TransferAuditForwardNonBlocking(t *testing.T) {
 	b := &Broker{cfg: Config{Logger: silentLogger()}}
 	release := make(chan struct{})
+	releaseForward := sync.OnceFunc(func() { close(release) })
+	t.Cleanup(releaseForward)
 	b.attachTransferAuditSinkWith(func([]byte) error {
 		<-release // block the forward
 		return nil
@@ -30,7 +33,7 @@ func TestD8TransferAuditForwardNonBlocking(t *testing.T) {
 	if elapsed := time.Since(start); elapsed > 80*time.Millisecond {
 		t.Fatalf("emitTransferAudit blocked %v on the forward — must be async", elapsed)
 	}
-	close(release)
+	releaseForward()
 	b.WaitTransferAudit()
 }
 
@@ -70,16 +73,38 @@ func TestD8TransferAuditForwardRetry(t *testing.T) {
 // TestD8TransferAuditForwardLeakGate (review M4 / CLAUDE.md §5): the async forward goroutine
 // must drain — after WaitTransferAudit the goroutine count returns to baseline.
 func TestD8TransferAuditForwardLeakGate(t *testing.T) {
-	b := &Broker{cfg: Config{Logger: silentLogger()}}
-	b.attachTransferAuditSinkWith(func([]byte) error { return nil })
+	// origin: hot-update S7 plan §11.3 / P31; exercise construction,
+	// transient retry and joined teardown at least five times on both leak axes.
 	before := runtime.NumGoroutine()
-	for i := 0; i < 20; i++ {
-		b.emitTransferAudit(d8AuditRec("start"))
+	fdBefore := testharness.FDCount()
+	for round := 0; round < 5; round++ {
+		exerciseTransferAuditForward(t)
 	}
-	b.WaitTransferAudit()
+	// The original shared-gate migration note follows. S7 expands each twenty-send exercise
+	// into five complete owner lifetimes and adds the independent descriptor assertion.
 	// The shared leak gate (internal/testharness/leakgate.go) replaces the inline poll this test used
 	// to carry: same tolerance derivation, one implementation, and visible to
 	// test/determinism/leak_assert_shape_test.go — which now checks that the 20-round loop above
 	// really exercises the subject. origin: docs/reviews/test-system-overhaul-plan.md B5 (D3).
 	testharness.AssertNoGoroutineLeak(t, "transfer-audit forward", before)
+	testharness.AssertNoFDLeak(t, "transfer-audit forward", fdBefore, 0)
+}
+
+func exerciseTransferAuditForward(t *testing.T) {
+	t.Helper()
+	b := &Broker{cfg: Config{Logger: silentLogger()}}
+	var calls atomic.Int32
+	b.attachTransferAuditSinkWith(func([]byte) error {
+		if calls.Add(1) == 1 {
+			return cluster.ErrForwardNotLeader
+		}
+		return nil
+	})
+	for i := 0; i < 20; i++ {
+		b.emitTransferAudit(d8AuditRec("start"))
+	}
+	b.WaitTransferAudit()
+	if got := calls.Load(); got != 21 {
+		t.Fatalf("joined audit forward attempts=%d, want 20 plus one retry", got)
+	}
 }

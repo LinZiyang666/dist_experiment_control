@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/LinZiyang666/tether/internal/brokerimage"
 	"github.com/LinZiyang666/tether/internal/cluster"
 	"github.com/LinZiyang666/tether/internal/clusteroffline"
 	"github.com/LinZiyang666/tether/internal/storage"
@@ -51,6 +52,13 @@ func clusterModeEnabled(cfg Config) (bool, error) {
 	if cfg.ClusterDataDir == "" {
 		return false, nil
 	}
+	// A validated restored bundle owns the mode/store checks at ACTIVE. Do not
+	// open the live Bolt file during dormant construction before adopting its lock.
+	// origin: hot-update S6 plan §4.1 / T01
+	if brokerimage.RestoredStore(cfg.ImageRun) {
+		return true, nil
+	}
+
 	raftExists, err := raftStateOnDisk(cfg.ClusterDataDir)
 	if err != nil {
 		return false, fmt.Errorf("broker: probe raft state under %q: %w", cfg.ClusterDataDir, err)
@@ -192,16 +200,11 @@ func (b *Broker) buildClusterRuntime() (*clusterRuntime, error) {
 	if fatal != nil {
 		return nil, fmt.Errorf("broker: secrets preflight: %w", fatal)
 	}
-	node, err := cluster.NewProduction(cluster.ProductionConfig{
-		Logger:       b.cfg.Logger, // batch-A review M1: without this the raft log bridge is a no-op
-		LocalID:      selfID,
-		DataDir:      b.cfg.ClusterDataDir,
-		DBPath:       b.cfg.DBPath,
-		RaftBind:     b.cfg.ClusterRaftAddr,
-		CACertPath:   filepath.Join(sec, secretClusterCA),
-		LeafCertPath: filepath.Join(sec, secretRouteCert),
-		LeafKeyPath:  filepath.Join(sec, secretRouteKey),
-	})
+	// The same production config supplies current-store callbacks at cold startup
+	// and hot reopen. Without ImageStamp, the running Node cannot export a seal.
+	// Logger remains bound for the raft bridge (batch-A review M1).
+	// origin: hot-update S6 plan §3.2 / rv-cluster-2
+	node, err := cluster.NewProduction(brokerProductionImageConfig(b, selfID))
 	if err != nil {
 		return nil, err
 	}

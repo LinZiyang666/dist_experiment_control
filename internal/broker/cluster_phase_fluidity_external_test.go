@@ -17,7 +17,7 @@ import (
 func TestExternalFailedNonvoterJoinCanBeRemovedOnline(t *testing.T) {
 	n, _ := d7SingleNode(t, "external-leader")
 	admin := NewClusterAdmin(n, nil)
-	admin.caughtUpFn = func(string, uint64) (bool, error) { return false, nil }
+	admin.CaughtUpFn = func(string, uint64) (bool, error) { return false, nil }
 
 	bundle, _ := makeJoinBundle(t, "unreachable-joiner", "10.0.0.99:7400", "external-nonce")
 	opID, err := admin.StartJoinOperation(bundle)
@@ -25,14 +25,14 @@ func TestExternalFailedNonvoterJoinCanBeRemovedOnline(t *testing.T) {
 		t.Fatalf("StartJoinOperation: %v", err)
 	}
 	for i := 0; i < 8; i++ {
-		admin.driveInFlightOperations()
+		admin.DriveInFlightOperations()
 	}
 
-	sub, err := admin.readSubstrate("unreachable-joiner")
+	sub, err := admin.ReadSubstrate("unreachable-joiner")
 	if err != nil {
 		t.Fatalf("readSubstrate: %v", err)
 	}
-	if !sub.inRaft || sub.isVoter || sub.phase != phaseCatchingUp {
+	if !sub.InRaft || sub.IsVoter || sub.Phase != phaseCatchingUp {
 		t.Fatalf("setup did not reach staged nonvoter/CATCHING_UP: %+v", sub)
 	}
 	if err := admin.AbortOp(opID); err != nil {
@@ -52,7 +52,7 @@ func TestExternalFailedNonvoterJoinCanBeRemovedOnline(t *testing.T) {
 func TestExternalAbortedJoinCannotBePromotedByStaleControllerTick(t *testing.T) {
 	n, _ := d7SingleNode(t, "external-stale-leader")
 	admin := NewClusterAdmin(n, nil)
-	admin.caughtUpFn = func(string, uint64) (bool, error) { return false, nil }
+	admin.CaughtUpFn = func(string, uint64) (bool, error) { return false, nil }
 
 	bundle, _ := makeJoinBundle(t, "stale-joiner", "10.0.0.98:7400", "external-stale-nonce")
 	opID, err := admin.StartJoinOperation(bundle)
@@ -60,7 +60,7 @@ func TestExternalAbortedJoinCannotBePromotedByStaleControllerTick(t *testing.T) 
 		t.Fatalf("StartJoinOperation: %v", err)
 	}
 	for i := 0; i < 8; i++ {
-		admin.driveInFlightOperations()
+		admin.DriveInFlightOperations()
 	}
 	stale, err := cluster.OperationByID(n.RODB(), opID)
 	if err != nil || stale == nil || stale.Terminal {
@@ -70,13 +70,13 @@ func TestExternalAbortedJoinCannotBePromotedByStaleControllerTick(t *testing.T) 
 		t.Fatalf("AbortOp: %v", err)
 	}
 
-	admin.caughtUpFn = func(string, uint64) (bool, error) { return true, nil }
-	admin.driveOne(stale) // deterministic simulation of the tick that read just before AbortOp.
-	sub, err := admin.readSubstrate("stale-joiner")
+	admin.CaughtUpFn = func(string, uint64) (bool, error) { return true, nil }
+	admin.DriveOne(stale) // deterministic simulation of the tick that read just before AbortOp.
+	sub, err := admin.ReadSubstrate("stale-joiner")
 	if err != nil {
 		t.Fatalf("readSubstrate: %v", err)
 	}
-	if sub.isVoter {
+	if sub.IsVoter {
 		t.Fatalf("a stale controller tick promoted an ABORTED join to voter: %+v", sub)
 	}
 }
@@ -86,6 +86,10 @@ func TestExternalAbortedJoinCannotBePromotedByStaleControllerTick(t *testing.T) 
 // operator can still abort while a retire tick is inside a readiness probe. No irreversible retire
 // side effect (phase->RETIRING, RemoveServer, roster delete) may run after that abort commits.
 func TestExternalAbortDuringRetireTickCannotRemoveServer(t *testing.T) {
+	// origin: hot-update S10 plan §11.1 / TEST-BUDGET
+	if runIsolatedBrokerTest(t) {
+		return
+	}
 	n, _ := d7SingleNode(t, "external-retire-leader")
 	admin := NewClusterAdmin(n, nil)
 	target := "retire-race-target"
@@ -96,7 +100,7 @@ func TestExternalAbortDuringRetireTickCannotRemoveServer(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("seed target roster: %v", err)
 	}
-	if err := admin.setPhase(target, phaseDraining, []string{"JOIN_VERIFIED_PENDING_VOTER"}, ""); err != nil {
+	if err := admin.SetPhase(target, phaseDraining, []string{"JOIN_VERIFIED_PENDING_VOTER"}, ""); err != nil {
 		t.Fatalf("seed target DRAINING phase: %v", err)
 	}
 	if err := n.AddNonvoter(target, "10.0.0.88:7400"); err != nil {
@@ -118,14 +122,14 @@ func TestExternalAbortDuringRetireTickCannotRemoveServer(t *testing.T) {
 	if err != nil || op == nil || op.Terminal {
 		t.Fatalf("capture retire op: op=%+v err=%v", op, err)
 	}
-	admin.streamsReadyFn = func(string) (bool, error) {
+	admin.StreamsReadyFn = func(string) (bool, error) {
 		if err := admin.AbortOp(opID); err != nil {
 			t.Fatalf("AbortOp from readiness hook: %v", err)
 		}
 		return true, nil
 	}
 
-	admin.driveOne(op)
+	admin.DriveOne(op)
 	got, err := cluster.OperationByID(n.RODB(), opID)
 	if err != nil {
 		t.Fatalf("read op after drive: %v", err)
@@ -133,11 +137,11 @@ func TestExternalAbortDuringRetireTickCannotRemoveServer(t *testing.T) {
 	if got == nil || got.OpState != cluster.OpStateAborted || !got.Terminal {
 		t.Fatalf("abort did not remain terminal after retire tick: %+v", got)
 	}
-	sub, err := admin.readSubstrate(target)
+	sub, err := admin.ReadSubstrate(target)
 	if err != nil {
 		t.Fatalf("read substrate after aborted retire tick: %v", err)
 	}
-	if !sub.inRaft || sub.phase != phaseDraining {
+	if !sub.InRaft || sub.Phase != phaseDraining {
 		t.Fatalf("retire side effects ran after AbortOp committed; substrate=%+v", sub)
 	}
 }

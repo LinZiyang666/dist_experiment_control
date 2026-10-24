@@ -302,6 +302,10 @@ func TestRotateCertOnFollowerGivesSelfOnlyGuidance(t *testing.T) {
 // redirect. This proves the #56 bypass is SPECIFIC to the self-only verb and did not disable the
 // generic gate for every verb (which would silently break every other command's leader-redirect UX).
 func TestGenericMutatingVerbStillRedirectsOnFollower(t *testing.T) {
+	// origin: hot-update S10 plan §11.1 / TEST-BUDGET
+	if runIsolatedBrokerTest(t) {
+		return
+	}
 	fb, followerID, _ := rotate2NodeFollower(t)
 
 	// The state under test is "follower, and the leader is known". Two transients are the product
@@ -330,6 +334,10 @@ func TestGenericMutatingVerbStillRedirectsOnFollower(t *testing.T) {
 // wording at the unit level (no raft needed for the wrong-host case): neither may say "re-run on the
 // leader host", and both must point at making the TARGET itself the leader.
 func TestRotateTunnelCertGuidanceNeverPointsAtLeaderHost(t *testing.T) {
+	// origin: hot-update S10 plan §11.1 / TEST-BUDGET
+	if runIsolatedBrokerTest(t) {
+		return
+	}
 	// Wrong-host: a single-node LEADER asked to rotate a DIFFERENT node's cert.
 	n, addr := d7SingleNode(t, "single-1")
 	admin := NewClusterAdmin(n, nil)

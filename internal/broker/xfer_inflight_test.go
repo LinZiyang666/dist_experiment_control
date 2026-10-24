@@ -1,3 +1,4 @@
+// origin: hot-update S7 plan §5.1 / §11.4 / P31; use the real leaf and locked record snapshots.
 package broker
 
 import (
@@ -14,17 +15,18 @@ import (
 	"github.com/LinZiyang666/tether/internal/schema"
 	"github.com/LinZiyang666/tether/internal/testharness"
 	"github.com/LinZiyang666/tether/internal/xferaudit"
+	"github.com/LinZiyang666/tether/internal/xfertrack"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 )
 
 // strandedEntry is a data-bearing tier-B transfer whose home crashed > timeout+slack ago.
-func strandedEntry(now time.Time) *transferEntry {
-	return &transferEntry{
-		transferID: "tid-stranded", sid: "sess", nid: "node1", actor: "AC", actorFP: "fp",
-		verb: "pull", tier: "b", bucket: "xfer-sess", path: "/tmp/f",
-		startedAt: now.Add(-(transferTimeoutTierB + xferStrandedSlack + time.Minute)),
-	}
+func strandedEntry(now time.Time) *xfertrack.LegacyEntry {
+	return xfertrack.NewLegacyEntry(xfertrack.LegacyRecord{
+		TransferID: "tid-stranded", SID: "sess", NID: "node1", Actor: "AC", ActorFP: "fp",
+		Verb: "pull", Tier: "b", Bucket: "xfer-sess", Path: "/tmp/f",
+		StartedAt: now.Add(-(transferTimeoutTierB + xferStrandedSlack + time.Minute)),
+	})
 }
 
 // TestXferInflightFinalizeOnRecovery is the #57 fix pin: a durable in-flight ledger lets a restarted home
@@ -34,7 +36,7 @@ func strandedEntry(now time.Time) *transferEntry {
 func TestXferInflightFinalizeOnRecovery(t *testing.T) {
 	dir := t.TempDir()
 	now := time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC)
-	b := &Broker{transfers: newTransferTracker()}
+	b := &Broker{transfers: xfertrack.NewLegacyTracker()}
 	var committed []schema.AuditTransfer
 	b.cfg = Config{ClusterDataDir: dir, Logger: silentLogger(), Now: func() time.Time { return now }}
 	// M1: the finalizer commits via the SYNCHRONOUS forward and deletes the ledger only on success.
@@ -48,10 +50,10 @@ func TestXferInflightFinalizeOnRecovery(t *testing.T) {
 	}
 
 	b.writeXferInflight(strandedEntry(now))
-	b.writeXferInflight(&transferEntry{transferID: "tid-fresh", sid: "sess", nid: "node1", verb: "push", tier: "a", startedAt: now})
-	live := &transferEntry{transferID: "tid-live", sid: "sess", nid: "node1", verb: "pull", tier: "b", startedAt: now.Add(-time.Hour)}
+	b.writeXferInflight(xfertrack.NewLegacyEntry(xfertrack.LegacyRecord{TransferID: "tid-fresh", SID: "sess", NID: "node1", Verb: "push", Tier: "a", StartedAt: now}))
+	live := xfertrack.NewLegacyEntry(xfertrack.LegacyRecord{TransferID: "tid-live", SID: "sess", NID: "node1", Verb: "pull", Tier: "b", StartedAt: now.Add(-time.Hour)})
 	b.writeXferInflight(live)
-	if code := b.transfers.put(live); code != "" {
+	if code := putLegacyTransfer(b.transfers, live); code != "" {
 		t.Fatalf("put live: %s", code)
 	}
 
@@ -70,7 +72,7 @@ func TestXferInflightFinalizeOnRecovery(t *testing.T) {
 		t.Fatalf("wrong synthetic terminal: %+v", rec)
 	}
 	stranded := strandedEntry(now)
-	if wantTs := stranded.startedAt.Add(transferTimeoutTierB); !rec.Ts.Equal(wantTs) {
+	if wantTs := b.transfers.Record(stranded).StartedAt.Add(transferTimeoutTierB); !rec.Ts.Equal(wantTs) {
 		t.Fatalf("Ts must be deterministic startedAt+timeout, got %v want %v", rec.Ts, wantTs)
 	}
 	inflight := filepath.Join(dir, "xfer-inflight")
@@ -100,7 +102,7 @@ func TestXferInflightFinalizeOnRecovery(t *testing.T) {
 func TestXferInflightFinalizeRetainsLedgerWhenUncommittable(t *testing.T) {
 	dir := t.TempDir()
 	now := time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC)
-	b := &Broker{transfers: newTransferTracker()}
+	b := &Broker{transfers: xfertrack.NewLegacyTracker()}
 	b.cfg = Config{ClusterDataDir: dir, Logger: silentLogger(), Now: func() time.Time { return now }}
 	b.writeXferInflight(strandedEntry(now))
 	ledger := filepath.Join(dir, "xfer-inflight", xferInflightFilename("tid-stranded"))
@@ -159,7 +161,7 @@ func TestXferInflightFinalizeRetainsLedgerWhenUncommittable(t *testing.T) {
 // remain covered only end-to-end (recorded residual).
 func TestXferInflightTerminalDropsLedger(t *testing.T) {
 	dir := t.TempDir()
-	b := &Broker{transfers: newTransferTracker()}
+	b := &Broker{transfers: xfertrack.NewLegacyTracker()}
 	b.cfg = Config{ClusterDataDir: dir, Logger: silentLogger(), Now: time.Now}
 	// EXTERNAL REVIEW F1: this pin previously used a no-op sink, which made "emitted" indistinguishable
 	// from "committed" and therefore FROZE THE WRONG ORDER as green — the reviewer's counter-example
@@ -171,8 +173,8 @@ func TestXferInflightTerminalDropsLedger(t *testing.T) {
 		}
 	}
 
-	e := &transferEntry{transferID: "tid-term", sid: "sess", nid: "n1", verb: "push", tier: "b", startedAt: time.Now()}
-	if code := b.transfers.put(e); code != "" {
+	e := xfertrack.NewLegacyEntry(xfertrack.LegacyRecord{TransferID: "tid-term", SID: "sess", NID: "n1", Verb: "push", Tier: "b", StartedAt: time.Now()})
+	if code := putLegacyTransfer(b.transfers, e); code != "" {
 		t.Fatalf("put: %s", code)
 	}
 	b.writeXferInflight(e)
@@ -192,8 +194,8 @@ func TestXferInflightTerminalDropsLedger(t *testing.T) {
 	// The OTHER half, which this pin used to miss entirely (external review F1): a sink that never
 	// commits must leave the ledger ALIVE, because the recovery finalizer is the only thing that can
 	// still write a terminal for that transfer.
-	e2 := &transferEntry{transferID: "tid-uncommitted", sid: "sess", nid: "n1", verb: "push", tier: "b", startedAt: time.Now()}
-	if code := b.transfers.put(e2); code != "" {
+	e2 := xfertrack.NewLegacyEntry(xfertrack.LegacyRecord{TransferID: "tid-uncommitted", SID: "sess", NID: "n1", Verb: "push", Tier: "b", StartedAt: time.Now()})
+	if code := putLegacyTransfer(b.transfers, e2); code != "" {
 		t.Fatalf("put: %s", code)
 	}
 	b.writeXferInflight(e2)
@@ -203,7 +205,7 @@ func TestXferInflightTerminalDropsLedger(t *testing.T) {
 		t.Fatal("when the audit forward never commits, the ledger MUST survive so the recovery finalizer " +
 			"can still synthesize a terminal — deleting it here is the #57 dangling-start shape")
 	}
-	if b.transfers.get("tid-term") != nil {
+	if b.transfers.Get("tid-term") != nil {
 		t.Fatal("cleanupEntry must also remove the tracker entry (pre-existing contract)")
 	}
 }
@@ -225,12 +227,12 @@ func TestXferInflightTerminalDropsLedger(t *testing.T) {
 // reader the opposite of what production does. That is worse than no test: it is a
 // confident wrong answer sitting next to the code.
 func TestXferInflightNoLedgerWithoutAnyDurableRoot(t *testing.T) {
-	b := &Broker{transfers: newTransferTracker()}
+	b := &Broker{transfers: xfertrack.NewLegacyTracker()}
 	b.cfg = Config{Logger: silentLogger(), Now: time.Now} // no ClusterDataDir, no DBPath
 	if d := b.xferInflightDir(); d != "" {
 		t.Fatalf("nothing durable to anchor a ledger to ⇒ no ledger dir, got %q", d)
 	}
-	b.writeXferInflight(&transferEntry{transferID: "x", sid: "s", tier: "b", startedAt: time.Now()})
+	b.writeXferInflight(xfertrack.NewLegacyEntry(xfertrack.LegacyRecord{TransferID: "x", SID: "s", Tier: "b", StartedAt: time.Now()}))
 	n, err := b.finalizeStrandedXfers(context.Background())
 	if err != nil || n != 0 {
 		t.Fatalf("no ledger root: no ledger, no finalize (n=%d err=%v)", n, err)
@@ -244,7 +246,7 @@ func TestXferInflightNoLedgerWithoutAnyDurableRoot(t *testing.T) {
 // statement in the suite about single-broker ledgers was the false one.
 func TestASingleBrokerKeepsItsLedgerBesideTheDatabase(t *testing.T) {
 	dir := t.TempDir()
-	b := &Broker{transfers: newTransferTracker()}
+	b := &Broker{transfers: xfertrack.NewLegacyTracker()}
 	b.cfg = Config{Logger: silentLogger(), Now: time.Now, DBPath: filepath.Join(dir, "tether.db")}
 
 	want := filepath.Join(dir, "xfer-inflight")
@@ -254,8 +256,8 @@ func TestASingleBrokerKeepsItsLedgerBesideTheDatabase(t *testing.T) {
 			"commit path — and a synthesis with no ledger to read has nothing to synthesize FROM.",
 			got, want)
 	}
-	e := &transferEntry{transferID: "tid-single", sid: "lab", nid: "n1", verb: "pull", tier: "b",
-		bucket: "xfer-lab", path: "/tmp/f", startedAt: time.Now()}
+	e := xfertrack.NewLegacyEntry(xfertrack.LegacyRecord{TransferID: "tid-single", SID: "lab", NID: "n1", Verb: "pull", Tier: "b",
+		Bucket: "xfer-lab", Path: "/tmp/f", StartedAt: time.Now()})
 	b.writeXferInflight(e)
 	if _, err := os.Stat(filepath.Join(want, xferInflightFilename("tid-single"))); err != nil {
 		t.Fatalf("a single broker wrote no in-flight row: %v.\n\n"+
@@ -267,14 +269,15 @@ func TestASingleBrokerKeepsItsLedgerBesideTheDatabase(t *testing.T) {
 // TestXferInflightDedupReqIDStable pins the #57 dedup keystone: two emissions of the SAME synthetic terminal
 // (a crash-window re-emit) derive the SAME content reqID, so the replicated ledger collapses the duplicate.
 func TestXferInflightDedupReqIDStable(t *testing.T) {
+	tracker := xfertrack.NewLegacyTracker()
 	now := time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC)
 	e := strandedEntry(now)
 	mk := func() schema.AuditTransfer {
 		return schema.AuditTransfer{
-			V: schema.AuditSchemaVersion, Kind: "failed", Verb: e.verb,
-			Ts: e.startedAt.Add(transferTimeoutTierB), Session: e.sid, Node: e.nid,
-			ActorNkey: e.actor, ActorFp: e.actorFP,
-			TransferID: e.transferID, Path: e.path, Tier: e.tier, Bucket: e.bucket,
+			V: schema.AuditSchemaVersion, Kind: "failed", Verb: tracker.Record(e).Verb,
+			Ts: tracker.Record(e).StartedAt.Add(transferTimeoutTierB), Session: tracker.Record(e).SID, Node: tracker.Record(e).NID,
+			ActorNkey: tracker.Record(e).Actor, ActorFp: tracker.Record(e).ActorFP,
+			TransferID: tracker.Record(e).TransferID, Path: tracker.Record(e).Path, Tier: tracker.Record(e).Tier, Bucket: tracker.Record(e).Bucket,
 			DurationMs: transferTimeoutTierB.Milliseconds(), Code: "home_broker_restart",
 			Error: "broker home restarted while the transfer was in flight; the crashed incarnation wrote no terminal audit (#57 finalize-on-recovery)",
 		}
@@ -300,10 +303,14 @@ func TestXferInflightDedupReqIDStable(t *testing.T) {
 // exists to prevent. The primary row owns the transfer; the outbox counterpart must be dropped, not
 // re-emitted.
 func TestXferTerminalOutboxDoesNotDoubleEmitWithPrimary(t *testing.T) {
+	// origin: hot-update S10 plan §11.1 / TEST-BUDGET
+	if runIsolatedBrokerTest(t) {
+		return
+	}
 	n, _ := d7SingleNode(t, "xfer-outbox-double-emit")
 	now := time.Now().UTC()
 	root := t.TempDir()
-	b := &Broker{transfers: newTransferTracker()}
+	b := &Broker{transfers: xfertrack.NewLegacyTracker()}
 	b.cfg = Config{ClusterDataDir: root, Logger: silentLogger(), Now: func() time.Time { return now }}
 	b.cl = &clusterRuntime{node: n}
 
@@ -361,16 +368,16 @@ func TestXferFallbackLedgerStateMatrix(t *testing.T) {
 	n, _ := d7SingleNode(t, "xfer-fallback-state-matrix")
 	now := time.Now().UTC()
 	root := t.TempDir()
-	b := &Broker{transfers: newTransferTracker()}
+	b := &Broker{transfers: xfertrack.NewLegacyTracker()}
 	b.cfg = Config{ClusterDataDir: root, Logger: silentLogger(), Now: func() time.Time { return now }}
 	b.cl = &clusterRuntime{node: n}
 
 	const tid = "xfer-fallback-state-matrix"
-	entry := &transferEntry{
-		transferID: tid, sid: "sess", nid: "n1", verb: "push", tier: "a",
-		bucket: "OBJ_xfer-sess", path: "/dst",
-		startedAt: now.Add(-transferTimeoutTierA - xferStrandedSlack - time.Second),
-	}
+	entry := xfertrack.NewLegacyEntry(xfertrack.LegacyRecord{
+		TransferID: tid, SID: "sess", NID: "n1", Verb: "push", Tier: "a",
+		Bucket: "OBJ_xfer-sess", Path: "/dst",
+		StartedAt: now.Add(-transferTimeoutTierA - xferStrandedSlack - time.Second),
+	})
 	b.writeXferInflight(entry) // a healthy start row, exactly as a live transfer leaves behind
 
 	// STATE 1 — the primary directory becomes unusable while the transfer is in flight, and the terminal

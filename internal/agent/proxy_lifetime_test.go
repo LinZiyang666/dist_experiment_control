@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/proto"
+	"github.com/LinZiyang666/tether/internal/testharness"
 	"github.com/nats-io/nats.go"
 )
 
@@ -545,14 +546,23 @@ func TestFailClosedIsNotUndoneByATokenlessPush(t *testing.T) {
 	a.cfg.ProxyFailClosedGrace = 20 * time.Millisecond
 	enableProxyForTest(t, a, 1)
 
+	deadline := time.Now().Add(2 * time.Second)
 	a.armFailClosed()
-	if !waitNotServing(a, 2*time.Second) {
+	if !waitNotServing(a, time.Until(deadline)) {
 		t.Fatal("precondition: fail-closed did not stop the server")
+	}
+	// S5 detaches the listener before lock-free cleanup completes. Join the
+	// same apply reservation that fences real pushes before inspecting its latch.
+	// origin: hot-update S5 plan §7.2 / DRILL-RUN fail-closed fixture.
+	release, err := beginProxyApplyUntil(a, deadline)
+	if err != nil {
+		t.Fatal("fail-closed cleanup did not finish within the original deadline")
 	}
 	p := a.proxy
 	p.mu.Lock()
 	needs := p.needsReestablish
 	p.mu.Unlock()
+	release()
 	if !needs {
 		t.Fatal("precondition: fail-closed must set needsReestablish (round-6 F7)")
 	}
@@ -676,6 +686,17 @@ func TestHeartbeatReapGivesSingleBrokerCorpseAnExitEdge(t *testing.T) {
 // before the heartbeat snapshots generation/epoch and ProxyBound. Moving the call below Publish
 // leaves the AST wiring gate green but makes this first report advertise the stale applied pair.
 func TestHeartbeatPublishesReapedCorpseStateOnItsFirstTick(t *testing.T) {
+	beforeG, beforeFD := runtime.NumGoroutine(), testharness.FDCount()
+	for round := 0; round < 5; round++ {
+		t.Run("round", func(t *testing.T) { exerciseInitialHeartbeat(t) })
+	}
+	testharness.AssertNoGoroutineLeak(t, "initial heartbeat x5", beforeG)
+	testharness.AssertNoFDLeak(t, "initial heartbeat x5", beforeFD, 0)
+}
+
+// origin: hot-update S5 plan §9.2 / T48 / DRILL-RUN 75.W
+func exerciseInitialHeartbeat(t *testing.T) {
+	t.Helper()
 	url := startNATS(t)
 	nc, err := nats.Connect(url)
 	if err != nil {
@@ -684,7 +705,7 @@ func TestHeartbeatPublishesReapedCorpseStateOnItsFirstTick(t *testing.T) {
 	defer nc.Close()
 
 	a := newProxyTestAgent(t)
-	a.cfg.HeartbeatInterval = 10 * time.Millisecond
+	a.cfg.HeartbeatInterval = time.Hour
 	enableProxyForTest(t, a, 7)
 	a.proxyTunnelUp.Store(true)
 	p := a.proxy
@@ -702,6 +723,7 @@ func TestHeartbeatPublishesReapedCorpseStateOnItsFirstTick(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// ctx-root: the exercise owns and joins the heartbeat loop.
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- a.heartbeatLoop(ctx, nc) }()

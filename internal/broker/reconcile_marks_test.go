@@ -154,6 +154,9 @@ func TestResolveReconcileMarks_VsLiveDifferential(t *testing.T) {
 			{PID: "01b", State: "running", StartTimeTicks: 200},
 			{PID: "01c", State: "exited", RC: &rc5},
 			{PID: "01e", State: "weird"},
+			// S1 C-5: an unknown running pid whose started is still in flight
+			// must be left alone by BOTH arms (a live-only skip would drift).
+			{PID: "01unacked", State: "running", StartTimeTicks: 600, StartedUnacked: true},
 		},
 	}
 
@@ -400,5 +403,58 @@ func TestRegisterReconcilePortReadFailureIssuesNoPortDirectives(t *testing.T) {
 	if len(accepted) != 0 {
 		t.Fatalf("accepted=%v: the process read succeeded and 'live' has no broker row, so it is an "+
 			"orphan, not an accepted process", accepted)
+	}
+}
+
+// origin: docs/reviews/hot-update-reliable-exec-plan.md §2.5 (C-5) — a pid
+// the agent reports as running with StartedUnacked is neither accepted nor
+// orphan-killed: its proc.started is still owed by the courier, so the row
+// may simply not exist yet. Without the flag the same pid is an orphan.
+func TestReconcileDefersOrphanKillForStartedUnackedRow(t *testing.T) {
+	now := time.Date(2026, 6, 21, 13, 14, 15, 0, time.UTC)
+	db, err := storage.Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	if _, err := db.Exec(`INSERT INTO sessions(sid,name,owner_pubkey_fp,pin_hash,state,created_at) VALUES('lab','lab','o','p','ACTIVE',?)`, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO nodes(nid,sid,status,registered_at) VALUES('lab-1','lab','ONLINE',?)`, now); err != nil {
+		t.Fatal(err)
+	}
+	// One known row so the live path's "no process history" fail-closed
+	// guard does not mask the decision under test.
+	if err := proc.Insert(db, proc.Process{PID: "01known", SID: "lab", NID: "lab-1", Argv: []string{"x"}, StartedAt: now, BootID: "boot2", StartTimeTicks: 100}); err != nil {
+		t.Fatal(err)
+	}
+	procs, err := proc.ListBySessionFiltered(db, "lab", proc.ListBySessionOpts{IncludeExited: false})
+	if err != nil {
+		t.Fatal(err)
+	}
+	orphans := func(flag bool) []string {
+		req := proto.NodeRegisterReq{BootID: "boot2", LocalProcesses: []proto.LocalProcess{
+			{PID: "01known", State: "running", StartTimeTicks: 100},
+			{PID: "01new", State: "running", StartTimeTicks: 700, StartedUnacked: flag},
+		}}
+		var out []string
+		for _, a := range resolveReconcile("lab", "lab-1", req, procs, nil, now).ProcAudit {
+			if a.Kind == "killed_orphan" {
+				out = append(out, a.PID)
+			}
+		}
+		// The live arm must agree: run it on a fresh copy and read its drop list.
+		bLive := &Broker{cfg: Config{DB: db, Logger: slogDiscard(), Now: func() time.Time { return now }}}
+		_, _, _, _, dropProcesses := bLive.reconcileOnRegister("lab", "lab-1", req)
+		for _, pid := range dropProcesses {
+			out = append(out, "live:"+pid)
+		}
+		return out
+	}
+	if got := orphans(true); len(got) != 0 {
+		t.Fatalf("started-unacked pid was orphan-killed: %v", got)
+	}
+	if got := orphans(false); len(got) != 2 || got[0] != "01new" || got[1] != "live:01new" {
+		t.Fatalf("the same pid without the flag must be an orphan in both arms: %v", got)
 	}
 }

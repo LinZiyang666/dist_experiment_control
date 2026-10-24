@@ -36,6 +36,7 @@ func d7SingleNode(t *testing.T, id string) (*cluster.Node, string) {
 	t.Helper()
 	addr, trans := raft.NewInmemTransport(raft.ServerAddress(id + ":7400"))
 	dir := t.TempDir()
+	seedBrokerFixtureDBFile(t, filepath.Join(dir, "state.db"))
 	n, err := cluster.New(cluster.Config{
 		LocalID:            raft.ServerID(id),
 		DataDir:            dir,
@@ -207,7 +208,7 @@ func TestD7ReconcileVoterAddFailedForwardCorrects(t *testing.T) {
 		t.Fatalf("phase-1: %v", err)
 	}
 	// Force the row into VOTER_ADD_FAILED (the half-success the reconcile heals).
-	if err := admin.setPhase("single-1", phaseAddFailed, []string{phasePending}, "injected"); err != nil {
+	if err := admin.SetPhase("single-1", phaseAddFailed, []string{phasePending}, "injected"); err != nil {
 		t.Fatalf("set VOTER_ADD_FAILED: %v", err)
 	}
 	if err := admin.ReconcileMembershipOnLeadership(); err != nil {
@@ -281,10 +282,14 @@ func TestD7TransferLeaderToRejectsBadTargets(t *testing.T) {
 // fp as cert_fp, moves the old to cert_fp_prev, and sets cert_fp_valid_until — a real
 // implemented path, not a stub.
 func TestD7RotateTunnelCertUpdatesPins(t *testing.T) {
+	// origin: hot-update S10 plan §11.1 / TEST-BUDGET
+	if runIsolatedBrokerTest(t) {
+		return
+	}
 	n, addr := d7SingleNode(t, "single-1")
 	admin := NewClusterAdmin(n, nil)
 	var hotSwapped bool
-	admin.prepareTunnelCertRotate = func(newFP string) (func(), error) {
+	admin.PrepareTunnelCertRotate = func(newFP string) (func(), error) {
 		if newFP != "sha256:NEW" {
 			t.Fatalf("prepare fp = %q, want sha256:NEW", newFP)
 		}
@@ -336,7 +341,7 @@ func TestD9RotateTunnelCertRejectsRemoteTarget(t *testing.T) {
 func TestD7CatchUpStalled(t *testing.T) {
 	n, addr := d7SingleNode(t, "single-1")
 	admin := NewClusterAdmin(n, nil)
-	admin.catchPoll = 5 * time.Millisecond
+	admin.CatchPoll = 5 * time.Millisecond
 	in := d7JoinInput(t, "single-1", addr)
 	never := func(uint64) (bool, error) { return false, nil }
 	err := admin.AddNode(in, addr, never, 40*time.Millisecond)

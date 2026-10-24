@@ -3,11 +3,13 @@ package broker
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 
-	"github.com/LinZiyang666/tether/internal/proto"
-	"github.com/nats-io/nats.go/jetstream"
+	"github.com/LinZiyang666/tether/internal/xfercontract"
+	"github.com/LinZiyang666/tether/internal/xfergc"
+	"github.com/LinZiyang666/tether/internal/xferserve"
 )
 
 // xferReapMinObjectAge is the grace period below which an xfer object is NEVER reaped, no matter what
@@ -48,8 +50,38 @@ const xferReapMinObjectAge = 2 * time.Minute
 //
 // Returns the count of deleted objects. Per-bucket errors are logged
 // and skipped; the returned error reflects only the top-level
-// ListStreams call.
+// ListStreams call. The shared pass deadline also returns its cancellation
+// error so the registry records a stalled sweep instead of reporting success.
 func (b *Broker) reconcileXferObjects(ctx context.Context) (int, error) {
+	// origin: hot-update S7 plan lead LQ3 / T30; S7 internal review rv-wiring F7
+	// Bound the entire pass, including both legacy lists and collector dispatch.
+	// Child operations inherit this absolute deadline; no bucket earns a fresh budget.
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	// Once continuation assembly is configured, absence of its current owner
+	// is recovering, not permission to fall back to age-only legacy deletion.
+	// origin: hot-update S7 plan §5.3 / M11 / M13
+	if b.cfg.TransferFactory != nil || b.transferRuntime.Load() != nil {
+		current := b.transferRuntime.Load()
+		if current == nil {
+			return 0, fmt.Errorf("%s: transfer collector is not installed", xfercontract.CodeOwnerRecovering)
+		}
+		deadline, err := transferPassDeadline(ctx)
+		if err != nil {
+			return 0, err
+		}
+		census, err := current.Collector.Pass(deadline)
+		if err != nil {
+			return 0, err
+		}
+		if !census.Ready || !census.Complete {
+			return 0, fmt.Errorf("%s: transfer collector census is incomplete", xfercontract.CodeOwnerRecovering)
+		}
+		// Collector owns candidate/retirement observations. Its census is not a
+		// deletion count, so do not manufacture an operator success statistic.
+		return 0, nil
+	}
+
 	if brokerJS(b) == nil {
 		return 0, nil
 	}
@@ -122,7 +154,7 @@ func (b *Broker) reconcileXferObjects(ctx context.Context) (int, error) {
 				// the leader itself homes one node and holds an in-flight transfer. Its live object must not be
 				// torn out even under a compressed cross-home floor (the drill sets ≥1s). A busy bucket is live
 				// work, not accumulating garbage → skip the GC AND the gauge (tracker key == the OBJ_xfer-<sid> name).
-				if _, busy := b.transfers.activeOBJStreams()[name]; busy {
+				if _, busy := b.transfers.ActiveOBJStreams()[name]; busy {
 					continue
 				}
 				// The caught-up LEADER GCs objects past the LONGER cross-home floor (only the leader, so no two
@@ -151,7 +183,7 @@ func (b *Broker) reconcileXferObjects(ctx context.Context) (int, error) {
 		// A transfer that put() its tracker entry AFTER the sweep began (but before this bucket is
 		// processed) is otherwise invisible, and its just-completed objects would be reaped. Re-reading
 		// here shields a bucket the instant a transfer registers.
-		if _, busy := b.transfers.activeOBJStreams()[name]; busy {
+		if _, busy := b.transfers.ActiveOBJStreams()[name]; busy {
 			continue
 		}
 		reaped := b.reapBucketObjects(ctx, name, b.xferReapMinAge, false, protected, unresolvedRows)
@@ -164,64 +196,32 @@ func (b *Broker) reconcileXferObjects(ctx context.Context) (int, error) {
 	// N-6: publish the latest unreapable-bucket count for the /metrics gauge + status. Store (not Add):
 	// it is a gauge that must fall back to 0 once topology heals the split-home / zero-node condition.
 	b.xferUnreapableBuckets.Store(int64(unreapable))
-	return deleted, infos.Err()
+	// The legacy Lists stop on their OWN timers at this pass's absolute deadline; never sample ctx.Err()
+	// before its own expiry callback has run (see expiredPassErr).
+	// origin: hot-update S7 plan lead LQ3 / T30 (S7 integration oplegacy reaper race)
+	return deleted, errors.Join(infos.Err(), expiredPassErr(ctx))
 }
 
-// brokerUptime is how long this process has been serving. Zero before Run, which is
-// the conservative direction for every caller below: an unknown uptime buys an object
-// the FULL protection window rather than none.
+// R13: stamp the process boot instant for the OpRuntime uptime BEFORE anything spawns a
+// goroutine that could read it (the admin socket's accept loop, below). Written once here, read
+// in runtimeSnapshot from the admin goroutine — race-free via the goroutine-start ordering. Guard
+// nil Now: a few tests drive Run on a bare Broker literal that refuses early (e.g. the data-dir
+// lock interlock) and never reaches broker.New's Now default; they never serve the admin socket,
+// so bootAt staying zero (uptime 0) is correct there.
+func stampBrokerUptime(b *Broker) {
+	if b.cfg.Now != nil {
+		b.bootAt = b.cfg.Now()
+	}
+}
+
+// origin: S7 internal review rv-txn F13 / hot-update S7 plan §5.3
+// The legacy broker adapters retain the same age policy in the GC leaf.
 //
 // A package-level function taking *Broker, not a method: the structural-budget ratchet
 // pins this type's method count exactly, and it caught this one on the way in.
-func brokerUptime(b *Broker) time.Duration {
-	if b.bootAt.IsZero() {
-		return 0
-	}
-	d := b.now().Sub(b.bootAt)
-	if d < 0 {
-		return 0
-	}
-	return d
-}
-
-// xferObjectReapFloor is the minimum age an object must reach before this pass may
-// delete it. Pure, so the three-way interaction below can be tested without a
-// broker, a bucket or a clock.
-//
-// THE UPTIME TERM (origin: prerelease audit broker-transfer/BT-F4).
-//
-// The home-owned reap runs with a short grace (2 minutes) because the per-bucket
-// busy re-read is supposed to shield live transfers. That protection is real for a
-// transfer THIS process started — it is in the tracker, so the whole bucket is
-// skipped. It says nothing about a transfer the PREVIOUS incarnation started: after
-// a restart the tracker is empty, and on a single broker with no data_dir the ledger
-// did not exist either (see #57, now fixed), so a 2-GiB tier-B push that was 3
-// minutes into its 35m08s budget was deleted out from under the agent that was
-// reading it.
-//
-// The fix is not to make this reap size-aware. That was considered and rejected:
-// TestHomeReapIsNotSizeAware pins decision N15 in the AST, and a 2-GiB object would
-// take a ~32-minute floor while buckets are sized for one max object plus margin, so
-// the next tier-B push would be refused as too_large.
-//
-// Instead the floor falls back toward the ordinary grace as the process ages. Once
-// this incarnation has been up for a full maximum budget, no object can still belong
-// to a previous one, so the extra protection has done its job and costs nothing in
-// steady state. It is also size-INDEPENDENT, so it does not reopen N15.
+func brokerUptime(b *Broker) time.Duration { return xfergc.LegacyUptime(b.bootAt, b.now()) }
 func xferObjectReapFloor(minAge time.Duration, sizeAware bool, size int64, uptime time.Duration) time.Duration {
-	floor := minAge
-	if sizeAware && floor > 0 {
-		floor += xferCrossHomeExtraFor(size)
-		return floor
-	}
-	if floor <= 0 {
-		// minAge<=0 is the zero-value test broker's "reap everything now".
-		return floor
-	}
-	if young := proto.XferTierBMaxBudget - uptime; young > floor {
-		return young
-	}
-	return floor
+	return xfergc.LegacyObjectReapFloor(minAge, sizeAware, size, uptime)
 }
 
 // reapBucketObjects deletes every non-deleted object in the OBJ_xfer bucket `name` older than minAge and
@@ -235,147 +235,11 @@ func xferObjectReapFloor(minAge time.Duration, sizeAware bool, size int64, uptim
 // instead, and widening it would make orphan garbage linger on exactly the small-disk brokers this
 // sweep exists to protect.
 func (b *Broker) reapBucketObjects(ctx context.Context, name string, minAge time.Duration, sizeAware bool,
-	protected, unresolvedRows map[string]bool) (deleted int) {
-	bucket := strings.TrimPrefix(name, "OBJ_")
-	store, err := brokerJS(b).ObjectStore(ctx, bucket)
-	if err != nil {
-		b.cfg.Logger.Warn("broker: open xfer bucket for reconcile", "bucket", bucket, "err", err)
-		return 0
-	}
-	// Deleted objects are listed too. The chunk sweep below treats a tombstone's chunk group as garbage
-	// either way — it builds its referenced set from NON-deleted objects only, so a tombstone that is
-	// listed (Deleted=true) and one that is not listed at all produce the same set (round-2 review
-	// R4-2-F11: the option is not what makes TOMB groups purgeable). It is kept so the object loop SEES
-	// the tombstones it skips: a ctl/agent Delete writes the tombstone but its PURGE is denied by the ACL,
-	// so the chunks stay (gotcha #85), and a listing that hid those objects would make that leak invisible
-	// to anyone reading this loop. An empty object list is NOT an early return any more: a bucket with no
-	// objects at all can still hold the chunks of an abandoned Put, which is exactly the leak.
-	objs, err := store.List(ctx, jetstream.ListObjectsShowDeleted())
-	if err != nil && !errors.Is(err, jetstream.ErrNoObjectsFound) {
-		b.cfg.Logger.Warn("broker: list xfer objects for reconcile", "bucket", bucket, "err", err)
-		return 0
-	}
-	for _, obj := range objs {
-		if obj.Deleted {
-			continue
-		}
-		// Never reap a FRESH object: the per-bucket busy re-read closes most of the snapshot race, but an
-		// object created between that check and this Delete — or one a mid-transfer rehome left on a broker
-		// whose tracker no longer tracks it — must not be torn out mid-upload. It ages past the grace and is
-		// reaped later. The cross-home GC uses a longer floor so a peer-home's live transfer is never torn out.
-		// EXTERNAL review B2: the durable ledger outranks every age heuristic below. A row that is
-		// still inside its own budget means a live transfer owns this object, whatever this process's
-		// in-memory tracker happens to remember.
-		if protected[bucket+"/"+obj.Name] {
-			continue
-		}
-		// An object whose ledger row could not be READ is protected individually.
-		// The object name IS the transfer id at every writer, so this is the same
-		// exact identity match the protected set uses, applied to the rows whose
-		// contents we do not have (prerelease audit BT-F3).
-		if unresolvedRows[xferInflightFilename(obj.Name)] {
-			continue
-		}
-		floor := xferObjectReapFloor(minAge, sizeAware, int64(obj.Size), brokerUptime(b))
-		if floor > 0 && !obj.ModTime.IsZero() && b.now().Sub(obj.ModTime) < floor {
-			continue
-		}
-		if err := store.Delete(ctx, obj.Name); err != nil && !errors.Is(err, jetstream.ErrObjectNotFound) {
-			b.cfg.Logger.Warn("broker: orphan xfer object delete", "bucket", bucket, "name", obj.Name, "err", err)
-			continue
-		}
-		deleted++
-	}
-	// The object loop above sees only what has a meta entry. The chunk sweep sees what does not.
-	deleted += reapOrphanChunks(ctx, brokerJS(b), name, objs, func(size int64) time.Duration {
+	protected, unresolvedRows map[string]bool) int {
+	until, _ := ctx.Deadline()
+	return (xferserve.LegacyReaper{JS: brokerJS(b), Now: b.now, Logger: b.cfg.Logger}).ReapBucketObjects(until, ctx.Done(), name, func(size int64) time.Duration {
 		return xferObjectReapFloor(minAge, sizeAware, size, brokerUptime(b))
-	}, b.now(), b.cfg.Logger)
-	return deleted
-}
-
-// xferChunkSize is nats.go's object-store chunk size (objDefaultChunkSize, 128 KiB); tether never sets
-// ObjectMeta.Opts.ChunkSize, so a chunk group's byte size is its message count times this. It is only an
-// estimate fed to the size-aware floor, never a correctness input.
-const xferChunkSize = 128 << 10
-
-// reapOrphanChunks purges the chunk groups of the OBJ_xfer bucket `name` that NO object references — the
-// storage half of an abandoned tier-B Put (gotcha #85).
-//
-// WHY THE OBJECT REAPER CANNOT SEE THEM. nats.go's ObjectStore.Put publishes the chunks first, on ONE
-// subject per object (`$O.<bucket>.C.<nuid>`), and the meta entry (`$O.<bucket>.M.<name>`) last. A Put
-// that is cancelled (the #84 watchdog / bounded retry), that times out, or whose ctl dies mid-upload
-// leaves the chunks with no meta; nats.go's own cleanup for that case is `STREAM.PURGE` with a subject
-// filter, which the ctl's and the agent's ACLs DENY by design (file-transfer-plan Round-4 #3: bucket
-// lifecycle is the broker's). That denial was harmless when a bucket was per-transfer and the broker
-// deleted the whole bucket on failure. Since v0.2.2 the bucket is per-SESSION and lives for ever, the
-// broker reaps per OBJECT through store.List — and a chunk group with no meta is not an object, so
-// nobody has ever deleted one: every failed Put has been leaving up to its full size behind, counted
-// against the bucket's MaxBytes, until the refusals turned into `insufficient storage`. A deleted object
-// has the same shape: the ctl/agent Delete writes the tombstone, its PURGE is denied, the chunks stay.
-//
-// WHAT IS SAFE TO PURGE. A chunk group whose NUID no live object references AND whose NEWEST chunk is
-// older than the caller's floor. The floor is the same one the object reaper applies (per-home grace,
-// cross-home extra, the uptime term that shields a previous incarnation's live uploads) — an upload in
-// flight keeps writing chunks (a 2 GiB Put at the 2 MiB/s admission floor writes one every 60 ms; one
-// stalled longer than 30 s is being cancelled by the ctl's watchdog), so "newest chunk older than the
-// grace" is what distinguishes abandoned from live without knowing the transfer id, which the chunk
-// group does not carry. The per-bucket busy skip at the call site (any local in-flight transfer → the
-// whole bucket is skipped) still applies above this function.
-//
-// A package-level function taking the JetStream handle, not a Broker method: the structural-budget
-// ratchet pins the type's method count (see brokerUptime).
-func reapOrphanChunks(ctx context.Context, js jetstream.JetStream, name string, objs []*jetstream.ObjectInfo,
-	floorFor func(size int64) time.Duration, now time.Time, logger interface {
-		Warn(string, ...any)
-		Info(string, ...any)
-	}) (purged int) {
-	if js == nil {
-		return 0
-	}
-	bucket := strings.TrimPrefix(name, "OBJ_")
-	chunkPrefix := "$O." + bucket + ".C."
-	stream, err := js.Stream(ctx, name)
-	if err != nil {
-		logger.Warn("broker: open xfer stream for chunk sweep", "bucket", bucket, "err", err)
-		return 0
-	}
-	si, err := stream.Info(ctx, jetstream.WithSubjectFilter(chunkPrefix+">"))
-	if err != nil {
-		logger.Warn("broker: xfer stream info for chunk sweep", "bucket", bucket, "err", err)
-		return 0
-	}
-	if len(si.State.Subjects) == 0 {
-		return 0
-	}
-	referenced := make(map[string]bool, len(objs))
-	for _, o := range objs {
-		if o != nil && !o.Deleted {
-			referenced[o.NUID] = true
-		}
-	}
-	for subj, count := range si.State.Subjects {
-		nuid := strings.TrimPrefix(subj, chunkPrefix)
-		if nuid == "" || referenced[nuid] {
-			continue
-		}
-		last, err := stream.GetLastMsgForSubject(ctx, subj)
-		if err != nil {
-			logger.Warn("broker: orphan chunk group newest message", "bucket", bucket, "nuid", nuid, "err", err)
-			continue
-		}
-		floor := floorFor(int64(count) * xferChunkSize)
-		if floor > 0 && !last.Time.IsZero() && now.Sub(last.Time) < floor {
-			continue
-		}
-		if err := stream.Purge(ctx, jetstream.WithPurgeSubject(subj)); err != nil {
-			logger.Warn("broker: orphan chunk group purge", "bucket", bucket, "nuid", nuid, "err", err)
-			continue
-		}
-		logger.Info("broker: orphan xfer chunk group purged (a Put that never wrote its meta, or a client-side delete whose purge the ACL denied)",
-			"bucket", bucket, "nuid", nuid, "chunks", count)
-		purged++
-	}
-	return purged
+	}, protected, unresolvedRows)
 }
 
 // crossHomeReapAge is the effective age floor for the #58 leader cross-home GC — the serveconf override when
@@ -393,22 +257,14 @@ func (b *Broker) crossHomeReapAge() time.Duration {
 // A missing bucket / empty list / transient error is "no aged objects" (fail-quiet: the gauge must not
 // over-count on a read blip).
 func (b *Broker) xferBucketHasAgedObjects(ctx context.Context, name string) bool {
-	bucket := strings.TrimPrefix(name, "OBJ_")
-	store, err := brokerJS(b).ObjectStore(ctx, bucket)
-	if err != nil {
-		return false
-	}
-	objs, err := store.List(ctx)
-	if err != nil {
-		return false // ErrNoObjectsFound (empty) or a transient error — not counted
-	}
-	for _, obj := range objs {
-		if obj.Deleted {
-			continue
-		}
-		if b.xferReapMinAge <= 0 || obj.ModTime.IsZero() || b.now().Sub(obj.ModTime) >= b.xferReapMinAge {
-			return true
-		}
-	}
-	return false
+	until, _ := ctx.Deadline()
+	return (xferserve.LegacyReaper{JS: brokerJS(b), Now: b.now, Logger: b.cfg.Logger}).HasAgedObjects(until, ctx.Done(), name, b.xferReapMinAge)
+}
+
+// Only the scheduler owns a caller context; transfer owners receive its fixed
+// deadline and cancellation signal across the lifetime boundary.
+// origin: S7 internal review GATES-PROD F1
+func transferPassDeadline(ctx context.Context) (xfercontract.Deadline, error) {
+	until, _ := ctx.Deadline()
+	return xferserve.PassDeadline(until, ctx.Done())
 }

@@ -2,6 +2,8 @@ package main
 
 import (
 	"fmt"
+	"github.com/LinZiyang666/tether/internal/brokerimage"
+	"github.com/LinZiyang666/tether/internal/infracli"
 	"github.com/LinZiyang666/tether/internal/proto"
 	"strings"
 )
@@ -47,6 +49,13 @@ var brokerCodeHints = map[string]string{
 	"transfer_budget_exceeded": "the transfer did not finish inside the broker's budget (derived from the file size and the slowest link tether promises to cover). The agent may be fine — check the link, or split the file; `tether expose` + rsync is the escape hatch for very large or very slow transfers.",
 	"agent_malformed_resp":     "the agent sent a reply we can't decode; usually a version skew — try `tether node upgrade <nid>`.",
 	// Upgrade
+	// origin: hot-update S3 plan §4.2. upgrade_deferred deliberately has no hint:
+	// brokerErrorMessage replaces the agent's Error with a hint, losing every reason and detail.
+	"image_abi_unsupported": "the candidate failed the image ABI compatibility check; choose a release with an image ABI supported by this agent. If the candidate has no image-abi line, pick a hot-update-capable release or drain the node first.",
+	"agent_upgrading":       "an image switch is in progress on this node; retry in a few seconds.",
+	// origin: hot-update S5 plan §7.3 / §10.2. This is a safe deferral,
+	// distinct from capacity exhaustion; do not expose private actor state.
+	"ss_state_unrepresentable":         "the SS connection state cannot be carried through this image switch yet; wait for it to reach a supported state and retry.",
 	"url_not_allowed":                  "the broker hasn't whitelisted that URL prefix; ask the broker operator to add it under `broker.upgrade.url_allow` in broker.yaml.",
 	"url_not_allowed_local":            "the agent re-checks the URL against its OWN allowlist, and that URL isn't on it; set the agent's `--upgrade-url-allow` flag or the `upgrade.url_allow` list in its agent.yaml (opening the broker's allowlist alone is not enough).",
 	"sha256_invalid":                   "SHA256 must be 64 lowercase hex chars; double-check the value.",
@@ -75,12 +84,14 @@ var brokerCodeHints = map[string]string{
 		"Reply sections are bounded, so this is a tether bug (not fixed by retrying) — " +
 		"check the broker ERROR log for the oversize subject and report it.",
 	// Cluster transient states (B1 item 6). All three are FAILOVER/transient artifacts — nothing
-	// the user did wrong, just wait and retry. NOTE: as of today NONE of these reaches a ctl
-	// reply: home_catching_up + try_again are returned from tunnelTokenLookup (the AGENT's tunnel
+	// the user did wrong, just wait and retry. home_catching_up + try_again are returned from tunnelTokenLookup (the AGENT's tunnel
 	// REGISTER DENY path, which the agent auto-retries — see internal/broker/expose.go), and
 	// leader_unavailable is consumed by the agent's register loop. These entries are defensive
-	// future-proofing — so that IF a ctl path ever carries one, the user sees a sentence instead
-	// of a raw token — and a friendly gloss for anyone reading broker logs.
+	// future-proofing for those paths and a friendly gloss for anyone reading broker logs.
+	// origin: hot-update S4 plan §9.2 / N1-REFUSAL. try_again also reaches ctl
+	// through legacy admission refusals; refusalHint selects the upgrade hint
+	// when its detail identifies agent_upgrading, preserving this storage hint
+	// for the original broker failure.
 	"home_catching_up":   "the broker that hosts this expose is briefly catching up after a failover; this is transient — wait a few seconds and retry.",
 	"leader_unavailable": "the broker cluster is electing a new leader (a routine failover); this is transient — wait a few seconds and retry.",
 	"try_again":          "the broker hit a transient storage hiccup (not a permanent failure); wait a moment and retry.",
@@ -91,7 +102,8 @@ var brokerCodeHints = map[string]string{
 // (70 = "a fault tether could not classify"). The classes are reviewed against the hint semantics:
 // permission/ownership -> 77; positively self-healing transients -> 75; operator-action-required
 // (a human must free a port / start an agent, NOT blind-retry) -> 64; our-bug/version-skew -> 70.
-var brokerCodeExitClasses = map[string]int{
+var brokerCodeExitClasses = transferWireExitClasses(map[string]int{
+
 	// permission / ownership / membership
 	"not_owner": exitNoPerm, "not_owner_or_creator": exitNoPerm, "not_a_member": exitNoPerm,
 	// `session create` from a fingerprint the operator has not admitted. PERMANENT until a
@@ -188,6 +200,10 @@ var brokerCodeExitClasses = map[string]int{
 	"pty_unavailable":         exitUsage,
 	"pty_alloc_failed":        exitTransient, // fd OR pty-count exhaustion (EMFILE/ENFILE/ENOSPC/ENOMEM/EAGAIN) — clears as sessions close
 	"attach_subscribe_failed": exitTransient, // the agent's NATS connection was unhealthy just now
+	// The legacy PTY start envelope includes command/setup errors and runtime
+	// ownership failures. Preserve its existing fallback class explicitly; it
+	// cannot honestly be called uniformly transient or an argument error.
+	"exec_failed": exitInternal,
 	// The other half of Y2: `download_failed` was carrying a 404, an oversize tarball and a transport
 	// blip under one name. The first two cannot succeed on a retry, so they must not land in the class
 	// automation retries.
@@ -204,8 +220,15 @@ var brokerCodeExitClasses = map[string]int{
 	// fleet on it (configUpgradeCodes). upgrade_in_progress is its temporal opposite — a prior upgrade on
 	// THIS node is still inside its register deadline; it self-resolves (commit or rollback) within that
 	// bound, which is the definition of the retry class.
-	"smoke_failed":                     exitUsage,
-	"upgrade_in_progress":              exitTransient,
+	"smoke_failed":        exitUsage,
+	"upgrade_in_progress": exitTransient,
+	// origin: hot-update S3 plan §4.2. Busy resources can clear; an incompatible candidate needs operator action.
+	"upgrade_deferred": exitTransient,
+	"agent_upgrading":  exitTransient,
+	// origin: hot-update S5 plan §7.3 / §10.2. The original owner remains
+	// live after this refusal, so retrying the upgrade does not recreate flows.
+	"ss_state_unrepresentable":         exitTransient,
+	"image_abi_unsupported":            exitUsage,
 	"clone_family_upgrade_unsupported": exitUsage,
 	"version_skew":                     exitUsage, // B6 A3: reinstall the joiner on a matching release
 	// R8a P1: the control plane committed the rehome but the agents have not confirmed the new
@@ -285,6 +308,42 @@ var brokerCodeExitClasses = map[string]int{
 	"verb_mismatch":         exitUsage,
 	"transfer_unknown":      exitUsage, // no such transfer id; it will not appear on retry
 
+	// Reliable exec (hot-update S1). The classes here apply to a refusal BEFORE the create
+	// was handed to the transport, and — for the two codes that prove no task was admitted
+	// (exec.go createNeverAdmitted) — after it too; every other post-create refusal but
+	// permission is 74 by exec.go's phase rule, so those entries only matter pre-create.
+	// process_request_too_large: the ctl built a body over the 1 MiB request limit (--stdin
+	// near its cap plus a long argv) — the same request is the same size next time; the ctl
+	// refuses it locally before publishing, and a broker that sees one anyway answers with
+	// CallID 0, which execclient surfaces instead of resending (S1 review ctl-V1).
+	// unsupported_process_operation: a client newer than this broker; a human must align
+	// releases, retrying changes nothing (post-create it is 74: the task may exist).
+	// unsupported_process_protocol is the client's own legacy-fallback signal and never
+	// reaches the classifier pre-create; classified as our-bug 70 so a leak of it is
+	// visible. process_capacity: the agent's admission table refused the create and admitted
+	// nothing (Reserve returns an existing record before it checks capacity), so it is
+	// retry-safe after the table drains. process_runtime_closed is checked before the record
+	// lookup, so post-create it may belong to an admitted task the runtime is closing — 74
+	// there, 75 only pre-create.
+	"process_request_too_large":     exitUsage,
+	"unsupported_process_operation": exitUsage,
+	"unsupported_process_protocol":  exitInternal,
+	"process_capacity":              exitTransient,
+	"process_runtime_closed":        exitTransient,
+	// S4 probes can surface these refusals before create. Keep their
+	// phase-independent meanings explicit; post-create continuity failures
+	// still take the classifier's 74 rule, and revoked authority stays 77.
+	// origin: hot-update S4 plan §2.2 / T49
+	"process_busy":             exitTransient,
+	"process_recovering":       exitTransient,
+	"process_revoked":          exitNoPerm,
+	"process_identity":         exitUsage,
+	"process_conflict":         exitUsage,
+	"process_stale":            exitUsage,
+	"process_instance_lost":    exitUsage,
+	"process_expired":          exitUsage,
+	"process_output_discarded": exitUsage,
+
 	// permission -> 77 (second entry; grouped with path_outside_roots above)
 	"unauthorized": exitNoPerm, // the grow trigger's account-signature check refused this caller
 
@@ -310,7 +369,7 @@ var brokerCodeExitClasses = map[string]int{
 	"signal_failed":          exitInternal,
 	"cutover_revival_failed": exitInternal,
 	"free_failed":            exitInternal,
-}
+})
 
 // dataplaneNotConvergedCode aliases the proto SSOT, which internal/broker also
 // aliases. Batch-A review F-17: these were two independent string literals kept
@@ -322,6 +381,9 @@ const dataplaneNotConvergedCode = proto.CodeDataplaneNotConverged
 
 // brokerCodeExitClass returns the exit class for a broker code (default exitInternal=70).
 func brokerCodeExitClass(code string) int {
+	if c, ok := infracli.ExitClasses[code]; ok {
+		return c
+	}
 	if c, ok := brokerCodeExitClasses[code]; ok {
 		return c
 	}
@@ -330,31 +392,40 @@ func brokerCodeExitClass(code string) int {
 
 // brokerErrorMessage formats a broker-rejected reply as one
 // human-friendly line: "<verb> failed: <code-hint or fallback>
-// (<raw-code>: <raw-error>)". The raw pair is preserved in
-// parens so logs / bug reports can still grep the architecture-
-// stable codes. B2: the returned error is an *ExitError carrying the
+// (<raw-code>)". The raw code is preserved in parens so logs / bug
+// reports can still grep the architecture-stable codes. ABI refusals
+// also retain the raw error, which distinguishes missing from future ABIs.
+// B2: the returned error is an *ExitError carrying the
 // code's exit class — the HUMAN STRING is byte-identical to before.
 func brokerErrorMessage(verb, code, errMsg string) error {
 	lookup := code
-	hint := brokerCodeHints[code]
+	hint := refusalHint(code, errMsg)
 	if hint == "" {
 		// Some agent-rejected codes arrive prefixed:
 		// "agent_rejected:install_failed". Strip the wrapper
 		// before lookup so the underlying code can still match.
 		if rest, ok := stripPrefix(code, "agent_rejected:"); ok {
 			lookup = rest
-			hint = brokerCodeHints[rest]
+			hint = refusalHint(rest, errMsg)
 		}
 	}
+	// origin: hot-update S4 plan §9.2 / N1-REFUSAL. The legacy-compatible
+	// code is shared with broker storage failures; its detail identifies the
+	// admission gate and must survive hint rendering for machine readers.
 	msg := errMsg
 	if hint != "" {
 		msg = hint
+		// origin: hot-update S3 plan §4.2 / §7 T17. The same code rejects missing
+		// and future ABIs; the agent's diagnostic carries the actual version pair.
+		if (brokerDetailExitClass(lookup, errMsg) == exitUnsettled || (lookup == proto.CodeStoreError && strings.HasPrefix(errMsg, brokerimage.DetailStoreCloseUnknown)) || lookup == "image_abi_unsupported" || (lookup == "try_again" && hint == brokerCodeHints["agent_upgrading"])) && errMsg != "" {
+			msg = errMsg + "; " + hint
+		}
 	}
 	// Code carries `lookup` (the agent_rejected:-stripped form), NOT the raw code: a caller branching on
 	// the code must not have to know which errors travelled wrapped. The PROSE still shows the raw code,
 	// because that is what an operator sees in the broker's own logs.
 	return &ExitError{
-		Class: brokerCodeExitClass(lookup),
+		Class: brokerDetailExitClass(lookup, errMsg),
 		Code:  lookup,
 		Err:   fmt.Errorf("%s failed: %s (%s)", verb, msg, code),
 	}
@@ -388,7 +459,9 @@ func connectError(verb, natsURL string, err error) error {
 // a one-line operator-facing diagnosis. Reasons are agent-emitted
 // (architecture C.5.1), so the set is fixed.
 var runFailureReasons = map[string]string{
-	"attach_timeout": "agent allocated the PTY but ctl didn't subscribe in time (default 15s); on high-RTT WSS links, raise TETHER_AGENT_ATTACH_DEADLINE on the agent side.",
+	// origin: hot-update S4 plan §2.2 / T49
+	"pty_input_overflow": "PTY input buffer overflowed; the task may have executed and some input was not delivered. Do not rerun blindly; inspect the task on the node.",
+	"attach_timeout":     "agent allocated the PTY but ctl didn't subscribe in time (default 15s); on high-RTT WSS links, raise TETHER_AGENT_ATTACH_DEADLINE on the agent side.",
 	// origin: line-2 external review M17. This used to say only "ran out of file descriptors", which named
 	// the LESS likely of the two exhaustions: opening /dev/ptmx past the devpts limit returns ENOSPC, not
 	// EMFILE, so an operator hitting /proc/sys/kernel/pty/max was told to look at the wrong resource.
@@ -419,6 +492,8 @@ var runFailureReasons = map[string]string{
 	"too_many_wedged_spawns":  "too many spawns are already wedged on a hung filesystem; wait for the mount to recover (or restart the agent).",
 }
 
+var runFailureExitClasses = infracli.RunFailureExitClasses
+
 func runFailureMessage(reason string) error {
 	// Batch-A A1 Step 4. The broker sends RunChunk.Reason as either "<code>" or
 	// "<code>: <detail>" (internal/broker/run.go builds the latter with
@@ -431,18 +506,23 @@ func runFailureMessage(reason string) error {
 	// shape, two different readers. The split is done here rather than by
 	// changing RunChunk: adding a Code field would be a wire change, and batch A
 	// is explicitly zero-wire.
-	code := reason
-	if i := strings.IndexByte(reason, ':'); i >= 0 {
-		code = strings.TrimSpace(reason[:i])
+	code, detail, _ := strings.Cut(reason, ":")
+	code = strings.TrimSpace(code)
+	class := brokerDetailExitClass(code, detail)
+	wireCode := ""
+	if class == exitUnsettled {
+		wireCode = code
 	}
-	class := brokerCodeExitClass(code)
+	if lifecycleClass, ok := runFailureExitClasses[code]; ok {
+		class = lifecycleClass
+	}
 	if hint := runFailureReasons[code]; hint != "" {
-		return &ExitError{Class: class, Err: fmt.Errorf("run failed: %s (%s)", hint, reason)}
+		return &ExitError{Class: class, Code: wireCode, Err: fmt.Errorf("run failed: %s (%s)", hint, reason)}
 	}
-	if hint := brokerCodeHints[code]; hint != "" {
-		return &ExitError{Class: class, Err: fmt.Errorf("run failed: %s (%s)", hint, reason)}
+	if hint := refusalHint(code, detail); hint != "" {
+		return &ExitError{Class: class, Code: wireCode, Err: fmt.Errorf("run failed: %s (%s)", hint, reason)}
 	}
-	return &ExitError{Class: class, Err: fmt.Errorf("run rejected by agent (%s)", reason)}
+	return &ExitError{Class: class, Code: wireCode, Err: fmt.Errorf("run rejected by agent (%s)", reason)}
 }
 
 // execFailureMessage wraps an exec error-chunk string, appending the operator
@@ -459,27 +539,47 @@ func runFailureMessage(reason string) error {
 // correctly by runFailureMessage; the two readers of the same wire shape simply
 // disagreed. The operator-visible text is unchanged; only the class is added.
 func execFailureMessage(chunkErr string) error {
-	code := chunkErr
-	if i := strings.IndexByte(chunkErr, ':'); i >= 0 {
-		code = chunkErr[:i]
-	}
+	code, detail, _ := strings.Cut(chunkErr, ":")
 	// TrimSpace AFTER the split, not before: " store_error: detail" must key on
 	// "store_error", and trimming the whole string first leaves the space after the
 	// colon inside the code.
 	code = strings.TrimSpace(code)
-	class := brokerCodeExitClass(code)
+	class := brokerDetailExitClass(code, detail)
+	wireCode := ""
+	if class == exitUnsettled {
+		wireCode = code
+	}
 	if hint := runFailureReasons[code]; hint != "" {
-		return &ExitError{Class: class, Err: fmt.Errorf("exec: %s (%s)", hint, chunkErr)}
+		return &ExitError{Class: class, Code: wireCode, Err: fmt.Errorf("exec: %s (%s)", hint, chunkErr)}
 	}
-	if hint := brokerCodeHints[code]; hint != "" {
-		return &ExitError{Class: class, Err: fmt.Errorf("exec: %s (%s)", hint, chunkErr)}
+	if hint := refusalHint(code, detail); hint != "" {
+		return &ExitError{Class: class, Code: wireCode, Err: fmt.Errorf("exec: %s (%s)", hint, chunkErr)}
 	}
-	return &ExitError{Class: class, Err: fmt.Errorf("exec: %s", chunkErr)}
+	return &ExitError{Class: class, Code: wireCode, Err: fmt.Errorf("exec: %s", chunkErr)}
 }
 
-func stripPrefix(s, prefix string) (string, bool) {
-	if strings.HasPrefix(s, prefix) {
-		return s[len(prefix):], true
+// origin: hot-update S4 plan §9.2 / N1-REFUSAL. Match the detail's reason
+// token, so unrelated try_again text mentioning an upgrade keeps its own hint.
+func refusalHint(code, detail string) string {
+	if hint := infracli.Hints[code]; hint != "" {
+		return hint
 	}
-	return "", false
+	detail = strings.TrimSpace(detail)
+	if code == "try_again" && (detail == "agent_upgrading" || strings.HasPrefix(detail, "agent_upgrading:")) {
+		return brokerCodeHints["agent_upgrading"]
+	}
+	return brokerCodeHints[code]
+}
+
+var stripPrefix = infracli.StripPrefix
+
+// The wire code remains agent_no_responders for N-1 readers. Its sent-result
+// detail is terminal: presenting it as 75 invites a duplicate side effect.
+// origin: hot-update S6 plan §9.1 / T36
+func brokerDetailExitClass(code, detail string) int {
+	reason, _, _ := strings.Cut(strings.TrimSpace(detail), ":")
+	if code == proto.CodeAgentNoResponders && reason == brokerimage.DetailControlResultUnknown {
+		return exitUnsettled
+	}
+	return brokerCodeExitClass(code)
 }

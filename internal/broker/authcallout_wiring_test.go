@@ -393,6 +393,10 @@ func buildsCompositeLit(fn *ast.FuncDecl, pkg, name string) bool {
 //
 // origin: prerelease audit external review M-1.
 func TestClusteredPINWritesRunThroughTheSuppliedVerifier(t *testing.T) {
+	// origin: hot-update S10 plan §11.1 / TEST-BUDGET
+	if runIsolatedBrokerTest(t) {
+		return
+	}
 	n, _ := d7SingleNode(t, "pin-budget-wiring")
 	now := time.Now().UTC()
 	if err := n.Propose(func(db *sql.DB) (*cluster.Command, error) {

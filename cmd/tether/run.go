@@ -3,22 +3,32 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/signal"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/cli"
+	"github.com/LinZiyang666/tether/internal/execclient"
 	"github.com/LinZiyang666/tether/internal/proto"
+	"github.com/LinZiyang666/tether/internal/terminalio"
+	"github.com/LinZiyang666/tether/internal/upgradebudget"
 	"github.com/nats-io/nats.go"
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
 )
 
-// newRunCmd implements `tether run` — the P5 PTY-mode interactive
+// newRunCmd first probes the reliable PTY protocol, opens cancellable local
+// I/O and enters raw mode before create. Legacy run remains the pre-create
+// compatibility path. The reliable transport loop belongs to execclient.
+// origin: hot-update S4 plan §7.2 / T49
+//
+// The legacy path implements the P5 PTY-mode interactive
 // remote command. Architecture C.5 / C.5.1 walks through the wire flow;
 // the ctl-side responsibilities here are:
 //
@@ -34,7 +44,7 @@ import (
 //  5. run three pumps for the lifetime of the child:
 //     local stdin  → pty.<PID>.in
 //     SIGWINCH     → pty.<PID>.resize  (with current cols/rows)
-//     local Ctrl-C → cmd.by.<A>.node.<N>.kill.req {SIGINT}
+//     raw Ctrl-C  → the remote line discipline as byte 0x03
 //     and one passive listener:
 //     pty.<PID>.out → local stdout
 //  6. on RunChunk{Kind:exit} restore terminal and exit with the same code.
@@ -48,16 +58,16 @@ func newRunCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "run <node> -- <argv...>",
 		Short: "Run an argv on a node interactively (allocates a PTY)",
-		Long: `tether run — interactive PTY remote command (P5).
+		Long: `tether run — interactive PTY remote command.
 
 Use for shells, vim, htop, anything that needs a terminal. The local
 terminal goes into raw mode so keys, arrow sequences, Ctrl-C, etc. flow
 through to the remote process group untouched. Resize is propagated.
 
-The two-phase attach handshake (architecture C.5.1) ensures the very
-first byte of remote output is not dropped; on the agent side an attach
-deadline (default 15s) guarantees no orphan PTYs if ctl drops
-mid-handshake.
+On compatible Linux agents, reliable input and output survive hot updates
+and reconnect using the original task. Older endpoints use the legacy
+two-phase attach handshake (architecture C.5.1). External SIGINT/SIGTERM
+cancel locally; raw Ctrl-C bytes reach the remote terminal unchanged.
 
 Flags must come BEFORE the node argument (flag parsing stops at the first
 positional). Use --safe to survive a hung network filesystem on the node:
@@ -65,7 +75,12 @@ positional). Use --safe to survive a hung network filesystem on the node:
 A trailing '--safe' is sent to the remote command, not parsed here.
 `,
 		Args: cobra.MinimumNArgs(2),
-		RunE: func(cmd *cobra.Command, args []string) error {
+		RunE: func(cmd *cobra.Command, args []string) (resultErr error) {
+			admission, err := beginCtlAdmission(cmd)
+			if err != nil {
+				return err
+			}
+			defer finishCtlAdmission(admission, &resultErr)
 			sid := cli.ReadCurrentSession(home)
 			if sid == "" {
 				return fmt.Errorf("no active session — run `tether login -s <sid>` first")
@@ -90,7 +105,7 @@ A trailing '--safe' is sent to the remote command, not parsed here.
 			defer nc.Close()
 
 			ackAlerts, _ := cmd.Flags().GetBool("ack-alerts")
-			if gerr := gateDestructive(nc, id.PublicKey, ackAlerts); gerr != nil { // D8b §10.4
+			if gerr := gateDestructiveWithin(cmd, nc, id.PublicKey, ackAlerts); gerr != nil { // D8b §10.4
 				return gerr
 			}
 
@@ -106,12 +121,18 @@ A trailing '--safe' is sent to the remote command, not parsed here.
 					env[k] = v
 				}
 			}
-			body, err := json.Marshal(proto.RunReq{
+			spec := proto.RunReq{
 				Argv: argv, Cwd: cwd, Cols: cols, Rows: rows, Env: env, Safe: safe,
 				// h1 D2: advertise the ctl-liveness keepalive (5s beat). An
 				// old agent ignores the field and never reaps — safe skew.
 				KAIntervalMS: int(runKeepaliveInterval / time.Millisecond),
-			})
+			}
+			legacy, reliableErr := tryReliableRun(cmd, nc, sid, id.PublicKey, nid, spec)
+			if !legacy {
+				return reliableErr
+			}
+
+			body, err := json.Marshal(spec)
 			if err != nil {
 				return err
 			}
@@ -123,27 +144,19 @@ A trailing '--safe' is sent to the remote command, not parsed here.
 			}
 			defer func() { _ = sub.Unsubscribe() }()
 
+			// Legacy admission also consumes the original budget; no new 20s
+			// window may start after CONNECT and reliable protocol negotiation.
+			// origin: hot-update S6 plan §8.2 / T30
+			readyCtx, cancelReady, err := ctlAdmissionContext(cmd.Context(), admission.deadline)
+			if err != nil {
+				return err
+			}
+			defer cancelReady()
 			runSubj := proto.SubjCmdBy(sid, id.PublicKey, nid, "run")
 			if err := nc.PublishRequest(runSubj, inbox, body); err != nil {
 				return fmt.Errorf("run: publish: %w", err)
 			}
 
-			// Wait for ready / failed.
-			// ctl waits for the agent's RunChunk{Kind:ready} reply
-			// before publishing pty.<pid>.attach. Has to outlast both
-			// the agent-side attachDeadline (default 15s, override
-			// TETHER_AGENT_ATTACH_DEADLINE) AND the round-trip cost
-			// of the run.req → ready reply over WSS. 20s gives slack
-			// without wedging on a truly dead broker. Override:
-			// TETHER_RUN_READY_TIMEOUT.
-			readyTimeout := 20 * time.Second
-			if v := os.Getenv("TETHER_RUN_READY_TIMEOUT"); v != "" {
-				if d, err := time.ParseDuration(v); err == nil && d > 0 {
-					readyTimeout = d
-				}
-			}
-			readyCtx, cancelReady := context.WithTimeout(cmd.Context(), readyTimeout)
-			defer cancelReady()
 			msg, err := sub.NextMsgWithContext(readyCtx)
 			if err != nil {
 				return fmt.Errorf("run: waiting for ready: %w", err)
@@ -182,16 +195,6 @@ A trailing '--safe' is sent to the remote command, not parsed here.
 			}
 			defer func() { _ = outSub.Unsubscribe() }()
 
-			// Step 4: raw mode on local terminal IF stdin is a tty.
-			restore, isTTY := enterRawMode()
-			defer restore()
-
-			// Step 5b: tell the agent we are subscribed and ready.
-			attachBody, _ := json.Marshal(proto.PtyAttachEvent{Cols: cols, Rows: rows})
-			if err := nc.Publish(proto.SubjPtyAttach(sid, pid), attachBody); err != nil {
-				return fmt.Errorf("run: publish attach: %w", err)
-			}
-
 			// Background pumps. ctxRun goes down on exit / failure.
 			ctxRun, cancelRun := context.WithCancel(cmd.Context())
 			defer cancelRun()
@@ -215,6 +218,19 @@ A trailing '--safe' is sent to the remote command, not parsed here.
 			// grant heartbeat-sub to ctl (older release) — we just stay
 			// unarmed and behave as before, no false positives.
 			startRunWatchdog(ctxRun, nc, sid, nid, lifecycleCh)
+
+			// Arm the watchdog before raw mode: its optional setup warning must
+			// not become a byte in the interactive terminal stream.
+			// origin: hot-update S4 plan §7.3 / T39; PRODUCT-R4 stderr audit
+			// Step 4: raw mode on local terminal IF stdin is a tty.
+			restore, isTTY := enterRawMode()
+			defer restore()
+
+			// Step 5b: tell the agent we are subscribed and ready.
+			attachBody, _ := json.Marshal(proto.PtyAttachEvent{Cols: cols, Rows: rows})
+			if err := nc.Publish(proto.SubjPtyAttach(sid, pid), attachBody); err != nil {
+				return fmt.Errorf("run: publish attach: %w", err)
+			}
 
 			// stdin → pty.<pid>.in, on BOTH the node-scoped subject and the legacy
 			// session-scoped one. origin: prerelease audit round 2, I-F6.
@@ -245,24 +261,10 @@ A trailing '--safe' is sent to the remote command, not parsed here.
 			go pumpWinchToBus(ctxRun, nc,
 				proto.SubjPtyResizeNode(sid, nid, pid), proto.SubjPtyResize(sid, pid), winchCh)
 
-			// Local Ctrl-C → kill.req {SIGINT}. We can't observe Ctrl-C as
-			// a SIGINT signal here because raw mode delivers ^C as a byte
-			// to stdin (so it's already in the .in pump). The dual capture
-			// would double-deliver. Instead, capture SIGINT only when stdin
-			// is NOT a tty (where the kernel still cooks ^C).
-			if !isTTY {
-				sigCh := make(chan os.Signal, 1)
-				signal.Notify(sigCh, syscall.SIGINT)
-				defer signal.Stop(sigCh)
-				go func() {
-					select {
-					case <-ctxRun.Done():
-						return
-					case <-sigCh:
-						_ = sendKill(nc, sid, id.PublicKey, nid, pid, int(syscall.SIGINT))
-					}
-				}()
-			}
+			// External SIGINT/SIGTERM cancel through main's root NotifyContext.
+			// A second SIGINT handler races that cancellation and double-delivers
+			// a cooked Ctrl-C; remote interrupt semantics belong to raw input.
+			// origin: hot-update S4 plan §7.3 / lead L3
 
 			// Foreground: drain .out → stdout AND wait for exit on the inbox.
 			out := cmd.OutOrStdout()
@@ -279,18 +281,31 @@ A trailing '--safe' is sent to the remote command, not parsed here.
 				}
 			}()
 
+			admissionDone := readyCtx.Done()
 			for {
 				select {
+				case <-admissionDone:
+					restore()
+					return &ExitError{Class: exitUnsettled, Err: fmt.Errorf("run: admission expired after %s; the sent task result is unknown", upgradebudget.RequestLatency)}
 				case b := <-outCh:
 					_, _ = out.Write(b)
 				case c := <-lifecycleCh:
 					switch c.Kind {
 					case "started":
-						// optional log; nothing to do.
+						// Only true start releases the admission deadline. Raw I/O retains
+						// the original user context for the rest of the task's lifetime.
+						// origin: hot-update S6 plan §8.2 / T30
+						cancelReady()
+						admissionDone = nil
 					case "exit":
 						// Drain any final bytes the kernel may have buffered.
 						drainPending(outCh, out, 100*time.Millisecond)
 						restore()
+						admission.settled = true
+						finishCtlAdmission(admission, &resultErr)
+						if resultErr != nil {
+							return resultErr
+						}
 						if c.ExitCode != 0 {
 							os.Exit(c.ExitCode)
 						}
@@ -298,7 +313,7 @@ A trailing '--safe' is sent to the remote command, not parsed here.
 					case "failed":
 						drainPending(outCh, out, 50*time.Millisecond)
 						restore()
-						return fmt.Errorf("run: %s", c.Reason)
+						return runFailureMessage(c.Reason)
 					}
 				case <-cmd.Context().Done():
 					restore()
@@ -332,16 +347,26 @@ A trailing '--safe' is sent to the remote command, not parsed here.
 }
 
 func terminalSize() (cols, rows int) {
-	if w, h, err := term.GetSize(int(os.Stdout.Fd())); err == nil {
-		return w, h
+	// File.Fd may clear O_NONBLOCK on a pollable inherited descriptor.
+	// Reliable run reopens its own OFD and must preserve the original flags.
+	// origin: hot-update S4 plan §7.3 / T49
+	cols, rows = 80, 24
+	raw, err := os.Stdout.SyscallConn()
+	if err != nil {
+		return cols, rows
 	}
-	return 80, 24
+	_ = raw.Control(func(fd uintptr) {
+		if w, h, err := term.GetSize(int(fd)); err == nil {
+			cols, rows = w, h
+		}
+	})
+	return cols, rows
 }
 
 // enterRawMode flips the local terminal to raw mode IF stdin is a tty.
 // Returns a restore function (always safe to call, even on non-tty) and
 // the isTTY bool the caller uses to decide whether to enable the stdin
-// pump and the SIGINT path.
+// pump. External signals always cancel through the root context.
 func enterRawMode() (restore func(), isTTY bool) {
 	fd := int(os.Stdin.Fd())
 	if !term.IsTerminal(fd) {
@@ -530,13 +555,6 @@ func startRunWatchdog(ctx context.Context, nc *nats.Conn, sid, nid string, lifec
 	}()
 }
 
-func sendKill(nc *nats.Conn, sid, actor, nid, pid string, sig int) error {
-	body, _ := json.Marshal(proto.KillReq{PID: pid, Signal: sig})
-	subj := proto.SubjCmdBy(sid, actor, nid, "kill")
-	_, err := nc.Request(subj, body, 2*time.Second)
-	return err
-}
-
 // drainPending greedily drains buffered .out bytes for up to maxWait so
 // the very last lines (e.g. "$ exit\r\n") aren't visually clipped when
 // the agent's exit chunk races past them.
@@ -561,5 +579,195 @@ func drainPending(outCh <-chan []byte, w io.Writer, maxWait time.Duration) {
 				return
 			}
 		}
+	}
+}
+
+// These structural interfaces keep CLI ordering independently testable while
+// the protocol loop and descriptor ownership remain in their respective packages.
+// origin: hot-update S4 plan §7.2 / T49
+type runPTYClient interface {
+	Run(context.Context, proto.RunReq, execclient.Source, execclient.Sink, <-chan execclient.ControlEvent) (execclient.Result, error)
+	Close() error
+}
+
+type runTerminal interface {
+	EnterRaw() error
+	Restore() error
+	Close() error
+	Source() terminalio.Source
+	Sink() terminalio.Sink
+}
+
+type reliableRunDeps struct {
+	probe  func(context.Context) (runPTYClient, error)
+	open   func() (runTerminal, error)
+	events func(context.Context) (<-chan execclient.ControlEvent, func())
+	exit   func(execclient.Result)
+}
+
+func tryReliableRun(cmd *cobra.Command, nc *nats.Conn, sid, actor, nid string, spec proto.RunReq) (bool, error) {
+	var closeErr error
+	legacy, err := runReliableBranch(cmd.Context(), nid, spec, cmd.ErrOrStderr(), reliableRunDeps{
+		probe: func(ctx context.Context) (runPTYClient, error) {
+			return execclient.ProbePTYWithin(ctx, nc, proto.SubjCmdBy(sid, actor, nid, proto.ProcessResumeVerb), ctlAdmissionConfig(cmd))
+		},
+		open:   func() (runTerminal, error) { return terminalio.Open(os.Stdin, os.Stdout) },
+		events: runResizeEvents,
+		exit: func(result execclient.Result) {
+			a, _ := cmd.Context().Value(ctlAdmissionKey{}).(*ctlAdmission)
+			if a != nil {
+				a.settled = true
+			}
+			finishCtlAdmission(a, &closeErr)
+			if closeErr != nil {
+				return
+			} // surfaced below before any remote-status exit
+			exitWithRemoteStatus(result)
+		},
+	})
+	return legacy, errors.Join(err, closeErr)
+}
+
+// Only Probe and Open may request legacy fallback. Run has crossed the create
+// boundary, even when its returned error happens to wrap ErrUnsupported.
+// Cleanup returns through runReliablePTY before any exit callback can bypass
+// Go's deferred terminal restoration.
+// origin: hot-update S4 plan §2.2 / §7.2 / lead L5 / T49
+func runReliableBranch(ctx context.Context, nid string, spec proto.RunReq, stderr io.Writer, deps reliableRunDeps) (bool, error) {
+	result, legacy, err := runReliablePTY(ctx, spec, stderr, deps)
+	if legacy {
+		return true, nil
+	}
+	if err != nil || result.InputAbort != "" || result.StdoutAbort != "" || result.StderrAbort != "" || result.TerminalError != "" {
+		return false, classifyReliableRunFailure(nid, result, err)
+	}
+	deps.exit(result)
+	return false, nil
+}
+
+func runReliablePTY(ctx context.Context, spec proto.RunReq, stderr io.Writer, deps reliableRunDeps) (result execclient.Result, legacy bool, err error) {
+	client, err := deps.probe(ctx)
+	if errors.Is(err, execclient.ErrUnsupported) {
+		return result, true, nil
+	}
+	if err != nil {
+		return result, false, err
+	}
+	defer func() { _ = client.Close() }()
+
+	terminal, err := deps.open()
+	// origin: hot-update S4 plan lead L5 — terminalio names the offending stream and
+	// its kind; the notice repeats them, and the legacy path is chosen before create.
+	var unsupported *terminalio.ErrUnsupportedStdio
+	if errors.As(err, &unsupported) {
+		_, _ = fmt.Fprintf(stderr, "tether: %s is a %s; using legacy run (no hot-update continuity)\n", unsupported.Stream, unsupported.Kind)
+		return result, true, nil
+	}
+	if err != nil {
+		return result, false, err
+	}
+	defer func() {
+		// Restore even if entering raw mode failed partway. Close owns only
+		// reopened descriptors; failures must not turn a remote rc0 into success.
+		// origin: hot-update S4 plan §7.3 / T49
+		restoreErr := terminal.Restore()
+		closeErr := terminal.Close()
+		err = errors.Join(err, restoreErr, closeErr)
+	}()
+	if err := terminal.EnterRaw(); err != nil {
+		return result, false, err
+	}
+	events, stopEvents := deps.events(ctx)
+	defer stopEvents() // join the local resize adapter before restoring the terminal
+	result, err = client.Run(ctx, spec, terminal.Source(), terminal.Sink(), events)
+	return result, false, err
+}
+
+// Run shares exec's established phase taxonomy, but an unknown PTY refusal
+// cannot imply retry-safe exit 70. Input responsibility is reported even for
+// rc0, with both the applied and accepted byte offsets preserved.
+// origin: hot-update S4 plan §2.2 / T49
+func classifyReliableRunFailure(nid string, result execclient.Result, err error) error {
+	var settled *execclient.SettledError
+	if errors.As(err, &settled) {
+		result = settled.Result
+	}
+	var permission *execclient.ProtocolError
+	if errors.As(err, &permission) && brokerCodeExitClass(permission.Code) == exitNoPerm {
+		return &ExitError{Class: exitNoPerm, Code: permission.Code, Err: fmt.Errorf("run: %s", permission.Message)}
+	}
+	if result.InputAbort != "" {
+		abort := strings.TrimPrefix(result.InputAbort, "pty input aborted: ")
+		message := fmt.Sprintf("run: pty input aborted: %s; applied=%d accepted=%d; remote exit=%d signal=%d (task %s on %s)",
+			abort, result.InputACK, result.InputAccepted, result.ExitCode, result.Signal, result.Handle.RequestID, nid)
+		return &ExitError{Class: exitUnsettled, Err: errors.New(message)}
+	}
+	if err == nil {
+		err = &execclient.SettledError{Result: result}
+	}
+	// Result.CreateSent is also evidence when the peer lacks a typed phase.
+	// Copy a ProtocolError rather than mutating an error retained by the client.
+	var pe *execclient.ProtocolError
+	// origin: hot-update S4 plan §2.2 / T38
+	// The PTY client marks only a definitive first-create admission refusal
+	// as pre-admission. Recovery-pending uses process_recovering; genuine busy
+	// is final even after a lost reply.
+	if errors.As(err, &pe) && pe.Code == proto.CodeProcessBusy && !pe.AfterCreate {
+		return &ExitError{Class: exitTransient, Code: pe.Code, Err: fmt.Errorf("run: %s: %s", pe.Code, pe.Message)}
+	}
+	if errors.As(err, &pe) && result.CreateSent && !pe.AfterCreate {
+		copyError := *pe
+		copyError.AfterCreate = true
+		err = &copyError
+	}
+	classified := classifyReliableFailure(nid, upgradebudget.PTYRecovery, result, err)
+	var exitErr *ExitError
+	if errors.As(classified, &exitErr) {
+		class := exitErr.Class
+		if class == exitInternal {
+			class = exitUnsettled
+		}
+		message := strings.Replace(classified.Error(), "exec:", "run:", 1)
+		// Run has no --timeout flag: its recovery window is fixed by the
+		// protocol, so exec's timeout guidance would name an unusable option.
+		// origin: hot-update S4 plan §7.2 / T49
+		message = strings.Replace(message, "gave up waiting after --timeout ", "recovery window expired after ", 1)
+		return &ExitError{Class: class, Code: exitErr.Code, Err: errors.New(message)}
+	}
+	return &ExitError{Class: exitUnsettled, Err: fmt.Errorf("run: %w", classified)}
+}
+
+// SIGWINCH is the only signal owned here. External SIGINT/SIGTERM belong to
+// main's root NotifyContext; raw 0x03 remains ordinary input to the protocol.
+// The single-slot event channel bounds a blocked transport's resize backlog.
+// origin: hot-update S4 plan §7.3 / lead L3
+func runResizeEvents(ctx context.Context) (<-chan execclient.ControlEvent, func()) {
+	ctx, cancel := context.WithCancel(ctx)
+	winch := make(chan os.Signal, 1)
+	signal.Notify(winch, syscall.SIGWINCH)
+	events := make(chan execclient.ControlEvent, 1)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer close(events)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-winch:
+				cols, rows := terminalSize()
+				event := execclient.ControlEvent{Op: "resize", Cols: uint16(cols), Rows: uint16(rows)}
+				select {
+				case events <- event:
+				case <-ctx.Done():
+					return
+				}
+			}
+		}
+	}()
+	return events, func() {
+		signal.Stop(winch)
+		cancel()
+		<-done
 	}
 }

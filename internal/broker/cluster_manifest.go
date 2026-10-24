@@ -6,8 +6,8 @@ import (
 
 	"github.com/LinZiyang666/tether/internal/adminsock"
 	"github.com/LinZiyang666/tether/internal/auth"
+	"github.com/LinZiyang666/tether/internal/brokercontrol"
 	"github.com/LinZiyang666/tether/internal/cluster"
-	"github.com/LinZiyang666/tether/internal/clusterroster"
 	"github.com/LinZiyang666/tether/internal/proto"
 )
 
@@ -132,25 +132,10 @@ func (b *Broker) accountPubOrEmpty() string {
 	return ap
 }
 
-// buildSeedBundle reads the replicated seed config + account-signs it. nil until `cluster seeds
-// publish` has stored at least one endpoint (or when no account seed).
+// origin: hot-update S7 plan §11.4 / S7 BROKER-SLIM-2
 func (b *Broker) buildSeedBundle(now time.Time, endpoints []string, bootstrap string, gen uint64) *proto.SeedBundle {
-	if b.cfg.AuthCallout == nil || len(endpoints) == 0 {
+	if b.cfg.AuthCallout == nil {
 		return nil
 	}
-	seed := b.cfg.AuthCallout.AccountSeed
-	if len(seed) == 0 {
-		return nil
-	}
-	accountPub, err := auth.PublicKeyFromSeed(seed)
-	if err != nil {
-		return nil
-	}
-	issued := now.UTC()
-	expires := issued.Add(rosterTTL)
-	s, err := clusterroster.BuildSeeds(seed, accountPub, gen, endpoints, bootstrap, issued.Format(time.RFC3339Nano), expires.Format(time.RFC3339Nano))
-	if err != nil {
-		return nil
-	}
-	return s
+	return brokercontrol.BuildSeedBundle(b.cfg.AuthCallout.AccountSeed, now, endpoints, bootstrap, gen, rosterTTL)
 }

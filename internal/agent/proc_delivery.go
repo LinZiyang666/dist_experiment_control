@@ -79,6 +79,10 @@ type pendingProcEvent struct {
 	parked     bool // register-replay-only
 	rc         int  // exit only — for the register snapshot row
 	endedAt    time.Time
+	// started only — for the register snapshot row (C-5, S1): the row a
+	// pending started describes may not exist on the broker yet.
+	startedAt      time.Time
+	startTimeTicks int64
 }
 
 // procCourier owns the pending set + the delivery goroutine. All methods hang
@@ -113,14 +117,38 @@ func (c *procCourier) enqueueStarted(pid string, argv []string, actorFP, bootID 
 	if err != nil {
 		return
 	}
-	c.add(&pendingProcEvent{pid: pid, kind: procEventStarted, payload: payload, enqueuedAt: time.Now()})
+	c.add(&pendingProcEvent{pid: pid, kind: procEventStarted, payload: payload, enqueuedAt: time.Now(),
+		startedAt: startedAt, startTimeTicks: startTimeTicks})
 }
 
-// enqueueExit queues a proc.exit event. NOTE the documented gap: run.go calls
-// unregisterProc BEFORE this enqueue, so a register snapshot built between
-// the two omits the pid entirely and G.1 marks -1 — a pre-existing window,
-// deliberately NOT "fixed" here (closing it by enqueueing first would let
-// the same exit be reported twice: snapshot row + live courier request).
+// pendingStartedSnapshot lists the tasks whose proc.started the broker has
+// not acknowledged yet, each flagged StartedUnacked so a new broker's G.1
+// pass leaves it alone instead of orphan-killing a child whose row it has
+// simply not received (C-5). An old broker ignores the flag — today's window,
+// never worse. Parked events are register-replay-only and are not listed:
+// their register carries the started itself.
+// origin: docs/reviews/hot-update-reliable-exec-plan.md §3.2.
+func (c *procCourier) pendingStartedSnapshot() []proto.LocalProcess {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]proto.LocalProcess, 0)
+	for _, ev := range c.pending {
+		if ev.kind != procEventStarted || ev.parked {
+			continue
+		}
+		out = append(out, proto.LocalProcess{
+			PID: ev.pid, State: "running", StartedAt: ev.startedAt, StartTimeTicks: ev.startTimeTicks,
+			StartedUnacked: true,
+		})
+	}
+	return out
+}
+
+// enqueueExit queues a proc.exit event. Child owners call this BEFORE retiring
+// the task record; localProcessSnapshot merges the overlap by task ID, with the
+// retained exit winning. The old unregister-then-enqueue order left a gap where
+// register omitted the task and G.1 incorrectly marked it exited with code -1.
+// Courier/register overlap already uses the broker's idempotent exit handling.
 func (c *procCourier) enqueueExit(pid string, exitCode int) {
 	endedAt := time.Now().UTC()
 	payload, err := json.Marshal(proto.ProcExitEvent{PID: pid, ExitCode: exitCode, EndedAt: endedAt})
@@ -268,8 +296,8 @@ func (c *procCourier) attempt(ctx context.Context, nc *nats.Conn, ev *pendingPro
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	key := courierKey(ev.pid, ev.kind)
-	if _, still := c.pending[key]; !still {
-		return // cleared concurrently (register clearance)
+	if c.pending[key] != ev {
+		return // cleared or replaced concurrently; this ACK owns only its event
 	}
 	if err == nil {
 		var ack proto.ProcEventAck
@@ -355,11 +383,28 @@ func (c *procCourier) drainStarted(ctx context.Context, nc *nats.Conn) {
 	}
 }
 
-// onRegisterSuccess is the replay-channel settlement (h1 plan C4). The
-// snapshot carried every pending exit as a State:"exited" row, so after a
-// successful register:
+// registerReceipt captures event identities BEFORE building a register
+// snapshot. A late exit or a replacement entry must not be settled by an ACK
+// for an older request. The receipt stays local to one attempt; concurrent
+// register callers cannot overwrite each other's delivery responsibility.
+func (c *procCourier) registerReceipt() map[string]*pendingProcEvent {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	receipt := make(map[string]*pendingProcEvent, len(c.pending))
+	for key, ev := range c.pending {
+		receipt[key] = ev
+	}
+	return receipt
+}
+
+// onRegisterSuccess is the replay-channel settlement (h1 plan C4). Only
+// events captured in receipt AND represented by the actual wire rows can be
+// settled. The queue may have changed while the broker processed the request;
+// "all pending exits" at reply time is not what that request acknowledged.
+// For events represented by this successful register:
 //
-//   - an EXIT entry whose pid is ABSENT from resp.AcceptedProcesses is done:
+//   - an EXIT entry with no pending STARTED in the request's receipt and whose
+//     pid is ABSENT from resp.AcceptedProcesses is done:
 //     the broker no longer believes the pid is RUNNING — it either reconciled
 //     the snapshot row to EXITED(rc) or already had it terminal. (Membership
 //     in ReconciledProcesses would be the WRONG rule — plan critique-2: an
@@ -371,7 +416,7 @@ func (c *procCourier) drainStarted(ctx context.Context, nc *nats.Conn) {
 //
 // Parked entries settle here too — this is exactly the register-replay they
 // were parked for.
-func (c *procCourier) onRegisterSuccess(resp proto.NodeRegisterResp) {
+func (c *procCourier) onRegisterSuccess(receipt map[string]*pendingProcEvent, rows []proto.LocalProcess, resp proto.NodeRegisterResp) {
 	// A CONTESTED reply is not a successful register. The broker returned
 	// BEFORE registerNode, so it never read LocalProcesses and never accepted a
 	// single pid — and this function reads "pid absent from AcceptedProcesses"
@@ -379,12 +424,16 @@ func (c *procCourier) onRegisterSuccess(resp proto.NodeRegisterResp) {
 	// therefore DELETE every pending exit: the real rc is lost forever and the
 	// ps row stays RUNNING. That is the 2026-08-04 zombie-row class, re-armed.
 	//
-	// The guard lives here rather than only at the two call sites on purpose:
+	// The guard lives here rather than only at the register call site on purpose:
 	// this is the function whose contract the emptiness would violate, and a
 	// third register site added later would otherwise re-introduce the bug
 	// silently.
-	if resp.Lease != nil {
+	if !resp.OK || resp.Lease != nil {
 		return
+	}
+	represented := make(map[string]proto.LocalProcess, len(rows))
+	for _, row := range rows {
+		represented[row.PID] = row
 	}
 	accepted := make(map[string]bool, len(resp.AcceptedProcesses))
 	for _, pid := range resp.AcceptedProcesses {
@@ -392,14 +441,30 @@ func (c *procCourier) onRegisterSuccess(resp proto.NodeRegisterResp) {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	for key, ev := range c.pending {
+	for key, ev := range receipt {
+		if c.pending[key] != ev {
+			continue
+		}
+		row, present := represented[ev.pid]
+		if !present {
+			continue
+		}
 		switch ev.kind {
 		case procEventExit:
-			if !accepted[ev.pid] {
+			// origin: hot-update S3 plan §3.4 / concurrency review CC-3.
+			// An unacknowledged start at request construction means absent
+			// from Accepted can mean unknown, not settled: the broker skips
+			// unknown exited rows. A later start ACK cannot make this older
+			// reply authoritative; a new register or exit ACK must settle it.
+			if receipt[courierKey(ev.pid, procEventStarted)] != nil {
+				continue
+			}
+			if row.State == "exited" && row.RC != nil && *row.RC == ev.rc &&
+				row.EndedAt != nil && row.EndedAt.Equal(ev.endedAt) && !accepted[ev.pid] {
 				delete(c.pending, key)
 			}
 		case procEventStarted:
-			if accepted[ev.pid] {
+			if row.State == "running" && accepted[ev.pid] {
 				delete(c.pending, key)
 			}
 		}

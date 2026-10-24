@@ -2,13 +2,27 @@ package agent
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"math"
 	"net/url"
-	"strings"
+	"path/filepath"
+	"sync"
 	"time"
 
+	"github.com/LinZiyang666/tether/internal/agentstate"
+	"github.com/LinZiyang666/tether/internal/agentupgrade"
+	"github.com/LinZiyang666/tether/internal/agentupgradeport"
+	"github.com/LinZiyang666/tether/internal/auth"
+	"github.com/LinZiyang666/tether/internal/brokermaint"
 	"github.com/LinZiyang666/tether/internal/clusterroster"
+	"github.com/LinZiyang666/tether/internal/procrequest"
 	"github.com/LinZiyang666/tether/internal/proto"
+	"github.com/LinZiyang666/tether/internal/upgradeauthority"
+
 	"github.com/nats-io/nats.go"
 )
 
@@ -70,7 +84,6 @@ func (a *Agent) loadRosterCacheAtBoot() {
 	}
 	a.rosterGen = rc.Generation
 	a.seedGen = rc.SeedGen
-	a.cachedRoster = rc.Roster
 	a.cachedSeeds = rc.Seeds
 	if a.pinAccount == "" {
 		return // nothing to verify the cached roster/seeds against
@@ -79,6 +92,7 @@ func (a *Agent) loadRosterCacheAtBoot() {
 	// expired cache still contributes its pin + generation hwm so anti-rollback survives a restart.
 	if rc.Roster != nil {
 		if err := clusterroster.VerifyAt(rc.Roster, a.pinAccount, now); err == nil {
+			a.cachedRoster = rc.Roster
 			if urls, derr := clusterroster.DialURLs(rc.Roster, a.cfg.NATSURL); derr == nil && len(urls) > 0 {
 				a.rosterURLs = urls
 			}
@@ -98,7 +112,7 @@ func (a *Agent) loadRosterCacheAtBoot() {
 // with no Home. Returns nil when no cache exists.
 func (a *Agent) loadCachedRoster() *RosterCache {
 	if a.rosterCacheStore != nil {
-		rc, err := a.rosterCacheStore.load()
+		rc, err := a.rosterCacheStore.Load()
 		if err != nil {
 			a.cfg.Logger.Warn("agent: load roster cache", "err", err)
 			return nil
@@ -121,118 +135,44 @@ func (a *Agent) loadCachedRoster() *RosterCache {
 	return nil
 }
 
-// RosterState is the agent's consumer discovery state — the input/output of the pure single-authority
-// AdoptDecision (C2 §2.5). Both the daemon (adoptManifest, holds rosterMu + persists) and the CLI
-// (config refresh / join / doctor) decide through AdoptDecision over this struct, so there is exactly
-// ONE verify/adopt enforcement site.
-type RosterState struct {
-	Pin       string
-	RosterGen uint64
-	SeedGen   uint64
-	DialURLs  []string
-	SeedURLs  []string
-	Roster    *proto.ClusterRoster
-	Seeds     *proto.SeedBundle
-}
+// Preserve the public consumer API shared with the CLI.
+// origin: hot-update S5 plan §10 / AGENT-SLIM-S5.
+type RosterState = clusterroster.ConsumerState
 
-// AdoptDecision is the ONE consumer authority (C1 roster decision table + C2 seed mirror). It verifies
-// a roster and/or a seed bundle against the pin (TOFU on the FIRST roster when pin==""), enforces the
-// monotone roster/seed generations, and returns the next state + whether anything was accepted. Every
-// reject keeps prior state (never wedge, never empty a pool). The pin passed to VerifyAt/VerifySeedsAt
-// is the PERSISTED/OOB pin — never the object's self-claimed AccountPub — except the first-TOFU roster.
-// templateURL is the agent's cfg.NATSURL (roster DialURLs templating). PURE — no I/O, no lock, the
-// only clock is the passed `now`.
-func AdoptDecision(prev RosterState, r *proto.ClusterRoster, s *proto.SeedBundle, templateURL string, now time.Time) (RosterState, bool) {
-	next := prev
-	accepted := false
-	pin := prev.Pin
-
-	if r != nil {
-		tofu := pin == ""
-		vp := pin
-		if tofu {
-			vp = r.AccountPub // row 2: trust-on-first-use
-		}
-		// rows 2-7: sig + account pin + schema + expiry + monotone generation. A reject leaves `next`
-		// at `prev` for the roster fields (prior kept).
-		if err := clusterroster.VerifyAt(r, vp, now); err == nil && r.Generation >= prev.RosterGen {
-			urls, derr := clusterroster.DialURLs(r, templateURL)
-			if derr == nil {
-				if len(urls) == 0 {
-					urls = prev.DialURLs // row E: empty-set floor — keep prior, never empty the pool
-				}
-				if tofu {
-					pin = r.AccountPub
-					next.Pin = r.AccountPub
-				}
-				next.RosterGen = r.Generation
-				next.DialURLs = urls
-				next.Roster = r
-				accepted = true
-			}
-		}
-	}
-
-	// Seeds verify against the SAME pin (possibly just TOFU-set by the roster above). A fresh agent
-	// with no pin AND no roster cannot adopt seeds — it has nothing to verify them against.
-	if s != nil && pin != "" {
-		if err := clusterroster.VerifySeedsAt(s, pin, now); err == nil && s.Generation >= prev.SeedGen {
-			next.SeedGen = s.Generation
-			next.SeedURLs = clusterroster.SeedDialURLs(s)
-			next.Seeds = s
-			accepted = true
-		}
-	}
-	return next, accepted
+func AdoptDecision(prev RosterState, r *proto.ClusterRoster, seeds *proto.SeedBundle, templateURL string, now time.Time) (RosterState, bool) {
+	return clusterroster.AdoptDecision(prev, r, seeds, templateURL, now)
 }
 
 // adoptManifest is the daemon's single adopt path: decide via AdoptDecision, then apply to the
 // in-memory mirror (monotone re-decide under the lock for concurrent adopts) + persist. nil roster
 // (single broker) AND nil seeds → no-op (byte-equivalent register reply).
-func (a *Agent) adoptManifest(r *proto.ClusterRoster, s *proto.SeedBundle) bool {
-	if r == nil && s == nil {
+func (a *Agent) adoptManifest(r *proto.ClusterRoster, seeds *proto.SeedBundle) bool {
+	if r == nil && seeds == nil {
 		return false
 	}
+	now := a.agentNow()
 	a.rosterMu.Lock()
-	prev := RosterState{
-		Pin: a.pinAccount, RosterGen: a.rosterGen, SeedGen: a.seedGen,
-		DialURLs: a.rosterURLs, SeedURLs: a.seedURLs, Roster: a.cachedRoster, Seeds: a.cachedSeeds,
-	}
-	a.rosterMu.Unlock()
-
-	next, accepted := AdoptDecision(prev, r, s, a.cfg.NATSURL, a.agentNow())
+	prev := RosterState{Pin: a.pinAccount, RosterGen: a.rosterGen, SeedGen: a.seedGen,
+		DialURLs: a.rosterURLs, SeedURLs: a.seedURLs, Roster: a.cachedRoster, Seeds: a.cachedSeeds}
+	// Verification and monotone adoption share the final lock. A concurrent
+	// first pin or newer roster cannot turn an earlier verification into authority.
+	// origin: hot-update S8 plan §11.2 P14.
+	next, accepted := AdoptDecision(prev, r, seeds, a.cfg.NATSURL, now)
 	if !accepted {
-		if r != nil || s != nil {
-			a.cfg.Logger.Warn("agent: roster/seed rejected (sig / account / schema / expiry / generation)")
-		}
+		a.rosterMu.Unlock()
+		a.cfg.Logger.Warn("agent: roster/seed rejected (sig / account / schema / expiry / generation)")
 		return false
 	}
-
-	a.rosterMu.Lock()
-	pinned := false
-	applied := false
-	if next.Pin != "" && a.pinAccount == "" { // first-writer-wins TOFU under the final lock
-		a.pinAccount = next.Pin
-		pinned = true
-	}
-	if r != nil && next.RosterGen >= a.rosterGen { // monotone re-decide vs a concurrent higher-gen adopt
-		a.rosterGen = next.RosterGen
-		a.rosterURLs = next.DialURLs
-		a.cachedRoster = next.Roster
-		applied = true
-	}
-	if s != nil && next.SeedGen >= a.seedGen {
-		a.seedGen = next.SeedGen
-		a.seedURLs = next.SeedURLs
-		a.cachedSeeds = next.Seeds
-		applied = true
-	}
+	pinned := a.pinAccount == "" && next.Pin != ""
+	a.pinAccount, a.rosterGen, a.seedGen = next.Pin, next.RosterGen, next.SeedGen
+	a.rosterURLs, a.seedURLs = next.DialURLs, next.SeedURLs
+	a.cachedRoster, a.cachedSeeds = next.Roster, next.Seeds
 	a.rosterMu.Unlock()
 	if pinned {
 		a.cfg.Logger.Info("agent: roster account pinned (TOFU)", "account_pub", next.Pin)
 	}
 	a.persistRosterCache()
-	return applied
+	return true
 }
 
 // adoptRoster is the C1 roster-only entry point (boot/reconnect register + refresh). It funnels to the
@@ -273,7 +213,7 @@ func (a *Agent) persistRosterCache() {
 	}
 	a.rosterMu.Unlock()
 	if a.rosterCacheStore != nil {
-		if err := a.rosterCacheStore.save(&rc); err != nil {
+		if err := a.rosterCacheStore.Save(&rc); err != nil {
 			a.cfg.Logger.Warn("agent: persist roster cache", "err", err)
 		}
 		return
@@ -370,7 +310,11 @@ func (a *Agent) rosterRefreshLoop(ctx context.Context, nc *nats.Conn) {
 			// #48: sustained silence on a healthy connection == a retired-broker island. If the
 			// cached roster still knows another dialable voter, rebuild onto it (excluding the
 			// silent broker from the immediate dial) instead of polling the island forever.
-			if silent >= maxSilentRosterRefreshes && a.rebuildOnBrokerSilence(nc) {
+			escaped := rosterSilenceRequiresRebuild(a, nc, silent)
+			// The observation describes the completed decision, so an immediate
+			// next wake cannot mistake a queued escape for a protected miss.
+			a.cfg.Logger.Debug("agent: roster refresh missed", "source", source, "consecutive", silent, "escaped", escaped)
+			if escaped {
 				return
 			}
 			next = a.rosterRefreshFailBackoff
@@ -391,13 +335,18 @@ const (
 // into the outcome line so a refresh and the wake that caused it are one record, not two to join.
 func (a *Agent) refreshRosterOnce(ctx context.Context, nc *nats.Conn, source string) bool {
 	genBefore := a.cachedRosterGen()
+	routeURL := nc.ConnectedUrl()
 	req := proto.NodeRegisterReq{
-		ProtoVersion:      proto.ProtoVersion,
-		NID:               nidOf(a),
-		RosterGen:         a.cachedRosterGen(),
-		RosterRefreshOnly: true,
+		ServerID:                  nc.ConnectedServerName(),
+		ProtoVersion:              proto.ProtoVersion,
+		NID:                       nidOf(a),
+		RosterGen:                 a.cachedRosterGen(),
+		RosterRefreshOnly:         true,
+		BrokerImageMaintenance:    brokermaint.Capability,
+		BrokerImageMaintenanceKey: agentMaintenanceKey(a),
 	}
-	payload, err := json.Marshal(req)
+	expected := agentIncarnation(a)
+	payload, err := marshalAuthorityRegister(a, req)
 	if err != nil {
 		return false
 	}
@@ -411,6 +360,10 @@ func (a *Agent) refreshRosterOnce(ctx context.Context, nc *nats.Conn, source str
 	if json.Unmarshal(msg.Data, &resp) != nil || !resp.OK {
 		return false
 	}
+	if err := checkRegisterAuthority(a, expected, msg.Data); err != nil {
+		return false
+	}
+	rememberConnectedBroker(a, nc, req.ServerID, routeURL, resp)
 	if resp.Roster != nil {
 		a.rosterMu.Lock()
 		previous := a.cachedRoster
@@ -432,61 +385,8 @@ func (a *Agent) refreshRosterOnce(ctx context.Context, nc *nats.Conn, source str
 	return true // a single/non-cluster broker (nil roster) is a successful no-op, not a retry
 }
 
-// rosterRequiresReconnect is the narrow proactive-move policy: a healthy connection is rebuilt only
-// when another dialable VOTER exists and the signed roster either marks the current broker as leaving,
-// or removes a broker that the previously accepted roster identified as current. The previous-roster
-// fence prevents an unrelated DNS/route alias from looking like a removal on every refresh.
 func rosterRequiresReconnect(previous, current *proto.ClusterRoster, connectedURL string) bool {
-	cu, err := url.Parse(connectedURL)
-	if err != nil || cu.Hostname() == "" || current == nil {
-		return false
-	}
-	connectedHost := cu.Hostname()
-	knownBefore := rosterContainsHost(previous, connectedHost)
-	currentPresent := false
-	currentLeaving := false
-	otherVoter := false
-	for _, b := range current.Brokers {
-		isCurrent := rosterBrokerMatchesHost(b, connectedHost)
-		if isCurrent {
-			currentPresent = true
-			switch b.Phase {
-			case proto.RosterPhaseDraining, proto.RosterPhaseRetiring, proto.RosterPhaseAddFailed:
-				currentLeaving = true
-			}
-			continue
-		}
-		// Dialability filters destinations, not identity. A cfg.NATSURL floor may legitimately connect
-		// a local/dev agent to a loopback roster entry; skipping that entry before the identity check
-		// makes an unchanged roster look like a removal and churns the session every refresh.
-		if b.PublicHost == "" || clusterroster.IsUndialableHost(b.PublicHost) {
-			continue
-		}
-		if b.Phase == proto.RosterPhaseVoter {
-			otherVoter = true
-		}
-	}
-	return otherVoter && (currentLeaving || (knownBefore && !currentPresent))
-}
-
-func rosterContainsHost(r *proto.ClusterRoster, host string) bool {
-	if r == nil {
-		return false
-	}
-	for _, b := range r.Brokers {
-		if rosterBrokerMatchesHost(b, host) {
-			return true
-		}
-	}
-	return false
-}
-
-func rosterBrokerMatchesHost(b proto.RosterBroker, host string) bool {
-	if strings.EqualFold(host, b.PublicHost) {
-		return true
-	}
-	ru, err := url.Parse(b.NatsRoute)
-	return err == nil && ru.Hostname() != "" && strings.EqualFold(host, ru.Hostname())
+	return clusterroster.RosterRequiresReconnect(previous, current, connectedURL)
 }
 
 // nc dropped for the same reason as rebuildOntoVoter's (external review F3): nothing on this path
@@ -516,21 +416,11 @@ func (a *Agent) rebuildOntoVoter(reason string) bool {
 	// no-deadline dial/handshake, so this log line alone could hang the whole teardown before
 	// cancel-first ran. `nc` stays in the signature for the caller's identity checks only.
 	a.cfg.Logger.Warn(reason, "connected_url", a.connectedURLSnapshot())
-	if fin := a.loadSessionFinalizer(); fin != nil {
-		fin.Do(teardownRebuild)
-		return true
-	}
-	a.sessCancelMu.Lock()
-	cancel := a.sessCancel
-	a.sessCancelMu.Unlock()
-	if cancel != nil {
-		cancel()
-		return true
-	}
 	// Same rollback as fireRedial (internal review CT-2 / S5): with neither a finalizer nor a
 	// cancel there is no session to rebuild, and latched flags would disarm the successor.
-	a.rebuilding.Store(false)
-	a.rebuildRequested.Store(false)
+	if finishSessionRebuild(a, a.loadSessionFinalizer()) {
+		return true
+	}
 	a.cfg.Logger.Warn("agent: rebuild requested with no live session to tear down; rolled back the rebuild flags")
 	return false
 }
@@ -541,15 +431,21 @@ func (a *Agent) rebuildOntoVoter(reason string) bool {
 // here would be pointless. It stamps the silent broker's host as a one-shot dial exclusion so the
 // rebuild lands on the survivor rather than re-sticking to the island. Returns true iff it rebuilt.
 func (a *Agent) rebuildOnBrokerSilence(nc *nats.Conn) bool {
+	// origin: hot-update S6 plan §7.3 / T44. A topology wake can spend the
+	// third miss immediately; timer/backoff duration is not a safety proof.
+	if agentupgradeport.InfraProtectsConnection(nc) || agentMaintenanceProtects(a, nc) {
+		return false
+	}
 	cu, err := url.Parse(nc.ConnectedUrl())
 	if err != nil || cu.Hostname() == "" {
 		return false
 	}
 	host := cu.Hostname()
-	if !a.hasOtherDialableVoter(host) {
+	avoid, other := silenceVoterDestination(a, nc, host)
+	if !other {
 		return false
 	}
-	a.setAvoidHost(host)
+	a.setAvoidHost(avoid)
 	if !a.rebuildOntoVoter("agent: current broker went silent (no roster reply — retired-broker island); rebuilding onto a known voter") {
 		return false // a rebuild is already in flight; the avoid hint is consumed next connect
 	}
@@ -557,29 +453,86 @@ func (a *Agent) rebuildOnBrokerSilence(nc *nats.Conn) bool {
 	return true
 }
 
-// hasOtherDialableVoter reports whether the cached signed roster names a VOTER on a host other than
-// connectedHost that is actually dialable (not loopback/unspecified). Read-only over the in-memory
-// mirror. It gates the #48 silence rebuild: with no survivor to move to, staying put is correct.
-func (a *Agent) hasOtherDialableVoter(connectedHost string) bool {
+// rosterRouteIdentity is bound to a particular connection AND its current
+// server. The same *nats.Conn can reconnect to another server without a new
+// agent session, so pointer identity alone cannot fence a delayed reply.
+type rosterRouteIdentity struct {
+	maintenanceOrder                                       uint64
+	order                                                  uint64
+	nc                                                     *nats.Conn
+	serverID, url, brokerID                                string
+	disabled                                               bool
+	ingressServerID, actualBrokerID, maintenanceCapability string
+	healthGeneration                                       uint64
+	aliases                                                []string
+}
+
+func rememberConnectedBroker(a *Agent, nc *nats.Conn, serverID, connectedURL string, resp proto.NodeRegisterResp) {
+	order := a.rosterRouteOrder.Add(1)
+	if !resp.OK || connectedURL == "" || nc.ConnectedServerName() != serverID || nc.ConnectedUrl() != connectedURL {
+		return
+	}
+	if current := a.ncBox.Load(); current != nil && current != nc {
+		return
+	}
 	a.rosterMu.Lock()
-	r := a.cachedRoster
-	a.rosterMu.Unlock()
-	if r == nil {
-		return false
+	defer a.rosterMu.Unlock()
+	if current := a.ncBox.Load(); current != nil && current != nc {
+		return
 	}
-	for _, b := range r.Brokers {
-		if b.Phase != proto.RosterPhaseVoter {
-			continue
-		}
-		if b.PublicHost == "" || clusterroster.IsUndialableHost(b.PublicHost) {
-			continue
-		}
-		if strings.EqualFold(b.PublicHost, connectedHost) {
-			continue
-		}
-		return true
+	// A same-*Conn reconnect can complete another reply while this one waits
+	// for rosterMu. Never overwrite that newer proof with the older route.
+	if old := a.rosterRoute; old != nil && old.order > order {
+		return
 	}
-	return false
+	id := resp.ConnectedBrokerID
+	var aliases []string
+	if old := a.rosterRoute; old != nil && old.nc == nc && old.serverID == serverID && old.url == connectedURL {
+		if id == "" {
+			id = old.brokerID // N-1 reply cannot erase a previously proven ingress
+		}
+		if id == old.brokerID {
+			aliases = append(aliases, old.aliases...)
+		}
+	}
+	id, aliases = upgradeauthority.RosterAuthority(upgradeauthority.RosterConsumer{Current: rosterCurrentAt,
+		Unique: clusterroster.UniqueRosterNodeAtHost, Aliases: clusterroster.AppendRosterAliases}, a.cachedRoster, a.agentNow(), connectedURL, id, aliases)
+	maintenanceOrder := order
+	if old := a.rosterRoute; old != nil && old.nc == nc && old.serverID == serverID && old.url == connectedURL &&
+		old.ingressServerID == nc.ConnectedServerId() && old.actualBrokerID == resp.ConnectedBrokerID &&
+		old.healthGeneration == a.ptyHealthGeneration.Load() && old.maintenanceCapability == resp.BrokerImageMaintenance {
+		maintenanceOrder = old.maintenanceOrder
+	}
+	a.rosterRoute = &rosterRouteIdentity{maintenanceOrder: maintenanceOrder, order: order, nc: nc, serverID: serverID, url: connectedURL,
+		brokerID: id, disabled: resp.Roster == nil, aliases: aliases,
+		ingressServerID: nc.ConnectedServerId(), actualBrokerID: resp.ConnectedBrokerID,
+		maintenanceCapability: resp.BrokerImageMaintenance, healthGeneration: a.ptyHealthGeneration.Load()}
+}
+
+// uniqueRosterNodeAtHost prevents a shared hostname from becoming a false
+// persistent ingress identity when an N-1 broker omits connected_broker_id.
+
+func silenceVoterDestination(a *Agent, nc *nats.Conn, host string) (string, bool) {
+	serverID, connectedURL := nc.ConnectedServerName(), nc.ConnectedUrl()
+	a.rosterMu.Lock()
+	defer a.rosterMu.Unlock()
+	var id string
+	var aliases []string
+	if route := a.rosterRoute; route != nil && route.nc == nc && route.serverID == serverID && route.url == connectedURL {
+		if route.disabled {
+			return "", false
+		}
+		id, aliases = route.brokerID, route.aliases
+	}
+	return rosterVoterDestination(a.cachedRoster, host, id, aliases, a.agentNow())
+}
+
+func rosterCurrentAt(r *proto.ClusterRoster, now time.Time) bool {
+	return clusterroster.RosterCurrentAt(r, now)
+}
+
+func rosterVoterDestination(r *proto.ClusterRoster, host, id string, aliases []string, now time.Time) (string, bool) {
+	return clusterroster.RosterVoterDestination(r, host, id, aliases, now)
 }
 
 // setAvoidHost / takeAvoidHost carry the one-shot dial exclusion (#48) from the silence-rebuild
@@ -598,26 +551,8 @@ func (a *Agent) takeAvoidHost() string {
 	return h
 }
 
-// excludeHostFromDial drops every comma-separated dial URL whose host equals `host` (the just-silent
-// island broker). If the filter would strand the agent (empty result), it returns the input
-// unchanged — never trade a stuck-on-island for a stuck-on-nothing.
 func excludeHostFromDial(csv, host string) string {
-	if csv == "" || host == "" {
-		return csv
-	}
-	parts := strings.Split(csv, ",")
-	kept := make([]string, 0, len(parts))
-	for _, p := range parts {
-		u, err := url.Parse(strings.TrimSpace(p))
-		if err == nil && u.Hostname() != "" && strings.EqualFold(u.Hostname(), host) {
-			continue
-		}
-		kept = append(kept, p)
-	}
-	if len(kept) == 0 {
-		return csv
-	}
-	return strings.Join(kept, ",")
+	return clusterroster.ExcludeHostFromDial(csv, host)
 }
 
 // --- C1 §D-1 L3: stuck-reconnect session-rebuild watchdog ---
@@ -665,26 +600,16 @@ func (a *Agent) fireRedial() {
 	}
 	a.rebuildRequested.Store(true)
 	a.cfg.Logger.Warn("agent: NATS stuck-disconnected; rebuilding session on the freshest roster")
-	if fin := a.loadSessionFinalizer(); fin != nil {
-		fin.Do(teardownRebuild)
-		return
-	}
 	// No finalizer published (a rebuild fired before this session installed one): fall back to the
 	// cancel alone. NEVER a bare nc.Close() here — that is the unbounded call this fix removed.
-	a.sessCancelMu.Lock()
-	cancel := a.sessCancel
-	a.sessCancelMu.Unlock()
-	if cancel != nil {
-		cancel()
-		return
-	}
 	// origin: internal review CT-2 (S5) — NOTHING to tear down: a stale timer fired inside the
 	// successor's connect window, before that session published either a finalizer or a cancel.
 	// Leaving `rebuilding`/`rebuildRequested` latched would silently disarm the NEXT session
 	// (onNATSReconnect early-returns while rebuilding, the roster refresh loop skips, the redial
 	// watchdog self-cancels) and would make a later clean shutdown read as a rebuild. Roll back.
-	a.rebuilding.Store(false)
-	a.rebuildRequested.Store(false)
+	if finishSessionRebuild(a, a.loadSessionFinalizer()) {
+		return
+	}
 	a.cfg.Logger.Warn("agent: stale redial fired with no live session to tear down; rolled back the rebuild flags")
 }
 
@@ -713,4 +638,308 @@ func (a *Agent) clearSessionCancel() {
 	a.sessCancelMu.Lock()
 	a.sessCancel = nil
 	a.sessCancelMu.Unlock()
+}
+
+// agentMaintenanceHold retains the challenge even after expiry/revocation. A
+// retransmission of the same cut must not obtain another local clock origin.
+// origin: hot-update S6 plan §7.1 / §7.3 / T44.
+type agentMaintenanceHold struct {
+	record      brokermaint.Record
+	routeOrder  uint64
+	routeDigest string
+	nonce       string
+	startedNS   int64
+	expiresNS   int64
+	installed   bool
+	ended       bool
+}
+
+const agentMaintenanceTTL = int64(8 * time.Second)
+
+func agentMaintenanceBootNow(a *Agent) (int64, error) {
+	if a.maintenanceNow != nil {
+		return a.maintenanceNow()
+	}
+	return procrequest.BootNow()
+}
+
+func agentMaintenanceSignedBytes(value any) ([]byte, error) {
+	return upgradeauthority.MaintenanceSignedBytes(value)
+}
+
+func verifyAgentMaintenance(pub, signature string, value any) error {
+	return upgradeauthority.VerifyMaintenance(pub, signature, value, auth.VerifySignature)
+}
+
+// Signing stays inside the install critical section: Accepted is a receipt for
+// an installed hold with the remaining lifetime measured AFTER installation.
+func signAgentMaintenanceAck(a *Agent, ack proto.BrokerMaintenanceAck) (proto.BrokerMaintenanceAck, error) {
+	body, err := agentMaintenanceSignedBytes(ack)
+	if err != nil {
+		return proto.BrokerMaintenanceAck{}, err
+	}
+	sig, err := auth.SignWithSeed(a.cfg.Identity.Seed, body)
+	if err != nil {
+		return proto.BrokerMaintenanceAck{}, err
+	}
+	ack.Sig = base64.RawStdEncoding.EncodeToString(sig)
+	return ack, nil
+}
+
+func validAgentMaintenanceRecord(r brokermaint.Record) bool {
+	return brokermaint.ValidateRecord(r) == nil
+}
+
+func sameAgentMaintenanceCut(left, right brokermaint.Record) bool {
+	left.Phase, right.Phase = brokermaint.MaintPrepared, brokermaint.MaintPrepared
+	return left == right
+}
+
+// The digest includes local order and reconnect generation. The broker learns
+// it from the signed challenge ACK and echoes it; no hostname fallback is used.
+func agentMaintenanceRouteDigest(route *rosterRouteIdentity) string {
+	return agentMaintenanceDigest(struct {
+		Order            uint64 `json:"order"`
+		HealthGeneration uint64 `json:"health_generation"`
+		BrokerID         string `json:"connected_broker_id"`
+		IngressServerID  string `json:"ingress_server_id"`
+		URL              string `json:"url"`
+	}{route.maintenanceOrder, route.healthGeneration, route.actualBrokerID, route.ingressServerID, route.url})
+}
+
+func agentMaintenanceRouteMatches(a *Agent, nc *nats.Conn, route *rosterRouteIdentity, serverID, ingressID, connectedURL string) bool {
+	return route != nil && a.ncBox.Load() == nc && route.nc == nc && route.serverID == serverID &&
+		route.ingressServerID == ingressID && ingressID != "" && route.url == connectedURL &&
+		route.healthGeneration == a.ptyHealthGeneration.Load() && route.maintenanceCapability == brokermaint.Capability
+}
+
+func acceptAgentMaintenance(a *Agent, nc *nats.Conn, req proto.BrokerMaintenanceReq) (proto.BrokerMaintenanceAck, error) {
+	if nc == nil || a.cfg.Identity == nil || !validAgentMaintenanceRecord(req.Record) || req.NID != nidOf(a) {
+		return proto.BrokerMaintenanceAck{}, errors.New("maintenance: unsupported observer or invalid record")
+	}
+	sig := req.Sig
+	req.Sig = ""
+	if err := verifyAgentMaintenance(a.pinnedAccountPub(), sig, req); err != nil {
+		return proto.BrokerMaintenanceAck{}, err
+	}
+	now, err := agentMaintenanceBootNow(a)
+	if err != nil || now <= 0 || now > math.MaxInt64-agentMaintenanceTTL {
+		return proto.BrokerMaintenanceAck{}, errors.New("maintenance: clock unavailable")
+	}
+	serverID, ingressID, connectedURL := nc.ConnectedServerName(), nc.ConnectedServerId(), nc.ConnectedUrl()
+	a.rosterMu.Lock()
+	defer a.rosterMu.Unlock()
+	route := a.rosterRoute
+	if !agentMaintenanceRouteMatches(a, nc, route, serverID, ingressID, connectedURL) ||
+		req.ConnectedBrokerID != route.actualBrokerID ||
+		(req.Record.Mode == proto.BrokerImageModeSingle && req.IngressServerID != ingressID) ||
+		(req.Record.Mode != proto.BrokerImageModeSingle && req.IngressServerID != "") {
+		return proto.BrokerMaintenanceAck{}, errors.New("maintenance: route changed or unsupported")
+	}
+	// origin: hot-update S6 plan §7.3 / T44. Cluster identity must come from
+	// the actual register reply; single uses the live external NATS server ID.
+	if req.Record.Mode == proto.BrokerImageModeSingle {
+		if route.actualBrokerID != "" || req.Record.IngressServerID != ingressID || !route.disabled {
+			return proto.BrokerMaintenanceAck{}, errors.New("maintenance: single ingress mismatch")
+		}
+	} else if route.disabled || route.actualBrokerID == "" || req.Record.Home != route.actualBrokerID {
+		return proto.BrokerMaintenanceAck{}, errors.New("maintenance: home mismatch")
+	}
+	digest := agentMaintenanceRouteDigest(route)
+	hold := a.brokerMaintenance
+	if hold != nil && hold.record.CutID == req.Record.CutID {
+		if !sameAgentMaintenanceCut(hold.record, req.Record) || hold.routeOrder != route.maintenanceOrder || hold.routeDigest != digest || hold.ended || req.Record.Phase < hold.record.Phase {
+			return proto.BrokerMaintenanceAck{}, errors.New("maintenance: cut identity changed or ended")
+		}
+	} else {
+		if req.Proof != (brokermaint.Proof{}) || req.Record.Phase != brokermaint.MaintPrepared ||
+			(hold != nil && !hold.ended && now < hold.expiresNS) || (req.RouteDigest != "" && req.RouteDigest != digest) {
+			return proto.BrokerMaintenanceAck{}, errors.New("maintenance: challenge required")
+		}
+		var nonce [32]byte
+		if _, err := rand.Read(nonce[:]); err != nil {
+			return proto.BrokerMaintenanceAck{}, err
+		}
+		// Local t0 is captured BEFORE a proof can be issued, never on reply.
+		hold = &agentMaintenanceHold{record: req.Record, routeOrder: route.maintenanceOrder, routeDigest: digest,
+			nonce: hex.EncodeToString(nonce[:]), startedNS: now, expiresNS: now + (req.Record.ExpiresBootNS - req.Record.IssuedBootNS)}
+		a.brokerMaintenance = hold
+	}
+	ack := proto.BrokerMaintenanceAck{CutID: req.Record.CutID, Nonce: hold.nonce, NID: req.NID,
+		ConnectedBrokerID: route.actualBrokerID, IngressServerID: req.IngressServerID, InstanceID: req.Record.InstanceID, RouteDigest: digest}
+	if req.Proof == (brokermaint.Proof{}) {
+		if req.Record.Phase != brokermaint.MaintPrepared || now >= hold.expiresNS {
+			return proto.BrokerMaintenanceAck{}, errors.New("maintenance: challenge expired")
+		}
+		return signAgentMaintenanceAck(a, ack) // Accepted=false: this is only a challenge
+	}
+	proof := req.Proof
+	proofSig := proof.Sig
+	proof.Sig = ""
+	if err := verifyAgentMaintenance(a.pinAccount, proofSig, proof); err != nil {
+		return proto.BrokerMaintenanceAck{}, err
+	}
+	recordDigest, digestErr := brokermaint.RecordDigest(req.Record)
+	if digestErr != nil || req.RouteDigest != digest || proof.Nonce != hold.nonce || proof.CutID != req.Record.CutID ||
+		proof.IssuerBootID != req.Record.IssuerBootID || proof.RecordDigest != recordDigest ||
+		proof.ExpiresBootNS != req.Record.ExpiresBootNS || proof.ResponseBootNS < req.Record.IssuedBootNS ||
+		proof.ResponseBootNS >= proof.ExpiresBootNS || (req.Record.Mode != proto.BrokerImageModeSingle && proof.AppliedIndex == 0) {
+		return proto.BrokerMaintenanceAck{}, errors.New("maintenance: proof mismatch")
+	}
+	// origin: hot-update S6 plan §7.1 / T44. Foreign BOOTTIME is a duration,
+	// not a local timestamp. Reproofs can only shorten the original deadline.
+	expiry := hold.startedNS + (proof.ExpiresBootNS - proof.ResponseBootNS)
+	if expiry < hold.expiresNS {
+		hold.expiresNS = expiry
+	}
+	if now >= hold.expiresNS || req.Record.Phase == brokermaint.MaintEnded {
+		hold.installed, hold.ended = false, true
+		return proto.BrokerMaintenanceAck{}, errors.New("maintenance: expired or ended")
+	}
+	hold.record = req.Record
+	hold.installed = true
+	ack.ProofDigest, err = brokermaint.ProofDigest(req.Proof)
+	if err != nil {
+		hold.installed = false
+		return proto.BrokerMaintenanceAck{}, err
+	}
+	// Re-read local time after installation/signature verification, so ACK
+	// cannot claim the lifetime consumed while this callback was queued.
+	ackNow, err := agentMaintenanceBootNow(a)
+	if err != nil || ackNow < now || ackNow >= hold.expiresNS {
+		hold.installed = false
+		return proto.BrokerMaintenanceAck{}, errors.New("maintenance: expired before acknowledgement")
+	}
+	ack.Accepted, ack.RemainingNS = true, hold.expiresNS-ackNow
+	signed, err := signAgentMaintenanceAck(a, ack)
+	if err != nil {
+		hold.installed = false
+	}
+	return signed, err
+}
+
+func invalidateAgentMaintenance(a *Agent) {
+	a.rosterMu.Lock()
+	if hold := a.brokerMaintenance; hold != nil {
+		hold.installed, hold.ended = false, true
+	}
+	a.rosterMu.Unlock()
+}
+
+func agentMaintenanceProtects(a *Agent, nc *nats.Conn) bool {
+	now, err := agentMaintenanceBootNow(a)
+	if err != nil || nc == nil {
+		return false
+	}
+	serverID, ingressID, connectedURL := nc.ConnectedServerName(), nc.ConnectedServerId(), nc.ConnectedUrl()
+	a.rosterMu.Lock()
+	defer a.rosterMu.Unlock()
+	hold, route := a.brokerMaintenance, a.rosterRoute
+	return hold != nil && hold.installed && !hold.ended && now >= hold.startedNS && now < hold.expiresNS &&
+		agentMaintenanceRouteMatches(a, nc, route, serverID, ingressID, connectedURL) &&
+		hold.routeOrder == route.maintenanceOrder && hold.routeDigest == agentMaintenanceRouteDigest(route)
+}
+
+// Maintenance runs inline under the existing subscription's drain receipt.
+// Ordinary mutators retain their original dispatch and authorization paths.
+func dispatchAgentMaintenance(a *Agent, nc *nats.Conn, msg *nats.Msg) bool {
+	if msg.Subject == proto.SubjCmdForwarded(a.cfg.SID, nidOf(a), proto.BrokerMaintenanceVerb) {
+		ctx := a.loadRunCtx()
+		if ctx == nil || ctx.Err() != nil || msg.Reply == "" || len(msg.Data) > 32*1024 {
+			return true
+		}
+		var req proto.BrokerMaintenanceReq
+		if err := json.Unmarshal(msg.Data, &req); err != nil {
+			return true
+		}
+		ack, err := acceptAgentMaintenance(a, nc, req)
+		if err != nil {
+			return true
+		} // never turn refusal into an installation ACK
+		body, err := json.Marshal(ack)
+		if err == nil {
+			_ = msg.Respond(body)
+		}
+		return true
+	}
+	// Ordinary pushes are not revocation evidence. Their decoded handlers and
+	// fresh route adoption decide whether authority actually changed.
+	// origin: hot-update S6 internal review rv-cluster-5
+	return false
+}
+
+// This is the decision shared by timer and immediate topology wakes; the
+// failure count is retained while maintenance protects the matching route.
+func rosterSilenceRequiresRebuild(a *Agent, nc *nats.Conn, silent int) bool {
+	return silent >= maxSilentRosterRefreshes && a.rebuildOnBrokerSilence(nc)
+}
+
+// A decoded removal only preempts the hold when it names a currently owned
+// allocation. Malformed, unrelated and stale broadcasts are not revocations.
+// origin: hot-update S6 internal review rv-cluster-5
+func invalidateMaintenanceForPort(a *Agent, name string, port int) {
+	if port <= 0 || name == "" {
+		return
+	}
+	sf, ok := a.loadStateBounded("maintenance authority change")
+	if !ok || sf == nil {
+		return
+	}
+	for _, owned := range sf.PortTokens {
+		if owned.Name == name && owned.Port == port {
+			invalidateAgentMaintenance(a)
+			return
+		}
+	}
+	if sf.Proxy != nil && name == proxyTokenName && sf.Proxy.PublicPort == port {
+		invalidateAgentMaintenance(a)
+	}
+}
+
+func invalidateMaintenanceForHome(a *Agent, d proto.HomeDirective) {
+	sf, ok := a.loadStateBounded("maintenance home change")
+	if !ok || sf == nil {
+		return
+	}
+	for _, owned := range sf.PortTokens {
+		if owned.Name == d.Name && owned.Port == d.PublicPort && d.Epoch >= owned.Epoch &&
+			(d.Epoch > owned.Epoch || d.BrokerAddr != owned.HomeBrokerAddr) {
+			invalidateAgentMaintenance(a)
+			return
+		}
+	}
+}
+
+func agentMaintenanceKey(a *Agent) string {
+	if a.cfg.Identity == nil {
+		return ""
+	}
+	return a.cfg.Identity.PublicKey
+}
+
+func probeAgentControl(ctx context.Context, a *Agent, nc *nats.Conn, nonce string) error {
+	return agentupgrade.ProbeControl(ctx, agentControlPort(a), nc, nonce)
+}
+
+func defaultAgentDuration(value, fallback time.Duration) time.Duration {
+	return agentupgrade.DefaultDuration(value, fallback)
+}
+
+func newRosterCacheStore(home, sid string) *rosterCacheStore {
+	return agentstate.NewCacheView(filepath.Join(home, "agent", sid, "roster_cache.json"), &sync.Mutex{})
+}
+func ReadRosterCache(home, sid string) (*RosterCache, error) {
+	return agentstate.ReadRosterCache(home, sid)
+}
+func WriteRosterCache(home, sid string, rc *RosterCache) error {
+	return agentstate.WriteRosterCache(home, sid, rc)
+}
+
+func agentControlPort(a *Agent) agentupgrade.ControlPort {
+	return agentupgrade.ControlPort{InstanceID: a.instanceID, SID: a.cfg.SID, NID: nidOf(a), Current: &a.ncBox,
+		Generation: &a.sessionGen, Dependencies: a.cfg.Upgrade, Anonymous: a.cfg.Identity == nil, Heartbeat: func() []byte { return heartbeatPayload(a, time.Now()) }}
+}
+
+func bindAgentInfra(a *Agent, nc *nats.Conn, fin *sessionFinalizer) error {
+	return agentupgradeport.BindInfraControl(nc, a.cfg.SID, func() string { return nidOf(a) }, fin.addBoundedCleanup)
 }

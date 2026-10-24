@@ -12,24 +12,23 @@ import (
 
 	"github.com/LinZiyang666/tether/internal/cli"
 	"github.com/LinZiyang666/tether/internal/proto"
+	"github.com/LinZiyang666/tether/internal/upgradebudget"
 	"github.com/nats-io/nats.go"
 	"github.com/spf13/cobra"
 )
 
-// psRequestTimeout is the wall-clock budget for one `tether ps` RPC.
-// Default 15 s — long enough that a momentarily-busy broker (large
-// SQLite scan after `tether ps -a` on a populous session) gets a
-// chance to reply, short enough that an operator never sits there
-// wondering whether the command hung. Override via TETHER_PS_TIMEOUT
-// (Go time.Duration syntax — "200ms", "5s") for diagnostics or fast
-// behavioral tests; invalid values are ignored and the default
-// stands.
-const defaultPsRequestTimeout = 15 * time.Second
+// psRequestTimeout may shorten admission for diagnostics; it cannot extend
+// the original RunE budget beyond RequestLatency.
+// origin: hot-update S6 plan §8.2 / T30
+const defaultPsRequestTimeout = upgradebudget.RequestLatency
 
 func psRequestTimeout() time.Duration {
 	if s := os.Getenv("TETHER_PS_TIMEOUT"); s != "" {
 		if d, err := time.ParseDuration(s); err == nil && d > 0 {
-			return d
+			if d < upgradebudget.RequestLatency {
+				return d
+			}
+			return upgradebudget.RequestLatency
 		}
 	}
 	return defaultPsRequestTimeout
@@ -51,7 +50,12 @@ processes — both RUNNING (live) and LOST (RUNNING row whose owning
 node is OFFLINE, derived at read time); pass -a to also include
 EXITED processes. Architecture F.8 — unified view.`,
 		Args: cobra.NoArgs,
-		RunE: func(cmd *cobra.Command, args []string) error {
+		RunE: func(cmd *cobra.Command, args []string) (resultErr error) {
+			admission, err := beginCtlAdmission(cmd)
+			if err != nil {
+				return err
+			}
+			defer finishCtlAdmission(admission, &resultErr)
 			sid := cli.ReadCurrentSession(home)
 			if sid == "" {
 				return fmt.Errorf("no active session — run `tether login -s <sid>` first")
@@ -76,10 +80,7 @@ EXITED processes. Architecture F.8 — unified view.`,
 				return fmt.Errorf("ps: marshal req: %w", err)
 			}
 			timeout := psRequestTimeout()
-			ctx, cancel := context.WithTimeout(cmd.Context(), timeout)
-			defer cancel()
-			msg, err := nc.RequestWithContext(ctx,
-				proto.SubjCtrlPs(id.PublicKey, sid), body)
+			msg, err := requestCtlWithin(cmd, nc, proto.SubjCtrlPs(id.PublicKey, sid), body, timeout)
 			if err != nil {
 				// Three distinct diagnostics: no-responder (broker
 				// down / sub missing — NATS replies immediately),
@@ -105,7 +106,7 @@ EXITED processes. Architecture F.8 — unified view.`,
 						"(the broker accepted the connection but never "+
 						"replied — it may be restarting or overloaded; "+
 						"check `tether alert ls` and the broker log, or "+
-						"raise TETHER_PS_TIMEOUT)", timeout, err)
+						"retry after the broker recovers; admission is bounded to 5s)", timeout, err)
 				}
 				return fmt.Errorf("ps: request failed: %w", err)
 			}
@@ -141,7 +142,9 @@ EXITED processes. Architecture F.8 — unified view.`,
 				}); err != nil {
 					return err
 				}
-				withBanner(nc, id.PublicKey, true) // suppressed under --json
+				if err := withBannerWithin(cmd, nc, id.PublicKey, true); err != nil {
+					return err
+				} // suppressed under --json
 				return nil
 			}
 
@@ -196,7 +199,9 @@ EXITED processes. Architecture F.8 — unified view.`,
 					"a session with more than %d live rows can still have some omitted)\n",
 					len(resp.Ports), resp.PortsTotal, len(resp.Ports))
 			}
-			withBanner(nc, id.PublicKey, false) // D8b §10.3: severe-alert banner to stderr (stdout stays parseable)
+			if err := withBannerWithin(cmd, nc, id.PublicKey, false); err != nil {
+				return err
+			} // D8b §10.3: severe-alert banner to stderr (stdout stays parseable)
 			return nil
 		},
 	}

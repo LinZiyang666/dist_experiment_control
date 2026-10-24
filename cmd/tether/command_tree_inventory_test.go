@@ -149,3 +149,25 @@ func dumpCommandTree(root *cobra.Command) string {
 	walk(root)
 	return strings.Join(lines, "\n") + "\n"
 }
+
+// S6's broker reload entry and scope belong to P24; these assertions and the
+// two complete golden dumps must be rerun against that producer's final tree.
+// origin: hot-update S6 plan §5 / §12.1 P23-P24 / T57Cmd
+func TestBrokerCommandSurface(t *testing.T) {
+	root := newRootCmd()
+	reload, args, err := root.Find([]string{"broker", "upgrade", "reload"})
+	if err != nil || len(args) != 0 || reload.CommandPath() != "tether broker upgrade reload" {
+		t.Fatalf("missing local broker reload entry (pending P24): command=%s args=%v err=%v", reload.CommandPath(), args, err)
+	}
+	roll, _, err := root.Find([]string{"cluster", "upgrade"})
+	if err != nil || roll.Flags().Lookup("broker-only") == nil {
+		t.Fatal("cluster upgrade lacks independent broker scope (pending P24)")
+	}
+	node, _, err := root.Find([]string{"node", "upgrade"})
+	if err != nil || node.Flags().Lookup("broker") != nil || node.Flags().Lookup("broker-only") != nil {
+		t.Fatal("node upgrade changed its agent object or added the rejected broker alias")
+	}
+	checkCommandTreeGolden(t, commandTreeGolden, dumpCommandTree(root))
+	root.InitDefaultCompletionCmd()
+	checkCommandTreeGolden(t, commandTreeGoldenRuntime, dumpCommandTree(root))
+}

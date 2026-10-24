@@ -1,3 +1,4 @@
+// origin: hot-update S7 plan §5.1 / §11.4 / P31; use the real leaf and locked record snapshots.
 package broker
 
 import (
@@ -10,10 +11,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/LinZiyang666/tether/internal/controlbudget"
 	"github.com/LinZiyang666/tether/internal/node"
 	"github.com/LinZiyang666/tether/internal/proto"
 	"github.com/LinZiyang666/tether/internal/session"
 	"github.com/LinZiyang666/tether/internal/testharness"
+	"github.com/LinZiyang666/tether/internal/xferbucket"
+	"github.com/LinZiyang666/tether/internal/xfercontract"
+	"github.com/LinZiyang666/tether/internal/xfertrack"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 )
@@ -68,10 +73,15 @@ func (s *stallJS) CreateObjectStore(ctx context.Context, _ jetstream.ObjectStore
 // The invariant: however long the best-effort sizing probe stalls, the LOAD-BEARING create must
 // still get a usable budget of its own.
 func TestSizingStallDoesNotConsumeCreateBudget(t *testing.T) {
+	// origin: hot-update S10 plan §11.1 / TEST-BUDGET
+	if runIsolatedBrokerTest(t) {
+		return
+	}
 	js := &stallJS{accountInfoBlocks: true, createBudget: make(chan time.Duration, 1)}
-	b := &Broker{transfers: newTransferTracker()}
+	b := &Broker{transfers: xfertrack.NewLegacyTracker()}
 	b.cfg = Config{Logger: silentLogger(), Now: time.Now}
 	setBrokerJS(b, js)
+	bindProvisionCoordinator(t, b, js)
 
 	// Written RED-first against the pre-fix sequence (one shared 5s ctx across both round trips),
 	// where the create was handed an ALREADY-EXPIRED context (-4ms observed). It now drives the
@@ -165,9 +175,10 @@ func TestXferProvisionRefusalDistinguishesTransientFromPermanent(t *testing.T) {
 // budget per request.
 func TestXferProvisionPermanentMakesExactlyOneAttempt(t *testing.T) {
 	js := &countingJS{err: errors.New("replicas > 1 not supported in non-clustered mode")}
-	b := &Broker{transfers: newTransferTracker()}
+	b := &Broker{transfers: xfertrack.NewLegacyTracker()}
 	b.cfg = Config{Logger: silentLogger(), Now: time.Now}
 	setBrokerJS(b, js)
+	bindProvisionCoordinator(t, b, js)
 
 	start := time.Now()
 	_, _, perr := b.provisionXferBucket(context.Background(), "sess", 0)
@@ -192,9 +203,10 @@ func TestXferProvisionPermanentMakesExactlyOneAttempt(t *testing.T) {
 // whole loop stays inside the wall-clock budget.
 func TestXferProvisionRetriesTransientWithinBudget(t *testing.T) {
 	js := &countingJS{err: context.DeadlineExceeded}
-	b := &Broker{transfers: newTransferTracker()}
+	b := &Broker{transfers: xfertrack.NewLegacyTracker()}
 	b.cfg = Config{Logger: silentLogger(), Now: time.Now}
 	setBrokerJS(b, js)
+	bindProvisionCoordinator(t, b, js)
 
 	start := time.Now()
 	_, _, perr := b.provisionXferBucket(context.Background(), "sess", 0)
@@ -221,9 +233,10 @@ func TestXferProvisionRetriesTransientWithinBudget(t *testing.T) {
 // freshly grown N=2 cluster.
 func TestXferProvisionSucceedsOnRetry(t *testing.T) {
 	js := &countingJS{err: context.DeadlineExceeded, succeedFrom: 2}
-	b := &Broker{transfers: newTransferTracker()}
+	b := &Broker{transfers: xfertrack.NewLegacyTracker()}
 	b.cfg = Config{Logger: silentLogger(), Now: time.Now}
 	setBrokerJS(b, js)
+	bindProvisionCoordinator(t, b, js)
 
 	_, _, perr := b.provisionXferBucket(context.Background(), "sess", 0)
 	if perr != nil {
@@ -238,9 +251,10 @@ func TestXferProvisionSucceedsOnRetry(t *testing.T) {
 // PERMANENT sizing verdict, so JetStream must not be touched at all.
 func TestXferProvisionSizingRefusalMakesZeroAttempts(t *testing.T) {
 	js := &countingJS{maxStore: 1024} // far below the events/history reserve + floor
-	b := &Broker{transfers: newTransferTracker()}
+	b := &Broker{transfers: xfertrack.NewLegacyTracker()}
 	b.cfg = Config{Logger: silentLogger(), Now: time.Now}
 	setBrokerJS(b, js)
+	bindProvisionCoordinator(t, b, js)
 
 	_, tooLarge, perr := b.provisionXferBucket(context.Background(), "sess", 0)
 	if tooLarge != nil {
@@ -265,6 +279,68 @@ type countingJS struct {
 	succeedFrom int   // 1-based attempt from which the create succeeds; 0 = never
 	maxStore    int64 // AccountInfo.Limits.MaxStore; 0 => unlimited => statfs fallback
 	creates     int
+	// created is the backing stream a successful create made. The real configuration owner
+	// confirms every CREATE with INFO -> UPDATE (Duplicates) -> INFO before it seals, so a create
+	// that "succeeds" into a stream nobody can read back could never let provisioning succeed.
+	created *jetstream.StreamConfig
+}
+
+// provisionStream serves the CURRENT full config of countingJS's created stream on every Info, as a
+// real handle does: a snapshot taken at lookup would hide the coordinator's own UPDATE from its
+// confirming readback.
+type provisionStream struct {
+	jetstream.Stream
+	config *jetstream.StreamConfig
+}
+
+func (s provisionStream) Info(context.Context, ...jetstream.StreamInfoOpt) (*jetstream.StreamInfo, error) {
+	return &jetstream.StreamInfo{Config: *s.config}, nil
+}
+
+// UpdateStream is the coordinator's full-config UPDATE that adds the recovery Duplicates window.
+func (c *countingJS) UpdateStream(_ context.Context, cfg jetstream.StreamConfig) (jetstream.Stream, error) {
+	if c.created == nil || cfg.Name != c.created.Name {
+		return nil, jetstream.ErrStreamNotFound
+	}
+	*c.created = cfg
+	return provisionStream{config: c.created}, nil
+}
+
+// Conn has no server behind it; the coordinator then seals MaxPayload 0 (fail closed for v1).
+func (c *countingJS) Conn() *nats.Conn { return nil }
+
+// bindProvisionCoordinator installs the real single-broker configuration owner in front of js, in
+// the shape the broker transfer factory installs: one bootstrap authority, one coordinator whose raw
+// JetStream is private to it, and this broker's own census. Only the Buckets port is bound — these
+// fixtures exercise legacy provisioning, not the continuation graph.
+// origin: hot-update S7 plan §2.1 / lead decision on G67 replay
+func bindProvisionCoordinator(t testing.TB, b *Broker, js jetstream.JetStream) {
+	t.Helper()
+	if err := bindProvisionOwner(b, js); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func bindProvisionOwner(b *Broker, js jetstream.JetStream) error {
+	coordinator, err := newProvisionOwner(b, js)
+	if err != nil {
+		return err
+	}
+	b.transferRuntime.Store(&BrokerTransfers{Buckets: coordinator})
+	return nil
+}
+
+func newProvisionOwner(b *Broker, js jetstream.JetStream) (xfercontract.BucketPort, error) {
+	authority, err := xferbucket.NewAuthority(xfercontract.ConfigWriterProof{
+		BrokerID: "broker", InstanceID: "instance", BootID: "boot", Nonce: "config", Generation: 1}, nil)
+	if err != nil {
+		return nil, err
+	}
+	clock := func() (string, int64, error) {
+		now, err := controlbudget.Now()
+		return "boot", now, err
+	}
+	return xferbucket.NewWithCensus(xferbucket.Config{Base: xfercontract.Base{Clock: clock}, JS: js, Authority: authority}, brokerBucketCensus{b: b})
 }
 
 // Publish accepts and discards. The embedded interface is nil, so without this any
@@ -289,9 +365,12 @@ func (c *countingJS) AccountInfo(context.Context) (*jetstream.AccountInfo, error
 	return &jetstream.AccountInfo{Tier: jetstream.Tier{Limits: jetstream.AccountLimits{MaxStore: c.maxStore}}}, nil
 }
 
-func (c *countingJS) CreateObjectStore(_ context.Context, _ jetstream.ObjectStoreConfig) (jetstream.ObjectStore, error) {
+func (c *countingJS) CreateObjectStore(_ context.Context, cfg jetstream.ObjectStoreConfig) (jetstream.ObjectStore, error) {
 	c.creates++
 	if c.succeedFrom > 0 && c.creates >= c.succeedFrom {
+		// The server defaults an SDK object store to a two-minute duplicate window.
+		c.created = &jetstream.StreamConfig{Name: "OBJ_" + cfg.Bucket, MaxBytes: cfg.MaxBytes, Replicas: cfg.Replicas,
+			Storage: cfg.Storage, Duplicates: 2 * time.Minute, Discard: jetstream.DiscardNew}
 		return nil, nil
 	}
 	return nil, c.err
@@ -316,8 +395,11 @@ func pushWiringBroker(t *testing.T, js jetstream.JetStream) (*nats.Conn, string,
 	}, time.Now()); err != nil {
 		t.Fatal(err)
 	}
-	b := &Broker{cfg: Config{DB: db, Logger: silentLogger(), Now: time.Now}, transfers: newTransferTracker()}
+	b := &Broker{cfg: Config{DB: db, Logger: silentLogger(), Now: time.Now}, transfers: xfertrack.NewLegacyTracker()}
 	setBrokerJS(b, js)
+	if js != nil {
+		bindProvisionCoordinator(t, b, js)
+	}
 	nc, err := nats.Connect(url)
 	if err != nil {
 		t.Fatal(err)
@@ -365,7 +447,7 @@ func TestPushHandlerRepliesTransientCodeOnStall(t *testing.T) {
 	if !strings.Contains(strings.ToLower(resp.Error), "retry") {
 		t.Fatalf("the operator-visible text must say it is worth retrying; got %q", resp.Error)
 	}
-	if b.transfers.get("tid-g67") != nil {
+	if b.transfers.Get("tid-g67") != nil {
 		t.Fatal("a refused prepare must leave NO tracker entry — provisioning runs before transfers.put()")
 	}
 }
@@ -414,9 +496,13 @@ func TestPushHandlerNilJetStreamHasRealProse(t *testing.T) {
 // Stream is what the resolve-before-create lookup calls. These fixtures exist to exercise the CREATE
 // path, so they report "no such stream" and the lookup falls through exactly as it did before that
 // step existed. (Without this the embedded nil interface panics — which is the fixture pattern doing
-// its job: it announced that the code under test began calling something new.)
-func (c *countingJS) Stream(context.Context, string) (jetstream.Stream, error) {
-	return nil, jetstream.ErrStreamNotFound
+// its job: it announced that the code under test began calling something new.) Once a create has
+// succeeded the stream exists, which is what the configuration owner's confirming INFO reads back.
+func (c *countingJS) Stream(_ context.Context, name string) (jetstream.Stream, error) {
+	if c.created == nil || name != c.created.Name {
+		return nil, jetstream.ErrStreamNotFound
+	}
+	return provisionStream{config: c.created}, nil
 }
 
 // Stream is what the resolve-before-create lookup calls. These fixtures exist to exercise the CREATE
@@ -480,22 +566,120 @@ func TestATierAPushCannotNameAnotherSessionsBucket(t *testing.T) {
 	if rerr != nil && !errors.Is(rerr, nats.ErrNoResponders) {
 		t.Fatalf("push prepare: %v", rerr)
 	}
-	if b.transfers.get("tid-forge") == nil {
+	if b.transfers.Get("tid-forge") == nil {
 		t.Fatal("the handler refused the push before taking a tracker slot, so this test would " +
 			"prove nothing about which bucket the slot carries")
 	}
 
-	if _, busy := b.transfers.activeOBJStreams()["OBJ_xfer-victim"]; busy {
+	if _, busy := b.transfers.ActiveOBJStreams()["OBJ_xfer-victim"]; busy {
 		t.Error("a tier-A push made the victim session's bucket look BUSY.\n\n" +
 			"The orphan reaper skips busy buckets, so the victim's tier-B garbage is never " +
 			"reclaimed and the bucket is never shrunk — for as long as an attacker keeps " +
 			"re-arming it. This is the small-disk-fill class, reachable by any member of any " +
 			"other session.")
 	}
-	if e := b.transfers.get("tid-forge"); e != nil && e.bucket != "" {
+	if e := b.transfers.Get("tid-forge"); e != nil && b.transfers.Record(e).Bucket != "" {
 		t.Errorf("the tracker entry kept the client-supplied bucket %q.\n\n"+
 			"put() serialises per bucket by plain string compare with no session in it, so this "+
 			"entry alone makes every tier-B push and pull in the victim session fail with "+
-			"too_many_in_flight.", e.bucket)
+			"too_many_in_flight.", b.transfers.Record(e).Bucket)
+	}
+}
+
+// The owner's census must count every responsibility for exactly its bucket, and must fail — never
+// report zero — for anything it cannot see completely: cluster homes, a missing tracker, a configured
+// but uninstalled continuation owner, an incomplete or unreadable ledger.
+// origin: hot-update S7 plan §2.1 / lead decision on authoritative shrink proof
+func TestTransferBucketShrinkCensusCoversEveryResponsibility(t *testing.T) {
+	d := wiringDeadline(t)
+	bucket := proto.XferBucketName("sid")
+	legacy := &Broker{transfers: newTransferTracker()}
+	count := func(b *Broker, bucket string) (int, error) { return brokerBucketCensus{b: b}.Responsible(bucket, d) }
+	if n, err := count(legacy, bucket); err != nil || n != 0 {
+		t.Fatalf("idle legacy broker: n=%d err=%v", n, err)
+	}
+	entry := xfertrack.NewLegacyEntry(xfertrack.LegacyRecord{TransferID: "legacy", SID: "sid", Verb: "push", Tier: "b", Bucket: bucket})
+	if code := putLegacyTransfer(legacy.transfers, entry); code != "" {
+		t.Fatalf("fixture transfer refused: %s", code)
+	}
+	if n, err := count(legacy, bucket); err != nil || n != 1 {
+		t.Fatalf("admitted legacy transfer was not counted: n=%d err=%v", n, err)
+	}
+	if n, err := count(legacy, proto.XferBucketName("other")); err != nil || n != 0 {
+		t.Fatalf("another session's bucket was charged: n=%d err=%v", n, err)
+	}
+	for name, b := range map[string]*Broker{
+		"no-tracker":   {},
+		"cluster-home": {transfers: newTransferTracker(), clusterMode: true},
+		"uninstalled-owner": {transfers: newTransferTracker(), cfg: Config{TransferFactory: func(*Broker, jetstream.JetStream, controlbudget.Deadline) (*BrokerTransfers, error) {
+			return nil, errors.New("unused")
+		}}},
+	} {
+		if n, err := count(b, bucket); err == nil {
+			t.Fatalf("%s: a census that cannot see every owner reported %d", name, n)
+		}
+	}
+	b, p := installWiringConfigGraph(t, &countingJS{})
+	if n, err := count(b, bucket); err != nil || n != 1 {
+		t.Fatalf("cleanup-pending continuation row was not counted: n=%d err=%v", n, err)
+	}
+	p.census.Rows[0].Phase = xfercontract.PhaseSettled
+	if n, err := count(b, bucket); err != nil || n != 0 {
+		t.Fatalf("settled continuation row was counted: n=%d err=%v", n, err)
+	}
+	p.census.Complete = false
+	if _, err := count(b, bucket); err == nil {
+		t.Fatal("an incomplete ledger census was treated as idle")
+	}
+	p.census.Complete = true
+	p.fail["scan"] = errors.New("ledger directory unreadable")
+	if _, err := count(b, bucket); err == nil {
+		t.Fatal("an unreadable ledger was treated as idle")
+	}
+}
+
+type recordingBucketPort struct {
+	xfercontract.BucketPort
+	applies, shrinks int
+}
+
+func (p *recordingBucketPort) Apply(xfercontract.ConfigPatch, controlbudget.Deadline) (xfercontract.BucketSeal, error) {
+	p.applies++
+	return xfercontract.BucketSeal{}, nil
+}
+
+type recordingBucketShrinker struct{ recordingBucketPort }
+
+func (p *recordingBucketShrinker) Shrink(xfercontract.ConfigPatch, controlbudget.Deadline) (xfercontract.BucketSeal, error) {
+	p.shrinks++
+	return xfercontract.BucketSeal{}, nil
+}
+
+// Only the leader's local owner can shrink: the forwarding envelope carries intent patches, never a
+// shrink, and a reduction is never downgraded into an Apply on an owner that cannot prove idleness.
+// origin: hot-update S7 plan §2.1 / lead decision on authoritative shrink proof
+func TestTransferBucketShrinkRoutesOnlyToTheLeaderOwner(t *testing.T) {
+	d := wiringDeadline(t)
+	patch := xfercontract.ConfigPatch{Bucket: proto.XferBucketName("sid"), MaxBytes: 1 << 30}
+	if _, err := (&TransferBucketRouter{}).Shrink(patch, d); err == nil {
+		t.Fatal("a router without an installed owner shrank")
+	}
+	applyOnly := &recordingBucketPort{}
+	if _, err := (&TransferBucketRouter{Local: applyOnly}).Shrink(patch, d); err == nil || applyOnly.applies != 0 {
+		t.Fatalf("an owner without Shrink received the reduction: err=%v applies=%d", err, applyOnly.applies)
+	}
+	local := &recordingBucketShrinker{}
+	if _, err := (&TransferBucketRouter{Local: local}).Shrink(patch, d); err != nil || local.shrinks != 1 {
+		t.Fatalf("the single-broker owner did not receive its shrink: err=%v shrinks=%d", err, local.shrinks)
+	}
+	follower, _ := d7SingleNode(t, "shrink-follower")
+	requireWiring(t, follower.Shutdown())
+	// The premise is polled, not read once (docs/testing-standards.md T3): a stopped node cannot
+	// regain leadership, so once it reports non-leader that answer is the one the router sees.
+	if !testharness.WaitFor(t, 5*time.Second, 10*time.Millisecond, func() bool { return !follower.IsLeader() }) {
+		t.Fatal("fixture: a stopped node still reports leadership")
+	}
+	if _, err := (&TransferBucketRouter{Local: local, Node: follower}).Shrink(patch, d); err == nil || local.shrinks != 1 || local.applies != 0 {
+		t.Fatalf("a non-leader shrank or forwarded the reduction: err=%v shrinks=%d applies=%d", err, local.shrinks, local.applies)
 	}
 }

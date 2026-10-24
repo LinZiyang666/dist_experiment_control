@@ -123,6 +123,15 @@ func (a *Agent) handleExposeForwarded(nc *nats.Conn, msg *nats.Msg) {
 		a.cfg.Logger.Warn("agent: expose.req.forwarded without Reply inbox")
 		return
 	}
+	// origin: hot-update S3 plan §4.0. Hold admission for the whole handler.
+	release, admitted := a.gate.admit(gateExpose)
+	if !admitted {
+		// origin: hot-update S4 plan §9.2 / N1-REFUSAL. v0.6.0 knows try_again as 75; keep the upgrade reason in detail.
+		a.replyExposeForwarded(msg, proto.ExposeForwardedResp{Code: "try_again", Error: "agent_upgrading: image switch in progress; retry"})
+		return
+	}
+	defer release()
+
 	var req proto.ExposeForwardedReq
 	if err := json.Unmarshal(msg.Data, &req); err != nil {
 		a.replyExposeForwarded(msg, proto.ExposeForwardedResp{
@@ -199,6 +208,7 @@ func (a *Agent) handleExposeRmForwarded(nc *nats.Conn, msg *nats.Msg) {
 		a.cfg.Logger.Warn("agent: expose-rm.forwarded parse", "err", err)
 		return
 	}
+	invalidateMaintenanceForPort(a, req.Name, req.Port)
 	if a.stateStore != nil {
 		if err := a.stateStore.RemovePort(req.Name); err != nil {
 			a.cfg.Logger.Warn("agent: state.json RemovePort", "err", err, "name", req.Name)

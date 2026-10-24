@@ -1,3 +1,4 @@
+// origin: hot-update S7 plan §5.1 / §11.4 / P31; use the real leaf and locked record snapshots.
 package broker
 
 import (
@@ -8,6 +9,7 @@ import (
 
 	"github.com/LinZiyang666/tether/internal/proto"
 	"github.com/LinZiyang666/tether/internal/testharness"
+	"github.com/LinZiyang666/tether/internal/xfertrack"
 	"github.com/nats-io/nats.go"
 )
 
@@ -24,7 +26,7 @@ func TestTransferContinuationDoesNotClaimAReusedID(t *testing.T) {
 			defer nc.Close()
 			actor := freshUserActor(t)
 			db := openDB(t)
-			b := &Broker{cfg: Config{DB: db, Logger: silentLogger(), Now: time.Now}, transfers: newTransferTracker()}
+			b := &Broker{cfg: Config{DB: db, Logger: silentLogger(), Now: time.Now}, transfers: xfertrack.NewLegacyTracker()}
 			b.nc.Store(nc)
 			seedD8TransferMemberNode(t, b, actor, "lab", "lab-1")
 			const id = "reused-id"
@@ -32,8 +34,8 @@ func TestTransferContinuationDoesNotClaimAReusedID(t *testing.T) {
 			if op == "pull-finalize" {
 				verb = "pull"
 			}
-			old := &transferEntry{transferID: id, sid: "lab", nid: "lab-1", actor: actor, verb: verb, tier: "b", startedAt: time.Now()}
-			if code := b.transfers.put(old); code != "" {
+			old := xfertrack.NewLegacyEntry(xfertrack.LegacyRecord{TransferID: id, SID: "lab", NID: "lab-1", Actor: actor, Verb: verb, Tier: "b", StartedAt: time.Now()})
+			if code := putLegacyTransfer(b.transfers, old); code != "" {
 				t.Fatal(code)
 			}
 			subj := proto.SubjCtrlTransferFinalize(actor, "lab", id)
@@ -82,9 +84,9 @@ func TestTransferContinuationDoesNotClaimAReusedID(t *testing.T) {
 			if !testharness.WaitFor(t, 5*time.Second, time.Millisecond, func() bool { return db.Stats().WaitCount > waiting }) {
 				t.Fatal("continuation did not reach authorization after reading its preview")
 			}
-			b.transfers.remove(old)
-			replacement := &transferEntry{transferID: id, sid: "other", nid: "other-1", actor: freshUserActor(t), verb: "push", tier: "b", startedAt: time.Now()}
-			if code := b.transfers.put(replacement); code != "" {
+			b.transfers.Remove(old)
+			replacement := xfertrack.NewLegacyEntry(xfertrack.LegacyRecord{TransferID: id, SID: "other", NID: "other-1", Actor: freshUserActor(t), Verb: "push", Tier: "b", StartedAt: time.Now()})
+			if code := putLegacyTransfer(b.transfers, replacement); code != "" {
 				t.Fatal(code)
 			}
 			if err := held.Close(); err != nil {
@@ -101,7 +103,7 @@ func TestTransferContinuationDoesNotClaimAReusedID(t *testing.T) {
 			if op == "push-commit" && (resp.OK || resp.Code != "transfer_unknown") {
 				t.Fatalf("stale commit response = %+v, want transfer_unknown", resp)
 			}
-			if b.transfers.get(id) != replacement || replacement.finalized || replacement.committed {
+			if b.transfers.Get(id) != replacement || b.transfers.Record(replacement).Finalized || b.transfers.Record(replacement).Committed {
 				t.Fatalf("%s authorized against an old entry changed another session's replacement", op)
 			}
 			if err := nc.Flush(); err != nil {
@@ -122,36 +124,35 @@ func TestTransferContinuationDoesNotClaimAReusedID(t *testing.T) {
 func TestTransferClaimsRejectReplacedEntries(t *testing.T) {
 	for _, op := range []string{"finalize", "commit", "abandon", "remove"} {
 		t.Run(op, func(t *testing.T) {
-			tr := newTransferTracker()
-			old := &transferEntry{transferID: "reused", sid: "lab", actor: "same-actor", verb: "push", tier: "b"}
-			if code := tr.put(old); code != "" {
+			tr := xfertrack.NewLegacyTracker()
+			old := xfertrack.NewLegacyEntry(xfertrack.LegacyRecord{TransferID: "reused", SID: "lab", Actor: "same-actor", Verb: "push", Tier: "b"})
+			if code := putLegacyTransfer(tr, old); code != "" {
 				t.Fatal(code)
 			}
-			tr.remove(old)
-			dup := *old
-			current := &dup
-			if code := tr.put(current); code != "" {
+			tr.Remove(old)
+			current := xfertrack.NewLegacyEntry(tr.Record(old))
+			if code := putLegacyTransfer(tr, current); code != "" {
 				t.Fatal(code)
 			}
-			claim := func(e *transferEntry) bool {
+			claim := func(e *xfertrack.LegacyEntry) bool {
 				switch op {
 				case "finalize":
-					_, ok := tr.claimFinalize(e)
+					_, ok := tr.ClaimFinalize(e)
 					return ok
 				case "commit":
-					return tr.markCommitted(e)
+					return tr.MarkCommitted(e)
 				case "abandon":
-					_, why := tr.claimAbandonedPush(e)
-					return why == abandonClaimed
+					_, why := tr.ClaimAbandonedPush(e)
+					return why == xfertrack.LegacyClaimed
 				case "remove":
-					tr.remove(e)
-					return tr.get(e.transferID) == nil
+					tr.Remove(e)
+					return tr.Get(tr.Record(e).TransferID) == nil
 				default:
 					t.Fatalf("unknown operation %q", op)
 					return false
 				}
 			}
-			if claim(old) || current.finalized || current.committed || tr.get(current.transferID) != current {
+			if claim(old) || tr.Record(current).Finalized || tr.Record(current).Committed || tr.Get(tr.Record(current).TransferID) != current {
 				t.Fatal("stale entry changed the replacement")
 			}
 			if !claim(current) {

@@ -36,7 +36,7 @@ var auditScrubSubstrings = []string{
 }
 
 func (b *clusterAdminBackend) handleExportIncident(req adminsock.Request) adminsock.Response {
-	ro := b.admin.node.RODB()
+	ro := b.admin.Node.RODB()
 
 	var since time.Time
 	if req.Since != "" {
@@ -44,7 +44,7 @@ func (b *clusterAdminBackend) handleExportIncident(req adminsock.Request) admins
 		if err != nil {
 			return adminsock.Response{Op: req.Op, Error: fmt.Sprintf("bad --since %q: %v", req.Since, err), Code: adminsock.CodeBadRequest}
 		}
-		since = b.admin.now().Add(-d)
+		since = b.admin.Now().Add(-d)
 	}
 
 	alerts, err := exportAlerts(ro, since)
@@ -109,13 +109,13 @@ func (b *clusterAdminBackend) handleExportIncident(req adminsock.Request) admins
 		}
 	}
 
-	_, leaderID := b.admin.node.LeaderWithID()
+	_, leaderID := b.admin.Node.LeaderWithID()
 	bundle := &adminsock.IncidentBundle{
 		Schema:        "incident",
 		SchemaVersion: 1,
 		Errors:        errs,
 		Partial:       partial,
-		GeneratedAt:   b.admin.now().UTC().Format(time.RFC3339Nano),
+		GeneratedAt:   b.admin.Now().UTC().Format(time.RFC3339Nano),
 		LeaderID:      leaderID,
 		Since:         req.Since,
 		Alerts:        alerts,

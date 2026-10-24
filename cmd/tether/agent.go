@@ -15,8 +15,10 @@ import (
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/agent"
+	"github.com/LinZiyang666/tether/internal/agentboot"
 	"github.com/LinZiyang666/tether/internal/cli"
 	"github.com/LinZiyang666/tether/internal/proto"
+	"github.com/LinZiyang666/tether/internal/upgradecli"
 	"github.com/spf13/cobra"
 	yaml "gopkg.in/yaml.v3"
 )
@@ -103,20 +105,10 @@ func parseOptDuration(s, field string) (time.Duration, error) {
 // Entries are validated, because the failure mode of a typo here is silent and confusing: urlAllowed is
 // a plain strings.HasPrefix test, so "githib.com/…" or a bare hostname simply never matches, and the
 // operator sees url_not_allowed_local for a URL they believe they allowed. Fail at startup instead.
+//
+// The validation body moved verbatim to upgradecli.AgentUpgradeAllow (S8 P19 slim move).
 func resolveAgentUpgradeAllow(cmd *cobra.Command, flagVal, yamlVal []string) ([]string, error) {
-	allow := flagVal
-	if !cmd.Flags().Changed("upgrade-url-allow") {
-		allow = yamlVal
-	}
-	for _, p := range allow {
-		if !strings.HasPrefix(p, "https://") && !strings.HasPrefix(p, "http://") {
-			return nil, fmt.Errorf("upgrade URL allowlist entry %q is not a URL prefix — entries must begin with "+
-				"https:// (or http://). The allowlist is matched by prefix, so a non-URL entry can never match a "+
-				"download URL: it would silently DISABLE upgrades rather than permit them. "+
-				"Set it via --upgrade-url-allow or the `upgrade.url_allow` list in agent.yaml", p)
-		}
-	}
-	return allow, nil
+	return upgradecli.AgentUpgradeAllow(cmd.Flags().Changed("upgrade-url-allow"), flagVal, yamlVal)
 }
 
 // agentDaemonInputs is everything the daemon's config fold needs that is not on the cobra command.
@@ -341,6 +333,13 @@ func newAgentCmd() *cobra.Command {
 			// the boot budget unconsumed exactly when the staged binary
 			// broke on those steps). Deliberately NOT called again here — a
 			// second call would double-count the boot.
+			// origin: hot-update S8 plan §5.2 / §11.2 P19 — a cold start follows the
+			// registered selector; an inherited same-PID image belongs to its cut owner.
+			// Both bind the registered journal to cfg.Upgrade below (S8 FIX-DESCRIBE R3).
+			plan, err := upgradecli.AgentBoot(upgradecli.AgentBootRole(home, sid, nid, uint32(os.Geteuid())), agentboot.Current() != nil, logger)
+			if err != nil {
+				return upgradeExit("agent canonical boot", err)
+			}
 
 			// The FLAGS+YAML → agent.Config fold lives in one testable function (see #28's wiring
 			// tests): assembling it inline here made it impossible to assert that a resolved setting
@@ -352,6 +351,7 @@ func newAgentCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			cfg.Upgrade = upgradecli.AgentPorts(plan)
 
 			// TETHER_DEV_NO_AUTH (CLI-side env, see internal/cli.DevNoAuthEnv):
 			// when set, skip loading the agent nkey and connect anonymously.
@@ -375,7 +375,6 @@ func newAgentCmd() *cobra.Command {
 			// still works — useful for debugging).
 			if tunnelAddr != "" {
 				adapter := agent.NewTunnelExposeAdapter(tunnelAddr, sid, nid, cfg.Logger)
-				adapter.Start(ctx)
 				cfg.ExposeAdapter = adapter
 			}
 

@@ -150,7 +150,7 @@ func fsBuildReport(selfID string, roster []clusteroffline.Peer, confirmed []stri
 // resulting N=1 cluster the address never needs to be dialed, but it is preserved in the new {self} config.
 func (b *clusterAdminBackend) selfRaftAddr(selfID string) (string, error) {
 	var addr string
-	err := b.admin.node.RODB().QueryRow(`SELECT raft_addr FROM cluster_nodes WHERE node_id = ?`, selfID).Scan(&addr)
+	err := b.admin.Node.RODB().QueryRow(`SELECT raft_addr FROM cluster_nodes WHERE node_id = ?`, selfID).Scan(&addr)
 	if err != nil {
 		return "", err
 	}
@@ -186,14 +186,14 @@ func (b *clusterAdminBackend) fsArmVerdict(roster []clusteroffline.Peer, confirm
 // without manufacturing an outage. A real (non-dry-run) arm REFUSES on any failing gate.
 func (b *clusterAdminBackend) handleForceSingleArm(req adminsock.Request) adminsock.Response {
 	op := req.Op
-	if b.admin == nil || b.admin.node == nil || b.fsArm == nil {
+	if b.admin == nil || b.admin.Node == nil || b.fsArm == nil {
 		return fsRefuse(op, adminsock.CodeClusterNotEnabled, "online force-single unavailable (cluster mode not enabled)")
 	}
-	selfID := b.admin.node.SelfID()
+	selfID := b.admin.Node.SelfID()
 	if mismatch := fsSelfIDMismatch(req.NodeID, selfID); mismatch != "" {
 		return fsRefuse(op, adminsock.CodeBadRequest, "%s", mismatch)
 	}
-	roster, err := clusteroffline.ReadRoster(b.admin.node.RODB(), selfID)
+	roster, err := clusteroffline.ReadRoster(b.admin.Node.RODB(), selfID)
 	if err != nil { // fail-closed: cannot read the roster ⇒ cannot prove peers dead
 		return fsRefuse(op, adminsock.CodeForceSingleRefused, "read roster: %v", err)
 	}
@@ -226,10 +226,10 @@ func (b *clusterAdminBackend) handleForceSingleArm(req adminsock.Request) admins
 // marker-propose failure returns a LOUD failure naming the repair rather than a false OK.
 func (b *clusterAdminBackend) handleForceSingleCommit(req adminsock.Request) adminsock.Response {
 	op := req.Op
-	if b.admin == nil || b.admin.node == nil || b.fsArm == nil {
+	if b.admin == nil || b.admin.Node == nil || b.fsArm == nil {
 		return fsRefuse(op, adminsock.CodeClusterNotEnabled, "online force-single unavailable (cluster mode not enabled)")
 	}
-	selfID := b.admin.node.SelfID()
+	selfID := b.admin.Node.SelfID()
 	if mismatch := fsSelfIDMismatch(req.NodeID, selfID); mismatch != "" {
 		return fsRefuse(op, adminsock.CodeBadRequest, "%s", mismatch)
 	}
@@ -237,7 +237,7 @@ func (b *clusterAdminBackend) handleForceSingleCommit(req adminsock.Request) adm
 	if !b.fsArm.consume(req.ArmToken, now) {
 		return fsRefuse(op, adminsock.CodeArmExpired, "no fresh arm token (missing/expired/already-used); re-run `cluster recovery force-single --online` to re-arm")
 	}
-	roster, err := clusteroffline.ReadRoster(b.admin.node.RODB(), selfID)
+	roster, err := clusteroffline.ReadRoster(b.admin.Node.RODB(), selfID)
 	if err != nil {
 		return fsRefuse(op, adminsock.CodeForceSingleRefused, "read roster: %v", err)
 	}
@@ -286,16 +286,16 @@ func (b *clusterAdminBackend) handleForceSingleCommit(req adminsock.Request) adm
 	// recovery callback out until this handler has either completed its synchronous prune or returned:
 	// otherwise the callback can create a retry op for the same ghosts while the happy path is still
 	// running, violating the "clean recovery creates no op" contract.
-	b.admin.forceSingleIntentMu.Lock()
-	defer b.admin.forceSingleIntentMu.Unlock()
-	if err := clusteroffline.WriteOnlineIntent(b.admin.dataDir, intent); err != nil {
+	b.admin.ForceSingleIntentMu.Lock()
+	defer b.admin.ForceSingleIntentMu.Unlock()
+	if err := clusteroffline.WriteOnlineIntent(b.admin.DataDir, intent); err != nil {
 		return fsRefuse(op, adminsock.CodeStoreError,
 			"could not record the force-single intent on disk (%v); refusing to start an irreversible "+
 				"raft rewrite that nothing would be able to finish if this process died", err)
 	}
 
 	// THE in-process swap. On failure the node stays read-only (never bricked); offline is the floor.
-	if err := b.admin.node.RecoverToSelfOnline(selfAddr); err != nil {
+	if err := b.admin.Node.RecoverToSelfOnline(selfAddr); err != nil {
 		// RecoverToSelfOnline can fail either BEFORE RecoverCluster changes disk, or AFTER disk is
 		// already {self} while rebuilding the transport. The caller cannot distinguish those phases
 		// from the error, so deleting the intent here reopens the exact post-rewrite crash window it
@@ -311,14 +311,14 @@ func (b *clusterAdminBackend) handleForceSingleCommit(req adminsock.Request) adm
 	// intent, so a failure returns a loud error AND leaves the intent in place for
 	// resumeForceSingleFinalizeOnLeadership to forward-complete — the repair no longer depends on an
 	// operator re-running a command the arm gate would refuse.
-	if err := b.admin.node.WaitForLeader(forceSingleLeaderWait); err != nil {
+	if err := b.admin.Node.WaitForLeader(forceSingleLeaderWait); err != nil {
 		return fsRefuse(op, adminsock.CodeStoreError,
 			"online recover rewrote raft to {self} but leadership did not settle in %s (%v); the recovery "+
 				"intent is recorded on disk and this broker will finish it automatically as soon as it "+
 				"becomes leader — watch `tether cluster status` and `tether cluster ops ls`",
 			forceSingleLeaderWait, err)
 	}
-	if err := b.admin.applyForceSingleIntent(intent); err != nil {
+	if err := b.admin.ApplyForceSingleIntent(intent); err != nil {
 		return fsRefuse(op, adminsock.CodeStoreError,
 			"online recover succeeded (node is a writable single voter) but persisting the emergency "+
 				"state FAILED (%v); the recovery intent is recorded on disk and will be completed "+
@@ -338,29 +338,29 @@ func (b *clusterAdminBackend) handleForceSingleCommit(req adminsock.Request) adm
 	// OpKindForceSingleFinalize that the controller retries to a terminal state.
 	report := adminsock.ForceSingleReport{BrokerSelfID: selfID, Abandoned: abandoned}
 	if len(abandoned) > 0 {
-		if err := b.admin.node.Propose(func(*sql.DB) (*cluster.Command, error) {
+		if err := b.admin.Node.Propose(func(*sql.DB) (*cluster.Command, error) {
 			return cluster.PlanClusterNodePrune(abandoned, time.Now())
 		}); err != nil {
 			// The rows are still there on BOTH sub-branches below; say so explicitly rather than
 			// leaving the CLI to infer it from whether an op id came back.
 			report.PruneIncomplete = true
-			opID, serr := b.admin.startForceSingleFinalize(selfID, abandoned)
+			opID, serr := b.admin.StartForceSingleFinalize(selfID, abandoned)
 			if serr != nil {
 				// Fall back to EXACTLY the pre-batch-C behaviour. Creating the op is an improvement, not
 				// a precondition: turning a survivable recovery into a hard failure at this moment would
 				// be the "one more failure mode during an emergency" this change exists to avoid.
-				b.admin.logger.Warn("online force-single: roster prune of abandoned peers failed AND a retry operation could not be started; they linger as ghosts until `cluster recovery node remove` (raft is already {self}, so this is not a quorum risk — but `reconcile nats --to-standalone` will REFUSE until they are gone)",
+				b.admin.Logger.Warn("online force-single: roster prune of abandoned peers failed AND a retry operation could not be started; they linger as ghosts until `cluster recovery node remove` (raft is already {self}, so this is not a quorum risk — but `reconcile nats --to-standalone` will REFUSE until they are gone)",
 					"abandoned", abandoned, "prune_err", err, "op_err", serr)
 			} else {
 				report.FinalizeOpID = opID
-				b.admin.logger.Warn("online force-single: roster prune failed; started a finalize operation to retry it",
+				b.admin.Logger.Warn("online force-single: roster prune failed; started a finalize operation to retry it",
 					"abandoned", abandoned, "err", err, "op", opID)
 			}
-		} else if serr := b.admin.deriveAndConvergeSeedsFromRoster(); serr != nil {
+		} else if serr := b.admin.DeriveAndConvergeSeedsFromRoster(); serr != nil {
 			// G3 #1: prune succeeded → roster is {self}; converge the published seeds so clients stop
 			// dialing (and failover-preferring) the abandoned endpoints. GATED on prune success (INV-4):
 			// deriving before the prune commits would re-derive the dead endpoints straight back into seeds.
-			b.admin.logger.Warn("online force-single: seed auto-converge failed (abandoned endpoints linger in published seeds until a later op / leadership backstop)",
+			b.admin.Logger.Warn("online force-single: seed auto-converge failed (abandoned endpoints linger in published seeds until a later op / leadership backstop)",
 				"err", serr)
 		}
 	}
@@ -368,8 +368,8 @@ func (b *clusterAdminBackend) handleForceSingleCommit(req adminsock.Request) adm
 	// and the roster prune. If a finalize op is still retrying the prune, the intent stays so that a
 	// crash before that op terminates is still recoverable from disk.
 	if !report.PruneIncomplete {
-		if err := clusteroffline.ClearOnlineIntent(b.admin.dataDir); err != nil {
-			b.admin.logger.Warn("online force-single: completed, but the on-disk recovery intent could "+
+		if err := clusteroffline.ClearOnlineIntent(b.admin.DataDir); err != nil {
+			b.admin.Logger.Warn("online force-single: completed, but the on-disk recovery intent could "+
 				"not be cleared; a later leadership tick will find it, re-verify the same facts and "+
 				"clear it then (the operations are idempotent)", "err", err)
 		}

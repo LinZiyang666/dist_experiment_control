@@ -635,17 +635,17 @@ func TestHomeDeliveryUsesTheRegisterBuilder(t *testing.T) {
 // ErrDataPlaneNotConverged (which clusterCodeFor maps to a nonzero-classified code).
 func TestDrainRefusesRcZeroWhenDataPlaneStale(t *testing.T) {
 	migrated := []rehomedExpose{
-		{sid: "lab", nid: "lab-1", name: "svc", port: 14000, epoch: 7, toBroker: "brk-b"},
-		{sid: "lab", nid: "lab-1", name: "api", port: 14001, epoch: 7, toBroker: "brk-b"},
+		{Sid: "lab", Nid: "lab-1", Name: "svc", Port: 14000, Epoch: 7, ToBroker: "brk-b"},
+		{Sid: "lab", Nid: "lab-1", Name: "api", Port: 14001, Epoch: 7, ToBroker: "brk-b"},
 	}
 	kicks := 0
 	a := &ClusterAdmin{
-		logger:        silentLogger(),
-		now:           time.Now,
-		homeAppliedFn: func(port int) int64 { return 6 }, // one epoch behind: NOT converged
-		homeDeliverFn: func(string, string) { kicks++ },
+		Logger:        silentLogger(),
+		Now:           time.Now,
+		HomeAppliedFn: func(port int) int64 { return 6 }, // one epoch behind: NOT converged
+		HomeDeliverFn: func(string, string) { kicks++ },
 	}
-	err := a.awaitHomeConvergence("drain", "brk-a", migrated, time.Now().Add(-time.Second))
+	err := a.AwaitHomeConvergence("drain", "brk-a", migrated, time.Now().Add(-time.Second))
 	var dp *ErrDataPlaneNotConverged
 	if err == nil {
 		t.Fatal("drain returned success while the data plane was still on the OLD home — this is the release blocker")
@@ -666,21 +666,21 @@ func TestDrainRefusesRcZeroWhenDataPlaneStale(t *testing.T) {
 	}
 	// And it must classify as the retry-later wire code, not as an internal error.
 	if code := clusterCodeFor(err); code != codeDataplaneNotConverged {
-		t.Fatalf("clusterCodeFor = %q, want %q", code, codeDataplaneNotConverged)
+		t.Fatalf("ClusterCodeFor = %q, want %q", code, codeDataplaneNotConverged)
 	}
 }
 
 // TestDrainReturnsOKOnceTheDataPlaneConfirms is the other half: the gate must not be
 // a permanent refusal. A converged data plane returns nil promptly.
 func TestDrainReturnsOKOnceTheDataPlaneConfirms(t *testing.T) {
-	migrated := []rehomedExpose{{sid: "lab", nid: "lab-1", name: "svc", port: 14000, epoch: 7, toBroker: "brk-b"}}
+	migrated := []rehomedExpose{{Sid: "lab", Nid: "lab-1", Name: "svc", Port: 14000, Epoch: 7, ToBroker: "brk-b"}}
 	a := &ClusterAdmin{
-		logger:        silentLogger(),
-		now:           time.Now,
-		homeAppliedFn: func(int) int64 { return 7 },
-		homeDeliverFn: func(string, string) {},
+		Logger:        silentLogger(),
+		Now:           time.Now,
+		HomeAppliedFn: func(int) int64 { return 7 },
+		HomeDeliverFn: func(string, string) {},
 	}
-	if err := a.awaitHomeConvergence("drain", "brk-a", migrated, time.Now().Add(-time.Second)); err != nil {
+	if err := a.AwaitHomeConvergence("drain", "brk-a", migrated, time.Now().Add(-time.Second)); err != nil {
 		t.Fatalf("converged data plane must return success, got %v", err)
 	}
 }
@@ -699,8 +699,8 @@ func TestDrainReturnsOKOnceTheDataPlaneConfirms(t *testing.T) {
 func TestRetireHoldsWhileTheDataPlaneIsStale(t *testing.T) {
 	n, _ := d7SingleNode(t, "ctl-1")
 	admin := NewClusterAdmin(n, silentLogger())
-	admin.homeAppliedFn = func(int) int64 { return 6 } // one epoch behind
-	admin.homeDeliverFn = func(string, string) {}
+	admin.HomeAppliedFn = func(int) int64 { return 6 } // one epoch behind
+	admin.HomeDeliverFn = func(string, string) {}
 
 	now := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
 	in := cluster.OpStartInput{
@@ -719,14 +719,14 @@ func TestRetireHoldsWhileTheDataPlaneIsStale(t *testing.T) {
 	}
 
 	migrated := []rehomedExpose{
-		{sid: "lab", nid: "lab-1", name: "svc", port: 14000, epoch: 7, toBroker: "brk-b"},
+		{Sid: "lab", Nid: "lab-1", Name: "svc", Port: 14000, Epoch: 7, ToBroker: "brk-b"},
 	}
-	pending := admin.pendingHomeConvergence(migrated)
+	pending := admin.PendingHomeConvergence(migrated)
 	if len(pending) != 1 {
 		t.Fatalf("a stale applied epoch must be reported pending; got %d", len(pending))
 	}
 	// This is the exact call driveRetire's REHOME_EXPOSES arm makes.
-	admin.recordOpError(op, &ErrDataPlaneNotConverged{Verb: "retire", NodeID: "brk-a", Pending: pending})
+	admin.RecordOpError(op, &ErrDataPlaneNotConverged{Verb: "retire", NodeID: "brk-a", Pending: pending})
 
 	after, err := cluster.OperationByID(n.RODB(), "op-retire-stale")
 	if err != nil {
@@ -743,8 +743,8 @@ func TestRetireHoldsWhileTheDataPlaneIsStale(t *testing.T) {
 		t.Fatalf("the held op's last_error must identify the verb, got %q", after.LastError)
 	}
 	// And a converged data plane must clear the hold.
-	admin.homeAppliedFn = func(int) int64 { return 7 }
-	if p := admin.pendingHomeConvergence(migrated); len(p) != 0 {
+	admin.HomeAppliedFn = func(int) int64 { return 7 }
+	if p := admin.PendingHomeConvergence(migrated); len(p) != 0 {
 		t.Fatalf("a converged data plane must release the retire hold; still pending %v", p)
 	}
 }
@@ -756,10 +756,14 @@ func TestRetireHoldsWhileTheDataPlaneIsStale(t *testing.T) {
 // clock and proves: first hold STAMPS a replicated deadline, before it the op keeps holding, and PAST it the
 // op routes to BLOCKED (a nonzero terminal `cluster retire --wait` sees, escapable via `cluster ops`).
 func TestRetireRehomeHoldIsBoundedToBlocked(t *testing.T) {
+	// origin: hot-update S10 plan §11.1 / TEST-BUDGET
+	if runIsolatedBrokerTest(t) {
+		return
+	}
 	n, _ := d7SingleNode(t, "ctl-1")
 	admin := NewClusterAdmin(n, silentLogger())
 	clk := time.Date(2026, 7, 20, 12, 0, 0, 0, time.UTC)
-	admin.now = func() time.Time { return clk }
+	admin.Now = func() time.Time { return clk }
 
 	in := cluster.OpStartInput{
 		OpID: "op-retire-bound", Kind: cluster.OpKindRetire, TargetNode: "brk-a",
@@ -779,7 +783,7 @@ func TestRetireRehomeHoldIsBoundedToBlocked(t *testing.T) {
 	holdErr := &ErrDataPlaneNotConverged{Verb: "retire", NodeID: "brk-a"}
 
 	// (1) First hold: no deadline yet → STAMP one (not blocked); op stays REHOME_EXPOSES WITH a deadline.
-	if blocked, stamped := admin.boundRehomeConvergence(reread(), holdErr); blocked || !stamped {
+	if blocked, stamped := admin.BoundRehomeConvergence(reread(), holdErr); blocked || !stamped {
 		t.Fatalf("first hold must stamp a deadline (blocked=%v stamped=%v)", blocked, stamped)
 	}
 	if op := reread(); op.OpState != cluster.OpStateRehomeExposes || op.CatchupDeadline == 0 {
@@ -787,7 +791,7 @@ func TestRetireRehomeHoldIsBoundedToBlocked(t *testing.T) {
 	}
 
 	// (2) Before the deadline: neither blocked nor re-stamped → keep holding in REHOME_EXPOSES.
-	if blocked, stamped := admin.boundRehomeConvergence(reread(), holdErr); blocked || stamped {
+	if blocked, stamped := admin.BoundRehomeConvergence(reread(), holdErr); blocked || stamped {
 		t.Fatalf("before the deadline the op must keep holding (blocked=%v stamped=%v)", blocked, stamped)
 	}
 	if reread().OpState != cluster.OpStateRehomeExposes {
@@ -796,11 +800,11 @@ func TestRetireRehomeHoldIsBoundedToBlocked(t *testing.T) {
 
 	// (3) Past the deadline: route to BLOCKED — the nonzero-terminal rc bound the verb promises.
 	clk = clk.Add(opRehomeConvergeTimeout + time.Minute)
-	if blocked, _ := admin.boundRehomeConvergence(reread(), holdErr); !blocked {
+	if blocked, _ := admin.BoundRehomeConvergence(reread(), holdErr); !blocked {
 		t.Fatal("a retire whose data plane never converged must route to BLOCKED once the deadline passes")
 	}
 	if got := reread().OpState; got != cluster.OpStateBlocked {
-		t.Fatalf("op state = %s, want BLOCKED (a permanently-unconverged retire must not fence membership forever)", got)
+		t.Fatalf("op state = %s, want BLOCKED (a permanently-unconverged retire must not Fence membership forever)", got)
 	}
 
 	// (4) F2: `cluster ops confirm` of the BLOCKED retire must reset the convergence window — re-enter
@@ -810,7 +814,7 @@ func TestRetireRehomeHoldIsBoundedToBlocked(t *testing.T) {
 		t.Fatalf("confirm blocked retire: %v", err)
 	}
 	if op := reread(); op.OpState != cluster.OpStateDrainRequested {
-		t.Fatalf("a confirmed retire must re-enter DRAIN_REQUESTED, got %s", op.OpState)
+		t.Fatalf("a confirmed retire must re-Enter DRAIN_REQUESTED, got %s", op.OpState)
 	} else if op.CatchupDeadline != 0 {
 		t.Fatalf("confirm must RESET catchup_deadline to 0 for a fresh window; got %d — the retry would immediately re-BLOCK (F2)", op.CatchupDeadline)
 	}
@@ -822,33 +826,33 @@ func TestRetireRehomeHoldIsBoundedToBlocked(t *testing.T) {
 // port_allocations rows, for which no plan command exists — so the call site is
 // pinned in source, the same idiom TestWireClusterLateWiresHomeConvergence uses.
 func TestRetireConsultsTheConvergenceGate(t *testing.T) {
-	src := readRepoFile(t, "cluster_operation_controller.go")
+	src := readRepoFile(t, "../brokercontrol/cluster_operation_drive.go")
 	for _, want := range []string{
 		// CRIT-1: the gate must read the DURABLE oracle (re-derived from current state each
 		// tick), NOT migrateExposes' self-destructing return, or the SECOND controller tick
 		// sees an empty list and walks on to the irreversible RemoveServer.
-		"a.pendingRetireConvergence(op.TargetNode,",
+		"a.PendingRetireConvergence(op.TargetNode,",
 		`&ErrDataPlaneNotConverged{Verb: "retire"`,
 	} {
 		if !strings.Contains(src, want) {
-			t.Fatalf("driveRetire no longer contains %q — retire would walk on to the irreversible "+
+			t.Fatalf("DriveRetire no longer contains %q — retire would walk on to the irreversible "+
 				"RemoveServer with the data plane still pointing at the node being removed", want)
 		}
 	}
 	// And it must NOT gate on the self-destructing migrateExposes return (the CRIT-1 bug shape).
-	if strings.Contains(src, "a.pendingHomeConvergence(migrated)") {
-		t.Fatal("driveRetire still gates on pendingHomeConvergence(migrated) — that list is empty on the " +
-			"second tick (migrateExposes self-destructs), so the gate leaks straight to RemoveServer (CRIT-1)")
+	if strings.Contains(src, "a.PendingHomeConvergence(migrated)") {
+		t.Fatal("DriveRetire still gates on PendingHomeConvergence(migrated) — that list is empty on the " +
+			"second Tick (MigrateExposes self-destructs), so the gate leaks straight to RemoveServer (CRIT-1)")
 	}
 	// F3/round-2: the retire gate must scope by the FIXED op.CreatedAt origin, NOT a sliding wall-clock
 	// window — a sliding window drifts past the row's fixed last_rehome_at across a confirm-retry and
 	// silently completes RemoveServer (fail-open).
-	if !strings.Contains(src, "parseClusterTime(op.CreatedAt)") {
-		t.Fatal("driveRetire no longer scopes the convergence gate by op.CreatedAt — a fixed origin is required " +
+	if !strings.Contains(src, "ParseClusterTime(op.CreatedAt)") {
+		t.Fatal("DriveRetire no longer scopes the convergence gate by op.CreatedAt — a fixed origin is required " +
 			"so a still-stranded row never ages out across a `cluster ops confirm` retry (round-2 fail-open)")
 	}
-	if strings.Contains(src, "pendingRetireConvergence(op.TargetNode, a.now().Add(") {
-		t.Fatal("driveRetire scopes the convergence gate by a SLIDING wall-clock window — it drifts past the " +
+	if strings.Contains(src, "PendingRetireConvergence(op.TargetNode, a.now().Add(") {
+		t.Fatal("DriveRetire scopes the convergence gate by a SLIDING wall-clock window — it drifts past the " +
 			"row's fixed last_rehome_at on a confirm-retry and fails OPEN (round-2 self-review)")
 	}
 }
@@ -859,14 +863,14 @@ func TestRetireConsultsTheConvergenceGate(t *testing.T) {
 // whole suite green (the unit DrainNode tests bail before the gate; both paths short-circuit to nil). Pin the
 // drain call site from source too.
 func TestDrainConsultsTheDurableConvergenceGate(t *testing.T) {
-	src := readRepoFile(t, "clusterdrain.go")
-	if !strings.Contains(src, "a.pendingRetireConvergence(nodeID,") {
-		t.Fatal("DrainNode no longer gates on the durable pendingRetireConvergence(nodeID) — on a drain re-run " +
-			"migrateExposes returns empty and `cluster drain` would print a false rc=0 with the tunnel stranded (CRIT-1 drain half)")
+	src := readRepoFile(t, "../brokercontrol/clusterdrain.go")
+	if !strings.Contains(src, "a.PendingRetireConvergence(nodeID,") {
+		t.Fatal("DrainNode no longer gates on the durable PendingRetireConvergence(nodeID) — on a drain re-run " +
+			"MigrateExposes returns empty and `cluster drain` would print a false rc=0 with the tunnel stranded (CRIT-1 drain half)")
 	}
-	if strings.Contains(src, `awaitHomeConvergence("drain", nodeID, migrated`) {
-		t.Fatal("DrainNode still feeds the self-destructing `migrated` list to awaitHomeConvergence — on re-run " +
-			"that list is empty and awaitHomeConvergence returns nil immediately (false rc=0, CRIT-1 drain half)")
+	if strings.Contains(src, `AwaitHomeConvergence("drain", nodeID, migrated`) {
+		t.Fatal("DrainNode still feeds the self-destructing `migrated` list to AwaitHomeConvergence — on re-run " +
+			"that list is empty and AwaitHomeConvergence returns nil immediately (false rc=0, CRIT-1 drain half)")
 	}
 }
 
@@ -900,28 +904,28 @@ func TestPendingRetireConvergenceIsDurable(t *testing.T) {
 	ins(14001, "brk-a", 7, "") // still homed ON brk-a (migrate will move it) → excluded from the gate
 
 	applied := map[int]int64{14000: 6} // one epoch behind: the tunnel still points at brk-a
-	admin.homeAppliedFn = func(p int) int64 { return applied[p] }
+	admin.HomeAppliedFn = func(p int) int64 { return applied[p] }
 
-	pending, err := admin.pendingRetireConvergence("brk-a", time.Time{})
+	pending, err := admin.PendingRetireConvergence("brk-a", time.Time{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(pending) != 1 || pending[0].port != 14000 {
+	if len(pending) != 1 || pending[0].Port != 14000 {
 		t.Fatalf("gate must report the moved-but-unconfirmed expose (and exclude the still-on-brk-a row); got %+v", pending)
 	}
 	// The CRIT-1 property: a SECOND call re-reads current state and STILL holds. The old
 	// gate (pendingHomeConvergence over migrateExposes' return) would be empty here — the
 	// rows already moved off brk-a — and the op would barrel on to RemoveServer.
-	pending2, err := admin.pendingRetireConvergence("brk-a", time.Time{})
+	pending2, err := admin.PendingRetireConvergence("brk-a", time.Time{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(pending2) != 1 {
-		t.Fatalf("gate self-destructed on the second tick (CRIT-1): got %d pending, want 1", len(pending2))
+		t.Fatalf("gate self-destructed on the second Tick (CRIT-1): got %d pending, want 1", len(pending2))
 	}
 	// Mutation: once the agent confirms the new epoch, the gate releases.
 	applied[14000] = 7
-	pending3, err := admin.pendingRetireConvergence("brk-a", time.Time{})
+	pending3, err := admin.PendingRetireConvergence("brk-a", time.Time{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -958,34 +962,34 @@ func TestPendingRetireConvergenceRecencyWindow(t *testing.T) {
 	}
 	ins(14000, 7, opStart.Add(30*time.Second)) // THIS op migrated it (AFTER op start) — unconfirmed
 	ins(14001, 7, opStart.Add(-1*time.Hour))   // an UNRELATED prior op's stranded expose (before op start)
-	admin.homeAppliedFn = func(int) int64 { return 6 }
+	admin.HomeAppliedFn = func(int) int64 { return 6 }
 
 	// (1)+(2) FIXED origin = op.CreatedAt: only this op's row is reported, the old stranded one dropped.
-	scoped, err := admin.pendingRetireConvergence("brk-a", opStart)
+	scoped, err := admin.PendingRetireConvergence("brk-a", opStart)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(scoped) != 1 || scoped[0].port != 14000 {
+	if len(scoped) != 1 || scoped[0].Port != 14000 {
 		t.Fatalf("fixed origin must report ONLY this op's row, not the pre-op stranded one; got %+v (F3)", scoped)
 	}
 	// (3) NO AGING: the SAME fixed origin still reports the row however far wall-clock has advanced (the
 	// function compares last_rehome_at>=origin, no `now`). The earlier SLIDING window would fail-open here:
 	// at a far-future now (a long confirm retry) it drifts PAST the row's fixed last_rehome_at and drops it.
 	farNow := opStart.Add(60 * time.Minute)
-	stillScoped, err := admin.pendingRetireConvergence("brk-a", opStart)
+	stillScoped, err := admin.PendingRetireConvergence("brk-a", opStart)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(stillScoped) != 1 || stillScoped[0].port != 14000 {
+	if len(stillScoped) != 1 || stillScoped[0].Port != 14000 {
 		t.Fatalf("the fixed origin must NEVER age out this op's still-stranded row; got %+v", stillScoped)
 	}
 	sliding := farNow.Add(-2 * opRehomeConvergeTimeout) // = opStart+40m > the row's last_rehome_at (opStart+30s)
-	if aged, _ := admin.pendingRetireConvergence("brk-a", sliding); len(aged) != 0 {
+	if aged, _ := admin.PendingRetireConvergence("brk-a", sliding); len(aged) != 0 {
 		t.Fatalf("sanity: the abandoned sliding window should have aged the row out (proving why the caller uses "+
 			"the FIXED op.CreatedAt); got %+v", aged)
 	}
 	// Drain-style zero window: fleet-wide, both unconfirmed exposes reported (fail-closed).
-	fleet, err := admin.pendingRetireConvergence("brk-a", time.Time{})
+	fleet, err := admin.PendingRetireConvergence("brk-a", time.Time{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1059,8 +1063,8 @@ func TestHomeDeliveryIsRegisteredInTheProductionPassSet(t *testing.T) {
 func TestWireClusterLateWiresHomeConvergence(t *testing.T) {
 	src := readRepoFile(t, "clusterwrite.go")
 	for _, want := range []string{
-		"admin.homeAppliedFn = b.homeAppliedEpoch",
-		"admin.homeDeliverFn = b.deliverHomeNow",
+		"admin.HomeAppliedFn = b.homeAppliedEpoch",
+		"admin.HomeDeliverFn = b.deliverHomeNow",
 		"b.subscribeHomeAcks(nc)",
 	} {
 		if !strings.Contains(src, want) {

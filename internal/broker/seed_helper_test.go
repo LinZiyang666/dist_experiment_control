@@ -39,13 +39,17 @@ func TestG3SeedFirstPublishStaysManual(t *testing.T) {
 }
 
 func TestG3SeedChangeGateAndBootstrapPreserve(t *testing.T) {
+	// origin: hot-update S10 plan §11.1 / TEST-BUDGET
+	if runIsolatedBrokerTest(t) {
+		return
+	}
 	admin := g3AdminWithSelf(t, "host.example")
 	if _, err := admin.PublishSeeds([]string{"wss://host.example:443"}, "https://boot.example/manifest"); err != nil {
 		t.Fatalf("PublishSeeds: %v", err)
 	}
 	_, _, gen0, _ := admin.ReadSeeds()
 	// derived set == stored set → change-gate must skip (no seed_generation bump, no fleet re-adopt).
-	if err := admin.deriveAndConvergeSeedsFromRoster(); err != nil {
+	if err := admin.DeriveAndConvergeSeedsFromRoster(); err != nil {
 		t.Fatalf("helper: %v", err)
 	}
 	_, boot, gen1, _ := admin.ReadSeeds()
@@ -65,7 +69,7 @@ func TestG3SeedShrinkConvergesDropsStale(t *testing.T) {
 		t.Fatalf("PublishSeeds: %v", err)
 	}
 	_, _, gen0, _ := admin.ReadSeeds()
-	if err := admin.deriveAndConvergeSeedsFromRoster(); err != nil {
+	if err := admin.DeriveAndConvergeSeedsFromRoster(); err != nil {
 		t.Fatalf("helper: %v", err)
 	}
 	eps, boot, gen1, _ := admin.ReadSeeds()
@@ -89,6 +93,10 @@ func TestG3SeedShrinkConvergesDropsStale(t *testing.T) {
 // leadership edge, the signed seed bundle advertised the retired endpoint
 // forever even though the roster deletion and operation were terminal.
 func TestG3AsyncRetireTerminalIncludesSeedConvergence(t *testing.T) {
+	// origin: hot-update S10 plan §11.1 / TEST-BUDGET
+	if runIsolatedBrokerTest(t) {
+		return
+	}
 	admin := g3AdminWithSelf(t, "self.example")
 	if _, err := admin.PublishSeeds([]string{"wss://self.example:443", "wss://retired.example:443"}, ""); err != nil {
 		t.Fatalf("PublishSeeds: %v", err)
@@ -99,18 +107,18 @@ func TestG3AsyncRetireTerminalIncludesSeedConvergence(t *testing.T) {
 		OpID: "op-retire-seeds", Kind: cluster.OpKindRetire, TargetNode: "retired",
 		InitState: cluster.OpStateNatsRolledOut, Confirmed: true, Timeline: `[{"s":"NATS_ROLLED_OUT"}]`,
 	}
-	if err := admin.node.Propose(func(*sql.DB) (*cluster.Command, error) {
+	if err := admin.Node.Propose(func(*sql.DB) (*cluster.Command, error) {
 		return cluster.PlanClusterOpStart(start, now)
 	}); err != nil {
 		t.Fatalf("seed retire operation: %v", err)
 	}
-	op, err := cluster.OperationByID(admin.node.RODB(), start.OpID)
+	op, err := cluster.OperationByID(admin.Node.RODB(), start.OpID)
 	if err != nil || op == nil {
 		t.Fatalf("read seeded operation: op=%+v err=%v", op, err)
 	}
-	admin.driveRetire(op, substrate{})
+	admin.DriveRetire(op, substrate{})
 
-	got, err := cluster.OperationByID(admin.node.RODB(), start.OpID)
+	got, err := cluster.OperationByID(admin.Node.RODB(), start.OpID)
 	if err != nil || got == nil || !got.Terminal || got.OpState != cluster.OpStateRetired {
 		t.Fatalf("retire did not reach terminal after seed convergence: op=%+v err=%v", got, err)
 	}
@@ -127,13 +135,17 @@ func TestG3AsyncRetireTerminalIncludesSeedConvergence(t *testing.T) {
 }
 
 func TestG3SeedHostMatchProtectsVIP(t *testing.T) {
+	// origin: hot-update S10 plan §11.1 / TEST-BUDGET
+	if runIsolatedBrokerTest(t) {
+		return
+	}
 	admin := g3AdminWithSelf(t, "host.example")
 	// stored is an operator-curated VIP set whose host matches NO broker → the helper must be hands-off.
 	if _, err := admin.PublishSeeds([]string{"wss://vip.lb.example:443"}, ""); err != nil {
 		t.Fatalf("PublishSeeds: %v", err)
 	}
 	_, _, gen0, _ := admin.ReadSeeds()
-	if err := admin.deriveAndConvergeSeedsFromRoster(); err != nil {
+	if err := admin.DeriveAndConvergeSeedsFromRoster(); err != nil {
 		t.Fatalf("helper: %v", err)
 	}
 	eps, _, gen1, _ := admin.ReadSeeds()
@@ -153,7 +165,7 @@ func TestG3SeedEmptyFloorKeepsStored(t *testing.T) {
 		t.Fatalf("PublishSeeds: %v", err)
 	}
 	_, _, gen0, _ := admin.ReadSeeds()
-	if err := admin.deriveAndConvergeSeedsFromRoster(); err != nil {
+	if err := admin.DeriveAndConvergeSeedsFromRoster(); err != nil {
 		t.Fatalf("helper: %v", err)
 	}
 	eps, _, gen1, _ := admin.ReadSeeds()
@@ -187,7 +199,7 @@ func TestG3SeedGrowConvergesMultiBroker(t *testing.T) {
 	if err := n.Propose(func(*sql.DB) (*cluster.Command, error) { return cluster.PlanClusterNodeUpsert(b2) }); err != nil {
 		t.Fatalf("upsert b2 roster row: %v", err)
 	}
-	if err := admin.deriveAndConvergeSeedsFromRoster(); err != nil {
+	if err := admin.DeriveAndConvergeSeedsFromRoster(); err != nil {
 		t.Fatalf("helper: %v", err)
 	}
 	eps, _, gen1, _ := admin.ReadSeeds()
@@ -208,6 +220,10 @@ func TestG3SeedGrowConvergesMultiBroker(t *testing.T) {
 // successor grow to rescue it. Then driveLeaderMaintenance (the fix, wired into the observe loop's leader
 // tick) re-converges and the 3rd voter finally enters `seeds show`; a 2nd tick is idempotent (no churn).
 func TestG3SeedThirdVoterConvergesViaLeaderMaintenance(t *testing.T) {
+	// origin: hot-update S10 plan §11.1 / TEST-BUDGET
+	if runIsolatedBrokerTest(t) {
+		return
+	}
 	n, addr := d7SingleNode(t, "self")
 	admin := NewClusterAdmin(n, nil)
 	self := d7JoinInput(t, "self", addr)
@@ -243,7 +259,7 @@ func TestG3SeedThirdVoterConvergesViaLeaderMaintenance(t *testing.T) {
 	}
 
 	// The fix: the observe loop's per-tick leader maintenance re-converges from the roster.
-	admin.driveLeaderMaintenance()
+	admin.DriveLeaderMaintenance()
 
 	eps, _, gen1, _ := admin.ReadSeeds()
 	joined := strings.Join(eps, ",")
@@ -256,7 +272,7 @@ func TestG3SeedThirdVoterConvergesViaLeaderMaintenance(t *testing.T) {
 
 	// Idempotent: a 2nd maintenance tick on the converged set must NOT churn seed_generation (routine
 	// ticks must never force the fleet to re-adopt).
-	admin.driveLeaderMaintenance()
+	admin.DriveLeaderMaintenance()
 	if _, _, gen2, _ := admin.ReadSeeds(); gen2 != gen1 {
 		t.Fatalf("#46: maintenance on a converged set must be a no-op, seed_generation churned: %d -> %d", gen1, gen2)
 	}

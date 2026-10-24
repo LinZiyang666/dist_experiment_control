@@ -28,6 +28,13 @@ func TestBrokerErrorMessageRegisteredCodes(t *testing.T) {
 		{"sha256_mismatch", "doesn't match"},
 		{"proto_bump_requires_reinstall", "full reinstall"},
 		{"clone_family_upgrade_unsupported", "rebuild the source image"},
+		// origin: hot-update S3 plan §4.2. upgrade_deferred retains raw reasons;
+		// individual compatibility refusals have their own hints.
+		{"image_abi_unsupported", "pick a hot-update-capable release or drain the node first"},
+		{"agent_upgrading", "retry in a few seconds"},
+		// origin: hot-update S5 plan §7.3 / §10.2. Diagnose a safe state
+		// deferral without suggesting that the operator replace live sockets.
+		{"ss_state_unrepresentable", "supported state and retry"},
 		{"name_taken", "expose rm"},
 		{"port_exhausted", "free public port"},
 		{"port_taken", "already allocated"},
@@ -49,9 +56,10 @@ func TestBrokerErrorMessageRegisteredCodes(t *testing.T) {
 }
 
 // TestBrokerCodeHintsTransientCluster (B1 item 6): the three failover/transient codes each render
-// a "wait and retry" sentence. All three are agent-internal today (home_catching_up / try_again are
+// a "wait and retry" sentence. Their original paths are agent-internal (home_catching_up / try_again are
 // agent tunnel-REGISTER deny reasons, leader_unavailable is consumed by the agent register loop);
-// the entries are defensive future-proofing + a log-reading gloss. None must imply user fault.
+// the entries are defensive future-proofing + a log-reading gloss. S4 also uses try_again for legacy
+// admission refusals, whose detail selects the upgrade hint. None must imply user fault.
 func TestBrokerCodeHintsTransientCluster(t *testing.T) {
 	for _, code := range []string{"home_catching_up", "leader_unavailable", "try_again"} {
 		t.Run(code, func(t *testing.T) {
@@ -144,6 +152,8 @@ func TestConnectErrorMentionsURL(t *testing.T) {
 func TestRunFailureMessageMapsKnownReasons(t *testing.T) {
 	for reason, want := range map[string]string{
 		"attach_timeout": "subscribe in time",
+		// origin: hot-update S4 plan §2.2 / T49
+		"pty_input_overflow": "task may have executed",
 		// origin: line-2 §12 Y2, corrected twice by the line-2 review.
 		//
 		// `/dev/ptmx` moved from pty_alloc_failed to pty_unavailable when the emitter split by errno.

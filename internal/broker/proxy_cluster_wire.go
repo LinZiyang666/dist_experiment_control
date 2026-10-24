@@ -14,7 +14,7 @@ import (
 // proxy_cluster_wire.go (C5) — the cluster-mode proxy CONTROL handlers. They route every write through
 // Raft (majority-write: no quorum ⇒ fail-closed), gated by the derived degraded state. The DATA plane
 // (the per-node __proxy__ allocation + the token-bearing directive push) is the leader-gated reaper's
-// job (proxy_reconcile.go) — these handlers only flip the replicated control state. They are broadcast
+// job (proxy_reconcile.go); committed subscriber revocation also pushes the fresh keyset immediately. They are broadcast
 // + leader-only (Stage-C N0): a follower returns silent and only the leader proposes locally.
 
 // proxyClusterStatusFor derives the proxy degraded state for one session from the live cluster
@@ -109,6 +109,16 @@ func (b *Broker) handleProxySubRevokeCluster(sid, fp, actor, name string, msg *n
 		return
 	}
 	if epochAfter, err := session.GetProxyEpoch(b.cfg.DB, sid); err == nil && epochAfter > epochBefore {
+		// A silent victim cannot wait for the next reaper/heartbeat phase.
+		// Send this committed key change immediately, using the same fresh,
+		// bounded authority reader as repair. A missed/refused push still has
+		// the normal repair path; no pre-commit keys or cached grant are used.
+		// origin: hot-update S5 plan §6.4 / §6.5 / T28 / DRILL-RUN 75.A
+		if nc := b.nc.Load(); nc != nil {
+			for _, nid := range b.onlineNIDs(sid) {
+				b.pushProxyDirective(nc, sid, nid, &proto.ProxyDirective{Epoch: epochAfter})
+			}
+		}
 		// Secret-free body ({sid} only), like every other pubSysEvent — no PSK/token ever.
 		b.pubSysEvent("proxy_keyset_changed", map[string]any{"sid": sid})
 	}

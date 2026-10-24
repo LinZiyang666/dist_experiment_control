@@ -14,10 +14,10 @@ import (
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/cluster"
-	"github.com/LinZiyang666/tether/internal/clusterupgrade"
 	"github.com/LinZiyang666/tether/internal/proto"
+	"github.com/LinZiyang666/tether/internal/testharness"
+	"github.com/LinZiyang666/tether/internal/upgradecli/clusterroll"
 	"github.com/nats-io/nats.go"
-	"github.com/spf13/cobra"
 )
 
 // cluster_lock_keeper_test.go (R7b) — the HOLDER half of the lease.
@@ -222,6 +222,10 @@ func waitFor(t *testing.T, timeout time.Duration, pred func() bool, msg string) 
 // acquire time is wrong for most of the roll. If the leader were cached, every renewal after the first
 // transfer would fail and the lease would lapse mid-roll.
 func TestRenewLeaseReresolvesTheLeaderEveryCall(t *testing.T) {
+	// origin: hot-update S10 plan L17 / §11.1 / POLISH-B
+	if runIsolatedBinaryTest(t) {
+		return
+	}
 	url := startCLIExternalReviewNATS(t)
 	nc, err := nats.Connect(url)
 	if err != nil {
@@ -286,6 +290,10 @@ func TestRenewLeaseReresolvesTheLeaderEveryCall(t *testing.T) {
 // Misclassifying a transient as terminal aborts a healthy operation; misclassifying terminal as transient
 // means the keeper renews a lock somebody else now holds.
 func TestRenewLeaseClassifiesRepliesCorrectly(t *testing.T) {
+	// origin: hot-update S10 plan L17 / §11.1 / POLISH-B
+	if runIsolatedBinaryTest(t) {
+		return
+	}
 	cases := []struct {
 		name      string
 		resp      proto.ClusterGrowResp
@@ -364,6 +372,10 @@ func TestProductionRenewCadenceIsTheLeaseInterval(t *testing.T) {
 	if growLeaseRenewInterval != cluster.LockLeaseRenewInterval {
 		t.Fatalf("grow keeper renews every %s, but the lease is sized for %s", growLeaseRenewInterval, cluster.LockLeaseRenewInterval)
 	}
+	// origin: hot-update S8 plan §6.3; S8 internal review upgrade-maketest-2 F1
+	if clusterroll.LeaseRenewInterval != cluster.LockLeaseRenewInterval {
+		t.Fatalf("transaction keeper renews every %s, but the lease is sized for %s", clusterroll.LeaseRenewInterval, cluster.LockLeaseRenewInterval)
+	}
 	if upgradeLeaseRenewInterval != cluster.LockLeaseRenewInterval {
 		t.Fatalf("upgrade keeper renews every %s, but the lease is sized for %s", upgradeLeaseRenewInterval, cluster.LockLeaseRenewInterval)
 	}
@@ -382,102 +394,22 @@ func TestProductionRenewCadenceIsTheLeaseInterval(t *testing.T) {
 // that nobody renews, so a live roll loses its lock on a fixed timer.
 //
 // The test drives a real `cluster upgrade` far enough to take the lock, stalls it inside the roll (a slow
-// leadership probe), and asserts renewals land on the wire. It then asserts the keeper STOPS when the roll
+// preflight port), and asserts renewals land on the wire. It then asserts the keeper STOPS when the roll
 // HALTs — the abandonment path where the lease is supposed to start running down.
+// origin: S8 internal review upgrade-maketest-2 F1; hot-update S8 plan §5.1 / §6.3
 func TestDriveUpgradeActuallyStartsAKeeper(t *testing.T) {
-	prev := upgradeLeaseRenewInterval
-	upgradeLeaseRenewInterval = time.Millisecond
-	t.Cleanup(func() { upgradeLeaseRenewInterval = prev })
-
-	url := startCLIExternalReviewNATS(t)
-	nc, err := nats.Connect(url)
-	if err != nil {
-		t.Fatal(err)
+	// origin: hot-update S10 plan L17 / §11.1 / POLISH-B
+	if runIsolatedBinaryTest(t) {
+		return
 	}
-	defer nc.Close()
-	seed, _ := cliExternalAccount(t)
-	actor := "Uactor-r7b-wiring"
-
-	// A deliberately SLOW health responder: it holds the roll inside waitLeader long enough for the
-	// compressed renew cadence to fire many times.
-	mustSub(t, nc, proto.SubjCtrlClusterHealth(actor), func(m *nats.Msg) {
-		if m.Reply == "" {
-			return
-		}
-		time.Sleep(2 * time.Millisecond)
-		body, _ := json.Marshal(proto.ClusterHealthResp{
-			NodeID: "brk-leader", WritableLeaderConfirmed: true, LeaderID: "brk-leader",
-		})
-		_ = m.Respond(body)
-	})
-
-	var mu sync.Mutex
-	var renews int
-	var sawAcquire bool
-	mustSub(t, nc, proto.SubjCtrlClusterUpgrade(actor), func(m *nats.Msg) {
-		if m.Reply == "" {
-			return
-		}
-		var req proto.ClusterUpgradeReq
-		_ = json.Unmarshal(m.Data, &req)
-		resp := proto.ClusterUpgradeResp{OK: true}
-		mu.Lock()
-		switch req.Op {
-		case "acquire-lock":
-			sawAcquire = true
-		case "renew-lock":
-			renews++
-		case "transfer-leader":
-			// Refuse, so the roll HALTs — the abandonment path.
-			resp = proto.ClusterUpgradeResp{Code: "store_error", Error: "injected refusal"}
-		}
-		mu.Unlock()
-		body, _ := json.Marshal(resp)
-		_ = m.Respond(body)
-	})
-	if err := nc.Flush(); err != nil {
-		t.Fatal(err)
+	previous := clusterroll.LeaseRenewInterval
+	clusterroll.LeaseRenewInterval = time.Millisecond
+	t.Cleanup(func() { clusterroll.LeaseRenewInterval = previous })
+	binary := signedRollBuild(t, true)
+	beforeG, beforeFD := runtime.NumGoroutine(), testharness.FDCount()
+	for round := 0; round < 5; round++ {
+		t.Run(fmt.Sprint(round), func(t *testing.T) { exerciseSignedRollKeeper(t, binary) })
 	}
-
-	// One step that transfers leadership first: acquire-lock → (keeper starts) → waitLeader spins on the
-	// slow health probe → transfer-leader refused → HALT.
-	plan := clusterupgrade.Plan{Steps: []clusterupgrade.Step{
-		{Kind: clusterupgrade.StepUpgrade, NodeID: "brk-a", TransferTo: "brk-b"},
-	}}
-
-	cmd := &cobra.Command{}
-	cmd.SetOut(&bytes.Buffer{})
-	cmd.SetContext(context.Background())
-
-	err = driveUpgrade(cmd, nc, actor, "sid", seed, plan, "v9.9.9", "", "")
-	if err == nil {
-		t.Fatal("the injected transfer-leader refusal must HALT the roll")
-	}
-
-	mu.Lock()
-	acquired, n := sawAcquire, renews
-	mu.Unlock()
-	if !acquired {
-		t.Fatal("fixture precondition: the roll never took the lock")
-	}
-	if n == 0 {
-		t.Fatal("driveUpgrade took the roll lock and NEVER RENEWED IT. The acquire stamps a lease that expires in " +
-			"LockLeaseTTL, so with no keeper wired the reaper will release the lock out from under a LIVE roll — " +
-			"strictly worse than the leak R7b set out to fix. The keeper exists but nothing calls it.")
-	}
-
-	// The HALT path must have stopped the keeper (driveUpgrade defers Stop on every return). If it had
-	// not, renewals would keep arriving after the function returned — an abandoned roll whose lock never
-	// decays, i.e. the permanent fence, restored.
-	mu.Lock()
-	settled := renews
-	mu.Unlock()
-	time.Sleep(30 * time.Millisecond)
-	mu.Lock()
-	after := renews
-	mu.Unlock()
-	if after != settled {
-		t.Fatalf("%d renewals arrived AFTER driveUpgrade returned — the keeper outlived the HALT, so the abandoned "+
-			"roll lock would be renewed forever and never decay", after-settled)
-	}
+	testharness.AssertNoGoroutineLeak(t, "signed roll keeper", beforeG)
+	testharness.AssertNoFDLeak(t, "signed roll keeper", beforeFD, 0)
 }

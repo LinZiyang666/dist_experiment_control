@@ -1,6 +1,7 @@
 package broker
 
 import (
+	"crypto/sha256"
 	"database/sql"
 	"errors"
 	"slices"
@@ -11,6 +12,7 @@ import (
 	"github.com/LinZiyang666/tether/internal/backoff"
 	"github.com/LinZiyang666/tether/internal/cluster"
 	"github.com/LinZiyang666/tether/internal/clusternodes"
+	"github.com/LinZiyang666/tether/internal/drillobserve"
 	"github.com/LinZiyang666/tether/internal/node"
 	"github.com/LinZiyang666/tether/internal/port"
 	"github.com/LinZiyang666/tether/internal/proto"
@@ -137,7 +139,7 @@ func (b *Broker) reconcileProxyTeardown(nc *nats.Conn) {
 		// Push Enabled:false so the agent tears down its SS server + tunnel (the tunnel drop closes the
 		// home broker's bound public listener). The epoch carries the post-off keyset bump → newer →
 		// accepted by the agent's proxyNewer guard (epoch-only ordering in cluster mode).
-		epoch, _ := session.GetProxyEpoch(b.cfg.DB, r.sid)
+		epoch, _ := session.GetProxyEpoch(b.read().SQL(), r.sid)
 		b.pushProxyDirective(nc, r.sid, r.nid, &proto.ProxyDirective{Enabled: false, Epoch: epoch})
 		// Close any LOCAL home listener immediately (if this broker is the home; harmless otherwise).
 		if srv := b.tunnelSrv.Load(); srv != nil {
@@ -192,13 +194,39 @@ func (b *Broker) reconcileProxySession(nc *nats.Conn, sid string) {
 	if err != nil {
 		return
 	}
-	epoch, _ := session.GetProxyEpoch(b.cfg.DB, sid)
+	epoch, _ := session.GetProxyEpoch(b.read().SQL(), sid)
 	nids := b.onlineNIDs(sid)
 	readyNodes := 0
 	for _, nid := range nids {
-		existing, lookErr := port.LookupProxyByNode(b.cfg.DB, sid, nid)
+		existing, lookErr := port.LookupProxyByNode(b.read().SQL(), sid, nid)
 		if lookErr != nil || existing == nil {
 			b.allocateAndPushProxy(nc, sid, nid, keys, epoch)
+			continue
+		}
+		// origin: hot-update S6 plan §7.2 / T43
+		// Preserve the real prior dwell and damper, including healthy-but-unready.
+		// Ready counts remain actual observations; maintenance never writes readiness.
+		if proxyHomeMaintained(b, existing.HomeBroker) {
+			ready := b.nodeProxyReady(sid, nid)
+			if ready {
+				readyNodes++
+			}
+			// origin: hot-update S6 plan §7.2 / T43 / DRILL-OBSERVER
+			// The existing passive reaper channel distinguishes a protected decision
+			// from real health. Historical dwell stays visible without logging tokens.
+			if drillobserve.Hook != nil {
+				dwell, _ := b.proxyDwell.Load(existing.Port)
+				historical, _ := dwell.(int)
+				var healthyValue, readyValue uint64
+				if b.proxyHomeHealthy(existing.HomeBroker) {
+					healthyValue = 1
+				}
+				if ready {
+					readyValue = 1
+				}
+				drillobserve.Hook(drillobserve.Event{Kind: "reaper", Domain: "proxy", Digest: sha256.Sum256([]byte(existing.TokenHash)),
+					Values: [16]uint64{uint64(existing.Port), uint64(existing.Epoch), uint64(proxyRehomeDwell), healthyValue, readyValue, 1, uint64(historical)}, Data: []byte(existing.HomeBroker)})
+			}
 			continue
 		}
 		// Home unhealthy (drained/retired OR crashed-unreachable, M1) for proxyRehomeDwell consecutive
@@ -232,18 +260,26 @@ func (b *Broker) reconcileProxySession(nc *nats.Conn, sid string) {
 				}
 				// BD9: this is an ALLOCATE (epoch resets to 0), NOT a rehome — emit rehome_stalled
 				// (change-keyed), never home_reassign_succeeded / a last_rehome_at stamp.
-				b.emitRehomeOnce(existing.Port, "stalled:"+reasonTargetNotReady, evRehomeStalled, map[string]any{
-					"kind": "proxy", "sid": sid, "nid": nid, "port": existing.Port,
-					"home_broker": existing.HomeBroker, "epoch": existing.Epoch, "reason": reasonTargetNotReady,
-				})
-				b.clearProxyDwell(existing.Port)
-				b.allocateAndPushProxy(nc, sid, nid, keys, epoch)
-				b.clearRehomeMark(existing.Port) // C6-EVT-3: the old port is freed by the re-alloc — drop its leaked mark
-				proxyRotateFailed(b, sid, nid)
+				// origin: hot-update S6 plan §7.2 / T43
+				if allocateProxyAndPush(b, nc, sid, nid, keys, epoch) {
+					b.emitRehomeOnce(existing.Port, "stalled:"+reasonTargetNotReady, evRehomeStalled, map[string]any{
+						"kind": "proxy", "sid": sid, "nid": nid, "port": existing.Port,
+						"home_broker": existing.HomeBroker, "epoch": existing.Epoch, "reason": reasonTargetNotReady,
+					})
+					b.clearProxyDwell(existing.Port)
+					b.clearRehomeMark(existing.Port) // C6-EVT-3: committed rotation retired this allocation.
+					proxyRotateFailed(b, sid, nid)
+				}
 				continue
 			}
 			b.pushProxyDirectiveWithHome(nc, sid, nid, existing, keys, epoch) // nudge while waiting
 			continue
+		}
+		// origin: hot-update S5 plan §4.5 / §9.1 / DRILL-OBSERVER.
+		// This receipt is the live default reaper's healthy+ready decision,
+		// not a collector's invocation or a replacement tick schedule.
+		if drillobserve.Hook != nil {
+			drillobserve.Hook(drillobserve.Event{Kind: "reaper", Domain: "proxy", Digest: sha256.Sum256([]byte(existing.TokenHash)), Values: [16]uint64{uint64(existing.Port), uint64(existing.Epoch), uint64(proxyRehomeDwell), 1, 1}, Data: []byte(existing.HomeBroker)})
 		}
 		b.clearProxyDwell(existing.Port)
 		b.clearRehomeMark(existing.Port) // healthy + ready → re-arm rehome event for a future down
@@ -572,7 +608,7 @@ func (b *Broker) proxyHomeHealthy(homeBroker string) bool {
 	if homeBroker == "" {
 		return false
 	}
-	home, err := clusternodes.LookupByNodeID(b.cfg.DB, homeBroker)
+	home, err := clusternodes.LookupByNodeID(b.read().SQL(), homeBroker)
 	if err != nil || !home.Eligible() || home.CertFP == "" || home.PublicHost == "" {
 		return false
 	}
@@ -600,28 +636,67 @@ func (b *Broker) homeReachable(nodeID string) bool {
 // and pushes the token-bearing directive with the resolved Home. Skips if no Eligible() home is
 // available yet (the next tick / the agent's register retries — never an unsatisfiable directive).
 func (b *Broker) allocateAndPushProxy(nc *nats.Conn, sid, nid string, keys []proto.ProxyKey, epoch int64) {
+	allocateProxyAndPush(b, nc, sid, nid, keys, epoch)
+}
+
+// Return true only for a committed allocation. Rotation history cannot be
+// cleared merely because a maintenance/stale guard rejected the proposal.
+// origin: hot-update S6 plan §7.2 / T41 / T43
+func allocateProxyAndPush(b *Broker, nc *nats.Conn, sid, nid string, keys []proto.ProxyKey, epoch int64) bool {
 	home := b.resolveHomeForAgent(sid, nid)
 	if home == nil {
-		return
+		return false
 	}
-	// B2 (Stage-C BLOCKER): PLAN inside the Propose closure on the live n.db (under applyMu), NOT on
-	// the RODB cfg.DB handle ahead of time — findFreePort must read the committed, serialized view so
-	// two concurrent allocations (e.g. a reaper proxy + a ctl expose) cannot bake the SAME port and
-	// fail-stop the FSM at Apply on idx_port_alloc_unique_active. The raw token is leak-once-captured
-	// from the closure (mirrors allocatePort, clusterwrite.go).
+	existing, err := port.LookupProxyByNode(b.read().SQL(), sid, nid)
+	if err != nil && !errors.Is(err, port.ErrNotFound) {
+		return false
+	}
 	var alloc *port.Allocation
+	var proposed bool
 	if err := b.cl.node.Propose(func(db *sql.DB) (*cluster.Command, error) {
-		a, cmd, e := port.PlanAllocateProxy(db, sid, nid, home.NodeID, b.cfg.PortAllocCfg())
-		if e != nil {
-			return nil, e
-		}
-		alloc = a
-		return cmd, nil
-	}); err != nil || alloc == nil {
-		return
+		a, cmd, err := planHomeAllocate(b, db, existing, port.AllocationIntent{SID: sid, NID: nid,
+			Name: port.ProxyPortName, HomeBroker: home.NodeID, Config: b.cfg.PortAllocCfg()})
+		alloc, proposed = a, cmd != nil
+		return cmd, err
+	}); err != nil || alloc == nil || !proposed {
+		return false
+	}
+	committed, err := port.LookupByTokenHash(b.read().SQL(), alloc.TokenHash)
+	if err != nil || !sameHomeAllocation(committed, alloc) {
+		return false
 	}
 	b.pubPortEvent(sid, alloc.Port, port.ProxyPortName, nid, 0, "allocated")
+	awaitProxyHomeAllocation(b, nc, alloc)
 	b.pushProxyDirectiveWithHome(nc, sid, nid, alloc, keys, epoch)
+	return true
+}
+
+// The agent presents this single-use token immediately. A remote home that
+// has not learned the allocation can deny it as terminal, rather than as known
+// lag. Match ordinary expose delivery's bounded wait, then read fresh authority
+// in pushProxyDirective; a revoke during the wait must still win.
+// origin: hot-update S5 plan §6.4 / §9.1 / DRILL-RUN 75.C
+func awaitProxyHomeAllocation(b *Broker, nc *nats.Conn, alloc *port.Allocation) {
+	if alloc.HomeBroker == "" || alloc.HomeBroker == b.selfNodeID() {
+		return
+	}
+	need, err := b.cl.node.AppliedIndex()
+	if err != nil {
+		return
+	}
+	home := alloc.HomeBroker
+	homeApplied := func(r map[string]proto.ClusterHealthResp) bool {
+		h, ok := r[home]
+		return ok && h.AppliedIndex >= need
+	}
+	waited, ok := awaitHomeApplied(home, need, exposeHomeApplyBudget, exposeHomeApplyStep,
+		func() map[string]proto.ClusterHealthResp {
+			return pollClusterHealthUntil(nc, proto.SubjClusterCursor, exposeHomeApplyStep, homeApplied)
+		})
+	if waited > exposeHomeApplyStep || !ok {
+		b.cfg.Logger.Info("broker: proxy waited for the home to apply the allocation",
+			"home", home, "need_applied", need, "waited", waited.Round(time.Millisecond), "caught_up", ok)
+	}
 }
 
 // rehomeProxy re-points a __proxy__ home to a fresh Eligible() VOTER (load-spread) via the D6
@@ -636,38 +711,27 @@ func (b *Broker) rehomeProxy(nc *nats.Conn, sid, nid string, existing *port.Allo
 		})
 		return
 	}
-	// C6-EVT-1: started + failed share ONE per-port mark so a SUSTAINED Propose failure does not flood
-	// sys.events every ~5s tick (two distinct marks would perpetually invalidate each other). A fresh
-	// attempt (the mark is neither this target's started nor failed) emits started once; the same
-	// sustained attempt re-enters silently until it succeeds (clearRehomeMark re-arms) or the target
-	// changes. HR2: PlanReassignHome returns the authoritative post-Apply epoch — use it, not the
-	// re-lookup, in the succeeded event.
-	startMark, failMark := "start:"+target, "fail:"+target
-	prev, _ := b.rehomeEvt.Load(existing.Port)
-	curMark, _ := prev.(string)
-	if curMark != startMark && curMark != failMark {
-		b.rehomeEvt.Store(existing.Port, startMark)
-		curMark = startMark
-		b.pubSysEvent(evHomeReassignStarted, map[string]any{
-			"kind": "proxy", "sid": sid, "nid": nid, "port": existing.Port,
-			"from_broker": existing.HomeBroker, "to_broker": target, "epoch": existing.Epoch,
-		})
-	}
-	var newEpoch int64
-	if err := b.cl.node.Propose(func(db *sql.DB) (*cluster.Command, error) {
-		ne, cmd, perr := port.PlanReassignHome(db, existing.Port, target, b.cfg.Now())
-		newEpoch = ne
-		return cmd, perr
-	}); err != nil {
-		if curMark != failMark {
-			b.rehomeEvt.Store(existing.Port, failMark)
-			b.pubSysEvent(evHomeReassignFailed, map[string]any{
-				"kind": "proxy", "sid": sid, "port": existing.Port,
-				"from_broker": existing.HomeBroker, "to_broker": target, "reason": classifyRehomeErr(err),
-			})
+	// C6-EVT-1: failed marks still suppress a sustained failed attempt; started
+	// now means the writer committed and readback matched the full identity.
+	// origin: hot-update S6 plan §7.2 / T41
+	failMark := "fail:" + target
+	upd, err := committedHomeMove(b, existing, target)
+	if err != nil {
+		var deferred *HomeMaintenanceDeferredError
+		if errors.As(err, &deferred) {
+			return
 		}
+		b.emitRehomeOnce(existing.Port, failMark, evHomeReassignFailed, map[string]any{
+			"kind": "proxy", "sid": sid, "port": existing.Port,
+			"from_broker": existing.HomeBroker, "to_broker": target, "reason": classifyRehomeErr(err),
+		})
 		return
 	}
+	newEpoch := upd.Epoch
+	b.pubSysEvent(evHomeReassignStarted, map[string]any{
+		"kind": "proxy", "sid": sid, "nid": nid, "port": existing.Port,
+		"from_broker": existing.HomeBroker, "to_broker": target, "epoch": existing.Epoch,
+	})
 	b.clearProxyDwell(existing.Port)
 	b.clearRehomeMark(existing.Port) // success → re-arm for a future down
 	b.pubSysEvent("proxy_node_unready", map[string]any{"sid": sid, "nid": nid})
@@ -675,9 +739,7 @@ func (b *Broker) rehomeProxy(nc *nats.Conn, sid, nid string, existing *port.Allo
 		"kind": "proxy", "sid": sid, "nid": nid, "port": existing.Port,
 		"from_broker": existing.HomeBroker, "to_broker": target, "epoch": newEpoch,
 	})
-	if upd, err := port.LookupProxyByNode(b.cfg.DB, sid, nid); err == nil && upd != nil {
-		b.pushProxyDirectiveWithHome(nc, sid, nid, upd, keys, epoch)
-	}
+	b.pushProxyDirectiveWithHome(nc, sid, nid, upd, keys, epoch)
 }
 
 // pickProxyRehomeTarget chooses an Eligible() VOTER different from the current (failed) home, spreading
@@ -701,10 +763,10 @@ func (b *Broker) pickProxyRehomeTarget(currentHome string) string {
 	// A9: exclude a mid-drain broker (broker_draining marker up but phase still VOTER during DrainNode's
 	// migrate window) as a rehome target, mirroring the allocatePort guard. Queried AFTER the rows above are
 	// fully drained (single store connection); a read error → no-draining, proceed unfiltered.
-	draining, _ := cluster.DrainingNodes(b.cfg.DB)
+	draining, _ := cluster.DrainingNodes(b.read().SQL())
 	best, bestLoad := "", int(^uint(0)>>1)
 	for _, id := range ids {
-		if slices.Contains(draining, id) {
+		if slices.Contains(draining, id) || proxyHomeMaintained(b, id) {
 			continue // A9: never rehome onto a draining broker
 		}
 		if id != b.selfID && !b.homeReachable(id) {

@@ -2,11 +2,14 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
+	"runtime"
 	"testing"
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/proto"
 	"github.com/LinZiyang666/tether/internal/testharness"
+	"github.com/nats-io/nats.go"
 )
 
 // origin: docs/reviews/cloned-credential-instances-plan.md
@@ -166,5 +169,67 @@ func TestInitialLeaseRefusalStopsRecompetitionAtTheBudget(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("terminal refusal wait ignored parent cancellation")
+	}
+}
+
+// A claim answer also supplies a real heartbeat after a broker subscription
+// cut; neither a retained ONLINE row nor a timer change can supply this proof.
+// origin: hot-update S6 plan §8.1 / T50 / EXITS-2-3
+func TestClaimProbeRefreshesActualAgentHeartbeat(t *testing.T) {
+	beforeG, beforeFD := runtime.NumGoroutine(), testharness.FDCount()
+	for round := 0; round < 5; round++ {
+		t.Run("round", func(t *testing.T) { exerciseClaimHeartbeat(t) })
+	}
+	testharness.AssertNoGoroutineLeak(t, "claim probe fresh heartbeat x5", beforeG)
+	testharness.AssertNoFDLeak(t, "claim probe fresh heartbeat x5", beforeFD, 0)
+}
+func exerciseClaimHeartbeat(t *testing.T) {
+	t.Helper()
+	url := startNATS(t)
+	a, err := New(Config{NATSURL: url, SID: "lab", NID: "n1", Home: t.TempDir(), Logger: testharness.SilentLog()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader, err := nats.Connect(url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	sender, err := nats.Connect(url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sender.Close()
+	inbox := reader.NewInbox()
+	answer, err := reader.SubscribeSync(inbox)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = answer.Unsubscribe() }()
+	heartbeat, err := reader.SubscribeSync(proto.SubjNodeHeartbeat("lab", "n1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = heartbeat.Unsubscribe() }()
+	if err = reader.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	before := time.Now()
+	replyClaimProbe(a, sender, &nats.Msg{Reply: inbox})
+	msg, err := answer.NextMsg(time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var response proto.ClaimProbeResp
+	if err = json.Unmarshal(msg.Data, &response); err != nil || response.InstanceID != a.instanceID {
+		t.Fatal("claim answer replaced original instance", err)
+	}
+	msg, err = heartbeat.NextMsg(time.Second)
+	if err != nil {
+		t.Fatal("claim answer omitted actual heartbeat", err)
+	}
+	var payload proto.HeartbeatPayload
+	if err = json.Unmarshal(msg.Data, &payload); err != nil || payload.Ts.Before(before) {
+		t.Fatal("claim heartbeat reused stale liveness", err)
 	}
 }

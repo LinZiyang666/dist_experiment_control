@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/LinZiyang666/tether/internal/testharness"
+	"github.com/LinZiyang666/tether/internal/upgradeauthority"
 	"github.com/LinZiyang666/tether/test/stackharness"
 )
 
@@ -143,7 +144,13 @@ func TestSeedSessionCreatesAnActiveOwnedSession(t *testing.T) {
 	if err := db.QueryRow(`SELECT state, owner_pubkey_fp, pin_hash FROM sessions WHERE sid='lab'`).Scan(&state, &owner, &pin); err != nil {
 		t.Fatal(err)
 	}
-	if state != "ACTIVE" || owner != fp || pin != stackharness.PlaceholderPINHash {
-		t.Fatalf("seeded session: state=%q owner=%q pin=%q", state, owner, pin)
+	if state != "ACTIVE" || owner != fp || pin != stackharness.SessionPINHash(t) {
+		t.Fatalf("seeded session: state=%q owner=%q valid_creation_hash=%t", state, owner, pin == stackharness.SessionPINHash(t))
+	}
+	// Removal now captures the creation salt as well as SID/owner/time.
+	// origin: S7 internal review MAKETEST-TRANSFER F2; S8 plan §6.2
+	guard, err := upgradeauthority.Capture(db, upgradeauthority.Guard{SID: "lab"})
+	if err != nil || guard.Incarnation == "" {
+		t.Fatalf("seeded session has no usable creation authority: %v", err)
 	}
 }

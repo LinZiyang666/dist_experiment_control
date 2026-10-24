@@ -1,5 +1,18 @@
 package broker
 
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"strings"
+	"time"
+
+	"github.com/LinZiyang666/tether/internal/brokercontrol"
+	"github.com/LinZiyang666/tether/internal/cluster"
+	"github.com/LinZiyang666/tether/internal/proto"
+	"github.com/nats-io/nats.go"
+)
+
 // observability.go — D9 §17 step 10b: the leader-gated observability poll that closes the
 // `broker_down` + `raft_lag` rows D8b left writerless. hashicorp/raft does not cleanly
 // expose per-peer liveness or command-domain cursors, so the leader SCATTER-GATHERs the
@@ -9,18 +22,6 @@ package broker
 //                       CommitIndex by more than the lag threshold.
 // Raise/clear go through the same transition-gated planAlertSignal as disk_pressure, so the
 // loop is idle-zero-writes (only a genuine transition Proposes a raft entry).
-
-import (
-	"context"
-	"database/sql"
-	"encoding/json"
-	"strings"
-	"time"
-
-	"github.com/LinZiyang666/tether/internal/cluster"
-	"github.com/LinZiyang666/tether/internal/proto"
-	"github.com/nats-io/nats.go"
-)
 
 // observeDecision is one §17 alert the poll decides to raise (Active) or clear (!Active).
 type observeDecision struct {
@@ -180,14 +181,20 @@ func (b *Broker) observeOnce(ctx context.Context, voters []string, lagThreshold 
 	for _, d := range decideObservabilityAlerts(b.selfID, leaderApplied, voters, responses, lagThreshold) {
 		b.proposeAlertSignal(d.Kind, d.NodeID, d.Active, d.Message)
 		if aerr == nil && d.Kind == cluster.AlertKindBrokerDown {
+			// origin: hot-update S6 plan §7.2 / T43
+			// Observe real alerts first. Planned edges affect only the return trigger;
+			// neither reachability nor broker_down is fabricated as healthy.
+			planned := suppressPlannedHomeReturn(b, d.NodeID, d.Active, !d.Active && prevDown[d.NodeID])
 			if d.Active {
-				downNow = append(downNow, d.NodeID)
+				if !planned {
+					downNow = append(downNow, d.NodeID)
+				}
 				// BD7: a brand-new broker_down (false→true) → one rehome-impact summary (proxy_homes the
 				// reaper will rehome vs exposes_stranded). Honest, secret-free, once per transition.
 				if !prevDown[d.NodeID] {
 					b.emitBrokerDownRehomeSummary(d.NodeID)
 				}
-			} else if prevDown[d.NodeID] {
+			} else if prevDown[d.NodeID] && !planned {
 				returned = append(returned, d.NodeID)
 			}
 		}
@@ -230,15 +237,6 @@ func (b *Broker) proposeAlertSignal(kind, node string, active bool, message stri
 		return planAlertSignal(db, payload, b.cfg.Now())
 	})
 }
-
-// observePollWindow bounds the health scatter-gather (a peer that does not answer within it
-// is treated as broker_down). observeTickInterval is how often the leader polls;
-// observeLagThreshold is the command-domain AppliedIndex gap that counts as raft_lag.
-const (
-	observePollWindow   = 2 * time.Second
-	observeTickInterval = 5 * time.Second
-	observeLagThreshold = 64
-)
 
 // runObserveLoop is the leader-gated §17 observability ticker (the 3rd cluster loop). It
 // polls health + raises/clears broker_down/raft_lag each tick; observeOnce no-ops on a
@@ -294,7 +292,7 @@ func (b *Broker) runObserveLoop(ctx context.Context) {
 			// leader picks up + drives to terminal by re-deriving from the substrate. It also re-converges
 			// client discovery seeds each tick (#46) — see driveLeaderMaintenance.
 			if isLeader && b.cl.admin != nil {
-				b.cl.admin.driveLeaderMaintenance()
+				b.cl.admin.DriveLeaderMaintenance()
 			}
 			// C5: the leader-gated proxy data-plane reaper (allocation + home-down rehome).
 			if isLeader {
@@ -333,3 +331,9 @@ func (b *Broker) clusterVoters() ([]string, error) {
 	}
 	return out, rows.Err()
 }
+
+// Compatibility adapters keep callers bound to the extracted control owner.
+// origin: hot-update S6 plan §9.3 / BROKER-SLIM
+const observePollWindow = brokercontrol.ObservePollWindow
+const observeTickInterval = brokercontrol.ObserveTickInterval
+const observeLagThreshold = brokercontrol.ObserveLagThreshold

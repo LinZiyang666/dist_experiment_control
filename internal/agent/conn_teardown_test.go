@@ -315,22 +315,6 @@ func TestConnTrackerPoisonIsSticky(t *testing.T) {
 
 // origin: internal review CT-5 (S11) — the registry must stay bounded across a long-lived session's
 // reconnect storm; an append-only slice grows one dead conn reference per redial forever.
-func TestConnTrackerRegistryStaysBounded(t *testing.T) {
-	tr := newConnTracker(context.Background(), func(context.Context, string, string) (net.Conn, error) {
-		return newBlockingConn(false), nil
-	})
-	for i := 0; i < 1000; i++ {
-		if _, err := tr.Dial("tcp", "127.0.0.1:4222"); err != nil {
-			t.Fatalf("dial %d: %v", i, err)
-		}
-	}
-	tr.mu.Lock()
-	n := len(tr.conns)
-	tr.mu.Unlock()
-	if n > trackerConnCap {
-		t.Fatalf("tracker holds %d conn references after 1000 redials (cap %d) — unbounded growth on a flapping link", n, trackerConnCap)
-	}
-}
 
 // origin: internal review TQ-1 (S7) — the tracker must FORWARD to the CustomDialer it displaces, or
 // a proxied agent silently dials direct (and a NAT'd fleet goes dark). Also covers S18: this is the

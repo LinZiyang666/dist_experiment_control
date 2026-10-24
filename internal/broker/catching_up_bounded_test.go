@@ -58,11 +58,11 @@ func TestControllerBoundsCatchingUpForAReachableJoiner(t *testing.T) {
 	now := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
 	n, _ := d7SingleNode(t, "ctl-1")
 	admin := NewClusterAdmin(n, nil)
-	admin.now = func() time.Time { return now }
+	admin.Now = func() time.Time { return now }
 
 	probes := 0
 	// Reachable and answering. Just never caught up.
-	admin.caughtUpFn = func(string, uint64) (bool, error) { probes++; return false, nil }
+	admin.CaughtUpFn = func(string, uint64) (bool, error) { probes++; return false, nil }
 
 	seedCatchingUpOp(t, n, "op-reachable", "brk-j", now, now.Add(2*time.Minute).UnixNano())
 
@@ -71,7 +71,7 @@ func TestControllerBoundsCatchingUpForAReachableJoiner(t *testing.T) {
 	const maxTicks = 40
 	terminatedAt := -1
 	for i := 0; i < maxTicks; i++ {
-		admin.driveInFlightOperations()
+		admin.DriveInFlightOperations()
 		s, _, _ := opState(t, admin, "op-reachable")
 		if s != cluster.OpStateCatchingUp {
 			terminatedAt = i
@@ -120,8 +120,8 @@ func TestControllerBoundsAPromotionThatKeepsFailing(t *testing.T) {
 	now := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
 	n, addr := d7SingleNode(t, "ctl-1")
 	admin := NewClusterAdmin(n, nil)
-	admin.now = func() time.Time { return now }
-	admin.caughtUpFn = func(string, uint64) (bool, error) { return true, nil } // caught up, ready to promote
+	admin.Now = func() time.Time { return now }
+	admin.CaughtUpFn = func(string, uint64) (bool, error) { return true, nil } // caught up, ready to promote
 
 	// A roster row so nodeRaftAddr resolves. The address collides with the sole existing voter, so raft
 	// refuses the promotion on every attempt — a joiner that is up and answering, and still cannot join.
@@ -130,7 +130,7 @@ func TestControllerBoundsAPromotionThatKeepsFailing(t *testing.T) {
 
 	const maxTicks = 40
 	for i := 0; i < maxTicks; i++ {
-		admin.driveInFlightOperations()
+		admin.DriveInFlightOperations()
 		s, _, lastErr := opState(t, admin, "op-promote")
 		if s == cluster.OpStateCatchingUp {
 			now = now.Add(30 * time.Second)
@@ -156,14 +156,14 @@ func TestCatchingUpDeadlineIsNotSelfRenewingUnderTheRealLoop(t *testing.T) {
 	now := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
 	n, _ := d7SingleNode(t, "ctl-1")
 	admin := NewClusterAdmin(n, nil)
-	admin.now = func() time.Time { return now }
-	admin.caughtUpFn = func(string, uint64) (bool, error) { return false, errNeverReachable }
+	admin.Now = func() time.Time { return now }
+	admin.CaughtUpFn = func(string, uint64) (bool, error) { return false, errNeverReachable }
 
 	// catchup_deadline == 0: the pre-#7 row shape. The first tick must GIVE it a deadline (blocking a
 	// healthy join for a bookkeeping gap would be a false failure), and no later tick may move it.
 	seedCatchingUpOp(t, n, "op-lazy", "brk-j", now, 0)
 
-	admin.driveInFlightOperations()
+	admin.DriveInFlightOperations()
 	first, _ := cluster.OperationByID(n.RODB(), "op-lazy")
 	if first.OpState != cluster.OpStateCatchingUp {
 		t.Fatalf("a missing deadline is a gap in the ladder, not evidence the joiner is dead; got %s", first.OpState)
@@ -176,7 +176,7 @@ func TestCatchingUpDeadlineIsNotSelfRenewingUnderTheRealLoop(t *testing.T) {
 	// will still be alive after we cross it below.
 	for now.UnixNano() < first.CatchupDeadline-int64(time.Minute) {
 		now = now.Add(30 * time.Second)
-		admin.driveInFlightOperations()
+		admin.DriveInFlightOperations()
 	}
 	mid, _ := cluster.OperationByID(n.RODB(), "op-lazy")
 	if mid.CatchupDeadline != first.CatchupDeadline {
@@ -185,7 +185,7 @@ func TestCatchingUpDeadlineIsNotSelfRenewingUnderTheRealLoop(t *testing.T) {
 	}
 	// Now cross it.
 	now = time.Unix(0, first.CatchupDeadline).Add(time.Second)
-	admin.driveInFlightOperations()
+	admin.DriveInFlightOperations()
 	if s, _, _ := opState(t, admin, "op-lazy"); s != cluster.OpStateBlocked {
 		t.Fatalf("the lazily stamped deadline never fired (state %s)", s)
 	}

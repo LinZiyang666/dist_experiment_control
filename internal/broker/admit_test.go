@@ -414,6 +414,7 @@ func TestConvertedVerbSpecsMatchTheirHandlers(t *testing.T) {
 		verb string
 	}{
 		{execSpec, "exec"},
+		{processResumeSpec, proto.ProcessResumeVerb},
 		{runSpec, "run"},
 		{killSpec, "kill"},
 		{exposeSpec, "expose"},
@@ -436,7 +437,7 @@ func TestConvertedVerbSpecsMatchTheirHandlers(t *testing.T) {
 		name string
 		spec verbSpec
 	}{{"exec", execSpec}, {"run", runSpec}, {"kill", killSpec},
-		{"expose", exposeSpec}, {"expose-rm", exposeRmSpec}} {
+		{"expose", exposeSpec}, {"expose-rm", exposeRmSpec}, {"process-resume", processResumeSpec}} {
 		if c.spec.role != admitMember {
 			t.Errorf("%s is no longer member-gated (role=%v) — that is a behaviour change for every "+
 				"non-owner member of every session", c.name, c.spec.role)
@@ -451,10 +452,28 @@ func TestConvertedVerbSpecsMatchTheirHandlers(t *testing.T) {
 		name string
 		spec verbSpec
 	}{{"exec", execSpec}, {"run", runSpec}, {"kill", killSpec},
-		{"expose", exposeSpec}, {"upgrade", upgradeSpec}} {
+		{"expose", exposeSpec}, {"upgrade", upgradeSpec}, {"process-resume", processResumeSpec}} {
 		if c.spec.skipNodeCheck {
 			t.Errorf("%s now skips the node check — it forwards to an agent, so it would publish to "+
 				"a subject with no subscriber and hang ctl until its own timeout", c.name)
+		}
+	}
+	// process-resume's ATTACH spec is the ONLY spec that tolerates a STALE node (S1, gotcha
+	// #90): the task already lives on the agent. Every other spec, including the probe spec
+	// of the same verb, keeps the strict ONLINE check — a new task must not be created on a
+	// node whose heartbeat is missing.
+	if !processResumeAttachSpec.allowStaleNode || processResumeAttachSpec.skipNodeCheck ||
+		processResumeAttachSpec.role != admitMember || processResumeAttachSpec.verb != proto.ProcessResumeVerb ||
+		processResumeAttachSpec.echoSubjectOnMalformed {
+		t.Errorf("processResumeAttachSpec lost its shape: %+v", processResumeAttachSpec)
+	}
+	for _, c := range []struct {
+		name string
+		spec verbSpec
+	}{{"exec", execSpec}, {"run", runSpec}, {"kill", killSpec}, {"expose", exposeSpec},
+		{"expose-rm", exposeRmSpec}, {"upgrade", upgradeSpec}, {"process-resume", processResumeSpec}} {
+		if c.spec.allowStaleNode {
+			t.Errorf("%s now tolerates a STALE node — only process-resume attach ops may", c.name)
 		}
 	}
 	// exec is the only verb that echoes the subject.
@@ -465,7 +484,7 @@ func TestConvertedVerbSpecsMatchTheirHandlers(t *testing.T) {
 		name string
 		spec verbSpec
 	}{{"run", runSpec}, {"kill", killSpec}, {"expose", exposeSpec},
-		{"expose-rm", exposeRmSpec}, {"upgrade", upgradeSpec}} {
+		{"expose-rm", exposeRmSpec}, {"upgrade", upgradeSpec}, {"process-resume", processResumeSpec}} {
 		if c.spec.echoSubjectOnMalformed {
 			t.Errorf("%s started echoing the subject on subject_malformed — a wire-visible change, "+
 				"and it leaks the actor nkey back to an unauthenticated caller", c.name)

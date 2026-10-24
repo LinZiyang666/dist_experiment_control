@@ -14,6 +14,10 @@ import (
 // (Reuses the g2_ghost_test.go harness: proposeCmd + d7SingleNode + d7JoinInput.)
 
 func TestG3RemoveGhostConvergesSeeds(t *testing.T) {
+	// origin: hot-update S10 plan §11.1 / TEST-BUDGET
+	if runIsolatedBrokerTest(t) {
+		return
+	}
 	n, addr := d7SingleNode(t, "self-1")
 	admin := NewClusterAdmin(n, nil)
 	caughtUp := func(barrier uint64) (bool, error) { cur, err := n.AppliedIndex(); return cur >= barrier, err }

@@ -1,3 +1,4 @@
+// origin: hot-update S7 plan §5.1 / §11.4 / P31; use the real leaf and locked record snapshots.
 package broker
 
 import (
@@ -9,6 +10,7 @@ import (
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/schema"
+	"github.com/LinZiyang666/tether/internal/xfertrack"
 )
 
 // TestExternalRereviewCommittedTerminalCrashDoesNotCreateContradiction covers the
@@ -21,20 +23,20 @@ import (
 func TestExternalRereviewCommittedTerminalCrashDoesNotCreateContradiction(t *testing.T) {
 	now := time.Now().UTC()
 	dir := t.TempDir()
-	first := &Broker{transfers: newTransferTracker()}
+	first := &Broker{transfers: xfertrack.NewLegacyTracker()}
 	first.cfg = Config{ClusterDataDir: dir, Logger: silentLogger(), Now: func() time.Time { return now }}
 
-	entry := &transferEntry{
-		transferID: "external-rereview-post-commit-window",
-		sid:        "sess",
-		nid:        "n1",
-		verb:       "push",
-		tier:       "a",
-		bucket:     "OBJ_xfer-sess",
-		path:       "/dst",
-		startedAt:  now.Add(-transferTimeoutTierA - xferStrandedSlack - time.Second),
-	}
-	if code := first.transfers.put(entry); code != "" {
+	entry := xfertrack.NewLegacyEntry(xfertrack.LegacyRecord{
+		TransferID: "external-rereview-post-commit-window",
+		SID:        "sess",
+		NID:        "n1",
+		Verb:       "push",
+		Tier:       "a",
+		Bucket:     "OBJ_xfer-sess",
+		Path:       "/dst",
+		StartedAt:  now.Add(-transferTimeoutTierA - xferStrandedSlack - time.Second),
+	})
+	if code := putLegacyTransfer(first.transfers, entry); code != "" {
 		t.Fatalf("put: %s", code)
 	}
 	first.writeXferInflight(entry)
@@ -49,7 +51,7 @@ func TestExternalRereviewCommittedTerminalCrashDoesNotCreateContradiction(t *tes
 		t.Fatalf("fixture did not commit the real terminal: %+v", committed)
 	}
 
-	restarted := &Broker{transfers: newTransferTracker()}
+	restarted := &Broker{transfers: xfertrack.NewLegacyTracker()}
 	restarted.cfg = Config{ClusterDataDir: dir, Logger: silentLogger(), Now: func() time.Time { return now }}
 	restarted.transferAuditForwardSync = func(payload []byte) error {
 		var rec schema.AuditTransfer
@@ -81,28 +83,28 @@ func TestExternalRereviewReqIDLookupFailureRetainsTerminalOutbox(t *testing.T) {
 
 	now := time.Now().UTC()
 	dir := t.TempDir()
-	b := &Broker{transfers: newTransferTracker()}
+	b := &Broker{transfers: xfertrack.NewLegacyTracker()}
 	b.cfg = Config{ClusterDataDir: dir, Logger: silentLogger(), Now: func() time.Time { return now }}
 	b.cl = &clusterRuntime{node: n}
 
-	entry := &transferEntry{
-		transferID: "external-rereview-lookup-error",
-		sid:        "sess",
-		nid:        "n1",
-		verb:       "push",
-		tier:       "a",
-		bucket:     "OBJ_xfer-sess",
-		path:       "/dst",
-		startedAt:  now.Add(-transferTimeoutTierA - xferStrandedSlack - time.Second),
-	}
+	entry := xfertrack.NewLegacyEntry(xfertrack.LegacyRecord{
+		TransferID: "external-rereview-lookup-error",
+		SID:        "sess",
+		NID:        "n1",
+		Verb:       "push",
+		Tier:       "a",
+		Bucket:     "OBJ_xfer-sess",
+		Path:       "/dst",
+		StartedAt:  now.Add(-transferTimeoutTierA - xferStrandedSlack - time.Second),
+	})
 	b.writeXferInflight(entry)
 	terminal := schema.AuditTransfer{
 		V: schema.AuditSchemaVersion, Kind: "failed", Verb: "push",
 		Ts: now, Session: "sess", Node: "n1",
-		TransferID: entry.transferID, Path: entry.path, Tier: entry.tier, Bucket: entry.bucket,
+		TransferID: b.transfers.Record(entry).TransferID, Path: b.transfers.Record(entry).Path, Tier: b.transfers.Record(entry).Tier, Bucket: b.transfers.Record(entry).Bucket,
 		Code: "forward_failed", Error: "peer went away",
 	}
-	if staged, _ := b.stageXferInflightTerminal(entry.transferID, terminal); !staged {
+	if staged, _ := b.stageXferInflightTerminal(b.transfers.Record(entry).TransferID, terminal); !staged {
 		t.Fatal("fixture: stage exact terminal")
 	}
 
@@ -115,7 +117,7 @@ func TestExternalRereviewReqIDLookupFailureRetainsTerminalOutbox(t *testing.T) {
 	if err != nil {
 		t.Fatalf("finalize: %v", err)
 	}
-	ledger := filepath.Join(dir, "xfer-inflight", xferInflightFilename(entry.transferID))
+	ledger := filepath.Join(dir, "xfer-inflight", xferInflightFilename(b.transfers.Record(entry).TransferID))
 	if _, statErr := os.Stat(ledger); statErr != nil {
 		t.Fatalf("an unknown commit state deleted the only exact terminal outbox: %v", statErr)
 	}
@@ -131,18 +133,18 @@ func TestExternalRereviewReqIDLookupFailureRetainsTerminalOutbox(t *testing.T) {
 func TestExternalRereviewTerminalStageFailureCannotCreateContradiction(t *testing.T) {
 	now := time.Now().UTC()
 	root := t.TempDir()
-	first := &Broker{transfers: newTransferTracker()}
+	first := &Broker{transfers: xfertrack.NewLegacyTracker()}
 	first.cfg = Config{ClusterDataDir: root, Logger: silentLogger(), Now: func() time.Time { return now }}
-	entry := &transferEntry{
-		transferID: "external-rereview-stage-failure",
-		sid:        "sess",
-		nid:        "n1",
-		verb:       "push",
-		tier:       "a",
-		bucket:     "OBJ_xfer-sess",
-		path:       "/dst",
-		startedAt:  now.Add(-transferTimeoutTierA - xferStrandedSlack - time.Second),
-	}
+	entry := xfertrack.NewLegacyEntry(xfertrack.LegacyRecord{
+		TransferID: "external-rereview-stage-failure",
+		SID:        "sess",
+		NID:        "n1",
+		Verb:       "push",
+		Tier:       "a",
+		Bucket:     "OBJ_xfer-sess",
+		Path:       "/dst",
+		StartedAt:  now.Add(-transferTimeoutTierA - xferStrandedSlack - time.Second),
+	})
 	first.writeXferInflight(entry)
 
 	// Make the ledger directory temporarily unavailable in a deterministic way:
@@ -164,9 +166,9 @@ func TestExternalRereviewTerminalStageFailureCannotCreateContradiction(t *testin
 	realTerminal := schema.AuditTransfer{
 		V: schema.AuditSchemaVersion, Kind: "complete", Verb: "push",
 		Ts: now, Session: "sess", Node: "n1",
-		TransferID: entry.transferID, Path: entry.path, Tier: entry.tier, Bucket: entry.bucket,
+		TransferID: first.transfers.Record(entry).TransferID, Path: first.transfers.Record(entry).Path, Tier: first.transfers.Record(entry).Tier, Bucket: first.transfers.Record(entry).Bucket,
 	}
-	first.emitTerminalTransferAudit(realTerminal, entry.transferID)
+	first.emitTerminalTransferAudit(realTerminal, first.transfers.Record(entry).TransferID)
 
 	if err := os.Remove(ledgerDir); err != nil {
 		t.Fatal(err)
@@ -175,7 +177,7 @@ func TestExternalRereviewTerminalStageFailureCannotCreateContradiction(t *testin
 		t.Fatal(err)
 	}
 
-	restarted := &Broker{transfers: newTransferTracker()}
+	restarted := &Broker{transfers: xfertrack.NewLegacyTracker()}
 	restarted.cfg = Config{ClusterDataDir: root, Logger: silentLogger(), Now: func() time.Time { return now }}
 	restarted.transferAuditForwardSync = func(payload []byte) error {
 		var rec schema.AuditTransfer
@@ -206,18 +208,18 @@ func TestExternalRereviewTerminalStageFailureNeedsExistingRecoveryEvidence(t *te
 		t.Fatal(err)
 	}
 
-	b := &Broker{transfers: newTransferTracker()}
+	b := &Broker{transfers: xfertrack.NewLegacyTracker()}
 	b.cfg = Config{ClusterDataDir: root, Logger: silentLogger(), Now: func() time.Time { return now }}
-	entry := &transferEntry{
-		transferID: "external-rereview-no-start-ledger",
-		sid:        "sess",
-		nid:        "n1",
-		verb:       "push",
-		tier:       "a",
-		bucket:     "OBJ_xfer-sess",
-		path:       "/dst",
-		startedAt:  now,
-	}
+	entry := xfertrack.NewLegacyEntry(xfertrack.LegacyRecord{
+		TransferID: "external-rereview-no-start-ledger",
+		SID:        "sess",
+		NID:        "n1",
+		Verb:       "push",
+		Tier:       "a",
+		Bucket:     "OBJ_xfer-sess",
+		Path:       "/dst",
+		StartedAt:  now,
+	})
 	// Production currently logs and continues when this write fails; it then
 	// emits a start audit and forwards the transfer.
 	b.writeXferInflight(entry)
@@ -226,11 +228,11 @@ func TestExternalRereviewTerminalStageFailureNeedsExistingRecoveryEvidence(t *te
 	b.transferAuditSink = func(schema.AuditTransfer, func()) { forwarded++ }
 	b.emitTerminalTransferAudit(schema.AuditTransfer{
 		V: schema.AuditSchemaVersion, Kind: "complete", Verb: "push",
-		Ts: now.Add(time.Second), Session: entry.sid, Node: entry.nid,
-		TransferID: entry.transferID, Path: entry.path, Tier: entry.tier, Bucket: entry.bucket,
-	}, entry.transferID)
+		Ts: now.Add(time.Second), Session: b.transfers.Record(entry).SID, Node: b.transfers.Record(entry).NID,
+		TransferID: b.transfers.Record(entry).TransferID, Path: b.transfers.Record(entry).Path, Tier: b.transfers.Record(entry).Tier, Bucket: b.transfers.Record(entry).Bucket,
+	}, b.transfers.Record(entry).TransferID)
 
-	ledger := filepath.Join(ledgerDir, xferInflightFilename(entry.transferID))
+	ledger := filepath.Join(ledgerDir, xferInflightFilename(b.transfers.Record(entry).TransferID))
 	_, statErr := os.Stat(ledger)
 	if forwarded == 0 && statErr != nil {
 		t.Fatalf("terminal was suppressed after the initial best-effort ledger write also failed: "+
@@ -247,18 +249,18 @@ func TestExternalRereviewTerminalStageFailureNeedsExistingRecoveryEvidence(t *te
 func TestExternalRereviewTerminalStageFailureNeedsCurrentRecoveryEvidence(t *testing.T) {
 	now := time.Now().UTC()
 	root := t.TempDir()
-	b := &Broker{transfers: newTransferTracker()}
+	b := &Broker{transfers: xfertrack.NewLegacyTracker()}
 	b.cfg = Config{ClusterDataDir: root, Logger: silentLogger(), Now: func() time.Time { return now }}
-	entry := &transferEntry{
-		transferID: "external-rereview-lost-start-ledger",
-		sid:        "sess",
-		nid:        "n1",
-		verb:       "push",
-		tier:       "a",
-		bucket:     "OBJ_xfer-sess",
-		path:       "/dst",
-		startedAt:  now,
-	}
+	entry := xfertrack.NewLegacyEntry(xfertrack.LegacyRecord{
+		TransferID: "external-rereview-lost-start-ledger",
+		SID:        "sess",
+		NID:        "n1",
+		Verb:       "push",
+		Tier:       "a",
+		Bucket:     "OBJ_xfer-sess",
+		Path:       "/dst",
+		StartedAt:  now,
+	})
 	b.writeXferInflight(entry)
 
 	ledgerDir := filepath.Join(root, "xfer-inflight")
@@ -273,11 +275,11 @@ func TestExternalRereviewTerminalStageFailureNeedsCurrentRecoveryEvidence(t *tes
 	b.transferAuditSink = func(schema.AuditTransfer, func()) { forwarded++ }
 	b.emitTerminalTransferAudit(schema.AuditTransfer{
 		V: schema.AuditSchemaVersion, Kind: "complete", Verb: "push",
-		Ts: now.Add(time.Second), Session: entry.sid, Node: entry.nid,
-		TransferID: entry.transferID, Path: entry.path, Tier: entry.tier, Bucket: entry.bucket,
-	}, entry.transferID)
+		Ts: now.Add(time.Second), Session: b.transfers.Record(entry).SID, Node: b.transfers.Record(entry).NID,
+		TransferID: b.transfers.Record(entry).TransferID, Path: b.transfers.Record(entry).Path, Tier: b.transfers.Record(entry).Tier, Bucket: b.transfers.Record(entry).Bucket,
+	}, b.transfers.Record(entry).TransferID)
 
-	ledger := filepath.Join(ledgerDir, xferInflightFilename(entry.transferID))
+	ledger := filepath.Join(ledgerDir, xferInflightFilename(b.transfers.Record(entry).TransferID))
 	_, statErr := os.Stat(ledger)
 	if forwarded == 0 && statErr != nil {
 		t.Fatalf("terminal was suppressed using a stale in-memory 'ledger was written' bit: "+
@@ -292,10 +294,14 @@ func TestExternalRereviewTerminalStageFailureNeedsCurrentRecoveryEvidence(t *tes
 // records. Otherwise the next pass sees the surviving start-only record and
 // synthesizes a contradictory home_broker_restart terminal.
 func TestExternalRereviewFallbackReplayDisposesPrimaryStartLedger(t *testing.T) {
+	// origin: hot-update S10 plan §11.1 / TEST-BUDGET
+	if runIsolatedBrokerTest(t) {
+		return
+	}
 	n, _ := d7SingleNode(t, "external-rereview-outbox-primary-start")
 	now := time.Now().UTC()
 	root := t.TempDir()
-	b := &Broker{transfers: newTransferTracker()}
+	b := &Broker{transfers: xfertrack.NewLegacyTracker()}
 	b.cfg = Config{ClusterDataDir: root, Logger: silentLogger(), Now: func() time.Time { return now }}
 	b.cl = &clusterRuntime{node: n}
 
@@ -354,7 +360,7 @@ func TestExternalRereviewFallbackOutboxWorksWhilePrimaryUnavailable(t *testing.T
 	n, _ := d7SingleNode(t, "external-rereview-outbox-primary-broken")
 	now := time.Now().UTC()
 	root := t.TempDir()
-	b := &Broker{transfers: newTransferTracker()}
+	b := &Broker{transfers: xfertrack.NewLegacyTracker()}
 	b.cfg = Config{ClusterDataDir: root, Logger: silentLogger(), Now: func() time.Time { return now }}
 	b.cl = &clusterRuntime{node: n}
 
@@ -400,18 +406,18 @@ func TestExternalRereviewFallbackOutboxWorksWhilePrimaryUnavailable(t *testing.T
 func TestExternalRereviewFallbackCommitDoesNotExposeOldPrimaryStart(t *testing.T) {
 	now := time.Now().UTC()
 	root := t.TempDir()
-	first := &Broker{transfers: newTransferTracker()}
+	first := &Broker{transfers: xfertrack.NewLegacyTracker()}
 	first.cfg = Config{ClusterDataDir: root, Logger: silentLogger(), Now: func() time.Time { return now }}
-	entry := &transferEntry{
-		transferID: "external-rereview-fallback-commit-hidden-start",
-		sid:        "sess",
-		nid:        "n1",
-		verb:       "push",
-		tier:       "a",
-		bucket:     "OBJ_xfer-sess",
-		path:       "/dst",
-		startedAt:  now.Add(-transferTimeoutTierA - xferStrandedSlack - time.Second),
-	}
+	entry := xfertrack.NewLegacyEntry(xfertrack.LegacyRecord{
+		TransferID: "external-rereview-fallback-commit-hidden-start",
+		SID:        "sess",
+		NID:        "n1",
+		Verb:       "push",
+		Tier:       "a",
+		Bucket:     "OBJ_xfer-sess",
+		Path:       "/dst",
+		StartedAt:  now.Add(-transferTimeoutTierA - xferStrandedSlack - time.Second),
+	})
 	first.writeXferInflight(entry)
 
 	primary := first.xferInflightDir()
@@ -430,9 +436,9 @@ func TestExternalRereviewFallbackCommitDoesNotExposeOldPrimaryStart(t *testing.T
 	}
 	first.emitTerminalTransferAudit(schema.AuditTransfer{
 		V: schema.AuditSchemaVersion, Kind: "complete", Verb: "push",
-		Ts: now, Session: entry.sid, Node: entry.nid,
-		TransferID: entry.transferID, Path: entry.path, Tier: entry.tier, Bucket: entry.bucket,
-	}, entry.transferID)
+		Ts: now, Session: first.transfers.Record(entry).SID, Node: first.transfers.Record(entry).NID,
+		TransferID: first.transfers.Record(entry).TransferID, Path: first.transfers.Record(entry).Path, Tier: first.transfers.Record(entry).Tier, Bucket: first.transfers.Record(entry).Bucket,
+	}, first.transfers.Record(entry).TransferID)
 
 	if err := os.Remove(primary); err != nil {
 		t.Fatal(err)
@@ -441,7 +447,7 @@ func TestExternalRereviewFallbackCommitDoesNotExposeOldPrimaryStart(t *testing.T
 		t.Fatal(err)
 	}
 
-	restarted := &Broker{transfers: newTransferTracker()}
+	restarted := &Broker{transfers: xfertrack.NewLegacyTracker()}
 	restarted.cfg = Config{ClusterDataDir: root, Logger: silentLogger(), Now: func() time.Time { return now }}
 	restarted.transferAuditForwardSync = func(payload []byte) error {
 		var rec schema.AuditTransfer
@@ -470,7 +476,7 @@ func TestExternalRereviewUnreadableOutboxCannotAuthorizeSyntheticTerminal(t *tes
 	n, _ := d7SingleNode(t, "external-rereview-outbox-unreadable")
 	now := time.Now().UTC()
 	root := t.TempDir()
-	b := &Broker{transfers: newTransferTracker()}
+	b := &Broker{transfers: xfertrack.NewLegacyTracker()}
 	b.cfg = Config{ClusterDataDir: root, Logger: silentLogger(), Now: func() time.Time { return now }}
 	b.cl = &clusterRuntime{node: n}
 
@@ -545,20 +551,24 @@ func TestExternalRereviewUnreadableOutboxCannotAuthorizeSyntheticTerminal(t *tes
 // durable primary start; it does not prove that row was durably removed. The
 // exact outbox terminal must survive until the primary source returns.
 func TestExternalRereviewMissingPrimaryPathIsNotConfirmedLedgerAbsence(t *testing.T) {
+	// origin: hot-update S10 plan §11.1 / TEST-BUDGET
+	if runIsolatedBrokerTest(t) {
+		return
+	}
 	now := time.Now().UTC()
 	root := t.TempDir()
-	first := &Broker{transfers: newTransferTracker()}
+	first := &Broker{transfers: xfertrack.NewLegacyTracker()}
 	first.cfg = Config{ClusterDataDir: root, Logger: silentLogger(), Now: func() time.Time { return now }}
-	entry := &transferEntry{
-		transferID: "external-rereview-primary-path-missing-at-cleanup",
-		sid:        "sess",
-		nid:        "n1",
-		verb:       "push",
-		tier:       "a",
-		bucket:     "OBJ_xfer-sess",
-		path:       "/dst",
-		startedAt:  now.Add(-transferTimeoutTierA - xferStrandedSlack - time.Second),
-	}
+	entry := xfertrack.NewLegacyEntry(xfertrack.LegacyRecord{
+		TransferID: "external-rereview-primary-path-missing-at-cleanup",
+		SID:        "sess",
+		NID:        "n1",
+		Verb:       "push",
+		Tier:       "a",
+		Bucket:     "OBJ_xfer-sess",
+		Path:       "/dst",
+		StartedAt:  now.Add(-transferTimeoutTierA - xferStrandedSlack - time.Second),
+	})
 	first.writeXferInflight(entry)
 
 	primary := first.xferInflightDir()
@@ -582,15 +592,15 @@ func TestExternalRereviewMissingPrimaryPathIsNotConfirmedLedgerAbsence(t *testin
 	}
 	first.emitTerminalTransferAudit(schema.AuditTransfer{
 		V: schema.AuditSchemaVersion, Kind: "complete", Verb: "push",
-		Ts: now, Session: entry.sid, Node: entry.nid,
-		TransferID: entry.transferID, Path: entry.path, Tier: entry.tier, Bucket: entry.bucket,
-	}, entry.transferID)
+		Ts: now, Session: first.transfers.Record(entry).SID, Node: first.transfers.Record(entry).NID,
+		TransferID: first.transfers.Record(entry).TransferID, Path: first.transfers.Record(entry).Path, Tier: first.transfers.Record(entry).Tier, Bucket: first.transfers.Record(entry).Bucket,
+	}, first.transfers.Record(entry).TransferID)
 
 	if err := os.Rename(parked, primary); err != nil {
 		t.Fatal(err)
 	}
 	n, _ := d7SingleNode(t, "external-rereview-primary-path-missing-at-cleanup")
-	restarted := &Broker{transfers: newTransferTracker()}
+	restarted := &Broker{transfers: xfertrack.NewLegacyTracker()}
 	restarted.cfg = Config{ClusterDataDir: root, Logger: silentLogger(), Now: func() time.Time { return now }}
 	restarted.cl = &clusterRuntime{node: n}
 	restarted.transferAuditForwardSync = func(payload []byte) error {

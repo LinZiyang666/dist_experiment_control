@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"strings"
 	"text/tabwriter"
@@ -153,7 +152,7 @@ func newSessionCmd() *cobra.Command {
 		},
 	}
 
-	var rmAckAlerts bool
+	var rmAckAlerts, abandonUnsettledTransfers bool
 	rm := &cobra.Command{
 		Use:   "rm <sid>",
 		Short: "Tombstone session (owner-only; ACTIVE → DELETING; full delete in P7)",
@@ -166,7 +165,10 @@ func newSessionCmd() *cobra.Command {
 			}
 			// rm needs the activated-member template (it grants pub allow
 			// for session.<sid>.rm.req). Require active session = arg sid.
-			nc, err := connectCtl(cmd, "session rm", home, natsURL, id, nats.Name(cli.CtlNameForSession(args[0])))
+			// That is the old-broker scope. The additive removal intent now
+			// narrows new-broker grants and survives DELETING reconnects.
+			// origin: S7 internal review rv-n1compat F4
+			nc, err := connectCtlOpts(cmd, "session rm", home, natsURL, id, cli.SessionRemovalOptions(args[0])...)
 			if err != nil {
 				return err
 			}
@@ -178,24 +180,13 @@ func newSessionCmd() *cobra.Command {
 				return gerr
 			}
 
-			body, _ := json.Marshal(proto.SessionRmReq{})
-			ctx, cancel := context.WithTimeout(cmd.Context(), 5*time.Second)
-			defer cancel()
-			msg, err := nc.RequestWithContext(ctx,
-				proto.SubjCtrlSessionRm(id.PublicKey, args[0]), body)
+			// origin: hot-update S7 plan lead LQ1 / T34
+			// The explicit flag is the only authority to abandon unresolved effects.
+			_, err = cli.RequestSessionRemoval(cmd.Context(), nc, id.PublicKey, args[0], abandonUnsettledTransfers, sessionRemovalRefusal)
 			if err != nil {
-				return fmt.Errorf("session rm: request: %w (broker unreachable on NATS)", err)
-			}
-			var resp proto.SessionRmResp
-			if err := json.Unmarshal(msg.Data, &resp); err != nil {
 				return err
 			}
-			if !resp.OK {
-				if resp.Code != "" {
-					return brokerErrorMessage("session rm", resp.Code, resp.Error)
-				}
-				return errors.New(resp.Error)
-			}
+
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "session %q tombstoned (state=DELETING)\n", args[0])
 			return nil
 		},
@@ -213,8 +204,27 @@ func newSessionCmd() *cobra.Command {
 		return cli.CompleteOwnedSessions(t, cctx, toComplete)
 	}
 
+	rm.Flags().BoolVar(&abandonUnsettledTransfers, "abandon-unsettled-transfers", false, "record failed, outcome-unknown terminals for unsettled transfers before deleting the session")
 	rm.Flags().BoolVar(&rmAckAlerts, "ack-alerts", false, "proceed despite an active severe cluster alert (quorum_lost / force_single_active)")
 	list.Flags().BoolVar(&listJSON, "json", false, "emit the stable machine JSON schema (default: human text)")
 	root.AddCommand(create, list, rm)
 	return root
+}
+
+// sessionRemovalBody preserves the legacy empty request when abandonment is not
+// authorized. The shared wire DTO keeps operator authority explicit end to end.
+// origin: hot-update S7 plan lead LQ1 / T34
+func sessionRemovalBody(abandon bool) ([]byte, error) {
+	return json.Marshal(proto.SessionRmReq{AbandonUnsettledTransfers: abandon})
+}
+
+// A generic hint would discard the pending IDs and reasons needed to settle or
+// explicitly abandon the session. Preserve the broker's refusal verbatim.
+// origin: hot-update S7 plan lead LQ1 / T34
+func sessionRemovalRefusal(code, detail string) error {
+	if code == "session_not_found_or_deleting" || code == "transfer_commit_inflight" {
+		return &ExitError{Class: exitTransient, Code: code,
+			Err: fmt.Errorf("session rm refused: %s (code=%s)", detail, code)}
+	}
+	return brokerErrorMessage("session rm", code, detail)
 }

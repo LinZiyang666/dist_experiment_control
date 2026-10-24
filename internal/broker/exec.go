@@ -3,13 +3,18 @@ package broker
 import (
 	"encoding/json"
 	"errors"
+	"strings"
 	"time"
 
+	"github.com/LinZiyang666/tether/internal/auth"
 	"github.com/LinZiyang666/tether/internal/node"
 	"github.com/LinZiyang666/tether/internal/port"
 	"github.com/LinZiyang666/tether/internal/proc"
+	"github.com/LinZiyang666/tether/internal/procforward"
 	"github.com/LinZiyang666/tether/internal/proto"
 	"github.com/LinZiyang666/tether/internal/schema"
+	"github.com/LinZiyang666/tether/internal/upgradeauthority"
+	"github.com/LinZiyang666/tether/internal/upgradewire"
 	"github.com/nats-io/nats.go"
 )
 
@@ -189,10 +194,29 @@ func (b *Broker) handleProcEvent(msg *nats.Msg) {
 		b.ackProcEvent(msg, proto.ProcEventAck{OK: true, Code: "recorded"})
 
 	case "exit":
-		var ev proto.ProcExitEvent
+		// origin: hot-update S8 plan §6.2 / P16
+		var ev struct {
+			proto.ProcExitEvent
+			Incarnation string `json:"incarnation,omitempty"`
+			InstanceID  string `json:"instance_id,omitempty"`
+		}
 		if err := json.Unmarshal(msg.Data, &ev); err != nil {
 			b.cfg.Logger.Warn("broker: proc.exit parse", "err", err)
 			return
+		}
+		p := ProcMarkExitedPayload{Pid: pid, Sid: sid, ExitCode: ev.ExitCode, EndedAt: ev.EndedAt}
+		if ev.Incarnation != "" {
+			g := upgradeauthority.Guard{SID: sid, Incarnation: ev.Incarnation, InstanceID: ev.InstanceID, ConfiguredNID: nid}
+			p.Authority = &g
+		}
+		// A terminal row is monotone only within its creation. Reject a carried
+		// stale proof before it can borrow the new incarnation's terminal ACK.
+		// origin: hot-update S8 plan §6.2 / P16
+		if p.Authority != nil {
+			if _, err := upgradeauthority.ReadCreation(b.read().SQL(), *p.Authority); err != nil {
+				b.ackProcEvent(msg, proto.ProcEventAck{Code: upgradewire.ErrorResponse(err).Code})
+				return
+			}
 		}
 		// Audit-dedup pre-read (monotone: EXITED is terminal). Sid-scoped for the
 		// same reason as the started arm above (round 2, E3): unscoped, this
@@ -202,7 +226,8 @@ func (b *Broker) handleProcEvent(msg *nats.Msg) {
 			b.ackProcEvent(msg, proto.ProcEventAck{OK: true, Code: "already_exited"})
 			return
 		}
-		if err := b.markProcExited(pid, sid, ev.ExitCode, ev.EndedAt); err != nil {
+
+		if err := markProcExitAuthority(b, p); err != nil {
 			// Leader-committed not-found (direct in single mode; carried
 			// across the forward as kind proc_not_found in cluster mode) is
 			// the ONE terminal ack: the row was GC'd or never existed on the
@@ -443,18 +468,7 @@ func (b *Broker) handlePsReq(msg *nats.Msg) {
 
 // splitDot exists so we don't import "strings" just for one Split call
 // (sessions.go has its own; keeping per-file independence).
-func splitDot(s string) []string {
-	out := []string{}
-	start := 0
-	for i := 0; i < len(s); i++ {
-		if s[i] == '.' {
-			out = append(out, s[start:i])
-			start = i + 1
-		}
-	}
-	out = append(out, s[start:])
-	return out
-}
+func splitDot(s string) []string { return strings.Split(s, ".") }
 
 // pubAuditCall emits an `audit.call` event using the schema package
 // types so the on-the-wire JSON matches what consumers decode with
@@ -558,4 +572,111 @@ func leasedNIDsForSession(b *Broker, sid string) map[string]bool {
 		}
 	}
 	return out
+}
+
+// handleProcessResumeReq checks the reply destination before even reporting
+// an error. A legal publisher must not be able to turn a malformed request
+// into a broker-authored message on another actor's inbox or a command topic.
+//
+// The body is forwarded as a RAW OVERLAY (internal/procforward): the broker
+// reads only version/call_id/op, stamps the authenticated actor into the top
+// level and into exec, and passes every other field through untouched. A
+// struct round trip would drop the fields of a client newer than this broker
+// — the very defect the legacy exec forwarder has and the reason this family
+// got its own verb. The refusal order is the live contract of
+// docs/reviews/hot-update-handoff-protocol.md §3.7: reply guard, size, shape
+// (CallID 0 when it cannot be read), CURRENT session/member/node ACL, then
+// version and op. The op is read before the ACL only to pick the node spec:
+// attach ops (create/resume/ack/terminal-ack and PTY mutations) tolerate a STALE node because
+// the task already lives on the agent and a heartbeat gap during a NATS or
+// broker restart must not turn a running exec into node_offline (gotcha
+// #90); probe, pty-probe and unknown ops keep the strict ONLINE check.
+// origin: docs/reviews/hot-update-reliable-exec-plan.md §2.3 / §2.4.
+func handleProcessResumeReq(b *Broker, nc *nats.Conn, msg *nats.Msg) {
+	ing, _, ok := b.admitSubject(msg.Subject, processResumeSpec)
+	if !ok || !privateProcessReply(ing.actor, msg.Reply) || b.isClusterFollower() {
+		return
+	}
+	if len(msg.Data) > procforward.MaxRequestBytes {
+		processResumeReject(b, msg, 0, proto.CodeProcessTooLarge, "process request too large")
+		return
+	}
+	env, err := procforward.Parse(msg.Data)
+	if err != nil {
+		processResumeReject(b, msg, 0, proto.CodeProcessBadRequest, "invalid process request")
+		return
+	}
+	spec := processResumeSpec
+	switch env.Op {
+	// origin: hot-update S4 plan §2.1 / T27. PTY mutations keep the
+	// existing attach tolerance for heartbeat gaps, but still recheck ACLs.
+	case "create", "resume", "ack", "terminal-ack", "input", "resize", "signal", "keepalive", "hangup":
+		spec = processResumeAttachSpec
+	}
+	if den, ok := b.admitACL(&ing, spec); !ok {
+		processResumeReject(b, msg, env.CallID, den.code, den.reason)
+		return
+	}
+	if env.Version != proto.ProcessResumeVersion {
+		processResumeReject(b, msg, env.CallID, proto.CodeProcessUnsupported, "unsupported process protocol")
+		return
+	}
+	switch env.Op {
+	// origin: hot-update S4 plan §2.1 / T27. Both probes retain the
+	// strict ONLINE spec above; unknown operations never inherit admission.
+	case "probe", "pty-probe", "create", "resume", "ack", "terminal-ack", "input", "resize", "signal", "keepalive", "hangup":
+	default:
+		processResumeReject(b, msg, env.CallID, proto.CodeProcessUnsupportedOp, "unsupported process operation")
+		return
+	}
+	body, err := env.Stamp(ing.fp)
+	if err != nil {
+		processResumeReject(b, msg, env.CallID, proto.CodeProcessBadRequest, "invalid process request")
+		return
+	}
+	if err := nc.PublishMsg(&nats.Msg{Subject: proto.SubjCmdForwarded(ing.sid, ing.nid, ing.verb),
+		Reply: msg.Reply, Data: body}); err != nil {
+		processResumeReject(b, msg, env.CallID, "forward_failed", "process forward failed")
+		return
+	}
+	// Every forwarded create is audited, so a client that lost the create
+	// reply and resent it produces more than one audit row by design: the
+	// "executed once" oracle is the agent's (one child, one started line),
+	// never the audit count.
+	if env.Op == "create" {
+		b.pubAuditCall(ing.sid, ing.fp, ing.actor, ing.verb, ing.nid, true, "", msg.Reply, nil)
+	}
+}
+
+// processResumeReject answers a refused process-resume request on its already
+// validated private reply. CallID echoes what could be read from the body (0
+// for a body too large or too malformed to read it); code is the stable wire
+// code the client classifies by and reason the prose older clients match.
+func processResumeReject(b *Broker, msg *nats.Msg, callID uint64, code, reason string) {
+	b.replyJSON(msg, proto.ProcessResumeReply{Version: proto.ProcessResumeVersion, CallID: callID,
+		Kind: "error", Code: code, Error: reason})
+}
+
+func privateProcessReply(actor, reply string) bool {
+	if _, err := auth.FingerprintFromActor(actor); err != nil {
+		return false
+	}
+	// The existing private-inbox grammar is identical for both control verbs.
+	// origin: hot-update S8 plan §6.2 / P16
+	return proto.ValidInfraReply(auth.InboxPrefixFor(actor), reply)
+}
+
+// exitStamp picks the ended_at instant for an agent-reported "exited" row
+// (h1 C4): the agent's TRUE end instant when it carried one (the courier's
+// snapshot rows do), clamped to `now` so a skewed agent clock can never write
+// a FUTURE ended_at into replicated state; a pre-h1 agent omits EndedAt and
+// falls back to register-time now — exactly today's semantics. Used
+// IDENTICALLY by both classifier paths (resolveReconcile for the cluster
+// batch, reconcileOnRegister's inline single-mode branch) so the
+// reconcile-marks equivalence tests keep holding.
+func exitStamp(lp proto.LocalProcess, now time.Time) time.Time {
+	if lp.EndedAt != nil && lp.EndedAt.Before(now) {
+		return lp.EndedAt.UTC()
+	}
+	return now
 }

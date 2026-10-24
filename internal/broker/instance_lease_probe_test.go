@@ -165,6 +165,10 @@ func TestSilentSubscriberCostsTheFullProbeBudgetAndIsTreatedAsHeld(t *testing.T)
 // MUTATION: make leaseProbe call probeNameHeldByOtherWithin inline instead of
 // spawning it, and this goes red.
 func TestContestedProbeCostsTheFullBudgetAgainstASilentSubscriber(t *testing.T) {
+	// origin: hot-update S10 plan §11.1 / TEST-BUDGET
+	if runIsolatedBrokerTest(t) {
+		return
+	}
 	url := testharness.StartNATS(t)
 	anc, err := nats.Connect(url)
 	if err != nil {

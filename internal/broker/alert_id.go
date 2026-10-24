@@ -1,19 +1,14 @@
 package broker
 
 import (
-	"crypto/rand"
-	"encoding/hex"
-	"fmt"
-	"sync/atomic"
 	"time"
+
+	"github.com/LinZiyang666/tether/internal/brokercontrol"
 )
 
-var alertIDFallback atomic.Uint64
+// Compatibility adapters keep callers bound to the extracted control owner.
+// origin: hot-update S6 plan §9.3 / BROKER-SLIM
 
 func newAlertID(dedupKey string, now time.Time) string {
-	var suffix [8]byte
-	if _, err := rand.Read(suffix[:]); err == nil {
-		return fmt.Sprintf("%s@%d.%s", dedupKey, now.UnixNano(), hex.EncodeToString(suffix[:]))
-	}
-	return fmt.Sprintf("%s@%d.%x", dedupKey, now.UnixNano(), alertIDFallback.Add(1))
+	return brokercontrol.NewAlertID(dedupKey, now)
 }

@@ -9,12 +9,10 @@
 package broker
 
 import (
-	"encoding/json"
 	"errors"
 	"time"
 
-	"github.com/LinZiyang666/tether/internal/cluster"
-	"github.com/LinZiyang666/tether/internal/schema"
+	"github.com/LinZiyang666/tether/internal/controlbudget"
 )
 
 // transferAuditForward* bound the async forward retry so the goroutine ALWAYS terminates
@@ -39,68 +37,49 @@ func (b *Broker) AttachTransferAuditSink(fwd *Forwarder) {
 	})
 }
 
-// attachTransferAuditSinkWith is the testable core of AttachTransferAuditSink: it wires the
-// sink to an arbitrary forward function (a fake in unit tests; fwd.Forward in production-harness
-// wiring). The forward runs in a tracked goroutine (transferAuditWG, drained by
-// WaitTransferAudit) so emitTransferAudit never blocks the NATS handler (OQ9-A); a transient
-// ErrForwardNotLeader is retried (the derived reqID dedups a double-commit), a permanent error
-// returns at once, and the loop ALWAYS terminates (bounded attempts×backoff) — not a leak.
-func (b *Broker) attachTransferAuditSinkWith(forward func(payload []byte) error) {
-	// R16 #57: expose the SYNCHRONOUS forward so finalizeStrandedXfers can confirm a commit before deleting
-	// the durable ledger (a fire-and-forget emit would lose the evidence in the leaderless post-crash window).
-	b.transferAuditForwardSync = forward
-	runForward := func(payload []byte, rec schema.AuditTransfer, onCommitted func()) {
-		for attempt := 0; attempt < transferAuditForwardAttempts; attempt++ {
-			ferr := forward(payload)
-			if ferr == nil {
-				// External review F1: the record is now COMMITTED — this, not "the goroutine started",
-				// is when a terminal path may drop its #57 in-flight ledger.
-				if onCommitted != nil {
-					onCommitted()
-				}
-				return
-			}
-			if !errors.Is(ferr, cluster.ErrForwardNotLeader) {
-				b.cfg.Logger.Warn("d8: transfer audit forward failed (best-effort)",
-					"err", ferr, "tid", rec.TransferID, "kind", rec.Kind)
-				return
-			}
-			time.Sleep(transferAuditForwardBackoff) // transient: retry (reqID dedups a double-commit)
-		}
-		b.cfg.Logger.Warn("d8: transfer audit forward gave up after retries (best-effort)",
-			"tid", rec.TransferID, "kind", rec.Kind)
-	}
-	b.transferAuditSink = func(rec schema.AuditTransfer, onCommitted func()) {
-		payload, err := json.Marshal(rec)
-		if err != nil {
-			return
-		}
-		// D9 round-1 MAJOR: during the ordered shutdown forward SYNCHRONOUSLY in the NATS
-		// handler so nc.Drain (which waits for handler callbacks) drains this audit too — the
-		// async goroutine could otherwise be spawned AFTER WaitTransferAudit returned and lost
-		// on Drain. Steady state stays async (OQ9-A: never block the agent-forward handler).
-		//
-		// audit M7 / xx-concurrency F1: the {check draining + WaitGroup.Add(1)} MUST be
-		// indivisible w.r.t. clusterShutdownOrdered's {set draining}, else a callback that read
-		// draining==false could be preempted, the shutdown could set draining + WaitTransferAudit
-		// (counter 0, returns), and the callback could THEN Add(1)+spawn an un-waited goroutine
-		// (leak + lost audit). transferAuditMu guards both sides; a bare atomic cannot.
-		b.transferAuditMu.Lock()
-		if b.transferAuditDraining.Load() {
-			b.transferAuditMu.Unlock()
-			runForward(payload, rec, onCommitted)
-			return
-		}
-		b.transferAuditWG.Add(1)
-		b.transferAuditMu.Unlock()
-		go func() {
-			defer b.transferAuditWG.Done()
-			runForward(payload, rec, onCommitted)
-		}()
-	}
-}
-
 // WaitTransferAudit blocks until every in-flight async transfer-audit forward has returned.
 // TEST-ONLY: the d8 harness calls it before its NumGoroutine/fd leak assertion so a forward
 // goroutine in flight is never miscounted as a leak.
 func (b *Broker) WaitTransferAudit() { b.transferAuditWG.Wait() }
+
+// JoinTransferAudit fences future forward borrowers and waits for actual exit
+// under the cut's original deadline. On refusal the caller keeps the current
+// backend alive; neither a Raft commit nor timeout retires a v1 history duty.
+// Single mode has no cluster audit forwards. Legacy test-only sinks have no
+// admission owner and cannot be used to certify an image cut.
+// origin: hot-update S7 plan §8.2 / T39
+func JoinTransferAudit(b *Broker, deadline controlbudget.Deadline) error {
+	if _, err := controlbudget.Remaining(deadline); err != nil {
+		return err
+	}
+	if b == nil {
+		return controlbudget.ErrInvalidDeadline
+	}
+	if b.cl == nil {
+		if b.transferAuditSink != nil {
+			return errors.New("broker: transfer audit join owner is missing")
+		}
+		return nil
+	}
+	return b.cl.transferAuditUsers.Fence(deadline)
+}
+
+// ResumeTransferAudit reopens the retained owner after a refused planned cut.
+// It must be called only after the caller has restored its current bindings.
+// origin: hot-update S7 plan §8.2 / T39
+func ResumeTransferAudit(b *Broker) {
+	if b != nil && b.cl != nil {
+		b.cl.transferAuditUsers.Resume()
+	}
+}
+
+// ResumeStoreUsers is the optional image-thaw hook for retained transfer RPC and
+// audit borrowers. It runs after current backend rebinding and before business.
+// origin: hot-update S7 plan §8.2 / T39
+func (c *brokerImageControl) ResumeStoreUsers() error {
+	ResumeTransferAudit(c.broker)
+	if c.broker.cl != nil {
+		ResumeTransferClusterForward(c.broker.cl.transferRPC)
+	}
+	return nil
+}

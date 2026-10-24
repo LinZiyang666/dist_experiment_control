@@ -14,6 +14,7 @@ import (
 	"github.com/LinZiyang666/tether/internal/jsstream"
 	"github.com/LinZiyang666/tether/internal/proto"
 	"github.com/LinZiyang666/tether/internal/session"
+	"github.com/LinZiyang666/tether/internal/upgradeauthority"
 	"github.com/nats-io/nats.go"
 )
 
@@ -157,10 +158,10 @@ func (b *Broker) handleSessionList(msg *nats.Msg) {
 			b.replyJSON(msg, proto.SessionListResp{Error: "store_error: " + err.Error()})
 			return
 		}
+
 		out = append(out, proto.SessionEntry{
 			SID: s.SID, Name: s.Name, OwnerFP: s.OwnerPubkeyFP,
-			State: string(s.State), CreatedAt: s.CreatedAt,
-			IsOwner: isOwner,
+			State: string(s.State), CreatedAt: s.CreatedAt, IsOwner: isOwner,
 		})
 	}
 	b.replyJSON(msg, proto.SessionListResp{Sessions: out})
@@ -170,7 +171,8 @@ func (b *Broker) handleSessionList(msg *nats.Msg) {
 // Owner-only. Drives all three H.3 stages inline:
 // ① tombstone (ACTIVE → DELETING) → ② DELETE history-<sid> stream
 // → ③ cascade-delete dependent SQLite rows + sys.events broadcast.
-// finalizeSessionRm (broker/audit.go) does ②-③ and is idempotent
+// removeTombstonedSession (broker/xfer_inflight.go) settles and then
+// cascadeSessionRm (broker/audit.go) does ②-③; both are idempotent
 // so a crash mid-finalize re-runs cleanly on next broker boot.
 func (b *Broker) handleSessionRm(msg *nats.Msg) {
 	actor, leaf, ok := proto.ParseCtrlBy(msg.Subject)
@@ -190,6 +192,10 @@ func (b *Broker) handleSessionRm(msg *nats.Msg) {
 		b.replyJSON(msg, proto.SessionRmResp{Code: "actor_invalid", Error: err.Error()})
 		return
 	}
+	// Capture before the role read so delete/recreate cannot turn an old
+	// owner's admission into authority over a replacement with another owner.
+	// origin: hot-update S8 plan §6.2 / P16
+	guard, captureErr := upgradeauthority.Capture(b.read().SQL(), upgradeauthority.Guard{SID: sid})
 	owner, err := session.IsOwner(b.cfg.DB, sid, fp)
 	if err != nil {
 		b.replyJSON(msg, proto.SessionRmResp{Code: "store_error", Error: err.Error()})
@@ -197,6 +203,20 @@ func (b *Broker) handleSessionRm(msg *nats.Msg) {
 	}
 	if !owner {
 		b.replyJSON(msg, proto.SessionRmResp{Code: "not_owner"})
+		return
+	}
+	// The ordinary body is empty; only the explicit LQ1 abandonment rides it.
+	// A malformed body never tombstones: that flag must not be guessed.
+	// origin: hot-update S7 plan §6.4 / lead LQ1
+	var req proto.SessionRmReq
+	if len(msg.Data) != 0 && json.Unmarshal(msg.Data, &req) != nil {
+		b.replyJSON(msg, proto.SessionRmResp{Code: "json_parse", Error: "invalid session removal request"})
+		return
+	}
+	// Capture while the original owner's removal is admitted, before settlement.
+	// origin: hot-update S8 plan §6.2 / P16
+	if captureErr != nil {
+		b.replyJSON(msg, proto.SessionRmResp{Code: "store_error", Error: captureErr.Error()})
 		return
 	}
 	// Phase ① — tombstone (architecture H.3). After this commits, C.1
@@ -207,42 +227,23 @@ func (b *Broker) handleSessionRm(msg *nats.Msg) {
 	// D9: route the tombstone through raft in cluster mode (the leader bakes deleting_at;
 	// a follower forwards). errors.Is still classifies ErrNotFound/ErrDeleting across the
 	// wire (ForwardBusinessError.Is maps the typed kinds); single mode is byte-identical.
-	if err := b.tombstoneSession(sid); err != nil {
-		switch {
-		case errors.Is(err, session.ErrNotFound):
-			b.replyJSON(msg, proto.SessionRmResp{Code: "not_found"})
-		case errors.Is(err, session.ErrDeleting):
-			b.replyJSON(msg, proto.SessionRmResp{Code: "already_deleting"})
-		default:
-			b.replyJSON(msg, proto.SessionRmResp{Code: "store_error", Error: err.Error()})
-		}
+	// That result is also the AUTHORITATIVE state the rest of the removal acts on: a
+	// follower's local replica may not have applied the tombstone the leader committed.
+	// origin: S7 lead integration decision 3
+	err = tombstoneSessionAuthority(b, guard)
+	retry := errors.Is(err, session.ErrDeleting)
+	switch {
+	case errors.Is(err, session.ErrNotFound):
+		b.replyJSON(msg, proto.SessionRmResp{Code: "not_found"})
 		return
+	case err != nil && !retry:
+		b.replyJSON(msg, proto.SessionRmResp{Code: "store_error", Error: err.Error()})
+		return
+	case !retry:
+		b.cfg.Logger.Info("broker: session tombstoned",
+			"sid", sid, "by_fp", fp, "actor", actor)
 	}
-	b.cfg.Logger.Info("broker: session tombstoned",
-		"sid", sid, "by_fp", fp, "actor", actor)
-
-	// Phases ②③④. Failures here are NON-fatal to the rm — the
-	// session is in DELETING, ctl gets OK, and the boot reconciler
-	// will retry on next broker start. We still log loudly because
-	// it usually means the JS server is down.
-	//
-	// Audit shard 01 F7: derive from b.runCtx (broker shutdown
-	// context) instead of context.Background so a graceful
-	// shutdown mid-rm cancels the JS+SQLite cascade instead of
-	// running it against a half-torn-down broker. Falls back to
-	// Background when runCtx is nil (broker.New + finalize tests
-	// that bypass Run).
-	parent := b.runCtx
-	if parent == nil {
-		parent = context.Background()
-	}
-	finalCtx, cancel := context.WithTimeout(parent, 5*time.Second)
-	defer cancel()
-	if err := b.finalizeSessionRm(finalCtx, sid); err != nil {
-		b.cfg.Logger.Warn("broker: session rm finalize failed; will resume on next boot",
-			"sid", sid, "err", err)
-	}
-	b.replyJSON(msg, proto.SessionRmResp{OK: true})
+	b.replyJSON(msg, removeTombstonedSessionAuthority(b, guard, retry, req.AbandonUnsettledTransfers))
 }
 
 // replyJSON marshals v and replies on msg.Reply if set. JSON marshal errors
@@ -252,12 +253,7 @@ func (b *Broker) replyJSON(msg *nats.Msg, v any) {
 	if msg.Reply == "" {
 		return
 	}
-	payload, err := json.Marshal(v)
-	if err != nil {
-		b.cfg.Logger.Warn("broker: marshal reply", "err", err, "subject", msg.Subject)
-		return
-	}
-	b.respondBytes(msg, payload)
+	replyJSONValue(b, msg, v)
 }
 
 // respondBytes is the ONE egress point for broker control-plane replies

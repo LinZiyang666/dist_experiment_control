@@ -27,14 +27,18 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/proc"
+	"github.com/LinZiyang666/tether/internal/procrequest"
 	"github.com/LinZiyang666/tether/internal/proto"
 	"github.com/LinZiyang666/tether/internal/pty"
+	"github.com/LinZiyang666/tether/internal/ptysession"
 	"github.com/LinZiyang666/tether/internal/spawnsafe"
+	"github.com/LinZiyang666/tether/internal/workload"
 	"github.com/nats-io/nats.go"
 )
 
@@ -62,13 +66,6 @@ func attachDeadline() time.Duration {
 	return defaultAttachDeadline
 }
 
-// runChunkSize / runFlushInterval bound the master→.out pump. 4KB or
-// 50ms whichever comes first — see architecture C.5.2.
-const (
-	runChunkSize     = 4 * 1024
-	runFlushInterval = 50 * time.Millisecond
-)
-
 // handleRunForwarded executes the full run lifecycle. msg.Reply is the
 // ctl's _INBOX where we publish RunChunk lifecycle events; PTY byte
 // streams travel on a separate `pty.<pid>.*` subject family.
@@ -77,6 +74,22 @@ func (a *Agent) handleRunForwarded(nc *nats.Conn, msg *nats.Msg) {
 		a.cfg.Logger.Warn("agent: run.req.forwarded without Reply inbox")
 		return
 	}
+	// origin: hot-update S4 plan §2.2. Legacy must obey the same pending
+	// rollback gate as reliable create; falling back cannot bypass it.
+	if err := checkPTYAdmission(a); err != nil {
+		// origin: hot-update S4 plan §9.2 / N1-REFUSAL. v0.6.0 knows try_again as 75; keep the upgrade reason in detail.
+		a.replyRunChunk(nc, msg.Reply, proto.RunChunk{Kind: "failed", Reason: "try_again: agent_upgrading: image switch in progress; retry"})
+		return
+	}
+	// origin: hot-update S3 plan §4.0. Hold admission for the whole handler.
+	release, admitted := a.gate.admit(gateRun)
+	if !admitted {
+		// origin: hot-update S4 plan §9.2 / N1-REFUSAL. v0.6.0 knows try_again as 75; keep the upgrade reason in detail.
+		a.replyRunChunk(nc, msg.Reply, proto.RunChunk{Kind: "failed", Reason: "try_again: agent_upgrading: image switch in progress; retry"})
+		return
+	}
+	defer release()
+
 	var req proto.RunReq
 	if err := json.Unmarshal(msg.Data, &req); err != nil {
 		a.replyRunChunk(nc, msg.Reply, proto.RunChunk{
@@ -181,6 +194,104 @@ func (a *Agent) handleRunForwarded(nc *nats.Conn, msg *nats.Msg) {
 		_ = sess.SetSize(attachCols, attachRows)
 	}
 
+	if reason, err := startAllocatedRunPTY(a, pid, &req, sess); err != nil {
+		a.replyRunChunk(nc, msg.Reply, proto.RunChunk{Kind: "failed", PID: pid, Reason: reason})
+		a.pubPtyFailed(nc, pid, reason, err.Error())
+		return
+	}
+	row, _ := a.workloads.Lookup(pid)
+	// h1 D2: arm only when ctl advertised keepalives; seed the first
+	// grace window at spawn, never at the epoch.
+	rec := &procRec{sess: sess, osPID: row.OSPID, startTimeTicks: row.StartTimeTicks,
+		startedAt: row.StartedAt, kaGrace: kaGraceFor(req.KAIntervalMS), lastKA: time.Now()}
+	master := sess.Master // capture before an intake owner can explicitly close the session
+	rec.input = newLegacyRunInput(a, pid, sess, nc, msg.Reply)
+	a.registerProc(pid, rec)
+	a.replyRunChunk(nc, msg.Reply, proto.RunChunk{Kind: "started", PID: pid})
+
+	// .in and .resize are SESSION-scoped wildcard subscriptions installed once per NATS
+	// session (startPtyIntake), not per-run subscriptions on the spawn conn.
+	//
+	// origin: prerelease audit agent-run/L3-F2. They used to be subscribed HERE, on the
+	// conn captured when the child was spawned. A session rebuild — which rebuildOntoVoter
+	// performs for ordinary events like a drain or a roster change — closes that conn, and
+	// the interactive session went deaf: keystrokes and window resizes stopped arriving,
+	// while `.out` kept streaming, so the user saw a live terminal that ignored them.
+	// pty.<pid>.out is a publisher (master→bus) and resolves its conn per flush.
+	//
+	// The reviewer's minimal alternative — hang up the session when the ctl link drops —
+	// was rejected: it trades "invisible" for "killed". Every rebuildOntoVoter would then
+	// SIGHUP the foreground job, and a long non-tmux task would simply die.
+	//
+	// This is the same shape startCtlLiveness already uses for `pty.*.ka`, and the ACL
+	// (internal/auth/permissions.go) already grants the wildcard.
+
+	outSubj := proto.SubjPtyOut(a.cfg.SID, pid)
+	pumpDone := make(chan struct{})
+	go func() {
+		a.pumpMasterToBus(nc, master, outSubj)
+		close(pumpDone)
+	}()
+
+	// origin: hot-update S4 plan §3.3 / §7.1. Descendants may retain the
+	// slave after the leader exits. Drain the real source before releasing
+	// the reap hold; no timer is evidence that the last slave has closed.
+	<-pumpDone
+	rec.input.Stop()
+	_ = a.workloads.AllowReap(pid)
+	exitCode, _ := sess.Wait()
+	// h1 D3: latch waitDone the INSTANT Wait returns, under procsMu — from
+	// here to unregisterProc the child's pgid is dead and can be RECYCLED,
+	// and the liveness reaper must never SIGHUP a recycled pgid. Checked (not
+	// cmd.ProcessState — reading that races Wait's own write) by
+	// shouldReapRun before any Hangup.
+	a.procsMu.Lock()
+	if lrec, ok := a.procs[pid]; ok {
+		lrec.waitDone = true
+	}
+	a.procsMu.Unlock()
+
+	// No per-run .in/.resize subscriptions to tear down: they are session-scoped now
+	// (startPtyIntake) and the session finalizer owns them. unregisterProc is what stops
+	// this pid from being routed — legacyPTYInputFor returns nil the moment the record goes.
+	_ = sess.Close()
+
+	// Symmetric with the started enqueue above: the courier delivers
+	// ev.proc.exit (ACKed, current-conn) so the broker transcribes the row to
+	// EXITED + writes audit.proc{kind:exit}. Enqueued BEFORE the lifecycle
+	// chunk so delivery is already in flight when ctl reacts to exit.
+	a.courier.enqueueExit(pid, exitCode)
+	a.unregisterProc(pid)
+	_ = a.workloads.Forget(pid)
+	// The exit lifecycle chunk rides the CURRENT conn — see liveConn (exec.go), which
+	// now carries this reasoning for both verbs. It used to live here, applied to this
+	// one publish, while exec's chunks all rode a captured conn (prerelease audit
+	// agent-exec/L3-F1).
+	a.replyRunChunk(liveConn(a, nc), msg.Reply, proto.RunChunk{
+		Kind: "exit", PID: pid, ExitCode: exitCode,
+	})
+	a.cfg.Logger.Info("agent: run exit", "pid", pid, "code", exitCode)
+}
+
+func startRunPTY(a *Agent, pid string, req *proto.RunReq) (*pty.Session, string, error) {
+	cols, rows := normalizedSize(req.Cols, req.Rows)
+	sess, err := pty.Allocate(cols, rows)
+	if err != nil {
+		if ptyFailureIsTransient(err) {
+			return nil, "pty_alloc_failed", err
+		}
+		return nil, "pty_unavailable", err
+	}
+	if reason, err := startAllocatedRunPTY(a, pid, req, sess); err != nil {
+		return nil, reason, err
+	}
+	return sess, "", nil
+}
+
+// startAllocatedRunPTY also accepts the legacy master allocated before ready.
+// Both paths therefore share safe spawn, courier ordering and draining adoption.
+// origin: hot-update S4 plan §7.1
+func startAllocatedRunPTY(a *Agent, pid string, req *proto.RunReq, sess *pty.Session) (string, error) {
 	// Now exec. Failures here are exec_failed (not attach_timeout) —
 	// keep them distinguishable so the audit kind is meaningful.
 	//
@@ -200,11 +311,8 @@ func (a *Agent) handleRunForwarded(nc *nats.Conn, msg *nats.Msg) {
 	// lookupPATH = agent process PATH (what LookPath would walk — review F2).
 	d, ferr := a.spawnPolicy.Prepare(req.Argv, req.Cwd, os.Getenv("PATH"), childEnv, req.Safe)
 	if ferr != nil {
-		reason := remoteFSFailReason(ferr)
 		_ = sess.Close()
-		a.replyRunChunk(nc, msg.Reply, proto.RunChunk{Kind: "failed", PID: pid, Reason: reason})
-		a.pubPtyFailed(nc, pid, reason, ferr.Error())
-		return
+		return remoteFSFailReason(ferr), ferr
 	}
 	if d.Active {
 		resolvedPath = d.Path // always self-resolve on a hangable machine (bypass LookPath)
@@ -243,31 +351,17 @@ func (a *Agent) handleRunForwarded(nc *nats.Conn, msg *nats.Msg) {
 		}
 		a.cfg.Logger.Warn("agent: pty start", "err", startErr, "pid", pid)
 		_ = sess.Close()
-		a.replyRunChunk(nc, msg.Reply, proto.RunChunk{
-			Kind: "failed", PID: pid, Reason: reason,
-		})
-		a.pubPtyFailed(nc, pid, reason, startErr.Error())
-		return
+		return reason, startErr
 	}
 
 	// Capture the G.1 PID-reuse triple at fork time. start_time_ticks
 	// is /proc/<os_pid>/stat field 22 — the kernel-stamped boot tick
-	// when this process started. agent echoes it on every register
-	// snapshot; broker compares against the value persisted at
-	// proc.Insert time.
+	// when this process started. Every register echoes it, and the broker
+	// compares it against the value persisted at proc.Insert time.
+	// Capture before adoption, while this session still owns the child.
 	startTicks, _ := readStartTimeTicks(sess.OSPID())
-	rec := &procRec{
-		sess:           sess,
-		osPID:          sess.OSPID(),
-		startTimeTicks: startTicks,
-		startedAt:      time.Now().UTC(),
-		// h1 D2: arm the ctl-liveness reaper ONLY when the ctl advertised
-		// keepalives (0 = pre-h1 ctl = never reap). lastKA seeds at spawn so
-		// the first window measures from the run's start, not the epoch.
-		kaGrace: kaGraceFor(req.KAIntervalMS),
-		lastKA:  time.Now(),
-	}
-	a.registerProc(pid, rec)
+	id := workload.Identity{ID: pid, OSPID: sess.OSPID(), BootID: readBootID(),
+		StartTimeTicks: startTicks, StartedAt: time.Now().UTC()}
 	// Hook into the shared process state machine: `tether run`
 	// processes must show up in `tether ps` and produce normal
 	// audit.proc{kind:start,exit} records, the same as `tether exec`.
@@ -276,73 +370,23 @@ func (a *Agent) handleRunForwarded(nc *nats.Conn, msg *nats.Msg) {
 	// was started, so no SQLite row should exist. Those surface via
 	// PtyFailedEvent → audit.proc{kind:reason} instead.
 	// h1 C1: through the courier — see handleExecForwarded's note.
-	a.courier.enqueueStarted(pid, req.Argv, req.ActorFP,
-		readBootID(), startTicks, rec.startedAt)
-	a.replyRunChunk(nc, msg.Reply, proto.RunChunk{Kind: "started", PID: pid})
-
-	// .in and .resize are SESSION-scoped wildcard subscriptions installed once per NATS
-	// session (startPtyIntake), not per-run subscriptions on the spawn conn.
-	//
-	// origin: prerelease audit agent-run/L3-F2. They used to be subscribed HERE, on the
-	// conn captured when the child was spawned. A session rebuild — which rebuildOntoVoter
-	// performs for ordinary events like a drain or a roster change — closes that conn, and
-	// the interactive session went deaf: keystrokes and window resizes stopped arriving,
-	// while `.out` kept streaming, so the user saw a live terminal that ignored them.
-	// pty.<pid>.out is a publisher (master→bus) and resolves its conn per flush.
-	//
-	// The reviewer's minimal alternative — hang up the session when the ctl link drops —
-	// was rejected: it trades "invisible" for "killed". Every rebuildOntoVoter would then
-	// SIGHUP the foreground job, and a long non-tmux task would simply die.
-	//
-	// This is the same shape startCtlLiveness already uses for `pty.*.ka`, and the ACL
-	// (internal/auth/permissions.go) already grants the wildcard.
-
-	outSubj := proto.SubjPtyOut(a.cfg.SID, pid)
-	pumpDone := make(chan struct{})
-	go func() {
-		a.pumpMasterToBus(nc, sess.Master, outSubj)
-		close(pumpDone)
-	}()
-
-	exitCode, _ := sess.Wait()
-	// h1 D3: latch waitDone the INSTANT Wait returns, under procsMu — from
-	// here to unregisterProc the child's pgid is dead and can be RECYCLED,
-	// and the liveness reaper must never SIGHUP a recycled pgid. Checked (not
-	// cmd.ProcessState — reading that races Wait's own write) by
-	// shouldReapRun before any Hangup.
-	a.procsMu.Lock()
-	if lrec, ok := a.procs[pid]; ok {
-		lrec.waitDone = true
+	// C-5 (hot-update S1 review P5): enqueued BEFORE adoption, like
+	// startExecPipes — a register snapshot taken between an adoption and
+	// its started enqueue would list the PTY child running with no pending
+	// started, and a broker without its row would orphan-kill it. The
+	// child already exists here, so a failed adoption below closes the row
+	// it just opened with a -1 exit instead of leaving it RUNNING.
+	a.courier.enqueueStarted(pid, req.Argv, req.ActorFP, id.BootID, startTicks, id.StartedAt)
+	// origin: hot-update S4 plan §3.3 / §7.1. The table must hold the leader
+	// until the last slave ends; a leader exit alone cannot delimit PTY output.
+	if err := sess.AdoptDraining(&a.workloads, id); err != nil {
+		_ = sess.Signal(syscall.SIGKILL)
+		_, _ = sess.Wait() // failed adoption leaves the session as the sole waiter
+		_ = sess.Close()
+		a.courier.enqueueExit(pid, -1)
+		return "exec_failed", err
 	}
-	a.procsMu.Unlock()
-	// Wait returning means the child closed its end of the slave;
-	// reading from the master will hit EOF imminently. Wait for the
-	// pump to drain so the very last bytes (e.g. "$ exit\r\n") aren't
-	// dropped.
-	select {
-	case <-pumpDone:
-	case <-time.After(200 * time.Millisecond):
-	}
-
-	// No per-run .in/.resize subscriptions to tear down: they are session-scoped now
-	// (startPtyIntake) and the session finalizer owns them. unregisterProc is what stops
-	// this pid from being routed — ptySessionFor returns nil the moment the record goes.
-	a.unregisterProc(pid)
-	_ = sess.Close()
-
-	// Symmetric with the started enqueue above: the courier delivers
-	// ev.proc.exit (ACKed, current-conn) so the broker transcribes the row to
-	// EXITED + writes audit.proc{kind:exit}. Enqueued BEFORE the lifecycle
-	// chunk so delivery is already in flight when ctl reacts to exit.
-	a.courier.enqueueExit(pid, exitCode)
-	// The exit lifecycle chunk rides the CURRENT conn — see liveConn (exec.go), which
-	// now carries this reasoning for both verbs. It used to live here, applied to this
-	// one publish, while exec's chunks all rode a captured conn (prerelease audit
-	// agent-exec/L3-F1).
-	a.replyRunChunk(liveConn(a, nc), msg.Reply, proto.RunChunk{
-		Kind: "exit", PID: pid, ExitCode: exitCode,
-	})
-	a.cfg.Logger.Info("agent: run exit", "pid", pid, "code", exitCode)
+	return "", nil
 }
 
 // waitForAttachOnSub blocks for at most attachDeadline waiting for
@@ -370,48 +414,10 @@ func (a *Agent) waitForAttachOnSub(sub *nats.Subscription, pid string) (int, int
 	return ev.Cols, ev.Rows, true
 }
 
-// pumpMasterToBus reads the PTY master and publishes byte chunks to
-// outSubj. Returns when EOF is reached (child closed its end). 4KB or
-// 50ms whichever first — see architecture C.5.2.
+// Publish against the current connection for every flush; the PTY owner batches the bytes.
+// origin: hot-update S5 plan §10 / AGENT-SLIM-S5.
 func (a *Agent) pumpMasterToBus(nc *nats.Conn, master io.Reader, outSubj string) {
-	buf := make([]byte, runChunkSize)
-	pending := make([]byte, 0, runChunkSize)
-	flushTimer := time.NewTimer(runFlushInterval)
-	defer flushTimer.Stop()
-
-	// resetTimer drains the channel if a tick is already queued and
-	// arms a fresh runFlushInterval. MUST be called every time the
-	// timer fires (even when pending is empty) so the periodic flush
-	// keeps ticking. Otherwise time.NewTimer fires once and stops,
-	// and any future PTY output that doesn't fill 4KB sits in
-	// `pending` until the child closes (operator pain: tmux echo
-	// only appears in batches at session end).
-	resetTimer := func() {
-		if !flushTimer.Stop() {
-			select {
-			case <-flushTimer.C:
-			default:
-			}
-		}
-		flushTimer.Reset(runFlushInterval)
-	}
-
-	flush := func() {
-		if len(pending) == 0 {
-			resetTimer()
-			return
-		}
-		// Make a copy because nats.Publish may queue and reuse our buf.
-		out := make([]byte, len(pending))
-		copy(out, pending)
-		// PER FLUSH, not the conn captured at spawn.
-		//
-		// origin: prerelease audit round 2, I-F2. L3-F2 moved the INPUT direction to a
-		// session-scoped subscription and left the OUTPUT direction publishing on the
-		// spawn conn, while a comment at the call site claimed this pump "resolves its
-		// conn per flush". After a session rebuild that conn is closed, so the terminal
-		// went silent in the direction the user actually watches — and the comment said
-		// otherwise.
+	pty.PumpLegacyOutput(master, func(out []byte) {
 		live := liveConn(a, nc)
 		_ = live.Publish(outSubj, out)
 		// Force the NATS client to push this chunk to the socket
@@ -423,44 +429,7 @@ func (a *Agent) pumpMasterToBus(nc *nats.Conn, master io.Reader, outSubj string)
 		// timeout means: best-effort push, but never block the
 		// pump on a wedged connection.
 		_ = live.FlushTimeout(50 * time.Millisecond)
-		pending = pending[:0]
-		resetTimer()
-	}
-
-	readCh := make(chan readResult, 1)
-	go func() {
-		for {
-			n, err := master.Read(buf)
-			data := append([]byte(nil), buf[:n]...)
-			readCh <- readResult{data: data, err: err}
-			if err != nil {
-				return
-			}
-		}
-	}()
-
-	for {
-		select {
-		case r := <-readCh:
-			if len(r.data) > 0 {
-				pending = append(pending, r.data...)
-				if len(pending) >= runChunkSize {
-					flush()
-				}
-			}
-			if r.err != nil {
-				flush()
-				return
-			}
-		case <-flushTimer.C:
-			flush()
-		}
-	}
-}
-
-type readResult struct {
-	data []byte
-	err  error
+	})
 }
 
 // handleKillForwarded is the Ctrl-C path: ctl sends KillReq{PID, Signal},
@@ -479,16 +448,27 @@ func (a *Agent) handleKillForwarded(nc *nats.Conn, msg *nats.Msg) {
 	if req.Signal == 0 {
 		req.Signal = 2 // SIGINT default
 	}
-	sess, ok := a.lookupProc(req.PID)
-	if !ok {
+	err := signalManagedProcess(a, req.PID, syscall.Signal(req.Signal))
+	if errors.Is(err, workload.ErrUnknown) {
 		a.replyKill(msg, proto.KillResp{Code: "pid_unknown"})
 		return
 	}
-	if err := sess.sess.Signal(syscall.Signal(req.Signal)); err != nil {
+	if err != nil {
 		a.replyKill(msg, proto.KillResp{Code: "signal_failed", Error: err.Error()})
 		return
 	}
 	a.replyKill(msg, proto.KillResp{OK: true})
+}
+
+// signalManagedProcess is shared by the public kill verb and register's orphan
+// decisions. Both address a stable task owner, never a detached OS PID list.
+// Sessions created by legacy in-process callers may not yet have a manager;
+// their Session remains the signal owner. Normal agent PTYs delegate internally.
+func signalManagedProcess(a *Agent, pid string, sig syscall.Signal) error {
+	if rec, ok := a.lookupProc(pid); ok {
+		return rec.sess.Signal(sig)
+	}
+	return a.workloads.Signal(pid, sig)
 }
 
 func (a *Agent) replyKill(msg *nats.Msg, resp proto.KillResp) {
@@ -525,22 +505,22 @@ func (a *Agent) pubPtyFailed(nc *nats.Conn, pid, reason, detail string) {
 	}
 }
 
-// registerExecChild / unregisterExecChild track a live synchronous `tether exec`
-// OS child so an admin EVICT can reap it (#26). p may be nil (a start that never
-// produced a process) — recorded as a no-op guard so callers need not nil-check.
-func (a *Agent) registerExecChild(pid string, p *os.Process) {
-	if p == nil {
-		return
+// execChildIdentity captures the OS identity of a just-spawned `tether exec`
+// child once, so the proc.started event, the ownership table row and the
+// reliable runtime's Started hook all describe the same (pid, boot, ticks).
+// The ownership table (#26) is what lets an admin EVICT reap the child and
+// keeps the wait result for reconnect snapshots until the courier takes over;
+// startExecPipes adopts with this identity right after enqueueing started.
+func execChildIdentity(pid string, p *os.Process) workload.Identity {
+	ticks, _ := readStartTimeTicks(p.Pid)
+	return workload.Identity{
+		ID: pid, OSPID: p.Pid, BootID: readBootID(), StartTimeTicks: ticks,
+		StartedAt: time.Now().UTC(),
 	}
-	a.execChildrenMu.Lock()
-	a.execChildren[pid] = p
-	a.execChildrenMu.Unlock()
 }
 
 func (a *Agent) unregisterExecChild(pid string) {
-	a.execChildrenMu.Lock()
-	delete(a.execChildren, pid)
-	a.execChildrenMu.Unlock()
+	_ = a.workloads.Forget(pid) // unsuccessful starts never entered the table
 }
 
 // reapManagedChildren SIGKILLs every process this agent still manages — the
@@ -552,18 +532,7 @@ func (a *Agent) unregisterExecChild(pid string) {
 // child AND any subtree it forked; the PTY session kills its own Setsid group.
 // Best-effort: a child that already exited (ESRCH) is fine.
 func (a *Agent) reapManagedChildren() {
-	a.execChildrenMu.Lock()
-	execs := make([]*os.Process, 0, len(a.execChildren))
-	for _, p := range a.execChildren {
-		execs = append(execs, p)
-	}
-	a.execChildrenMu.Unlock()
-	for _, p := range execs {
-		// Setpgid => pgid == child pid; kill the whole group (child + descendants).
-		if err := syscall.Kill(-p.Pid, syscall.SIGKILL); err != nil {
-			_ = p.Kill() // fallback: the group is gone / never formed → target the pid directly
-		}
-	}
+	_ = a.workloads.SignalAll(syscall.SIGKILL)
 
 	a.procsMu.Lock()
 	ptys := make([]*procRec, 0, len(a.procs))
@@ -595,72 +564,64 @@ func (a *Agent) lookupProc(pid string) (*procRec, bool) {
 	return r, ok
 }
 
-// normalizedSize returns sane defaults for cols/rows when ctl forgot.
-// 80x24 is the conventional dumb-terminal default.
-func normalizedSize(cols, rows int) (int, int) {
-	if cols <= 0 {
-		cols = 80
+// localProcessSnapshot forms a union with terminal records taking precedence.
+// Both child owners enqueue exit BEFORE retiring their live record. Reading
+// owners before the courier prevents a missing-pid gap; the overlap is collapsed
+// here so the broker never receives two states for the same task in one request.
+// h1 C4: register is the courier's exit replay channel, carrying the REAL code
+// instead of G.1's missed-exit -1 after a transport outage.
+//
+// C-5 (hot-update S1): pending started events are merged too. startExecPipes
+// enqueues started BEFORE adopting, so between the two courier reads here the
+// windows are: pid adopted after owners were read → the courier still holds
+// the started → the row is added running+unacked; started ACKed between the
+// reads → the table row exists without the flag and the broker already has
+// its row → G.1's accepted arm. The reverse (adopted before enqueued) cannot
+// happen. Over-reporting StartedUnacked only ever means "do not kill".
+func localProcessSnapshot(a *Agent) []proto.LocalProcess {
+	byID := make(map[string]proto.LocalProcess)
+	a.procsMu.Lock()
+	for pid, rec := range a.procs {
+		byID[pid] = proto.LocalProcess{PID: pid, State: "running",
+			StartedAt: rec.startedAt, StartTimeTicks: rec.startTimeTicks}
 	}
-	if rows <= 0 {
-		rows = 24
-	}
-	return cols, rows
-}
-
-// ptyFailureIsTransient decides which of the two PTY-failure wire codes a pty.Allocate error earns.
-//
-// origin: line-2 external review M18 / PC-3. This predicate used to be written inline in handleRunReq,
-// which made the DECISION untestable while leaving the two code literals testable — and the review
-// measured the consequence: replacing the condition with `if false` (the transient branch permanently
-// unreachable) left ./internal/agent/ and ./cmd/tether/ both green. The wire-code coverage gate only
-// asserts that each code literal EXISTS somewhere, so it could not see that one of them had become
-// dead. Extracting the predicate is what gives the criterion itself a test
-// (TestPTYFailureTransientClassification).
-//
-// The two code literals stay written out at the two call sites, unchanged: the coverage gate resolves
-// codes statically and a `reason` variable there would need an unresolvedCodeSites exemption, which is an
-// exemption avoidable by writing the code out.
-//
-// EMFILE / ENFILE  the process or the host is out of file descriptors. Self-healing — the next attempt
-//
-//	after some sessions close will succeed, so pty_alloc_failed is retryable.
-//
-// anything else    /dev/ptmx is absent, not permitted, or the container forbids it. A property of the
-//
-//	HOST, not of this instant; pty_unavailable tells automation to stop retrying.
-//
-// ptyTransientErrnos are the allocation failures that clear on their own as sessions close.
-//
-// ENOSPC is the one that matters most and was missing. origin: line-2 external review M17 / PC-2 / F2 / D5.
-// Opening /dev/ptmx goes ptmx_open -> devpts_new_index, and when the devpts instance is at its limit
-// (/proc/sys/kernel/pty/max, minus pty_reserve for non-root, or a `max=` mount option) that returns
-// -ENOSPC, not EMFILE. So PTY EXHAUSTION -- the single most likely transient PTY failure on a busy host,
-// and the exact thing pty_alloc_failed exists to name -- was landing in the terminal branch and telling
-// automation to stop retrying something that clears in seconds.
-//
-// Measured, not inferred: in a privileged container with devpts mounted `newinstance,max=1`, the second
-// open returns `no space left on device` with EMFILE=false ENFILE=false ENOSPC=true. This host's
-// /proc/sys/kernel/pty/max is 4096, so an ordinary busy broker can reach it.
-//
-// ENOMEM and EAGAIN are included on the same principle: both are resource-pressure errnos that a later
-// attempt can win. The list is a variable while the two Reason literals at the call site stay written out
-// -- the wire-code coverage gate resolves codes statically, and an errno list is not a code.
-var ptyTransientErrnos = []syscall.Errno{
-	syscall.EMFILE, // this process is out of file descriptors
-	syscall.ENFILE, // the host's file table is full
-	syscall.ENOSPC, // devpts index exhaustion -- the pty limit, see above
-	syscall.ENOMEM, // kernel allocation pressure
-	syscall.EAGAIN, // resource temporarily unavailable
-}
-
-func ptyFailureIsTransient(err error) bool {
-	for _, e := range ptyTransientErrnos {
-		if errors.Is(err, e) {
-			return true
+	a.procsMu.Unlock()
+	for _, row := range a.workloads.Snapshot() {
+		p := proto.LocalProcess{PID: row.ID, State: "running",
+			StartedAt: row.StartedAt, StartTimeTicks: row.StartTimeTicks}
+		if row.Exit != nil {
+			rc := row.Exit.Code
+			endedAt := row.Exit.EndedAt
+			p.State, p.RC, p.EndedAt = "exited", &rc, &endedAt
 		}
+		byID[p.PID] = p
 	}
-	return false
+	for _, p := range a.courier.pendingStartedSnapshot() {
+		if existing, ok := byID[p.PID]; ok {
+			if existing.State == "running" {
+				existing.StartedUnacked = true
+				byID[p.PID] = existing
+			}
+			continue
+		}
+		byID[p.PID] = p
+	}
+	for _, p := range a.courier.pendingExitSnapshot() {
+		byID[p.PID] = p
+	}
+	rows := make([]proto.LocalProcess, 0, len(byID))
+	for _, p := range byID {
+		rows = append(rows, p)
+	}
+	sort.Slice(rows, func(i, j int) bool { return rows[i].PID < rows[j].PID })
+	return rows
 }
+
+func normalizedSize(cols, rows int) (int, int) { return pty.NormalizedSize(cols, rows) }
+
+var ptyTransientErrnos = pty.TransientErrnos
+
+func ptyFailureIsTransient(err error) bool { return pty.FailureIsTransient(err) }
 
 // ---- h1 D: ctl-liveness contract for interactive runs -----------------------
 // origin: docs/reviews/h1-plan.md workstream D (2026-08-04 incident, zombie
@@ -673,11 +634,6 @@ func ptyFailureIsTransient(err error) bool {
 var ctlLivenessTick = 5 * time.Second
 
 const (
-	// kaGraceFloor: the reap window never drops below 3 minutes (h1 plan Q3).
-	// A laptop lid-close under 3min resumes its keepalives unharmed; longer
-	// suspends hang the session up — sshd-with-ClientAliveInterval semantics,
-	// documented in usage.md. For tmux the cost is a reattach.
-	kaGraceFloor = 3 * time.Minute
 	// ctlProbeTimeout bounds the reaper's round-trip proof (h1 plan
 	// critique-4 BLOCKER): nc.Status() stays CONNECTED for minutes on a
 	// silent partition (nats.go only notices via socket error or its 2min
@@ -699,26 +655,7 @@ const (
 // probe is how that hazard gets a real test instead of a hopeful comment.
 var ctlConnProbe = func(nc *nats.Conn) error { return nc.FlushTimeout(ctlProbeTimeout) }
 
-// kaGraceFor derives the reap window from a ctl-advertised keepalive
-// interval: 0 = not advertised = never reap; otherwise the interval clamps to
-// [1s, 60s] and the grace is max(6×interval, kaGraceFloor) — six missed beats
-// or three minutes, whichever is longer.
-func kaGraceFor(intervalMS int) time.Duration {
-	if intervalMS <= 0 {
-		return 0
-	}
-	iv := time.Duration(intervalMS) * time.Millisecond
-	if iv < time.Second {
-		iv = time.Second
-	}
-	if iv > time.Minute {
-		iv = time.Minute
-	}
-	if g := 6 * iv; g > kaGraceFloor {
-		return g
-	}
-	return kaGraceFloor
-}
+func kaGraceFor(intervalMS int) time.Duration { return pty.KeepaliveGraceFor(intervalMS) }
 
 // reapVerdict is shouldReapRun's decision for one run on one reaper tick.
 type reapVerdict int
@@ -729,27 +666,8 @@ const (
 	reapNow                        // second probe-backed strike — hang it up
 )
 
-// shouldReapRun is the PURE reap decision (table-tested): a run is reaped
-// only when (armed) ∧ (not already reaped) ∧ (child not already exited —
-// recycled-pgid guard) ∧ (keepalive silence exceeds grace) ∧ (the agent's
-// conn was verifiably healthy on THIS tick) ∧ (this is the second
-// consecutive such tick). Anything less reaps healthy sessions: an
-// unhealthy-conn tick proves only that the AGENT is deaf, not that the ctl
-// is dead.
 func shouldReapRun(now time.Time, rec *procRec, connProven bool) reapVerdict {
-	if rec.kaGrace <= 0 || rec.reaped || rec.waitDone {
-		return reapNone
-	}
-	if now.Sub(rec.lastKA) <= rec.kaGrace {
-		return reapNone
-	}
-	if !connProven {
-		return reapNone
-	}
-	if !rec.probeConfirmed {
-		return reapConfirm
-	}
-	return reapNow
+	return reapVerdict(pty.ShouldReapLegacy(now, rec.kaGrace, rec.lastKA, rec.reaped, rec.waitDone, connProven, rec.probeConfirmed))
 }
 
 // ctlLivenessReaper is the per-session watchdog goroutine (h1 D3): every tick
@@ -767,32 +685,15 @@ func (a *Agent) ctlLivenessReaper(ctx context.Context) {
 		case <-t.C:
 		}
 		nc := a.ncBox.Load()
-		if nc == nil || !nc.IsConnected() {
-			// Unobservable silence NEVER counts against the ctl: while the
-			// agent itself is deaf, every stamp is pushed forward so the
-			// window restarts once the conn heals.
+		// Unobservable silence NEVER counts against the ctl: while the
+		// agent itself is deaf, stamps move forward so the legacy window
+		// restarts once the connection heals. The round-trip probe also
+		// detects a connected socket that is silently blackholed.
+		if !provePTYHealth(a, nc) {
 			a.restampProcKA()
 			continue
 		}
 		now := time.Now()
-		a.procsMu.Lock()
-		anyExpired := false
-		for _, rec := range a.procs {
-			if rec.kaGrace > 0 && !rec.reaped && !rec.waitDone && now.Sub(rec.lastKA) > rec.kaGrace {
-				anyExpired = true
-			}
-		}
-		a.procsMu.Unlock()
-		if !anyExpired {
-			continue
-		}
-		// Round-trip proof BEFORE acting (never under procsMu — Flush blocks).
-		// A failed probe means the conn is lying about its health: restamp,
-		// don't reap.
-		if err := ctlConnProbe(nc); err != nil {
-			a.restampProcKA()
-			continue
-		}
 		var hangups []*procRec
 		a.procsMu.Lock()
 		for pid, rec := range a.procs {
@@ -856,104 +757,66 @@ func startSessionIntakes(runCtx context.Context, a *Agent, nc *nats.Conn, fin *s
 // A package-level function taking *Agent, not a method: the structural-budget ratchet
 // pins this type's method count exactly.
 func startPtyIntake(a *Agent, nc *nats.Conn, fin *sessionFinalizer) error {
-	pidOf := func(subject, suffix string) string {
-		parts := strings.Split(subject, ".")
-		if len(parts) < 2 || parts[len(parts)-1] != suffix {
-			return ""
-		}
-		return parts[len(parts)-2]
-	}
-	writeIn := func(m *nats.Msg) {
-		// ctx-none: nats.go MsgHandler has no ctx.
-		// WriteInput, not sess.Master.Write — origin: prerelease audit round 2,
-		// I-F5. ptySessionFor releases procsMu before returning, so reading the
-		// Master field here was unsynchronized against Close()'s `s.Master = nil`.
-		if sess := ptySessionFor(a, pidOf(m.Subject, "in")); sess != nil {
-			_, _ = sess.WriteInput(m.Data)
+	for _, suffix := range []string{".pty.*.in", ".pty.*.resize"} {
+		if err := subscribeLegacyPTY(a, nc, fin, suffix); err != nil {
+			return err
 		}
 	}
-	// NODE-SCOPED FIRST — origin: prerelease audit round 2, I-F6. This is the
-	// subscription that carries keystrokes on an upgraded fleet, and the server delivers
-	// it only to the agent it is addressed to.
-	subInNode, err := nc.Subscribe(
-		proto.SubjectPrefix+".s."+a.cfg.SID+".node."+nidOf(a)+".pty.*.in", writeIn)
-	if err != nil {
-		return fmt.Errorf("agent: subscribe node-scoped pty intake: %w", err)
-	}
-	fin.addBoundedCleanup(func() { _ = subInNode.Unsubscribe() })
-
-	// THE LEGACY SESSION-SCOPED FORM, for a ctl older than the node-scoped subject.
-	// It is the fan-out I-F6 reports, kept only for the N-1 window.
-	//
-	// A message that carries PtyNodeHeader is DROPPED here: its sender also published a
-	// node-scoped copy, which the subscription above has already delivered. Without that
-	// check an upgraded ctl talking to an upgraded agent would write every keystroke
-	// twice, and a keystroke stream cannot be de-duplicated after the fact.
-	subIn, err := nc.Subscribe(
-		proto.SubjectPrefix+".s."+a.cfg.SID+".pty.*.in",
-		func(m *nats.Msg) {
-			if m.Header.Get(proto.PtyNodeHeader) != "" {
-				return
-			}
-			writeIn(m)
-		},
-	)
-	if err != nil {
-		return fmt.Errorf("agent: subscribe pty intake: %w", err)
-	}
-	fin.addBoundedCleanup(func() { _ = subIn.Unsubscribe() })
-
-	doResize := func(m *nats.Msg) {
-		// ctx-none: nats.go MsgHandler has no ctx.
-		sess := ptySessionFor(a, pidOf(m.Subject, "resize"))
-		if sess == nil {
-			return
-		}
-		var ev proto.PtyResizeEvent
-		if err := json.Unmarshal(m.Data, &ev); err != nil {
-			return
-		}
-		_ = sess.SetSize(ev.Cols, ev.Rows)
-	}
-	subResizeNode, err := nc.Subscribe(
-		proto.SubjectPrefix+".s."+a.cfg.SID+".node."+nidOf(a)+".pty.*.resize", doResize)
-	if err != nil {
-		return fmt.Errorf("agent: subscribe node-scoped pty resize: %w", err)
-	}
-	fin.addBoundedCleanup(func() { _ = subResizeNode.Unsubscribe() })
-
-	// Legacy, same reasoning and same header drop as `.in` above. A resize IS idempotent,
-	// so a duplicate would be harmless here — the check is kept anyway so the two intakes
-	// have one shape, and so a reader does not have to work out which of them is allowed
-	// to double-deliver.
-	subResize, err := nc.Subscribe(
-		proto.SubjectPrefix+".s."+a.cfg.SID+".pty.*.resize",
-		func(m *nats.Msg) {
-			if m.Header.Get(proto.PtyNodeHeader) != "" {
-				return
-			}
-			doResize(m)
-		},
-	)
-	if err != nil {
-		return fmt.Errorf("agent: subscribe pty resize: %w", err)
-	}
-	fin.addBoundedCleanup(func() { _ = subResize.Unsubscribe() })
 	return nil
 }
 
-// ptySessionFor returns the live PTY for pid, or nil when the run has ended.
+// ctx-none: nats.go MsgHandler has no ctx.
+// The queue writer uses WriteInput, not sess.Master.Write — origin:
+// prerelease audit round 2, I-F5. Releasing procsMu before reading
+// Master used to race Close()'s `s.Master = nil`. The callback now
+// only copies into a bounded queue (hot-update S4 plan §7.1 / T42).
+// NODE-SCOPED FIRST — origin: prerelease audit round 2, I-F6. This is the
+// subscription that carries keystrokes on an upgraded fleet, and the server delivers
+// it only to the agent it is addressed to.
+// THE LEGACY SESSION-SCOPED FORM, for a ctl older than the node-scoped subject.
+// It is the fan-out I-F6 reports, kept only for the N-1 window.
 //
-// A package-level function taking *Agent, not a method: the structural-budget ratchet
-// pins this type's method count exactly, and it caught this one on the way in.
-func ptySessionFor(a *Agent, pid string) *pty.Session {
-	if pid == "" {
-		return nil
-	}
-	a.procsMu.Lock()
-	defer a.procsMu.Unlock()
-	if rec, ok := a.procs[pid]; ok && !rec.waitDone {
-		return rec.sess
+// A message that carries PtyNodeHeader is DROPPED here: its sender also published a
+// node-scoped copy, which the subscription above has already delivered. Without that
+// check an upgraded ctl talking to an upgraded agent would write every keystroke
+// twice, and a keystroke stream cannot be de-duplicated after the fact.
+// ctx-none: nats.go MsgHandler has no ctx.
+// Legacy, same reasoning and same header drop as `.in` above. A resize IS idempotent,
+// so a duplicate would be harmless here — the check is kept anyway so the two intakes
+// have one shape, and so a reader does not have to work out which of them is allowed
+// to double-deliver.
+// origin: hot-update S4 plan §7.1 / T42. One subscription shape owns the
+// N-1 header filter for input, resize and KA so none can drift on its own.
+func subscribeLegacyPTY(a *Agent, nc *nats.Conn, fin *sessionFinalizer, suffix string) error {
+	op := suffix[strings.LastIndexByte(suffix, '.')+1:]
+	base := proto.SubjectPrefix + ".s." + a.cfg.SID
+	for _, route := range []string{".node." + nidOf(a), ""} {
+		nodeScoped := route != ""
+		sub, err := nc.Subscribe(base+route+suffix, func(m *nats.Msg) {
+			if !nodeScoped && m.Header.Get(proto.PtyNodeHeader) != "" {
+				return
+			}
+			parts := strings.Split(m.Subject, ".")
+			q := legacyPTYInputFor(a, parts[len(parts)-2])
+			if q == nil {
+				return
+			}
+			ev := pty.LegacyInputEvent{Keepalive: op == "ka"}
+			switch op {
+			case "in":
+				ev.Data = m.Data
+			case "resize":
+				ev.Resize = &proto.PtyResizeEvent{}
+				if json.Unmarshal(m.Data, ev.Resize) != nil {
+					return
+				}
+			}
+			q.Enqueue(ev)
+		})
+		if err != nil {
+			return fmt.Errorf("agent: subscribe pty %s intake: %w", op, err)
+		}
+		fin.addBoundedCleanup(func() { _ = sub.Unsubscribe() })
 	}
 	return nil
 }
@@ -965,22 +828,9 @@ func ptySessionFor(a *Agent, pid string) *pty.Session {
 // teardown matches subFwd's: Unsubscribe takes nc.mu, so it goes through the
 // finalizer rather than a plain defer (origin: internal review CT-1 / #72).
 func (a *Agent) startCtlLiveness(runCtx context.Context, nc *nats.Conn, fin *sessionFinalizer) error {
-	subKA, err := nc.Subscribe(
-		proto.SubjectPrefix+".s."+a.cfg.SID+".pty.*.ka",
-		func(msg *nats.Msg) {
-			// ctx-none: nats.go MsgHandler has no ctx.
-			// Subject: <prefix>.s.<sid>.pty.<pid>.ka — pid is token n-2.
-			parts := strings.Split(msg.Subject, ".")
-			if len(parts) < 2 || parts[len(parts)-1] != "ka" {
-				return
-			}
-			a.touchProcKA(parts[len(parts)-2])
-		},
-	)
-	if err != nil {
-		return fmt.Errorf("agent: subscribe pty keepalive: %w", err)
+	if err := subscribeLegacyPTY(a, nc, fin, ".pty.*.ka"); err != nil {
+		return err
 	}
-	fin.addBoundedCleanup(func() { _ = subKA.Unsubscribe() })
 	// A session (re)build reopens the intake after a deaf window — restamp so
 	// the silence that accumulated while we could not HEAR keepalives never
 	// counts against the ctl.
@@ -1014,4 +864,73 @@ func (a *Agent) restampProcKA() {
 		}
 	}
 	a.procsMu.Unlock()
+}
+
+type legacyPTYInput = pty.LegacyInput
+
+const legacyPTYQueueEvents = pty.LegacyInputEventLimit
+
+// legacyPTYInputFor returns the legacy input owner for pid, or nil when the run has ended.
+//
+// A package-level function taking *Agent, not a method: the structural-budget ratchet
+// pins this type's method count exactly, and it caught this one on the way in.
+func legacyPTYInputFor(a *Agent, pid string) *legacyPTYInput {
+	a.procsMu.Lock()
+	defer a.procsMu.Unlock()
+	if rec := a.procs[pid]; rec != nil && !rec.waitDone {
+		return rec.input
+	}
+	return nil
+}
+
+// provePTYHealth is deliberately independent of the legacy wall-clock grace:
+// imported reliable actors keep absolute deadlines and decide whether a fresh
+// proof counts as either of their two strikes. Never restamp them on reconnect.
+// origin: hot-update S4 plan §6.1
+func provePTYHealth(a *Agent, nc *nats.Conn) bool {
+	generation := a.ptyHealthGeneration.Load()
+	healthy := nc != nil && nc.IsConnected()
+	var reconnects uint64
+	if healthy {
+		reconnects = nc.Stats().Reconnects
+		healthy = ctlConnProbe(nc) == nil
+	}
+	healthy = healthy && a.ncBox.Load() == nc && nc.IsConnected() &&
+		nc.Stats().Reconnects == reconnects && a.ptyHealthGeneration.Load() == generation
+	if a.processRuntime != nil {
+		now, err := procrequest.BootNow()
+		a.processRuntime.PTYHealth(ptysession.HealthProof{Generation: generation, AtBootNS: now, Healthy: healthy && err == nil,
+			Verifier: ptyHealthConnectionProof{agent: a, conn: nc, reconnects: reconnects}})
+	}
+	return healthy
+}
+
+// A successful probe can wait behind a terminal control transaction. Its
+// captured generation alone cannot authorize a destructive second strike.
+// Recheck the same connection and reconnect counter once the actor holds its
+// token; no network round trip or agent method is added here.
+// origin: hot-update S4 internal review rv-auth RV-AUTH-3
+type ptyHealthConnectionProof struct {
+	agent      *Agent
+	conn       *nats.Conn
+	reconnects uint64
+}
+
+func (p ptyHealthConnectionProof) Current(generation uint64) bool {
+	return p.conn != nil && p.agent.ncBox.Load() == p.conn && p.conn.IsConnected() &&
+		p.conn.Stats().Reconnects == p.reconnects && p.agent.ptyHealthGeneration.Load() == generation
+}
+
+func newLegacyRunInput(a *Agent, pid string, sess *pty.Session, nc *nats.Conn, inbox string) *legacyPTYInput {
+	return pty.NewLegacyInput(sess, func() { a.touchProcKA(pid) }, func() {
+		// origin: hot-update S4 plan §7.1 / T42. Overflow is a failed running
+		// task, never a claim that spawn failed or silently discarded bytes.
+		a.cfg.Logger.Warn("agent: legacy PTY input overflow", "pid", pid, "detail", "pty input buffer full")
+		a.replyRunChunk(liveConn(a, nc), inbox, proto.RunChunk{Kind: "failed", PID: pid, Reason: "pty_input_overflow"})
+		sess.Hangup()
+		// Overflow is an explicit abort. Even if the leader already exited
+		// and its Manager signal guard refuses HUP, close the input source
+		// to discharge the writer's blocked-I/O responsibility.
+		_ = sess.Close()
+	})
 }

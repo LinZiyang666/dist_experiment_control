@@ -1,307 +1,108 @@
 package broker
 
 import (
+	"cmp"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
-	"encoding/json"
+	"database/sql"
 	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
-	"strconv"
-	"strings"
 	"time"
 
+	"github.com/LinZiyang666/tether/internal/authcallout"
+	"github.com/LinZiyang666/tether/internal/brokercontrol"
 	"github.com/LinZiyang666/tether/internal/cluster"
+	"github.com/LinZiyang666/tether/internal/controlbudget"
 	"github.com/LinZiyang666/tether/internal/jsstream"
-	"github.com/LinZiyang666/tether/internal/proto"
 	"github.com/LinZiyang666/tether/internal/schema"
 	"github.com/LinZiyang666/tether/internal/xferaudit"
+	"github.com/LinZiyang666/tether/internal/xferauth"
+	"github.com/LinZiyang666/tether/internal/xfercontract"
+	"github.com/LinZiyang666/tether/internal/xfercontrol"
+	"github.com/LinZiyang666/tether/internal/xferledger"
+	"github.com/LinZiyang666/tether/internal/xferserve"
+	"github.com/LinZiyang666/tether/internal/xfertrack"
+	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 )
 
-// xfer_inflight.go (R16 #57 Lane B) — a node-local DURABLE in-flight-transfer ledger + a finalize-on-recovery
-// pass. The transfer state machine (transferTracker + the watchdog goroutine) is process-memory-only, so a
-// HOME broker that crashes between the durable "start" audit row and any terminal row leaves that start row
-// DANGLING FOREVER (the tracker is rebuilt empty, the watchdog goroutine is gone, and the receiver's late
-// finalization is dropped for want of a tracker entry). This ledger persists the immutable fields of every
-// in-flight transfer to `<ClusterDataDir>/xfer-inflight/<hash>.json` at put() time and removes it at every
-// terminal path; on the periodic reconcile pass, any ledger file older than its tier timeout with no live
-// tracker entry gets a DETERMINISTIC synthetic terminal (Ts = startedAt+timeout) emitted through the normal
-// audit path — so the content-addressed TransferRecordReqID collapses every re-emit in the replicated dedup
-// ledger. Cluster mode only (ClusterDataDir set); single-broker audit publish is best-effort by design.
+// The cap0 ledger's disk/replay state machine lives in xferledger. The adapter
+// supplies only the current broker backend; it never creates a second tracker.
+// origin: hot-update S7 plan §5.1 / §12.2 / P13
+type xferInflightRecord = xferledger.LegacyRecord
+type ledgerSite = xferledger.LegacySite
+type ledgerDisposition = xferledger.LegacyDisposition
+type ledgerRowInputs = xferledger.LegacyRowInputs
 
-// xferStrandedSlack is added to a transfer's tier timeout before the finalizer will synthesize a terminal —
-// a grace so a transfer that legitimately took just over its timeout (a slow receiver whose real terminal is
-// in flight) is never double-finalized by a too-eager pass.
-const xferStrandedSlack = 60 * time.Second
+const (
+	xferStrandedSlack = xferledger.LegacyStrandedSlack
+	ledgerSiteOutbox  = xferledger.LegacySiteOutbox
+	ledgerSitePrimary = xferledger.LegacySitePrimary
+	ledgerLeave       = xferledger.LegacyLeave
+	ledgerReplay      = xferledger.LegacyReplay
+	ledgerSynthesize  = xferledger.LegacySynthesize
+)
 
-// xferInflightRecord is the persisted immutable projection of a transferEntry — everything the finalizer
-// needs to synthesize a byte-deterministic terminal audit row for a stranded transfer.
-type xferInflightRecord struct {
-	TransferID string    `json:"transfer_id"`
-	Session    string    `json:"session"`
-	Node       string    `json:"node"`
-	ActorNkey  string    `json:"actor_nkey"`
-	ActorFp    string    `json:"actor_fp"`
-	Verb       string    `json:"verb"`
-	Tier       string    `json:"tier"`
-	Bucket     string    `json:"bucket"`
-	Path       string    `json:"path"`
-	StartedAt  time.Time `json:"started_at"`
-	// Size (batch C) is the declared transfer size, so a recovering broker derives the SAME budget the
-	// live watchdog was using. Additive omitempty: a record written before batch C has no size, which
-	// degrades to the fixed tier floor — the pre-batch-C behaviour, and the fail-SAFE direction (a
-	// live transfer is declared stranded no EARLIER than it used to be, never sooner).
-	Size int64 `json:"size,omitempty"`
-
-	// Terminal (external RE-REVIEW F1) is the COMPLETE, already-decided terminal audit record, staged
-	// here BEFORE it is forwarded. It turns this ledger into an OUTBOX and is what closes the second
-	// crash window: the first fix only guaranteed "the ledger outlives the commit", so a process killed
-	// AFTER the real terminal committed but BEFORE the unlink came back to a start-only ledger, and the
-	// finalizer then GUESSED a different `failed/home_broker_restart` row. TransferRecordReqID hashes the
-	// whole normalized record, so a guess never dedups against the real terminal and the audit ends up
-	// claiming the same transfer both completed and failed.
-	//
-	// With the record staged, recovery REPLAYS THIS EXACT ROW instead of guessing: identical bytes ⇒
-	// identical reqID ⇒ the replicated dedup ledger collapses it against the already-committed one.
-	Terminal *schema.AuditTransfer `json:"terminal,omitempty"`
-}
-
-// A SINGLE BROKER HAS A LEDGER TOO.
-//
-// origin: prerelease audit broker-transfer/#57. This used to return "" whenever
-// ClusterDataDir was unset, and scripts/install.sh renders a production broker.yaml
-// with data_dir commented out — so on every single-broker deployment (which is the
-// common one) there was no durable ledger at all. Two things silently followed: a
-// restart could never finalize a stranded transfer, and ledgerProtectedObjects
-// returned an EMPTY protected set, which the orphan reaper reads as "nobody owns
-// any of these objects".
-//
-// The DB file's directory is the right fallback because it is the one path a broker
-// always has, is always writable, and already holds the state whose loss would be
-// equally fatal.
-func (b *Broker) xferInflightDir() string {
-	return xferLedgerSubdir(b.cfg.ClusterDataDir, b.cfg.DBPath, "xfer-inflight")
-}
-
-// xferLedgerSubdir is the shared root resolution, extracted so both ledger
-// directories cannot drift apart and so the fallback is testable without a Broker.
-func xferLedgerSubdir(clusterDataDir, dbPath, sub string) string {
-	if clusterDataDir != "" {
-		return filepath.Join(clusterDataDir, sub)
+func legacyTransferLedger(b *Broker, parents ...context.Context) *xferledger.Legacy {
+	ctx := b.runCtx
+	if len(parents) > 0 {
+		ctx = parents[0]
 	}
-	if dbPath == "" {
-		// Nothing durable to hang it off — an in-memory test broker. Callers already
-		// treat "" as "no ledger".
-		return ""
+	var streamCommitted func(string, string) (bool, error)
+	if js := brokerJS(b); js != nil {
+		streamCommitted = func(sid, id string) (bool, error) { return jsstream.TransferTerminalCommitted(ctx, js, sid, id) }
 	}
-	return filepath.Join(filepath.Dir(dbPath), sub)
+	return &xferledger.Legacy{Config: xferledger.LegacyConfig{
+		ClusterDataDir: b.cfg.ClusterDataDir, DBPath: b.cfg.DBPath, Logger: b.cfg.Logger, Now: b.cfg.Now,
+		Cluster: b.cl != nil, StreamCommitted: streamCommitted, Live: func(id string) bool { return b.transfers.Get(id) != nil },
+		Delete: func(sid, id string) error { return b.deleteXferObject(ctx, sid, id) }, Committed: b.transferTerminalAlreadyCommitted, Commit: b.commitSyntheticTransferTerminal,
+		Publish: func(subject string, data []byte, id string) error { return publishAuditDeduped(b, subject, data, id) }, Confirm: xferserve.LegacyConfirm(brokerJS(b)),
+	}}
 }
-
-// ── DURABLE PRECEDENCE OF THE TWO LEDGER DIRECTORIES (round-5 疑惑 1) ──────────────────────────────────
-//
-// Two sibling directories hold rows for the same transfer, so the precedence between them must be a
-// written rule rather than a consequence of the order in which a scan happens to visit them:
-//
-//	AN EXACT TERMINAL OUTRANKS A START ROW, WHEREVER EITHER LIVES, AND A START ROW MAY ONLY BE RETIRED
-//	TOGETHER WITH — NEVER BEFORE — THE EXACT TERMINAL THAT SUPERSEDES IT.
-//
-// The legal states, the crash point each one represents, and what the next pass does:
-//
-//	primary        outbox        means                                  next pass
-//	-----------    ----------    ------------------------------------   ------------------------------------
-//	start          -             in flight, or crashed before any        synthesize after timeout+slack (#57)
-//	                             terminal was decided
-//	terminal       -             terminal decided, staged in place;      replay the exact row, then consume
-//	                             crash before/after commit               both rows
-//	start          terminal      terminal decided while the primary      replay the OUTBOX row (pass 1);
-//	                             directory was unwritable                never synthesize from the start row
-//	-              terminal      as above, and the start row was          replay the outbox row
-//	                             already retired (or never written)
-//	terminal       terminal      two terminal paths raced across a       pass 1 replays once and consumes
-//	                             directory failure                       both; pass 2 finds nothing
-//
-// THE TABLE ABOVE IS NOT THE WHOLE RULE — three more inputs decide every row (B8)
-// ------------------------------------------------------------------------------
-// The two columns are necessary but not sufficient, and for years the missing inputs lived only in
-// the branch order of finalizeStrandedXfers. They are now arguments to ledgerRowDisposition below,
-// because a rule that exists only as control flow cannot be tested row by row:
-//
-//	LIVE     a tracker entry for this transfer in THIS incarnation ⇒ NEVER finalize; its own terminal
-//	         path owns it. Checked at BOTH sites.
-//	NOW      a start row younger than its tier timeout + xferStrandedSlack is not stranded, it is slow.
-//	CENSUS   whether the outbox scan SUCCEEDED. A failed census is UNKNOWN, not empty (R6-F1): a
-//	         start-only row must not be synthesized while a higher-precedence exact terminal may still
-//	         be hidden in an unreadable outbox.
-//
-// And the SITE is itself an input, not a detail: the two passes apply these gates in a DIFFERENT
-// order (pass 2's staged-terminal branch does not consult the outbox census at all — only its
-// start-only branch does), and one transfer can hold a row at each site simultaneously.
-//
-// Retirement is therefore a single ordered operation (consumeXferLedgerRow): primary FIRST, and the
-// outbox row only once the primary row is confirmed gone. If the primary removal cannot be confirmed, the
-// outbox row STAYS — it is the only evidence that stops the surviving start row from being turned into a
-// second, contradictory terminal. Every disposal path in this file goes through that one function.
-//
-// xferTerminalOutboxDir is the FALLBACK staging location for a terminal whose in-flight ledger record
-// cannot be updated (round-4 external re-review).
-//
-// Staging is what makes forwarding a terminal recoverable, so the primary directory becoming unwritable
-// — replaced by a file, unmounted, gone read-only, wiped by an operator recovery — must not silently
-// remove the only durable record of the outcome. It is a SIBLING of the in-flight directory, so it
-// survives exactly the failures that take the in-flight directory itself out. Recovery scans both and
-// replays an outbox row verbatim, identically to an in-place one.
-func (b *Broker) xferTerminalOutboxDir() string {
-	return xferLedgerSubdir(b.cfg.ClusterDataDir, b.cfg.DBPath, "xfer-terminal-outbox")
-}
-
-// xferInflightFilename hashes the transfer_id into a path-safe fixed-width name so a transfer_id can never
-// escape the ledger dir (path traversal) or collide with the atomic temp files.
-func xferInflightFilename(transferID string) string {
-	sum := sha256.Sum256([]byte(transferID))
-	return hex.EncodeToString(sum[:]) + ".json"
-}
-
-// transferTimeoutFor is the budget a RECOVERING broker attributes to a transfer it finds in the
-// ledger. It must agree with the live watchdog (proto.XferBudget over the same legs), or crash
-// recovery declares a transfer stranded while the process that owned it would still have been
-// waiting — writing a `failed` terminal for something that was healthy.
-//
-// size==0 is an old record (written before batch C added Size) and yields the fixed tier floor: the
-// pre-batch-C behaviour, and the direction that can only wait LONGER, never reap sooner.
-func transferTimeoutFor(tier string, size int64) time.Duration {
-	return proto.XferBudget(tier, size, proto.XferPushLegs)
-}
-
-// transferTierFloorFor is the FIXED per-tier timeout, and it is deliberately NOT the size-derived
-// budget. It has exactly one caller: the synthetic terminal's Ts and DurationMs.
-//
-// Ts is the dedup carrier. TransferRecordReqID hashes the whole normalized record, so two
-// incarnations that disagree about Ts produce two DIFFERENT reqIDs for the same transfer and the
-// replicated dedup ledger cannot collapse them — the audit then claims the transfer both failed and
-// failed again, at two timestamps. Deriving Ts from the size-derived budget would make it depend on
-// XferMinThroughput, so a ROLLBACK (or any future retune of that constant) would have the old and
-// new binaries stamp different Ts for the identical ledger record. Pinning Ts to the tier floor
-// keeps it a pure function of (StartedAt, tier), which is stable across versions by construction.
-//
-// The stranded DECISION does use the real budget — that one must track the live watchdog or recovery
-// declares a healthy slow transfer stranded. The two uses are genuinely different questions.
-func transferTierFloorFor(tier string) time.Duration {
-	if tier == "b" {
-		return transferTimeoutTierB
-	}
-	return transferTimeoutTierA
-}
-
-// writeLedgerRecord atomically and DURABLY installs a ledger record: temp -> write -> fsync(file) ->
-// close -> rename -> fsync(dir). External review F6: the previous version did Write/Close/Rename with no
-// sync at all, so a power loss or kernel crash could lose either the bytes or the directory entry while
-// the doc comment called the ledger "durable". A ledger that can vanish is exactly the evidence #57 needs.
+func (b *Broker) xferInflightDir() string       { return legacyTransferLedger(b).InflightDir() }
+func (b *Broker) xferTerminalOutboxDir() string { return legacyTransferLedger(b).OutboxDir() }
 func (b *Broker) writeLedgerRecord(dir string, rec xferInflightRecord) error {
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return err
-	}
-	payload, err := json.Marshal(rec)
-	if err != nil {
-		return err
-	}
-	tmp, err := os.CreateTemp(dir, ".xfer-inflight-*.tmp")
-	if err != nil {
-		return err
-	}
-	tmpName := tmp.Name()
-	_ = tmp.Chmod(0o600)
-	if _, werr := tmp.Write(payload); werr != nil {
-		_ = tmp.Close()
-		_ = os.Remove(tmpName)
-		return werr
-	}
-	if serr := tmp.Sync(); serr != nil { // F6: the bytes must reach stable storage before the rename
-		_ = tmp.Close()
-		_ = os.Remove(tmpName)
-		return serr
-	}
-	if cerr := tmp.Close(); cerr != nil {
-		_ = os.Remove(tmpName)
-		return cerr
-	}
-	if rerr := os.Rename(tmpName, filepath.Join(dir, xferInflightFilename(rec.TransferID))); rerr != nil {
-		_ = os.Remove(tmpName)
-		return rerr
-	}
-	return syncDir(dir) // F6: the rename itself must be durable, not just the bytes
+	return legacyTransferLedger(b).WriteRecord(dir, rec)
+}
+func (b *Broker) stageXferInflightTerminal(id string, rec schema.AuditTransfer) (bool, bool) {
+	return legacyTransferLedger(b).StageTerminal(id, rec)
 }
 
-// syncDir fsyncs a directory so a rename/unlink inside it is durable.
-func syncDir(dir string) error {
-	d, err := os.Open(dir)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = d.Close() }()
-	return d.Sync()
-}
+func (b *Broker) removeXferInflight(id string) { legacyTransferLedger(b).Remove(id) }
 
-// stageXferInflightTerminal writes the DECIDED terminal record into the ledger before it is forwarded
-// (external RE-REVIEW F1). Returns false when nothing was staged (no ledger dir at all, or the write
-// failed) so the caller can fall back to the pre-outbox behaviour rather than silently lose a row.
-//
-// Returns (staged, applicable). applicable=false means this deployment keeps NO ledger, which is NOT a
-// failure; staged=false with applicable=true is a real durability failure and the caller must NOT proceed
-// to an async forward (round-3 R3-F2).
-//
-// "NO LEDGER" IS NO LONGER "SINGLE-BROKER MODE" — origin: prerelease audit round 2, F-T6. Both sentences
-// above said it was, and #57's extension to single brokers made that false in the same commit that
-// relied on it: xferLedgerSubdir falls back to the DB's own directory, so a single broker with a
-// database on disk DOES keep a ledger. What reaches applicable=false today is a broker with neither a
-// ClusterDataDir nor a DBPath — an in-memory test broker. A reader auditing this function was being told,
-// in the file itself, that a state it must handle cannot arise.
-func (b *Broker) stageXferInflightTerminal(transferID string, rec schema.AuditTransfer) (staged, applicable bool) {
-	dir := b.xferInflightDir()
-	if dir == "" {
-		return false, false // nothing durable to anchor a ledger to — nothing to stage, nothing at risk
+func (b *Broker) replayStagedTerminal(ctx context.Context, rec xferInflightRecord) bool {
+	return legacyTransferLedger(b, ctx).ReplayTerminal(rec)
+}
+func (b *Broker) ledgerProtectedObjects(now time.Time) (map[string]bool, map[string]bool, error) {
+	return legacyTransferLedger(b).ProtectedObjects(now)
+}
+func xferLedgerSubdir(dir, db, sub string) string { return xferledger.LegacySubdir(dir, db, sub) }
+func xferInflightFilename(id string) string       { return xferledger.LegacyFilename(id) }
+func transferTimeoutFor(tier string, size int64) time.Duration {
+	return xferledger.LegacyTimeout(tier, size)
+}
+func transferTierFloorFor(tier string) time.Duration { return xferledger.LegacyTierFloor(tier) }
+
+func readXferInflight(path string) (xferInflightRecord, error) {
+	return xferledger.ReadLegacyRecord(path)
+}
+func ledgerRowDisposition(in ledgerRowInputs) (ledgerDisposition, string) {
+	return xferledger.LegacyRowDisposition(in)
+}
+func (b *Broker) finalizeStrandedXfers(ctx context.Context) (int, error) {
+	// A live imported tracker protects objects from GC, but must still drive
+	// its own history/cleanup responsibilities. Never run legacy synthesis on
+	// a v1 grant merely because the original byte deadline has passed.
+	// origin: hot-update S7 plan §5.3 / M11 / M13
+	if b.cfg.TransferFactory != nil || b.transferRuntime.Load() != nil {
+		return advanceBrokerTransfers(ctx, b)
 	}
-	cur, err := readXferInflight(filepath.Join(dir, xferInflightFilename(transferID)))
-	if err != nil {
-		// No start record (single-mode, pre-ledger transfer, or an unreadable file): stage a
-		// self-contained record so recovery can still replay the exact terminal.
-		// batch C: Size is carried here too. This is the SECOND writer of an xferInflightRecord, and
-		// the one easy to miss — a Size filled only on the start path would leave every
-		// synthesized-terminal record at 0 and quietly re-fix the budget at the tier floor.
-		cur = xferInflightRecord{TransferID: transferID, Session: rec.Session, Node: rec.Node,
-			ActorNkey: rec.ActorNkey, ActorFp: rec.ActorFp, Verb: rec.Verb, Tier: rec.Tier,
-			Bucket: rec.Bucket, Path: rec.Path, StartedAt: rec.Ts, Size: rec.Bytes}
-	}
-	cur.Terminal = &rec
-	werr := b.writeLedgerRecord(dir, cur)
-	if werr == nil {
-		return true, true
-	}
-	// ROUND-4 RE-REVIEW: do not conclude "unstageable" from ONE unwritable directory. Retry in the sibling
-	// outbox — that record carries the EXACT terminal, so recovery replays it byte-for-byte instead of
-	// inventing a synthetic one that contradicts it.
-	outbox := b.xferTerminalOutboxDir()
-	if outbox == "" {
-		b.cfg.Logger.Error("broker: could not stage the terminal into the xfer-inflight ledger",
-			"err", werr, "tid", transferID, "kind", rec.Kind)
-		return false, true
-	}
-	if oerr := b.writeLedgerRecord(outbox, cur); oerr != nil {
-		b.cfg.Logger.Error("broker: could not stage the terminal in EITHER the xfer-inflight ledger or the "+
-			"fallback outbox — recovery will have no record of this outcome",
-			"err", werr, "outbox_err", oerr, "tid", transferID, "kind", rec.Kind)
-		return false, true
-	}
-	b.cfg.Logger.Warn("broker: the xfer-inflight ledger is unwritable — staged this transfer's terminal in the "+
-		"fallback outbox instead, so recovery can still replay it exactly",
-		"err", werr, "tid", transferID, "kind", rec.Kind)
-	return true, true
+	return legacyTransferLedger(b, ctx).Finalize()
 }
 
 // writeXferInflight persists the in-flight ledger record for e (called right after transfers.put(), before
 // the prepare is forwarded — a crash between put() and this loses only what a crash before put() already
 // does). Best-effort + atomic (temp + rename): a failure only degrades #57 recovery, never the transfer.
+
 func (b *Broker) writeXferInflight(e *transferEntry) {
 	dir := b.xferInflightDir()
 	if dir == "" {
@@ -315,753 +116,28 @@ func (b *Broker) writeXferInflight(e *transferEntry) {
 		// 2026-09-02 prerelease audit together with the xferInflightDir fallback.
 		return
 	}
+	record := b.transfers.Record(e)
 	if err := b.writeLedgerRecord(dir, xferInflightRecord{
-		TransferID: e.transferID, Session: e.sid, Node: e.nid,
-		ActorNkey: e.actor, ActorFp: e.actorFP, Verb: e.verb, Tier: e.tier,
-		Bucket: e.bucket, Path: e.path, StartedAt: e.startedAt, Size: e.size,
+		TransferID: record.TransferID, Session: record.SID, Node: record.NID,
+		ActorNkey: record.Actor, ActorFp: record.ActorFP, Verb: record.Verb, Tier: record.Tier,
+		Bucket: record.Bucket, Path: record.Path, StartedAt: record.StartedAt, Size: record.Size, Start: record.Start,
 	}); err != nil {
 		b.cfg.Logger.Warn("broker: install xfer-inflight ledger", "err", err)
-		return
 	}
 }
 
-// removeXferInflight drops the ledger file for a transfer that reached a terminal (called from every
-// terminal path). Idempotent: a missing file is fine.
-// consumeXferLedgerRow retires a transfer's ledger credentials in BOTH directories, PRIMARY FIRST.
-//
-// ROUND-5 R5-F1: the exact terminal parked in the outbox is the only thing that stops recovery from
-// synthesizing a contradictory `failed/home_broker_restart` beside an already-committed `complete`. So it
-// may be dropped ONLY once the primary start row is confirmed gone. Deleting them independently and
-// ignoring failures — which is what the first version did — leaves a hidden start row behind whenever the
-// primary directory is momentarily unusable, and the next finalize pass turns that row into a second,
-// contradictory terminal. Order and error-propagation ARE the invariant here.
-func (b *Broker) consumeXferLedgerRow(transferID string) error {
-	dir := b.xferInflightDir()
-	if dir == "" {
-		return nil
-	}
-	name := xferInflightFilename(transferID)
-	if err := removeLedgerRowDurably(dir, name, false); err != nil {
-		// The start row may survive. KEEP the outbox terminal: it is the tombstone that makes the next
-		// pass replay the TRUE outcome instead of inventing one. In particular, ENOENT for the parent
-		// directory is not proof that a row hidden by an unmounted/replaced directory is gone.
-		return err
-	}
-	outbox := b.xferTerminalOutboxDir()
-	if outbox == "" {
-		return nil
-	}
-	// Once the primary row is durably absent, a missing outbox directory is harmless: there is no start
-	// row left for recovery to misinterpret, and any outbox terminal exposed by a later remount replays
-	// the already-committed exact bytes. If the directory exists, however, its unlink must be durable too.
-	return removeLedgerRowDurably(outbox, name, true)
-}
-
-// removeLedgerRowDurably removes name relative to an already-open directory and fsyncs that SAME
-// directory before reporting success. Opening the directory first is load-bearing: os.Remove on
-// "<missing-parent>/<name>" returns ENOENT too, but a missing mount point may still hide a durable row
-// that will reappear later. os.Root keeps the operation bound to the directory that was actually opened
-// even if its path is renamed while cleanup runs.
-func removeLedgerRowDurably(dir, name string, missingDirOK bool) error {
-	root, err := os.OpenRoot(dir)
-	if err != nil {
-		if missingDirOK && os.IsNotExist(err) {
-			return nil
-		}
-		return err
-	}
-	defer func() { _ = root.Close() }()
-
-	d, err := root.Open(".")
-	if err != nil {
-		return err
-	}
-	defer func() { _ = d.Close() }()
-
-	if err := root.Remove(name); err != nil && !os.IsNotExist(err) {
-		return err
-	}
-	// F6: Remove returning nil (or a child ENOENT inside this known directory) is not a durable
-	// retirement until the directory entry state itself reaches stable storage.
-	return d.Sync()
-}
-
-// removeXferInflight is the commit-callback face of consumeXferLedgerRow: a terminal has just been
-// committed, so both credentials should go. A failure is NOT silently swallowed — it means the outbox row
-// is deliberately still there, and recovery will re-drive this transfer from the exact terminal.
-func (b *Broker) removeXferInflight(transferID string) {
-	if err := b.consumeXferLedgerRow(transferID); err != nil {
-		b.cfg.Logger.Warn("broker: could not retire this transfer's ledger rows after its terminal committed "+
-			"— the EXACT terminal is deliberately kept in the outbox so a later pass re-drives it rather than "+
-			"synthesizing a contradictory one",
-			"err", err, "transfer_id", transferID)
-	}
-}
-
-// finalizeStrandedXfers scans the ledger and, for every transfer whose home broker crashed mid-flight (the
-// ledger file is older than its tier timeout + slack AND no live tracker entry exists), emits a
-// DETERMINISTIC synthetic terminal (Kind=failed, Code=home_broker_restart, Ts=startedAt+timeout) through the
-// normal audit path, deletes any orphan object, and removes the ledger file. The deterministic Ts makes the
-// content-addressed TransferRecordReqID collapse every re-emit/crash-window duplicate in the replicated
-// dedup ledger. Returns the number of transfers finalized.
-// forEachLedgerRecord walks one ledger directory, handing each readable record to fn. It owns the
-// housekeeping that must happen on EVERY ledger directory: pruning orphaned atomic temps and
-// quarantining unreadable rows. Round-4 factored it out so the fallback outbox gets exactly the same
-// treatment as the primary in-flight directory rather than a thinner copy of it.
-//
-// It also returns the set of ledger filenames that EXIST but could not be turned into a record —
-// either unparseable now, or quarantined as <name>.corrupt by an earlier pass. That set is what stops
-// an unreadable row from reading as an ABSENT row (B8). The keys are canonical `<hash>.json` names:
-// the hash is one-way, so a caller cannot recover a transfer_id from one, but a caller that HAS a
-// transfer_id can compute the same name forward and ask.
-//
-// The `.corrupt` half is what makes the answer durable. Quarantining renames the row out of the
-// directory, so a set built only from parse failures would be non-empty on the pass that quarantined
-// the row and EMPTY on every pass after it — the synthesizer would simply be delayed by one tick
-// instead of blocked.
-func (b *Broker) forEachLedgerRecord(dir string, fn func(path string, rec xferInflightRecord)) (map[string]bool, error) {
-	unresolved := map[string]bool{}
-	if dir == "" {
-		return unresolved, nil
-	}
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return unresolved, nil
-		}
-		return unresolved, err
-	}
-	for _, de := range entries {
-		if de.IsDir() {
-			continue
-		}
-		if !strings.HasSuffix(de.Name(), ".json") {
-			// A row quarantined by an earlier pass still means "a ledger row for this transfer exists and
-			// this process could not read it". Fold it back under its canonical name so the answer
-			// survives the rename that put it here.
-			if base, _, ok := strings.Cut(de.Name(), ".json.corrupt"); ok {
-				unresolved[base+".json"] = true
-				continue
-			}
-			// nit: prune an orphaned atomic temp (a crash between CreateTemp and Rename) once it is clearly
-			// stale, so .xfer-inflight-*.tmp files do not accumulate unbounded.
-			if strings.HasPrefix(de.Name(), ".xfer-inflight-") && strings.HasSuffix(de.Name(), ".tmp") {
-				if info, ierr := de.Info(); ierr == nil && b.cfg.Now().Sub(info.ModTime()) > xferStrandedSlack {
-					_ = os.Remove(filepath.Join(dir, de.Name()))
-				}
-			}
-			continue
-		}
-		path := filepath.Join(dir, de.Name())
-		rec, rerr := readXferInflight(path)
-		if rerr != nil {
-			// Record it BEFORE the quarantine: from here on this row exists only under a .corrupt name.
-			unresolved[de.Name()] = true
-			// nit: a corrupt ledger would re-warn every pass forever — move it aside ONCE (preserved for
-			// inspection) so the log doesn't churn and the finalizer stops re-reading it.
-			// EXTERNAL REVIEW F6: when a .corrupt target already existed this left the NEW bad file in
-			// place and still logged "moved aside", so every pass re-read it forever while the message
-			// said it had been dealt with. Give each one a distinct name, and say what actually happened.
-			corrupt := path + ".corrupt"
-			if _, se := os.Stat(corrupt); se == nil {
-				corrupt = path + ".corrupt." + strconv.FormatInt(b.cfg.Now().UnixNano(), 10)
-			}
-			if merr := os.Rename(path, corrupt); merr != nil {
-				b.cfg.Logger.Warn("broker: unreadable xfer-inflight ledger could NOT be moved aside — it will be re-read every pass",
-					"file", de.Name(), "err", rerr, "move_err", merr)
-				continue
-			}
-			_ = syncDir(dir)
-			b.cfg.Logger.Warn("broker: unreadable xfer-inflight ledger — moved aside for inspection", "file", de.Name(), "moved_to", filepath.Base(corrupt), "err", rerr)
-			continue
-		}
-		fn(path, rec)
-	}
-	return unresolved, nil
-}
-
-// replayStagedTerminal handles a ledger row that already carries the EXACT terminal, from either the
-// primary in-flight directory or the fallback outbox. It reports whether the row was disposed of;
-// false means RETAINED for a later pass.
-// window: the real terminal may already be committed and the process died before the unlink, so
-// emitting anything ELSE would produce a second, contradictory terminal that the content-addressed
-// reqID cannot collapse. Replaying the identical record is idempotent by construction — and it is
-// also the correct answer for the PRE-commit crash, where this row is simply the terminal that was
-// decided but never forwarded. No timeout grace applies: the outcome is already decided, so there
-// is nothing to wait for.
-func (b *Broker) replayStagedTerminal(ctx context.Context, rec xferInflightRecord) bool {
-	// DETECT A PRIOR COMMIT (re-review F1). The staged row may already be committed — that is
-	// precisely the post-commit crash window. Its reqID is content-addressed, so asking the
-	// replicated dedup ledger is an exact answer, and its retention (~1M raft indices, months)
-	// dwarfs the 2-minute JetStream Duplicates window a replay would otherwise rely on.
-	// THE AUDIT INVARIANT, stated (re-review 疑惑 #1): EXACTLY ONE TRUE TERMINAL per transfer.
-	// A contradictory pair is worse than a dangling start — a dangling start is detectable and
-	// repairable, whereas two terminals claiming different outcomes corrupt the record itself and
-	// no consumer can tell which is true. So a staged terminal is re-emitted ONLY when we can
-	// positively establish it was NOT already committed. "Cannot verify" therefore means DROP,
-	// not replay.
-	//
-	// The sentence that used to sit here — "in production the check is always available (the
-	// ledger dir exists only in cluster mode, where b.cl is wired)" — was the load-bearing
-	// justification for F-T1's bug, and it stopped being true when #57 gave single brokers a
-	// ledger directory. Single mode is now handled explicitly above rather than falling into
-	// the unknown branch.
-	// ROUND-3 R3-F1: only a POSITIVE "already committed" answer may drop the outbox.
-	//
-	// The previous version folded a lookup ERROR into "seen" and deleted the ledger. That is the
-	// worst of both worlds: a transient SQLite/disk/closed-DB error is not evidence of a commit,
-	// so if the terminal had NOT committed we destroyed the only exact record of it and left a
-	// permanent dangling start — reopening #57, the very defect this file exists to close. It also
-	// contradicted this file's own comment, which correctly says an unknown state must degrade to
-	// an exact replay.
-	//
-	// So the three states are now distinct:
-	//   committed      -> drop the outbox (nothing more to write)
-	//   NOT committed  -> replay the EXACT staged terminal (identical bytes ⇒ identical reqID)
-	//   unknown        -> RETAIN and retry on the next pass; never emit, never delete
-	// SINGLE MODE HAS NO DEDUP LEDGER TO ASK, and that is not the same as "unknown".
-	//
-	// origin: prerelease audit round 2, F-T1. The condition below used to be
-	// `serr != nil || b.cl == nil`, and on a single broker b.cl is ALWAYS nil — so this
-	// function could never do anything but retain. That was harmless while #57 was inert
-	// on single brokers; the moment the ledger directory was enabled there (round 1's
-	// #57 fix), every staged terminal became a row that is kept forever and a transfer
-	// whose outcome is never emitted. Half a feature wired is worse than none: the ledger
-	// now accumulates and nothing drains it.
-	//
-	// What single mode CAN do is exactly what commitSyntheticTransferTerminal does there:
-	// publish the EXACT staged bytes. The terminal is content-deterministic, so a replay
-	// of an already-published one collapses in JetStream's duplicate window, and the
-	// residual — one repeated terminal — is strictly better than a transfer with none.
-	if b.cl == nil {
-		// SINGLE MODE REPLAYS THE EXACT STAGED TERMINAL, deduped by content.
-		//
-		// origin: prerelease audit external review M-3. This branch used to RETAIN
-		// unconditionally, and said so for a reason that was true when it was written:
-		// replaying needed a duplicate-suppression key single mode did not have, because
-		// JetStream dedups on Nats-Msg-Id and pubAuditTransfer set none. The consequence
-		// was a permanent OPEN — a transfer that crashed between staging and publishing
-		// got NO terminal at all, and its ledger row was kept forever.
-		//
-		// pubAuditTransfer now derives the SAME content id from the same record, so the
-		// first publish and this replay are the same message to JetStream. That closes
-		// both windows with one rule instead of trading them off:
-		//
-		//   crashed BEFORE publish -> this is the only emission, and it is the right one
-		//   crashed AFTER publish  -> identical id, collapsed inside the duplicate window
-		//
-		// The "EXACTLY ONE TRUE TERMINAL" invariant that made the earlier attempt wrong is
-		// therefore preserved by the id rather than by refusing to act. UNLINK ONLY AFTER
-		// a successful publish: returning true on a failed publish is how a decided
-		// outcome would be dropped, which is worse than replaying it again next pass.
-		if rec.Terminal == nil {
-			return false // not a staged-terminal row; the caller's other dispositions apply
-		}
-		payload, merr := json.Marshal(*rec.Terminal)
-		if merr != nil {
-			b.cfg.Logger.Warn("broker: marshal staged transfer terminal for replay",
-				"err", merr, "transfer_id", rec.TransferID)
-			return false
-		}
-		msgID, ierr := xferaudit.TransferRecordReqID(*rec.Terminal)
-		if ierr != nil {
-			// No id means no way to prove a replay is not a duplicate. RETAIN — the old
-			// behaviour, now confined to the case that actually justifies it.
-			b.cfg.Logger.Warn("broker: cannot derive a dedup id for a staged transfer terminal — "+
-				"RETAINING rather than risking a second, contradictory terminal",
-				"err", ierr, "transfer_id", rec.TransferID)
-			return false
-		}
-		// ASK THE STREAM, not the clock — origin: prerelease audit external review R2-M2.
-		// The content-derived Msg-Id makes a replay idempotent only inside JetStream's
-		// duplicate window (two minutes here). A broker that crashes after the publish ack,
-		// before the unlink, and stays down longer than that comes back to a window which has
-		// forgotten the id — and writes a SECOND terminal. The audit stream still knows, and
-		// unlike the window it does not expire, so it is the thing to ask.
-		//
-		// THREE STATES, same discipline as the cluster branch below:
-		//   committed     -> drop the ledger row; the record is already correct
-		//   NOT committed -> publish the exact staged bytes
-		//   unknown       -> RETAIN and retry next pass; never emit, never delete
-		if js := brokerJS(b); js != nil {
-			switch committed, cerr := jsstream.TransferTerminalCommitted(
-				ctx, js, rec.Terminal.Session, rec.TransferID); {
-			case cerr != nil:
-				b.cfg.Logger.Warn("broker: cannot verify whether a staged transfer terminal was "+
-					"already committed — RETAINING (an unverifiable state is not evidence of absence)",
-					"err", cerr, "transfer_id", rec.TransferID)
-				return false
-			case committed:
-				b.cfg.Logger.Info("broker: staged transfer terminal was already committed to the "+
-					"audit stream; dropping the ledger row without re-publishing",
-					"transfer_id", rec.TransferID)
-				return true
-			}
-		}
-		if perr := publishAuditDeduped(b, proto.SubjAuditTransfer(rec.Terminal.Session), payload, msgID); perr != nil {
-			b.cfg.Logger.Warn("broker: single-mode staged transfer terminal replay failed (retry next pass)",
-				"err", perr, "transfer_id", rec.TransferID)
-			return false
-		}
-		return true
-	}
-	seen, serr := b.transferTerminalAlreadyCommitted(*rec.Terminal)
-	if serr != nil {
-		b.cfg.Logger.Warn("broker: cannot determine whether a staged transfer terminal was already committed — RETAINING the outbox for the next pass (deleting it could strand a transfer with no terminal at all)",
-			"transfer_id", rec.TransferID, "kind", rec.Terminal.Kind, "err", serr)
-		return false
-	}
-	if seen {
-		_ = b.deleteXferObject(ctx, rec.Session, rec.TransferID)
-		if cErr := b.consumeXferLedgerRow(rec.TransferID); cErr != nil {
-			b.cfg.Logger.Warn("broker: a staged terminal was already committed but its ledger rows could not "+
-				"be retired — RETAINING both so the start row can never be synthesized behind it",
-				"err", cErr, "transfer_id", rec.TransferID)
-			return false
-		}
-		b.cfg.Logger.Info("broker: staged transfer terminal was already committed before the crash — dropping the ledger without re-emitting (#57)",
-			"transfer_id", rec.TransferID, "kind", rec.Terminal.Kind)
-		return true
-	}
-	if !b.commitSyntheticTransferTerminal(*rec.Terminal) {
-		b.cfg.Logger.Warn("broker: could not durably commit a STAGED transfer terminal (leaderless?) — leaving the ledger for the next pass (#57)",
-			"transfer_id", rec.TransferID, "kind", rec.Terminal.Kind)
-		return false
-	}
-	_ = b.deleteXferObject(ctx, rec.Session, rec.TransferID)
-	if cErr := b.consumeXferLedgerRow(rec.TransferID); cErr != nil {
-		b.cfg.Logger.Warn("broker: replayed a staged terminal but could not retire its ledger rows — RETAINING "+
-			"both; the replay is idempotent (same bytes ⇒ same reqID), a stranded start row would not be",
-			"err", cErr, "transfer_id", rec.TransferID)
-		return false
-	}
-	return true
-}
-
-// ledgerSite says which of the two sibling directories a row was read from.
-type ledgerSite int
-
-const (
-	ledgerSiteOutbox  ledgerSite = iota // the fallback staging dir — scanned FIRST (pass 1)
-	ledgerSitePrimary                   // the in-flight dir (pass 2)
-)
-
-// ledgerDisposition is what a pass must do with ONE ledger row.
-type ledgerDisposition int
-
-const (
-	ledgerLeave      ledgerDisposition = iota // retain the row untouched; a later pass re-decides
-	ledgerReplay                              // replay the EXACT staged terminal, then consume both rows
-	ledgerSynthesize                          // no terminal exists anywhere — synthesize a deterministic one
-)
-
-// ledgerRowInputs is everything the precedence rule needs about ONE row. Assembling it is the
-// caller's job (it owns the tracker, the clock and the outbox census); deciding is this file's.
-type ledgerRowInputs struct {
-	Site ledgerSite
-	Rec  xferInflightRecord
-
-	// Live: a tracker entry exists for this transfer in THIS incarnation.
-	Live bool
-	// OutboxHasExactTerminal: the outbox census found a readable row carrying an exact terminal for
-	// this transfer. Only consulted for a primary start-only row.
-	OutboxHasExactTerminal bool
-	// OutboxCensusOK: the outbox scan completed. False ⇒ absence there is UNKNOWN, not empty (R6-F1).
-	OutboxCensusOK bool
-	// OutboxRowUnreadable: the outbox HOLDS a row for this transfer that this process could not turn
-	// into a record (unparseable now, or quarantined as .corrupt earlier). The ROW-level twin of
-	// OutboxCensusOK: the directory read fine, one file did not. Absence of a parsed terminal is then
-	// not evidence of an absent terminal, and the outbox stages terminals ONLY — so whatever is in
-	// there is a decided outcome that outranks a start row.
-	OutboxRowUnreadable bool
-	Now                 time.Time
-}
-
-// ledgerRowDisposition applies the durable-precedence rule documented at the top of this file to one
-// row. It is PURE — no disk, no clock, no tracker — so every legal combination is reachable from a
-// table-driven test instead of only from a crash sequence that has to be staged on disk.
-//
-// The returned reason is the rule that fired. Production puts it in the finalize log line, and the
-// table-driven test asserts on it, so a branch that is reached for the wrong reason is visible rather
-// than merely producing the right answer by luck.
-func ledgerRowDisposition(in ledgerRowInputs) (ledgerDisposition, string) {
-	// A live tracker entry outranks everything at BOTH sites: the transfer is genuinely in flight in
-	// this incarnation and its own terminal path will write the terminal and retire the ledger.
-	if in.Live {
-		return ledgerLeave, "live tracker entry — the in-flight terminal path owns this transfer"
-	}
-
-	if in.Site == ledgerSiteOutbox {
-		// The outbox only ever stages DECIDED terminals. A row here without one is not a start row to
-		// be finalized — it is a row this pass has nothing to say about.
-		if in.Rec.Terminal == nil {
-			return ledgerLeave, "outbox row carries no terminal — the outbox stages terminals only"
-		}
-		return ledgerReplay, "exact terminal staged in the outbox"
-	}
-
-	// Primary site. A terminal staged in place is replayed without consulting the outbox at all: an
-	// exact terminal is an exact terminal wherever it lives, and re-emitting the identical record is
-	// idempotent by construction (content-addressed reqID).
-	if in.Rec.Terminal != nil {
-		return ledgerReplay, "exact terminal staged in place"
-	}
-	// From here the row is start-only, i.e. the only path that can MANUFACTURE a terminal. Every gate
-	// below is fail-closed by design.
-	if !in.OutboxCensusOK {
-		return ledgerLeave, "outbox census failed — a terminal there would outrank this start row, and " +
-			"absence in an unreadable directory is UNKNOWN rather than empty (R6-F1)"
-	}
-	if in.OutboxHasExactTerminal {
-		return ledgerLeave, "an exact terminal in the outbox outranks this start row"
-	}
-	if in.OutboxRowUnreadable {
-		return ledgerLeave, "the outbox holds an UNREADABLE row for this transfer — the outbox stages " +
-			"terminals only, so that row is a decided outcome this process cannot read, and synthesizing " +
-			"beside it would commit a terminal that contradicts evidence still on disk"
-	}
-	if in.Now.Sub(in.Rec.StartedAt) < transferTimeoutFor(in.Rec.Tier, in.Rec.Size)+xferStrandedSlack {
-		return ledgerLeave, "younger than its tier timeout + slack — slow, not stranded"
-	}
-	return ledgerSynthesize, "stranded past timeout + slack with no exact terminal at either site"
-}
-
-// ledgerProtectedObjects returns the object names the DURABLE ledger says are still inside their
-// watchdog budget, keyed by "<bucket>/<object>". The object name IS the transfer id at every writer
-// (the ctl's Put and the agent's Put both use it), so this is an exact identity match, not a heuristic.
-//
-// origin: batch-c EXTERNAL review B2. The orphan reaper decided "nobody owns this object" from the
-// IN-MEMORY tracker alone — which a restart rebuilds EMPTY. With the tier-B budget now size-derived
-// (up to 35m08s) and the home grace still 2 minutes, a broker restart during a large transfer meant
-// the reaper deleted an object whose transfer was very much alive, roughly two minutes in. The
-// internal review had recorded that as an accepted residual on the grounds that there was no durable
-// evidence of ownership; that was simply wrong. This ledger has existed since #57 and already carries
-// the transfer id, bucket, size and start time — everything the decision needs.
-//
-// Read errors yield an EMPTY set and are reported. The caller must treat "I could not read the
-// ledger" as "do not delete anything on evidence I do not have", never as "nothing is protected".
-// UNRESOLVED ROWS ARE PER-OBJECT EVIDENCE, NOT A CIRCUIT BREAKER.
-//
-// origin: prerelease audit broker-transfer/BT-F3. An unreadable row used to be
-// folded into the returned error, and the caller skipped the WHOLE pass on any
-// error. But an unreadable row is PERMANENT: forEachLedgerRecord renames it to
-// <hash>.json.corrupt and nothing in the repo ever deletes those, so every later
-// pass rediscovered it. One corrupt row — belonging to any session — stopped
-// orphan reclamation for EVERY session forever, which is the "tier-B garbage is
-// immortal, the small disk fills up" failure this sweep exists to prevent, caused
-// by the guard rather than by the thing it guards against.
-//
-// So the second return is the set of ledger FILENAMES that could not be read. The
-// caller protects exactly the objects those name and reaps everything else. err is
-// now reserved for a directory-level read failure, which is transient and does
-// self-heal.
-func (b *Broker) ledgerProtectedObjects(now time.Time) (map[string]bool, map[string]bool, error) {
-	protected := map[string]bool{}
-	unresolvedNames := map[string]bool{}
-	var firstErr error
-	for _, dir := range []string{b.xferInflightDir(), b.xferTerminalOutboxDir()} {
-		if dir == "" {
-			continue
-		}
-		unresolved, err := b.forEachLedgerRecord(dir, func(_ string, rec xferInflightRecord) {
-			// A row carrying a TERMINAL is a decided outcome — its object is disposable.
-			if rec.Terminal != nil || rec.Bucket == "" || rec.TransferID == "" {
-				return
-			}
-			if rec.StartedAt.IsZero() {
-				// No start time to judge against. Protect it: a row we cannot age is exactly the kind of
-				// evidence that must not be resolved in favour of deletion.
-				protected[rec.Bucket+"/"+rec.TransferID] = true
-				return
-			}
-			budget := transferTimeoutFor(rec.Tier, rec.Size) + xferStrandedSlack
-			if now.Sub(rec.StartedAt) < budget {
-				protected[rec.Bucket+"/"+rec.TransferID] = true
-			}
-		})
-		if err != nil && firstErr == nil {
-			firstErr = err
-		}
-		for name := range unresolved {
-			unresolvedNames[name] = true
-		}
-	}
-	return protected, unresolvedNames, firstErr
-}
-
-func (b *Broker) finalizeStrandedXfers(ctx context.Context) (int, error) {
-	dir := b.xferInflightDir()
-	if dir == "" {
-		return 0, nil
-	}
-	outboxDir := b.xferTerminalOutboxDir()
-	finalized := 0
-
-	// PASS 1 — THE OUTBOX, AND IT RUNS FIRST (round-5 R5-F2).
-	//
-	// These rows carry the EXACT terminal, so replaying them needs no guessing and no grace period. More
-	// importantly, the outbox exists precisely BECAUSE the primary directory can be unusable — so making
-	// its recovery depend on scanning the primary directory first would disable the fallback in the one
-	// state it was built for. A primary scan error must never preempt this pass.
-	outboxOwned := map[string]bool{}
-	obUnreadable, obErr := b.forEachLedgerRecord(outboxDir, func(_ string, rec xferInflightRecord) {
-		// The census is maintained regardless of what this row's disposition turns out to be — even a
-		// row that is left alone here (a live transfer) still means an exact terminal EXISTS at this
-		// site, and pass 2 must not synthesize one from the start row it will find.
-		if rec.Terminal != nil {
-			outboxOwned[rec.TransferID] = true
-		}
-		d, _ := ledgerRowDisposition(ledgerRowInputs{
-			Site: ledgerSiteOutbox,
-			Rec:  rec,
-			Live: b.transfers.get(rec.TransferID) != nil,
-			Now:  b.cfg.Now(),
-		})
-		if d == ledgerReplay && b.replayStagedTerminal(ctx, rec) {
-			finalized++
-		}
-	})
-
-	// blockedByUnreadable collects transfers that can never be finalized while an unreadable outbox row
-	// outranks their start row. Reported once per pass below — see the ledgerLeave branch.
-	var blockedByUnreadable []string
-
-	// PASS 2 — the primary directory: staged terminals, then start-only rows old enough to synthesize.
-	_, prErr := b.forEachLedgerRecord(dir, func(_ string, rec xferInflightRecord) {
-		in := ledgerRowInputs{
-			Site:                   ledgerSitePrimary,
-			Rec:                    rec,
-			Live:                   b.transfers.get(rec.TransferID) != nil,
-			OutboxHasExactTerminal: outboxOwned[rec.TransferID],
-			OutboxCensusOK:         obErr == nil,
-			// The hash is one-way, so the census cannot name the transfers it failed to read — but this
-			// side HAS the transfer_id and computes the same filename forward.
-			OutboxRowUnreadable: obUnreadable[xferInflightFilename(rec.TransferID)],
-			Now:                 b.cfg.Now(),
-		}
-		d, why := ledgerRowDisposition(in)
-		switch d {
-		case ledgerLeave:
-			// A row left alone because an UNREADABLE outbox row outranks it is a PERMANENT state, and it
-			// must not be a silent one (internal review B8-1).
-			//
-			// Every other ledgerLeave reason resolves itself: a live transfer finishes, a fresh one ages
-			// out, a failed census succeeds on the next pass. This one does not. The unreadable row was
-			// quarantined to <name>.corrupt on the pass that found it, the census folds that name back in
-			// forever, and nothing removes either file — so the transfer has ZERO terminals in the audit
-			// (the true one is in a file no code path will read again, the synthetic one is blocked) and
-			// the ledger row is immortal.
-			//
-			// That is still the right disposition: this file's own argument at replayStagedTerminal is
-			// that a dangling start is "detectable and repairable" while a contradictory pair corrupts the
-			// record. But "detectable" is a property something has to provide. One Warn on the pass that
-			// quarantined the row, possibly weeks ago and possibly rotated away, does not.
-			//
-			// So: count it, and report it once per pass at Warn with the operator's next step. It is
-			// bounded — one line per pass, not per row — and it names the directory to look in.
-			if in.OutboxRowUnreadable {
-				blockedByUnreadable = append(blockedByUnreadable, rec.TransferID)
-			}
-			return
-		case ledgerReplay:
-			if b.replayStagedTerminal(ctx, rec) {
-				finalized++
-			}
-			return
-		case ledgerSynthesize:
-			// Named rather than left to the fallthrough: the synthesis path is everything below this
-			// switch, and a new disposition joining the enum must not inherit it by default. Emitting a
-			// synthetic `failed` terminal for a transfer that should have been left alone would put a
-			// permanent lie in the audit log.
-		}
-		// DELIBERATELY the tier floor, not the size-derived budget — see transferTierFloorFor.
-		timeout := transferTierFloorFor(rec.Tier)
-		synthetic := schema.AuditTransfer{
-			V: schema.AuditSchemaVersion, Kind: "failed", Verb: rec.Verb,
-			Ts: rec.StartedAt.Add(timeout), Session: rec.Session, Node: rec.Node,
-			ActorNkey: rec.ActorNkey, ActorFp: rec.ActorFp,
-			TransferID: rec.TransferID, Path: rec.Path, Tier: rec.Tier, Bucket: rec.Bucket,
-			DurationMs: timeout.Milliseconds(),
-			Code:       "home_broker_restart",
-			Error:      "broker home restarted while the transfer was in flight; the crashed incarnation wrote no terminal audit (#57 finalize-on-recovery)",
-		}
-		// M1: the ledger may be deleted ONLY after the synthetic terminal is durably COMMITTED. A
-		// fire-and-forget emit would destroy the durable evidence in the leaderless post-crash window
-		// (exactly #57's flagship case) — so on a not-yet-committable emit we LEAVE the file and the next
-		// pass retries (the deterministic Ts makes the content reqID dedup the re-emit for free).
-		if !b.commitSyntheticTransferTerminal(synthetic) {
-			b.cfg.Logger.Warn("broker: could not durably commit a stranded-transfer terminal (leaderless?) — leaving the ledger for the next pass (#57)",
-				"transfer_id", rec.TransferID, "verb", rec.Verb, "tier", rec.Tier)
-			return
-		}
-		_ = b.deleteXferObject(ctx, rec.Session, rec.TransferID)
-		if cErr := b.consumeXferLedgerRow(rec.TransferID); cErr != nil {
-			// The synthetic is deterministic (Ts = startedAt+timeout), so a re-emit next pass dedups on
-			// content. Leaving the row is therefore safe; losing it would not be.
-			b.cfg.Logger.Warn("broker: committed a stranded-transfer terminal but could not retire its ledger row",
-				"err", cErr, "transfer_id", rec.TransferID)
-		}
-		finalized++
-		b.cfg.Logger.Info("broker: finalized a stranded in-flight transfer after a home restart (#57)",
-			"transfer_id", rec.TransferID, "verb", rec.Verb, "tier", rec.Tier, "session", rec.Session,
-			"reason", why)
-	})
-	// A scan failure of ONE source is a logged, retried condition — not a pass failure. Returning it would
-	// hand the caller (the reconcile pass) an error for a run in which the other source made real progress,
-	// and would keep doing so for as long as the broken directory stays broken. Only a run in which NO
-	// source could be read at all is a genuine failure worth propagating.
-	// B8-1: the one ledgerLeave that never resolves itself, surfaced once per pass rather than once ever.
-	// Bounded to one line and a capped sample so a hundred stuck rows do not become a hundred log lines.
-	if len(blockedByUnreadable) > 0 {
-		sample := blockedByUnreadable
-		if len(sample) > 5 {
-			sample = sample[:5]
-		}
-		// EXTERNAL REVIEW B2-3: both halves of the previous version of this text were FALSE, and the second
-		// half was destructive.
-		//
-		//   (a) "repair it in place (the next pass replays it)" — forEachLedgerRecord only ever calls fn for
-		//       entries ending in ".json" (see the suffix check at the top of its loop). A repaired
-		//       *.json.corrupt keeps a name the replay walk skips, so editing the bytes alone changes
-		//       nothing, forever. The file has to be RENAMED back to its canonical <hash>.json.
-		//
-		//   (b) "remove BOTH the .corrupt file and the matching in-flight row" — the in-flight start row is
-		//       the ONLY record synthesis can derive a deterministic terminal from (transfer id, verb, tier,
-		//       bucket, path, startedAt). Deleting it alongside the corrupt outbox row leaves neither a real
-		//       terminal nor anything to synthesize one from: the transfer becomes permanently unauditable,
-		//       which is worse than the state this warning is reporting. Removing ONLY the corrupt outbox row
-		//       is what unblocks synthesis — the census stops marking the name unresolved, the start row is
-		//       then a plain stale start row, and the next pass writes failed/home_broker_restart for it.
-		//
-		// Stated as two numbered operator actions rather than prose, because the difference between them is
-		// one filename and the cost of getting it wrong is an audit record that can never be reconstructed.
-		b.cfg.Logger.Warn("broker: transfer(s) can never be finalized — an UNREADABLE terminal is staged in "+
-			"the outbox and outranks their in-flight row, so no terminal audit will ever be written for them. "+
-			"Inspect the quarantined *.json.corrupt files in outbox_dir. (1) RECOVERABLE: repair the JSON and "+
-			"RENAME it back to its canonical <hash>.json name — a repaired file left under the .corrupt name is "+
-			"never replayed, because the ledger walk only reads *.json. (2) UNRECOVERABLE: delete ONLY the "+
-			".corrupt file in outbox_dir and KEEP the matching row in inflight_dir — that row is the only input "+
-			"a synthesized terminal can be derived from, so deleting it makes the transfer permanently "+
-			"unauditable instead of repairing it",
-			"count", len(blockedByUnreadable), "sample_transfer_ids", sample,
-			"outbox_dir", outboxDir, "inflight_dir", dir)
-	}
-	if obErr != nil {
-		b.cfg.Logger.Warn("broker: could not scan the transfer terminal outbox — retrying on the next pass",
-			"err", obErr, "dir", outboxDir)
-	}
-	if prErr != nil {
-		b.cfg.Logger.Warn("broker: could not scan the xfer-inflight ledger — retrying on the next pass; any "+
-			"exact terminals staged in the fallback outbox were still replayed",
-			"err", prErr, "dir", dir)
-	}
-	if obErr != nil && prErr != nil {
-		return finalized, errors.Join(obErr, prErr)
-	}
-	return finalized, nil
-}
-
-// commitSyntheticTransferTerminal emits a #57 synthetic terminal and reports whether it
-// durably COMMITTED. The caller deletes the ledger row only on true, so a false must
-// always mean "not durable yet, try again next pass".
-//
-// TWO PATHS, because a single broker has no leader to forward to:
-//
-//   - CLUSTER (transferAuditForwardSync attached): forwards to the leader with the same
-//     bounded transient-retry as the async sink, so a brief election is absorbed within
-//     the pass. A persistent not_leader or a permanent error returns false. A sink that
-//     is not attached YET (pre-wireClusterLate) also returns false — never delete a
-//     ledger on an unconfirmed emit.
-//   - SINGLE (b.cl == nil): publishes straight to the audit stream. There is no raft
-//     dedup ledger here; what makes a replay safe is that the synthetic terminal is
-//     content-deterministic, so JetStream collapses a repeat within its duplicate
-//     window. See the branch's own comment for the limits of that argument.
-//
-// origin: prerelease audit round 2, C4. This doc described only the cluster path while
-// the same commit added the single-mode branch beneath it — a branch that forwards
-// nothing, retries nothing, and returns true with no sink attached.
+// The cap0 audit owner keeps content-derived IDs and the original retry bound.
 func (b *Broker) commitSyntheticTransferTerminal(rec schema.AuditTransfer) bool {
-	fwd := b.transferAuditForwardSync
-	if fwd == nil && b.cl != nil {
-		return false // sink not attached yet (pre-wireClusterLate) — retry next pass, never lose the ledger
-	}
-	payload, err := json.Marshal(rec)
-	if err != nil {
-		b.cfg.Logger.Warn("broker: marshal synthetic transfer terminal", "err", err, "tid", rec.TransferID)
-		return false
-	}
-	if fwd == nil {
-		// SINGLE MODE. There is no raft dedup ledger here, and requiring one is why
-		// the whole of #57 was inert on the deployment shape it was written for: the
-		// sink is only ever attached by the cluster's AttachTransferAuditSink, so a
-		// single broker could stage a synthetic terminal and never commit one.
-		//
-		// Published with a CONTENT-DERIVED Nats-Msg-Id, which is what actually makes a
-		// replay safe.
-		//
-		// origin: prerelease audit round 2, F-T2. This used to say the publish was safe
-		// because the terminal is byte-deterministic and "JetStream's own duplicate
-		// window collapses it". That is false: JetStream dedups on the Nats-Msg-Id
-		// header and NEVER on payload bytes, and publishAudit set no header — so a
-		// replay produced a SECOND identical terminal. internal/jsstream/replicas.go
-		// documents that exact fact two files over, and the repo's own recovery test
-		// caught the duplicate the moment F-T1 made single-mode replay reachable.
-		//
-		// TransferRecordReqID hashes the whole normalized record, so the id is stable
-		// across retries and distinct for a genuinely different terminal.
-		msgID, ierr := xferaudit.TransferRecordReqID(rec)
-		if ierr != nil {
-			b.cfg.Logger.Warn("broker: cannot derive a dedup id for a single-mode transfer terminal — "+
-				"retaining the ledger rather than risking a duplicate", "err", ierr, "tid", rec.TransferID)
-			return false
-		}
-		// WITH a content-derived Nats-Msg-Id. origin: round 2, F-T2 — the comment that
-		// used to justify this publish claimed JetStream collapses byte-identical
-		// payloads. It does not; it dedups on this header and publishAudit sets none.
-		if perr := publishAuditDeduped(b, proto.SubjAuditTransfer(rec.Session), payload, msgID); perr != nil {
-			b.cfg.Logger.Warn("broker: single-mode synthetic transfer terminal publish failed (retry next pass)",
-				"err", perr, "tid", rec.TransferID)
-			return false
-		}
-		return true
-	}
-	for attempt := 0; attempt < transferAuditForwardAttempts; attempt++ {
-		ferr := fwd(payload)
-		if ferr == nil {
-			return true // committed (content reqID dedups any earlier partial attempt)
-		}
-		if !errors.Is(ferr, cluster.ErrForwardNotLeader) {
-			b.cfg.Logger.Warn("broker: synthetic transfer terminal forward failed (retry next pass)", "err", ferr, "tid", rec.TransferID)
-			return false
-		}
-		time.Sleep(transferAuditForwardBackoff)
-	}
-	return false // persistent not_leader — retry on the next pass
-}
-
-func readXferInflight(path string) (xferInflightRecord, error) {
-	var rec xferInflightRecord
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return rec, err
-	}
-	if err := json.Unmarshal(data, &rec); err != nil {
-		return rec, err
-	}
-	// EXTERNAL REVIEW F6: a decode success is not a valid record. `{}` decodes fine and would drive the
-	// finalizer with an empty transfer id / zero StartedAt, which then looks infinitely "stranded". Treat
-	// a structurally invalid record as unreadable so it takes the .corrupt path instead.
-	if rec.TransferID == "" || rec.Session == "" || rec.Verb == "" || rec.Tier == "" || rec.StartedAt.IsZero() {
-		return xferInflightRecord{}, fmt.Errorf("xfer-inflight: incomplete ledger record (transfer_id=%q session=%q verb=%q tier=%q started_at=%v)",
-			rec.TransferID, rec.Session, rec.Verb, rec.Tier, rec.StartedAt)
-	}
-	return rec, nil
+	return (xferserve.LegacyAudit{Cluster: b.cl != nil, Forward: b.transferAuditForwardSync,
+		Publish: func(subject string, data []byte, id string) error { return publishAuditDeduped(b, subject, data, id) },
+		Logger:  b.cfg.Logger, Attempts: transferAuditForwardAttempts, Backoff: transferAuditForwardBackoff}).Commit(rec)
 }
 
 // transferTerminalAlreadyCommitted asks the replicated dedup ledger whether this exact terminal record
 // has already been committed (external RE-REVIEW F1). A nil cluster runtime (single-broker mode) or an
 // unreadable ledger answers "unknown" -> false, which degrades to the replay path: replaying is still
 // idempotent at Apply, so an unknown answer is safe, never a double-count.
+
 func (b *Broker) transferTerminalAlreadyCommitted(rec schema.AuditTransfer) (bool, error) {
 	if b.cl == nil || b.cl.node == nil {
 		return false, nil
@@ -1071,4 +147,650 @@ func (b *Broker) transferTerminalAlreadyCommitted(rec schema.AuditTransfer) (boo
 		return false, err
 	}
 	return cluster.ReqIDCommitted(b.cl.node.RODB(), reqID)
+}
+
+// BrokerTransferFactory is the outer assembly seam, not a second leaf factory.
+// It returns a sleeping tracker restored from the reconciled ledger/image and
+// handlers made from the control owner's single registration descriptor. Leaf
+// constructors keep their frozen xfercontract signatures.
+// origin: hot-update S7 plan §8.1 / §12.2 / P22
+type BrokerTransferFactory func(*Broker, jetstream.JetStream, controlbudget.Deadline) (*BrokerTransfers, error)
+
+// BrokerTransferSubscription carries an already-authenticating control adapter.
+// Cold and hot callers consume the same descriptors; continuation subscriptions
+// must be broadcast so the original owner receives them after a home move.
+type BrokerTransferSubscription = xfercontrol.Subscription
+
+// BrokerTransfers contains current bindings only. The leaves own entry maps,
+// watchdogs, canonical decisions, revision serializers and retirement state.
+// Its fields are immutable after installation; replacement requires the image
+// admission fence and joining the old owners, not assignment during a callback.
+type BrokerTransfers struct {
+	Assembly      *xferserve.Assembly
+	Capacity      xfercontract.CapacityAccount
+	Origin        xfercontract.Origin
+	Bindings      xfercontract.Bindings
+	Tracker       xfercontract.TrackerManager
+	Ledger        xfercontract.LedgerPort
+	Controller    xfercontract.Controller
+	Finalizer     xfercontract.FinalizerPort
+	Collector     xfercontract.Collector
+	Buckets       xfercontract.BucketPort
+	Subscriptions []BrokerTransferSubscription
+	Settlement    xferauth.SessionBarrier
+	Forward       *TransferClusterForward
+	// Link delivers grants/receipts to the original agent; Release removes a
+	// private state root of an in-memory broker after its owners joined.
+	// origin: hot-update S7 plan §6.3 / P22 — S7 production activation
+	Link      *xferserve.Link
+	Release   func() error
+	Decisions xfercontract.DecisionPort
+}
+
+// InstallBrokerTransfers publishes only a complete current graph. Missing
+// census evidence is recovery, never an empty tracker that authorizes GC.
+// The caller owns cleanup after any error, including a failed Bind.
+// origin: hot-update S7 plan §5.3 / §8.2 / M11
+func InstallBrokerTransfers(b *Broker, current *BrokerTransfers, deadline controlbudget.Deadline) error {
+	if b.transferRuntime.Load() != nil {
+		return fmt.Errorf("%s: current transfer graph is already installed", xfercontract.CodeOwnerRecovering)
+	}
+
+	if current == nil {
+		return fmt.Errorf("%s: incomplete broker transfer graph", xfercontract.CodeOwnerRecovering)
+	}
+	if err := xfercontrol.ValidateSubscriptions(current.Subscriptions); err != nil {
+		return err
+	}
+	if err := xfercontrol.BindRuntime(brokerTransferRuntime(current), current.Bindings, deadline); err != nil {
+		return err
+	}
+	if !b.transferRuntime.CompareAndSwap(nil, current) {
+		return fmt.Errorf("%s: current transfer graph is already installed", xfercontract.CodeOwnerRecovering)
+	}
+	return nil
+}
+
+// BrokerTransferSubscriptions is also the hot-wiring input. It returns a copy
+// so subscription setup cannot mutate the factory's frozen registration table.
+func BrokerTransferSubscriptions(b *Broker) []BrokerTransferSubscription {
+	current := b.transferRuntime.Load()
+	if current == nil {
+		return nil
+	}
+	return xfercontrol.OrderSubscriptions(current.Subscriptions)
+}
+
+func startBrokerTransfers(ctx context.Context, b *Broker, nc *nats.Conn) error {
+	deadline, err := transferPassDeadline(ctx)
+	if err != nil {
+		return err
+	}
+	current, err := installBrokerTransferGraph(b, nc, deadline)
+	if current == nil || err != nil {
+		return err
+	}
+	var installed []*nats.Subscription
+	cleanup := func(cause error) error {
+		for _, sub := range installed {
+			cause = errors.Join(cause, sub.Unsubscribe())
+		}
+		return errors.Join(cause, uninstallBrokerTransfers(b, current, deadline))
+	}
+	for _, registration := range BrokerTransferSubscriptions(b) {
+		// Plain SUB is deliberate even in N3. Queue assignment can send an
+		// origin-bound request to a broker that must remain silent.
+		// origin: hot-update S7 plan §6.3 / T39
+		sub, err := nc.Subscribe(registration.Subject, brokerBusinessHandler(b, registration.Handler))
+		if err != nil {
+			return cleanup(err)
+		}
+		installed = append(installed, sub)
+		trackBrokerSubscription(b, sub)
+	}
+	remaining, err := controlbudget.Remaining(deadline)
+	if err != nil {
+		return cleanup(err)
+	}
+	if err := nc.FlushTimeout(remaining); err != nil {
+		return cleanup(err)
+	}
+	return nil
+}
+
+func brokerTransferFactory(b *Broker) BrokerTransferFactory {
+	if b.cfg.TransferFactory == nil && brokerJS(b) != nil {
+		// Production activation: every JetStream broker (tether serve, single
+		// or cluster) installs the real continuation graph and its bucket
+		// coordinator. Without it a capable ctl has no probe responder and
+		// even cap0 tier-B provisioning refuses at the coordinator guard.
+		// origin: hot-update S7 plan §8.2 / P22 — S7 production activation
+		return ServeTransferFactory
+	}
+	return b.cfg.TransferFactory
+}
+
+// installBrokerTransferGraph assembles the graph from the durable ledger and
+// installs it before any continuation subscription or destructive pass. Cold
+// Run and image StartBusiness (rollback, restored activation) share it; the
+// hot path subscribes through transferSubscriptions.
+// origin: hot-update S7 plan §5.3 / §6.3 / §8.2 / P22 / P24
+func installBrokerTransferGraph(b *Broker, nc *nats.Conn, deadline controlbudget.Deadline) (*BrokerTransfers, error) {
+	factory := brokerTransferFactory(b)
+	if factory == nil {
+		return nil, nil
+	}
+	current, err := factory(b, brokerJS(b), deadline)
+	if err == nil {
+		err = InstallBrokerTransfers(b, current, deadline)
+	}
+	// The current ports and retained origin must exist before RPC callbacks.
+	// Session removal reads the settlement barrier from the graph installed
+	// above (sessionSettlementBarrier). Mirroring it into b.cfg here was an
+	// unsynchronized write racing every session-rm handler, which Run has
+	// already subscribed by this point.
+	// origin: hot-update S7 lead integration — make test on the merged tree
+	if err == nil && current.Settlement != nil {
+		err = startBrokerTransferForward(b, nc, current)
+	}
+	if err != nil {
+		return nil, errors.Join(err, uninstallBrokerTransfers(b, current, deadline))
+	}
+	if b.imageControl == nil && b.cfg.TransferFactory != nil && current.Settlement != nil {
+		// An injected factory keeps its hot-subscription table even without
+		// an image run. The default graph never does this: a cold non-image
+		// Run would then root its disk monitor in a control generation that
+		// Run's own cancellation does not reach.
+		b.imageControl = newBrokerImageControl(b)
+	}
+	if b.imageControl != nil {
+		b.imageControl.transferSubscriptions = func(*nats.Conn) []TransferImageSubscription {
+			var subscriptions []TransferImageSubscription
+			for _, spec := range brokerTransferWireSubscriptions(b) {
+				subscriptions = append(subscriptions, TransferImageSubscription{Subject: spec.Subject, Handler: spec.Handler})
+			}
+			return subscriptions
+		}
+	}
+	return current, nil
+}
+
+// uninstallBrokerTransfers joins every owner and only then publishes absence;
+// a failed join keeps the graph installed as retained responsibility.
+func uninstallBrokerTransfers(b *Broker, current *BrokerTransfers, deadline controlbudget.Deadline) error {
+	if current == nil {
+		return nil
+	}
+	if err := stopBrokerTransferGraph(current, deadline); err != nil {
+		return err
+	}
+	b.transferRuntime.CompareAndSwap(current, nil)
+	return nil
+}
+
+// suspendBrokerTransfers is the image cut's transfer join (JoinStoreUsers):
+// the graph's readers and ledger writers stop before the store closes. It is
+// also the managed terminal stop, so Run's own defer never stops it twice.
+// origin: hot-update S7 plan §8.2 / P24 — managed slot transfer stop
+func suspendBrokerTransfers(b *Broker, deadline controlbudget.Deadline) error {
+	return uninstallBrokerTransfers(b, b.transferRuntime.Load(), deadline)
+}
+
+// resumeBrokerTransferGraph reinstalls the graph after a rollback or in the
+// restored process; the same-boot durable origin re-adopts every retained row.
+func resumeBrokerTransferGraph(b *Broker, nc *nats.Conn, deadline controlbudget.Deadline) error {
+	if b.transferRuntime.Load() != nil {
+		return nil // a failed suspension kept the original owners
+	}
+	_, err := installBrokerTransferGraph(b, nc, deadline)
+	return err
+}
+
+// sessionSettlementBarrier reports the transfer settlement barrier that governs
+// a session removal (settleSessionRm), and whether this broker is governed by
+// one at all.
+//
+// LQ1 keeps a session DELETING with rc75 only while a real continuation
+// transfer is unsettled. A broker with no continuation capability — no
+// transfer factory configured, no transfer graph installed, no barrier
+// injected — never issued a continuation Grant, so there is no retained
+// responsibility a census could find, and removal must run the pre-S7
+// history→OBJ→SQL cascade unchanged. The first P19 cut failed closed on a
+// nil barrier instead, which made `session rm` (and the boot DELETING
+// resumer) permanently rc75 on every broker the S7 factory is not wired into.
+//
+// A continuation-capable broker whose barrier is NOT installed (factory set
+// but Run has not installed the graph yet, or a graph assembled without a
+// settlement port) is different: it may hold responsibilities it cannot
+// enumerate, so it still reports governed=true with a nil barrier and the
+// caller fails closed with origin_census_unavailable.
+//
+// The installed graph is consulted first and the Config seam only without
+// one: the graph is published atomically, while session-rm handlers are
+// subscribed before Run installs it, so a Config field mirrored at install
+// time would be an unsynchronized read for every concurrent handler.
+// origin: hot-update S7 plan §6.4 / lead LQ1 / T31; S7 lead integration
+func sessionSettlementBarrier(b *Broker) (xferauth.SessionBarrier, bool) {
+	if graph := b.transferRuntime.Load(); graph != nil {
+		return graph.Settlement, true
+	}
+	if b.cfg.TransferSettlement != nil {
+		return b.cfg.TransferSettlement, true
+	}
+	// Before the default graph is installed, a retained durable root is
+	// responsibility this broker cannot yet enumerate: removal fails closed.
+	// origin: S7 production activation — default graph on every JS broker
+	return nil, b.cfg.TransferFactory != nil || brokerJS(b) != nil && xferserve.RetainsState(b.cfg.ClusterDataDir, b.cfg.DBPath)
+}
+
+// Settlement uses the immutable live graph, never a Config write after Run.
+// origin: hot-update S7 plan §6.4 / lead LQ1 / T31
+
+func settleSessionDeadline(b *Broker, deadline controlbudget.Deadline, stop <-chan struct{}, sid string, abandon bool) error {
+	barrier, governed := sessionSettlementBarrier(b)
+	return xferauth.SettleSession(deadline, stop, barrier, governed, sid, abandon)
+}
+
+// Historical SID-only removal is retired in favor of guarded authority.
+// The original settlement and retry rationale remains relevant to that owner.
+// removeTombstonedSession drives phases ②③④ for handleSessionRm once the
+// tombstone is authoritative (retry: the session was ALREADY DELETING).
+//
+// rc75 is LQ1's answer, and only while the barrier keeps the session: an
+// unsettled continuation transfer, or a census that cannot prove there is
+// none. Everything else keeps the pre-S7 contract:
+//   - a broker with no continuation barrier answers a retry with
+//     already_deleting and does nothing else, exactly as before S7;
+//   - once the barrier has released the session, phase ②③ failures are
+//     NON-fatal — the session stays DELETING, ctl gets OK, and the boot
+//     reconciler finishes the job. A JetStream or
+//     SQL hiccup after settlement is not a reason to tell the operator to
+//     wait for a settlement that has already happened.
+//
+// A retry on a governed broker does run the barrier: that is the only way to
+// know whether unsettled transfers still hold the session, and the documented
+// LQ1 flow is to repeat the removal (with or without the explicit flag) once
+// they retire. The cascade it then drives is the same idempotent one; it must
+// answer OK so completing the documented retry does not become CLI exit 64.
+// origin: hot-update S7 plan §6.4 / lead LQ1; S7 lead integration decisions 1 and 2
+// Existing connections can retain cached JWT permissions. Notify workers
+// immediately; their authority checks close byte/primitive admission before
+// settling. Returning success still requires the durable barrier below.
+// origin: hot-update S7 plan §6.4 / T31
+// Audit shard 01 F7: derive from b.runCtx (broker shutdown
+// context) instead of context.Background so a graceful
+// shutdown mid-rm cancels the JS+SQLite cascade instead of
+// running it against a half-torn-down broker. Falls back to
+// Background when runCtx is nil (broker.New + finalize tests
+// that bypass Run). The settlement shares this five-second budget.
+// ctx-none: NATS handler before Run in isolated tests
+// Phases ②③④. Failures here are NON-fatal to the rm — the
+// session is in DELETING, ctl gets OK, and the boot reconciler
+// will retry on next broker start. We still log loudly because
+// it usually means the JS server is down.
+
+// StopBrokerTransfers is the normal-stop seam for the current runtime owner.
+// Keep the graph reachable on error: a failed join is retained responsibility,
+// not a successful empty owner that permits a replacement or store close.
+func StopBrokerTransfers(b *Broker, deadline controlbudget.Deadline) error {
+	return stopBrokerTransferGraph(b.transferRuntime.Load(), deadline)
+}
+
+func stopBrokerTransfers(b *Broker) error {
+	deadline, err := controlbudget.After(5 * time.Second)
+	if err != nil {
+		return err
+	}
+	return suspendBrokerTransfers(b, deadline)
+}
+
+func stopBrokerTransferGraph(current *BrokerTransfers, deadline controlbudget.Deadline) error {
+	if current == nil {
+		return nil
+	}
+	var result error
+	if current.Forward != nil {
+		result = errors.Join(result, StopTransferClusterForward(current.Forward, deadline))
+	}
+	result = errors.Join(result, xfercontrol.StopRuntime(brokerTransferRuntime(current), deadline))
+	if result == nil && current.Release != nil {
+		result = current.Release() // only after every owner joined
+	}
+	return result
+}
+
+// advanceBrokerTransfers is scheduling only. The finalizer decides exact ACK,
+// object retirement and primary-before-outbox consumption under its serializer.
+// origin: hot-update S7 plan §5.2 / §5.3 / P22
+//
+// The cap0 ledger (its own xfer-inflight/outbox roots, never a v1 grant) is scheduled beside the
+// installed owner, after it. Every JetStream broker installs one, so skipping it stranded cap0 START
+// rows, never replayed a staged cap0 terminal and kept those rows in the image-cut census for ever.
+// A missing owner still refuses above, before any legacy synthesis.
+// origin: hot-update S7 plan §5.1 / §5.3 / M13 (S7 integration oplegacy F2)
+func advanceBrokerTransfers(ctx context.Context, b *Broker) (int, error) {
+	current := b.transferRuntime.Load()
+	if current == nil {
+		return 0, fmt.Errorf("%s: transfer finalizer is not installed", xfercontract.CodeOwnerRecovering)
+	}
+	deadline, err := transferPassDeadline(ctx)
+	if err != nil {
+		return 0, err
+	}
+	n, err := xfercontrol.AdvanceRuntime(brokerTransferRuntime(current), deadline)
+	legacy, lerr := legacyTransferLedger(b, ctx).Finalize()
+	return n + legacy, errors.Join(err, lerr)
+}
+
+// NewBrokerTransferFactory assembles real leaf owners against the current
+// backend. Environment ports must prove original-origin discovery, receiver
+// retirement and config authority; constructors cannot infer them from SQL.
+// origin: hot-update S7 plan §5 / §6.3 / §8.2 / P22
+func NewBrokerTransferFactory(ports func(*Broker, jetstream.JetStream, controlbudget.Deadline) (xfercontrol.AssemblyConfig, error)) BrokerTransferFactory {
+	return func(b *Broker, js jetstream.JetStream, d controlbudget.Deadline) (*BrokerTransfers, error) {
+		cfg, err := ports(b, js, d)
+		if err != nil {
+			return nil, err
+		}
+		return assembleBrokerTransfers(b, js, cfg)
+	}
+}
+
+func assembleBrokerTransfers(b *Broker, js jetstream.JetStream, cfg xfercontrol.AssemblyConfig, states ...*xfercontract.TrackerState) (*BrokerTransfers, error) {
+	current := &BrokerTransfers{Origin: cfg.Origin, Buckets: cfg.Buckets, Capacity: cfg.Capacity}
+	authority := xferauth.ControlAuthority{SQL: func() *sql.DB { return b.read().SQL() }, Ledger: func() xfercontract.LedgerPort { return current.Ledger }, NodeGate: func(sid, nid string, accepted bool) string { return transferNodeGate(b, sid, nid, accepted) }}
+	if link, ok := cfg.Transport.(*xferserve.Link); ok {
+		authority.SettlementRows = xferserve.SettlementRows(link, link.Rows)
+	}
+	cfg.JS, cfg.Authority = js, authority
+	var state *xfercontract.TrackerState
+	if len(states) > 0 {
+		state = states[0]
+	}
+	runtime, err := xferserve.AssembleRuntime(cfg, state)
+	if runtime != nil {
+		current.Tracker, current.Ledger, current.Controller, current.Finalizer, current.Collector = runtime.Tracker, runtime.Ledger, runtime.Controller, runtime.Finalizer, runtime.Collector
+		current.Settlement = runtime.Settlement
+	}
+	if err != nil {
+		return current, err
+	}
+	current.Bindings = xfercontract.Bindings{JS: js, Authority: authority, Transport: cfg.Transport, Ledger: current.Ledger, OwnerGeneration: cfg.Origin.Generation}
+	if state != nil {
+		current.Bindings.OwnerGeneration = state.Generation + 1
+	}
+	current.Subscriptions = brokerTransferWireSubscriptions(b)
+	return current, nil
+}
+
+// ServeTransferFactory is the production composition installed on every
+// JetStream broker: durable origin/issuer, permit authority, the shared bucket
+// coordinator (with this broker's shrink census), the broker→agent link and
+// the receiver/object/census ports. A cluster controller writes config only
+// through the leader router; the graph keeps the local coordinator.
+// origin: hot-update S7 plan §5 / §6 / §8.2 / P22 — S7 production activation
+func ServeTransferFactory(b *Broker, js jetstream.JetStream, d controlbudget.Deadline) (*BrokerTransfers, error) {
+	return serveTransferFactoryState(b, js, d, nil)
+}
+func serveTransferFactoryState(b *Broker, js jetstream.JetStream, d controlbudget.Deadline, state *xfercontract.TrackerState) (*BrokerTransfers, error) {
+	graph := func() *BrokerTransfers { return cmp.Or(b.transferRuntime.Load(), &BrokerTransfers{}) }
+	ledger := func() xfercontract.LedgerPort { return graph().Ledger }
+	host := xferserve.Host{ClusterDataDir: b.cfg.ClusterDataDir, DBPath: b.cfg.DBPath, BrokerID: cmp.Or(b.selfID, "single"),
+		Conn: func() *nats.Conn { return js.Conn() }, Census: brokerBucketCensus{b}, Logger: b.cfg.Logger,
+		Tracker: func() xfercontract.TrackerManager { return graph().Tracker }, Ledger: ledger, Settlement: func() xferserve.SettlementView {
+			g := graph()
+			return xferserve.SettlementView{Origin: g.Origin, Tracker: g.Tracker, Finalizer: g.Finalizer}
+		},
+		Rows: xferserve.RowsFrom(func() xfercontract.DecisionPort { return graph().Decisions }, ledger)}
+	if b.cfg.AuthCallout != nil {
+		host.AuthenticateAgent = func(sid, nid, pub string) error { return xferserve.AuthenticateAgent(b.read().SQL(), sid, nid, pub) }
+	}
+	if b.clusterMode && b.cl != nil {
+		host.Peers = func(d controlbudget.Deadline) ([]xfercontract.Origin, error) {
+			return xferserve.MemberOrigins(b.cl.node, d)
+		}
+		host.Leader = func() bool { return b.cl.node.VerifyLeaderRead(func(*sql.DB) error { return nil }) == nil }
+		host.Probe = func(o xfercontract.Origin, d controlbudget.Deadline) (xfercontract.ProbeResult, error) {
+			return ProbeTransferBroker(b.cl.forwarder, o, d)
+		}
+		host.Replicas = b.xferTargetReplicas()
+		host.Router = func(local xfercontract.BucketPort) xfercontract.BucketPort {
+			return &TransferBucketRouter{Local: local, Node: b.cl.node, Forwarder: b.cl.forwarder}
+		}
+		host.Remote = TransferOwnerResolver{Forwarder: b.cl.forwarder}
+	}
+	asm, err := xferserve.Assemble(host, js, d)
+	if err != nil {
+		return nil, err
+	}
+	current, err := assembleBrokerTransfers(b, js, asm.Config, state)
+	if current == nil {
+		return nil, errors.Join(err, asm.Release())
+	}
+	// Release runs only after every owner joined (stopBrokerTransferGraph).
+	current.Buckets, current.Link, current.Release = asm.Local, asm.Link, asm.Release
+	current.Assembly = &asm
+	if err == nil {
+		// The sleeping tracker is idle here; a later live view could be refused.
+		current.Decisions, err = xfertrack.DecisionsForBinding(current.Tracker, current.Bindings.OwnerGeneration)
+		current.Controller = xferserve.SettleEagerly(current.Controller, current.Finalizer)
+	}
+	return current, err
+}
+
+// serveTransferCarrier answers a capable continuation carried on a legacy
+// command subject (prepare / push-commit); false keeps the legacy handler. A
+// capable body never falls through to legacy byte work.
+// origin: hot-update S7 plan §6.2 / §7 / INTEG-D carrier request
+func serveTransferCarrier(b *Broker, msg *nats.Msg, sid, actor, nid, verb string) bool {
+	// Explicitly composed INTEG-G graphs use their original directed carrier port.
+	// origin: hot-update S7 plan §6.3 / T39
+	if graph := b.transferRuntime.Load(); graph != nil && graph.Link == nil {
+		return false
+	}
+	d, err := controlbudget.After(5 * time.Second)
+	if err != nil {
+		return false
+	}
+	reply, handled, silent := xferserve.Carrier(brokerTransferIngress(b), func(o xfercontract.Origin) bool { return transferOriginGate(b, o) }, actor, sid, nid, verb, msg.Data, d)
+	if handled && !silent && reply != nil {
+		b.respondBytes(msg, reply)
+	}
+	return handled
+}
+
+// serveAgentTransferRequest answers the agent-role verbs on the agent's own
+// authenticated subtree; the principal instance is the retained entry's.
+// origin: hot-update S7 plan §6.3 / T39 / INTEG-A trusted agent binding
+func serveAgentTransferRequest(b *Broker, reg xfercontrol.Registration, msg *nats.Msg) {
+	if reply := xferserve.DispatchAgent(brokerTransferIngress(b), func(o xfercontract.Origin) bool { return transferOriginGate(b, o) }, reg, msg); reply != nil {
+		b.respondBytes(msg, reply)
+	}
+}
+
+func brokerTransferIngress(b *Broker) xferserve.Graph {
+	current := b.transferRuntime.Load()
+	if current == nil {
+		return xferserve.Graph{}
+	}
+	authority, _ := current.Bindings.Authority.(xferauth.ControlAuthority)
+	rows := xferserve.RowsFrom(func() xfercontract.DecisionPort { return current.Decisions }, func() xfercontract.LedgerPort { return current.Ledger })
+	return xferserve.Graph{Controller: current.Controller, Authority: authority, Tracker: current.Tracker, Rows: rows, Link: current.Link, Decisions: current.Decisions}
+}
+
+// brokerTransferWireSubscriptions resolves the installed graph at invocation,
+// so the shared cold/hot descriptor never captures a pre-cut NC or tracker.
+func brokerTransferWireSubscriptions(b *Broker) []BrokerTransferSubscription {
+	var result []BrokerTransferSubscription
+	for _, reg := range xfercontrol.Registrations() {
+		if reg.LegacyCarrier || reg.ClusterVerb != "" {
+			continue
+		}
+		result = append(result, BrokerTransferSubscription{Subject: reg.Subject, Handler: func(msg *nats.Msg) { handleBrokerTransferRequest(b, reg, msg) }})
+	}
+	return result
+}
+
+// Transfer census RPCs retain the original owner and only use current ports.
+// Public census contains protection evidence, never private ledger/capsules.
+func startBrokerTransferForward(b *Broker, nc *nats.Conn, current *BrokerTransfers) error {
+	// A single broker has no cluster RPC borrower. A clustered broker with a
+	// missing node must still fail installation instead of claiming readiness.
+	// origin: hot-update S7 plan §6.3 / P22
+	if !b.clusterMode && b.cl == nil {
+		return nil
+	}
+	cfg := TransferClusterForwardConfig{Origin: current.Origin, Buckets: current.Buckets, Logger: b.cfg.Logger}
+	if b.cl != nil {
+		cfg.Node = b.cl.node
+	}
+	cfg.Census = func(origin xfercontract.Origin, d controlbudget.Deadline) (xfercontract.LedgerCensus, error) {
+		graph := b.transferRuntime.Load()
+		if graph == nil || graph.Origin != origin {
+			return xfercontract.LedgerCensus{}, xferauth.ControlRefusal(xfercontract.CodeOwnerRecovering)
+		}
+		return xferserve.LocalCensus(graph.Origin, graph.Ledger, graph.Assembly, origin, d)
+	}
+	cfg.Probe = xferserve.ProbeOrigin(func() xfercontract.Origin { return cmp.Or(b.transferRuntime.Load(), &BrokerTransfers{}).Origin }, nc)
+	var err error
+	current.Forward, err = SubscribeTransferClusterForward(nc, cfg)
+	if err == nil && current.Assembly != nil {
+		current.Forward.Extra, err = current.Assembly.StartCluster(nc)
+	}
+	return err
+}
+
+// Projection borrows current leaves only; it transfers no ownership or state.
+func brokerTransferRuntime(c *BrokerTransfers) xfercontrol.Runtime {
+	return xfercontrol.Runtime{Tracker: c.Tracker, Ledger: c.Ledger, Controller: c.Controller, Finalizer: c.Finalizer, Collector: c.Collector, Buckets: c.Buckets, Settlement: c.Settlement}
+}
+
+// Managed image owners join through the cut; ordinary Run returns join here.
+// origin: hot-update S7 plan §8.2 / P22
+//
+// A clean stop must hand Run's cancellation sentinel back untouched:
+// errors.Join(context.Canceled, nil) is a *joinError that prints
+// "context canceled" yet is != context.Canceled, which turned every ordinary
+// shutdown of an embedded broker into "did not exit cleanly" (test/p13 proxy
+// tunnel-drop stack, internal/broker Run tests). JoinCleanupError keeps both
+// errors only when the transfer stop itself failed — the same T52 contract the
+// other Run cleanup defers already follow.
+// origin: hot-update S6 plan §4.2 / T52; S6-proxyfix make-test regression
+// origin: hot-update S7 lead integration — make test on the merged tree (s7-p9k)
+//
+// managed is read when Run RETURNS, not when the defer is registered: Run
+// flips it to true only after InstallCurrent hands every owner to the image
+// slot, whose StopCurrent joins the graph (JoinStoreUsers →
+// suspendBrokerTransfers). Capturing it by value meant the defer always saw
+// false, so a managed Run stopped the graph behind the slot's back.
+// origin: hot-update S7 plan §8.2 / P24 — managed slot transfer stop
+func stopBrokerTransferRun(b *Broker, managed *bool, runErr *error) {
+	if !*managed {
+		*runErr = brokercontrol.JoinCleanupError(*runErr, stopBrokerTransfers(b))
+	}
+}
+
+func reconcileBrokerTransfersOnBoot(ctx context.Context, b *Broker) {
+	// R16 #57 (minor-2): eagerly finalize any transfer stranded by a PRIOR crash, so a broker that crash-loops
+	// faster than XferReapInterval still closes dangling start rows (the periodic pass is anchored at
+	// start+interval). M1 makes it safe when leaderless — the ledger is deleted only on a CONFIRMED commit.
+	//
+	// PLACEMENT IS LOAD-BEARING: this walks a ledger and, per stranded transfer, forwards to the leader with a
+	// bounded retry (~500ms each when leaderless). It MUST run AFTER the admin socket is serving. Running it
+	// earlier delays the socket, and the socket IS the joiner-readiness signal `tether cluster add` polls
+	// (joinerBrokerUpLocal → OpClusterStatus): a joiner restarted mid-grow that is merely still finalizing
+	// would be misread as "not up in cluster mode" and the grow would HALT at the start-joiner boundary.
+	// Observed on the deploy tier (drill 42 returning-node re-grow) when this ran before the socket.
+	//
+	// NOT GATED ON clusterMode — origin: prerelease audit round 2, F-T7. It was, and
+	// that made the crash-loop case this block exists for unreachable on exactly the
+	// deployment #57 had just been extended to: batch F made synthesis work on a single
+	// broker (commitSyntheticTransferTerminal's single-mode branch) and the ledger root
+	// falls back to the DB's directory when no ClusterDataDir is set, so a lone broker
+	// really does accumulate stranded rows — and then only the periodic pass, anchored at
+	// start+XferReapInterval, would ever close them. A broker crash-looping faster than
+	// that interval closed none, forever, which is the whole reason for finalizing here.
+	//
+	// finalizeStrandedXfers is a no-op when there is no ledger dir at all (an in-memory
+	// test broker), so the added call costs nothing on the shapes that have nothing to
+	// finalize.
+	// file-transfer-plan §Object bucket lifecycle G.2 — reap leftover OBJ_xfer-* streams
+	// from a previous crash. The current transfer graph and its census must be
+	// installed first, including sleeping imported ownership (S7 §5.3 / M11).
+	if n, rerr := b.reconcileXferObjects(ctx); rerr != nil {
+		b.cfg.Logger.Warn("broker: OBJ_xfer boot reconcile", "err", rerr)
+	} else if n > 0 {
+		b.cfg.Logger.Info("broker: orphan xfer buckets reaped", "count", n)
+	}
+	if n, ferr := b.finalizeStrandedXfers(ctx); ferr != nil {
+		b.cfg.Logger.Warn("broker: eager stranded-transfer finalize on boot", "err", ferr)
+	} else if n > 0 {
+		b.cfg.Logger.Info("broker: eagerly finalized stranded in-flight transfers on boot (#57)", "count", n)
+	}
+
+}
+
+// The slot owns this projection in managed mode; cold Run's defer reads its
+// managed latch by reference. The same image template is available before the
+// restored process opens SQL or NATS.
+// origin: hot-update S7 plan §8.2 / T36
+func configureProductionTransferImage(b *Broker) {
+	if b.cfg.ImageRun == nil {
+		return
+	}
+	if b.imageControl == nil {
+		b.imageControl = newBrokerImageControl(b)
+	}
+	if b.imageControl.transfers != nil {
+		return
+	}
+	b.imageControl.transfers = xferserve.NewImageOwner(xferserve.ImageConfig{
+		Capacity: func() xfercontract.CapacityAccount {
+			if g := b.transferRuntime.Load(); g != nil {
+				return g.Capacity
+			}
+			return nil
+		},
+		Current: func() (xfercontract.TrackerManager, xfercontract.BucketPort) {
+			if g := b.transferRuntime.Load(); g != nil {
+				return g.Tracker, g.Buckets
+			}
+			return nil, nil
+		},
+		Stop: func(d xfercontract.Deadline) error { return suspendBrokerTransfers(b, d) },
+		Resume: func(d xfercontract.Deadline) error {
+			g := b.transferRuntime.Load()
+			if g == nil {
+				return xferauth.ControlRefusal(xfercontract.CodeOwnerRecovering)
+			}
+			return g.Tracker.Bind(g.Bindings, d)
+		},
+		Rebuild: func(state *xfercontract.TrackerState, d xfercontract.Deadline) (xfercontract.TrackerManager, error) {
+			g, err := serveTransferFactoryState(b, brokerJS(b), d, state)
+			if err == nil {
+				err = InstallBrokerTransfers(b, g, d)
+			}
+			if err == nil {
+				err = startBrokerTransferForward(b, b.nc.Load(), g)
+			}
+			if err != nil {
+				return nil, errors.Join(err, uninstallBrokerTransfers(b, g, d))
+			}
+			return g.Tracker, nil
+		},
+	})
+	b.imageControl.transferSubscriptions = func(*nats.Conn) []TransferImageSubscription {
+		var out []TransferImageSubscription
+		for _, sub := range brokerTransferWireSubscriptions(b) {
+			out = append(out, TransferImageSubscription{Subject: sub.Subject, Handler: sub.Handler})
+		}
+		return out
+	}
+}
+
+// The loaded-config adapter lives outside authcallout to keep rendering and
+// admission independent; only this broker composition joins them.
+// origin: hot-update S9 plan §3.3 / P12 / T27
+func brokerSystemPrincipals(b *Broker) func() []authcallout.SystemPrincipal {
+	return xferserve.LoadedSystemPrincipals(b.cfg.NatsConfPath, b.cfg.Logger)
 }

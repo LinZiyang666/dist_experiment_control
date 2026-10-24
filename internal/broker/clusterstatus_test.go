@@ -242,6 +242,10 @@ func TestB1IsLeaderViewSerializes(t *testing.T) {
 }
 
 func TestD7StatusReportRendersRoleAndHealth(t *testing.T) {
+	// origin: hot-update S10 plan §11.1 / TEST-BUDGET
+	if runIsolatedBrokerTest(t) {
+		return
+	}
 	n, addr := d7SingleNode(t, "single-1")
 	admin := NewClusterAdmin(n, nil)
 	in := d7JoinInput(t, "single-1", addr)

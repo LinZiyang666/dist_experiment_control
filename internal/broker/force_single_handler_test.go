@@ -65,7 +65,7 @@ func fsTestBackend(t *testing.T, selfID, peerID, peerRaftAddr string) (*clusterA
 	// EXTERNAL review B1: production always has a ClusterDataDir (it is where raft lives, so a
 	// cluster-mode broker cannot exist without one), and the commit path now refuses to start an
 	// irreversible rewrite it could not first record an intent for. Give the fixture the same.
-	admin.dataDir = t.TempDir()
+	admin.DataDir = t.TempDir()
 	return &clusterAdminBackend{admin: admin, fsArm: newForceSingleArm()}, n
 }
 
@@ -123,6 +123,10 @@ func TestForceSingleHandlerSelfIDMismatchRefused(t *testing.T) {
 // raft_addr) must HARD-REFUSE the real (non-dry-run) arm with CodePeerAlive, and the report must mark
 // that peer Alive with the port that answered.
 func TestForceSingleHandlerPeerAliveRefused(t *testing.T) {
+	// origin: hot-update S10 plan §11.1 / TEST-BUDGET
+	if runIsolatedBrokerTest(t) {
+		return
+	}
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -167,6 +171,10 @@ func TestForceSingleHandlerCommitWithoutTokenRefused(t *testing.T) {
 // commit success boundary includes the marker — a missing marker = a writable broker with no visible
 // emergency).
 func TestForceSingleHandlerArmCommitPersistsMarkerAndEpoch(t *testing.T) {
+	// origin: hot-update S10 plan §11.1 / TEST-BUDGET
+	if runIsolatedBrokerTest(t) {
+		return
+	}
 	b, n := fsTestBackend(t, "brk-a", "brk-b", "127.0.0.1:1") // peer dead on all probed ports
 	markQuorumLostPastDwell(b)
 

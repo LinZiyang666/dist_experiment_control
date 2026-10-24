@@ -1,569 +1,56 @@
-// Agent side of the file-transfer feature (file-transfer-plan v0.2.0).
-//
-// Verbs handled here:
-//
-//   push.req.forwarded         → handlePushForwarded
-//     Tier A: agent IS receiver; verify SHA + write tmp + rename +
-//             emit ev.transfer.<id>.complete|failed. Reply OK after
-//             the byte work so ctl's request/reply latency includes
-//             the file actually landing.
-//     Tier B: agent acks "ready for your Put"; the bytes-on-disk
-//             phase happens later under push-commit.req.forwarded.
-//
-//   push-commit.req.forwarded  → handlePushCommitForwarded
-//     Tier B push step. Agent ObjectStore.Get from broker-created
-//     bucket → SHA verify → rename → emit ev.transfer.
-//
-//   pull.req.forwarded         → handlePullForwarded
-//     Agent is the sender. Validates allow_roots, stats the file,
-//     compares size against MaxInline. Tier A → reply inline.
-//     Tier B → ObjectStore.Put into broker-supplied bucket → reply
-//             with bucket/object_key/size/sha. ctl is the receiver
-//             and emits the finalize.req.
-
 package agent
 
 import (
 	"context"
-	"crypto/rand"
-	"crypto/sha256"
-	"encoding/hex"
-	"encoding/json"
-	"errors"
-	"fmt"
-	"io"
 	"os"
-	"path/filepath"
-	"strings"
 	"time"
 
+	"github.com/LinZiyang666/tether/internal/filetransfer"
 	"github.com/LinZiyang666/tether/internal/proto"
+	"github.com/LinZiyang666/tether/internal/transferpath"
+	"github.com/LinZiyang666/tether/internal/xferagent"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
-	"golang.org/x/sys/unix"
 )
 
-// tier-A inline ceiling. batch C: the value now comes from internal/proto, which the broker and the
-// ctl also read — three hand-kept copies of a bound the BROKER refuses at is three chances to drift
-// on one edit, and the ctl offering what the broker will refuse is a user-visible failure.
-const agentTierAMaxBytes = proto.XferTierAMaxBytes
-
-// Hard per-transfer ceiling. Every streaming path enforces this while
-// reading, not only from a pre-read stat, because regular files can grow.
-const agentTransferMaxBytes = int64(proto.XferMaxBytes)
-
-func pullBucketPayloadCeiling(advertised *int64) int64 {
-	if advertised == nil || *advertised > agentTransferMaxBytes {
-		return agentTransferMaxBytes
-	}
-	if *advertised < 0 {
-		return 0
-	}
-	return *advertised
+// Transfer handlers delegate byte work while admission and preparation ownership remain here.
+// origin: hot-update S5 plan §10 / AGENT-SLIM-S5.
+func transferHandler(a *Agent) *filetransfer.Handler {
+	return filetransfer.LoadWorkerHandler(&a.transfers, a.cfg.TransferWorker, func() *filetransfer.Handler { return transferShell(a) })
 }
 
-// pushCommitCacheSlack is the headroom a prep entry keeps beyond the time the CTL needs to upload
-// that file. It preserves the shape of the pre-batch-C constant: the old TTL was 6m against a 5m
-// tier-B watchdog, and that ONE MINUTE OF MARGIN was the entire meaning of the 6 — written nowhere.
-const pushCommitCacheSlack = time.Minute
-
-const pushCommitCacheMaxEntries = 1024
-
-// pushCommitEntryTTL is how long ONE prep entry stays valid, derived from ITS OWN size.
-//
-// It used to be a single 6-minute constant, which worked only because it happened to sit just above
-// the fixed 5-minute tier-B watchdog. Once the watchdog became size-derived, a 2 GiB push takes the
-// ctl ~17 minutes to upload and the entry would be swept long before push-commit arrived — the agent
-// would answer `transfer_unknown` and the whole transfer would fail, on exactly the large slow files
-// this batch exists to make work.
-//
-// PER-ENTRY, not a raised global TTL, and that distinction is load-bearing. Raising the TTL globally
-// would make every small entry linger ~3x longer, push the 1024-entry cache to capacity sooner, and
-// the capacity path evicts the OLDEST entry — which is precisely the multi-minute large transfer we
-// just extended the TTL to protect. Keying expiry on each entry's own size keeps small entries
-// short-lived, so capacity pressure does not rise at all.
-func pushCommitEntryTTL(size int64) time.Duration {
-	// XferBudget, not XferLegBudget: the former carries the TIER FLOOR, the latter is raw
-	// size/throughput. Deriving from the raw leg made the comment above a lie in the direction that
-	// matters — an 8 MiB tier-B push got 5s+60s = 65 SECONDS where it used to have 6 minutes, and a
-	// 100 MiB one got 110s. Every tier-B transfer under ~480 MiB came out with a prep entry SHORTER
-	// than the broker's own watchdog for the same transfer, so a second concurrent prepare (the only
-	// thing that sweeps this map) could evict it mid-upload and the push-commit would land on
-	// transfer_unknown. A batch whose purpose is to make slow large files work must not shrink the
-	// tolerance of medium ones to a fifth. With the floor, size==0 gives 5m+1m — byte-for-byte the
-	// pre-batch-C constant — and 2 GiB gives 17m+1m.
-	return proto.XferBudget("b", size, 1) + pushCommitCacheSlack
+// transferShell is the handler before its worker exists; an image restore
+// builds the same shell around the imported worker (bootstrap.go).
+func transferShell(a *Agent) *filetransfer.Handler {
+	return &filetransfer.Handler{
+		Logger: a.cfg.Logger, Roots: a.canonAllowRoots, Mode: int(a.transferMode), JetStream: func() jetstream.JetStream { return snapshotAgentJetStream(a) }, SID: a.cfg.SID,
+		Instance: func() string { return a.instanceID }, NID: func() string { return nidOf(a) }, Admit: func() (func(), bool) { return a.gate.admit(gateTransfer) }, RunContext: a.loadRunCtx, AdmitCreation: func() (func(), bool) { return admitTransferCreation(a) },
+		Remember: func(id string, e filetransfer.PushCommitEntry) bool {
+			return a.rememberPushCommit(id, pushCommitEntry{vp: e.Validated, path: e.Path, sha256: e.SHA256, size: e.Size, force: e.Force, added: e.Added})
+		},
+		Lookup: func(id string) (filetransfer.PushCommitEntry, bool) {
+			a.pushCacheMu.Lock()
+			defer a.pushCacheMu.Unlock()
+			e, ok := a.pushCommitCache[id]
+			return filetransfer.PushCommitEntry{Validated: e.vp, Path: e.path, SHA256: e.sha256, Size: e.size, Force: e.force, Added: e.added}, ok
+		},
+		Purge: a.purgePushCommitCache,
+		// Keep the frozen Agent forwarding surface in the real dispatch path.
+		// Concrete methods dispatch downstream operations only, never their own adapters.
+		// origin: hot-update S5 plan §10 / AGENT-SLIM-S5.
+		Operations: filetransfer.Operations{
+			HandlePushTierA: a.handlePushTierA, ObjectStoreGetAndWrite: a.objectStoreGetAndWrite,
+			PublishEvent: a.pubTransferEv, PublishFailedEvent: a.pubTransferEvFailed,
+			ReplyPush: a.replyPush, ReplyCommit: a.replyCommit, ReplyPull: a.replyPull,
+		},
+	}
 }
 
+var pullBucketPayloadCeiling = filetransfer.PullBucketPayloadCeiling
+
+func pushCommitEntryTTL(size int64) time.Duration { return filetransfer.PushCommitEntryTTL(size) }
 func pushCommitEntryExpired(e pushCommitEntry, now time.Time) bool {
 	return now.Sub(e.added) >= pushCommitEntryTTL(e.size)
-}
-
-// handlePushForwarded — push.req.forwarded entrypoint.
-func (a *Agent) handlePushForwarded(nc *nats.Conn, msg *nats.Msg) {
-	if msg.Reply == "" {
-		a.cfg.Logger.Warn("agent: push.req.forwarded without Reply inbox")
-		return
-	}
-	var req proto.PushPrepareReq
-	if err := json.Unmarshal(msg.Data, &req); err != nil {
-		a.replyPush(nc, msg.Reply, proto.PushPrepareResp{
-			OK: false, Code: "json_parse", Error: err.Error()})
-		return
-	}
-	if req.Tier != "a" && req.Tier != "b" {
-		a.replyPush(nc, msg.Reply, proto.PushPrepareResp{
-			OK: false, Code: "tier_invalid", Error: req.Tier})
-		return
-	}
-	vp, err := ValidateForWrite(req.Path, a.canonAllowRoots, a.transferMode)
-	if err != nil {
-		code := "io_error"
-		errMsg := err.Error()
-		var pve *PathValidationError
-		if errors.As(err, &pve) {
-			code = pve.Code
-			errMsg = pve.Msg
-		}
-		a.replyPush(nc, msg.Reply, proto.PushPrepareResp{
-			OK: false, Code: code, Error: errMsg})
-		// Emit ev.transfer.failed so the broker can write audit
-		// failed + reap its in-memory entry immediately, instead of
-		// waiting on the per-tier watchdog timeout.
-		a.pubTransferEvFailed(nc, "push", &req, req.Tier, code, errMsg, 0)
-		return
-	}
-
-	switch req.Tier {
-	case "a":
-		a.handlePushTierA(nc, msg, &req, vp)
-	case "b":
-		// Cache prep state so push-commit knows what bucket + path
-		// + sha to use. Bucket name was stamped by the broker.
-		if !a.rememberPushCommit(req.TransferID, pushCommitEntry{
-			vp:     vp,
-			path:   req.Path,
-			sha256: req.SHA256,
-			size:   req.Size,
-			force:  req.Force,
-		}) {
-			// batch C: the prep cache is full of LIVE entries. Refuse instead of evicting one — see
-			// rememberPushCommit. Retriable: the entries drain as their transfers finish.
-			a.replyPush(nc, msg.Reply, proto.PushPrepareResp{
-				OK: false, Code: "too_many_in_flight",
-				Error: "this agent already holds the maximum number of in-flight tier-B prepares; retry shortly"})
-			a.pubTransferEvFailed(nc, "push", &req, req.Tier, "too_many_in_flight", "agent prep cache full", 0)
-			return
-		}
-		a.replyPush(nc, msg.Reply, proto.PushPrepareResp{OK: true, Tier: "b"})
-	}
-}
-
-// handlePushTierA writes the inline bytes through the
-// path.go tmp+rename pipeline, sha-verifies, and emits ev.transfer.
-// The ctl-bound reply happens AFTER the write so ctl's RTT includes
-// the actual outcome (file in place or rejected); ev.transfer is
-// emitted unconditionally so the broker's audit always flows from the
-// receiver-finalization invariant for symmetry with tier B.
-func (a *Agent) handlePushTierA(nc *nats.Conn, msg *nats.Msg, req *proto.PushPrepareReq, vp *ValidatedPath) {
-	startedAt := time.Now().UTC()
-	finalize := func(code, errMsg string, bytes int64) {
-		if code == "" {
-			a.replyPush(nc, msg.Reply, proto.PushPrepareResp{OK: true, Tier: "a"})
-			a.pubTransferEv(nc, "complete", "push", req, "a", bytes, time.Since(startedAt))
-		} else {
-			a.replyPush(nc, msg.Reply, proto.PushPrepareResp{OK: false, Code: code, Error: errMsg})
-			a.pubTransferEvFailed(nc, "push", req, "a", code, errMsg, time.Since(startedAt))
-		}
-	}
-
-	// SHA verify the inline blob BEFORE touching disk.
-	if got := hexSHA256(req.InlineData); got != req.SHA256 {
-		finalize("sha_mismatch",
-			fmt.Sprintf("inline_data sha256: want=%s got=%s", req.SHA256, got), 0)
-		return
-	}
-	rnd := randSuffix()
-	f, pending, err := OpenForWriteAtomic(vp, rnd)
-	if err != nil {
-		var pve *PathValidationError
-		if errors.As(err, &pve) {
-			finalize(pve.Code, pve.Msg, 0)
-		} else {
-			finalize("io_error", err.Error(), 0)
-		}
-		return
-	}
-	defer pending.Abort()
-	n, werr := f.Write(req.InlineData)
-	if werr == nil {
-		werr = f.Sync()
-	}
-	cerr := f.Close()
-	if werr != nil || cerr != nil {
-		finalize("io_error", firstNonNilErr(werr, cerr).Error(), int64(n))
-		return
-	}
-	if err := RenameForWriteAtomic(vp, pending, req.Force); err != nil {
-		var pve *PathValidationError
-		if errors.As(err, &pve) {
-			finalize(pve.Code, pve.Msg, int64(n))
-		} else {
-			finalize("io_error", err.Error(), int64(n))
-		}
-		return
-	}
-	finalize("", "", int64(n))
-}
-
-// handlePushCommitForwarded — tier B push receiver-side. ctl has
-// finished ObjectStore.Put; we Get the object, SHA-verify, rename
-// into place, and emit ev.transfer.<id>.complete|failed.
-func (a *Agent) handlePushCommitForwarded(nc *nats.Conn, msg *nats.Msg) {
-	if msg.Reply == "" {
-		a.cfg.Logger.Warn("agent: push-commit.req.forwarded without Reply inbox")
-		return
-	}
-	var req proto.TransferCommitReq
-	if err := json.Unmarshal(msg.Data, &req); err != nil {
-		a.replyCommit(nc, msg.Reply, proto.TransferCommitResp{
-			OK: false, Code: "json_parse", Error: err.Error()})
-		return
-	}
-	if a.js == nil {
-		a.replyCommit(nc, msg.Reply, proto.TransferCommitResp{
-			OK: false, Code: "jetstream_unavailable"})
-		return
-	}
-	// Look up the expected SHA + path + allow_roots validation saved
-	// during push.req prepare (a.pushCommitCache — no object metadata
-	// is written, the original PushPrepareReq is the only carrier).
-	// Cache miss (agent restarted between prep and commit) →
-	// transfer_unknown; the broker's watchdog writes the failed audit.
-	//
-	// batch C moved this lookup AHEAD of the context so the download deadline can be derived from the
-	// transfer's own size. It used to be a hardcoded 5 minutes, which silently capped every tier-B
-	// download at the value the broker's fixed watchdog happened to use — so raising only the broker's
-	// budget would have made things WORSE, not better: the broker would patiently hold a bucket and a
-	// goroutine for half an hour waiting on a download this side had already abandoned at 5 minutes.
-	a.pushCacheMu.Lock()
-	cached, hit := a.pushCommitCache[req.TransferID]
-	a.pushCacheMu.Unlock()
-	if !hit {
-		a.replyCommit(nc, msg.Reply, proto.TransferCommitResp{
-			OK: false, Code: "transfer_unknown",
-			Error: "no in-process prep entry for this transfer"})
-		return
-	}
-
-	// ONE leg: this end only performs the Get. The broker covers both crossings.
-	commitCtx, cancel := context.WithTimeout(context.Background(), proto.XferBudget("b", cached.size, 1))
-	store, err := a.js.ObjectStore(commitCtx, req.Bucket)
-	if err != nil {
-		cancel()
-		a.replyCommit(nc, msg.Reply, proto.TransferCommitResp{
-			OK: false, Code: "bucket_unknown", Error: err.Error()})
-		return
-	}
-
-	a.replyCommit(nc, msg.Reply, proto.TransferCommitResp{OK: true})
-	// Run the actual data-plane work asynchronously: emitting
-	// ev.transfer is the receiver-finalization signal, not the
-	// reply.
-	go func() {
-		defer cancel()
-		startedAt := time.Now().UTC()
-		bytes, err := a.objectStoreGetAndWrite(
-			commitCtx, store, req.TransferID, cached.vp,
-			cached.size, cached.sha256, cached.force,
-		)
-		if err != nil {
-			var pve *PathValidationError
-			code := "object_get_failed"
-			msg := err.Error()
-			if errors.As(err, &pve) {
-				code = pve.Code
-				msg = pve.Msg
-			}
-			a.pubTransferEvFailed(nc, "push", &proto.PushPrepareReq{
-				TransferID: req.TransferID, Path: cached.path,
-				SHA256: cached.sha256, Size: cached.size, Tier: "b",
-				Bucket: req.Bucket,
-			}, "b", code, msg, time.Since(startedAt))
-			a.purgePushCommitCache(req.TransferID)
-			return
-		}
-		a.pubTransferEv(nc, "complete", "push", &proto.PushPrepareReq{
-			TransferID: req.TransferID, Path: cached.path,
-			SHA256: cached.sha256, Size: cached.size, Tier: "b",
-			Bucket: req.Bucket,
-		}, "b", bytes, time.Since(startedAt))
-		a.purgePushCommitCache(req.TransferID)
-	}()
-}
-
-// objectStoreGetAndWrite streams the object into a pinned-parent tmp,
-// enforces the prepare-time size, verifies SHA, then commits. Verification
-// must happen before rename: a failed object never becomes the destination.
-func (a *Agent) objectStoreGetAndWrite(
-	ctx context.Context,
-	store jetstream.ObjectStore,
-	objectName string,
-	vp *ValidatedPath,
-	expectedSize int64,
-	expectedSHA string,
-	force bool,
-) (int64, error) {
-	if expectedSize < 0 || expectedSize > agentTransferMaxBytes {
-		return 0, pathErr("too_large", "invalid expected size %d", expectedSize)
-	}
-	result, err := store.Get(ctx, objectName)
-	if err != nil {
-		return 0, err
-	}
-	defer func() { _ = result.Close() }()
-
-	rnd := randSuffix()
-	f, pending, err := OpenForWriteAtomic(vp, rnd)
-	if err != nil {
-		return 0, err
-	}
-	defer pending.Abort()
-	h := sha256.New()
-	limited := &io.LimitedReader{R: result, N: expectedSize + 1}
-	tee := io.TeeReader(limited, h)
-	n, copyErr := io.Copy(f, tee)
-	if copyErr == nil {
-		copyErr = f.Sync()
-	}
-	closeErr := f.Close()
-	if copyErr != nil || closeErr != nil {
-		return n, firstNonNilErr(copyErr, closeErr)
-	}
-	if n != expectedSize {
-		return n, pathErr("size_mismatch",
-			"object size=%d differs from prepare size=%d", n, expectedSize)
-	}
-	gotSHA := hex.EncodeToString(h.Sum(nil))
-	if gotSHA != expectedSHA {
-		return n, pathErr("sha_mismatch",
-			"get sha256: want=%s got=%s", expectedSHA, gotSHA)
-	}
-	if err := RenameForWriteAtomic(vp, pending, force); err != nil {
-		return n, err
-	}
-	return n, nil
-}
-
-// handlePullForwarded — pull receiver is ctl; agent is the sender.
-// On tier-A path agent reads the bytes + replies inline. On tier-B
-// agent ObjectStore.Puts into the broker-supplied bucket and replies
-// with the bucket coordinates.
-func (a *Agent) handlePullForwarded(nc *nats.Conn, msg *nats.Msg) {
-	if msg.Reply == "" {
-		a.cfg.Logger.Warn("agent: pull.req.forwarded without Reply inbox")
-		return
-	}
-	var combined struct {
-		proto.PullPrepareReq
-		Bucket                string `json:"bucket,omitempty"`
-		ObjectKey             string `json:"object_key,omitempty"`
-		BucketPayloadMaxBytes *int64 `json:"bucket_payload_max_bytes,omitempty"`
-	}
-	if err := json.Unmarshal(msg.Data, &combined); err != nil {
-		a.replyPull(nc, msg.Reply, proto.PullPrepareResp{
-			OK: false, Code: "json_parse", Error: err.Error()})
-		return
-	}
-	req := combined.PullPrepareReq
-	bucket := combined.Bucket
-	objectKey := combined.ObjectKey
-	if objectKey == "" {
-		// Older brokers (pre-v0.2.2) used a per-bucket "object" key;
-		// newer brokers send the transfer_id. Default to transfer_id
-		// when broker didn't supply — matches the v0.2.2 design.
-		objectKey = req.TransferID
-	}
-
-	vp, err := ValidateForRead(req.Path, a.canonAllowRoots, a.transferMode)
-	if err != nil {
-		var pve *PathValidationError
-		if errors.As(err, &pve) {
-			a.replyPull(nc, msg.Reply, proto.PullPrepareResp{
-				OK: false, Code: pve.Code, Error: pve.Msg})
-		} else {
-			a.replyPull(nc, msg.Reply, proto.PullPrepareResp{
-				OK: false, Code: "io_error", Error: err.Error()})
-		}
-		return
-	}
-	f, err := OpenForReadAtomic(vp)
-	if err != nil {
-		var pve *PathValidationError
-		if errors.As(err, &pve) {
-			a.replyPull(nc, msg.Reply, proto.PullPrepareResp{
-				OK: false, Code: pve.Code, Error: pve.Msg})
-		} else {
-			a.replyPull(nc, msg.Reply, proto.PullPrepareResp{
-				OK: false, Code: "io_error", Error: err.Error()})
-		}
-		return
-	}
-	defer func() { _ = f.Close() }()
-	st, err := f.Stat()
-	if err != nil {
-		a.replyPull(nc, msg.Reply, proto.PullPrepareResp{
-			OK: false, Code: "io_error", Error: err.Error()})
-		return
-	}
-	size := st.Size()
-	if size > agentTransferMaxBytes {
-		a.replyPull(nc, msg.Reply, proto.PullPrepareResp{
-			OK: false, Code: "too_large",
-			// origin: batch-c internal review F4 — DERIVED, not hand-copied. See proto.HumanBytes.
-			Error: fmt.Sprintf("file size=%d > %s", size, proto.HumanBytes(agentTransferMaxBytes))})
-		return
-	}
-	maxInline := req.MaxInline
-	if maxInline <= 0 || maxInline > agentTierAMaxBytes {
-		maxInline = agentTierAMaxBytes
-	}
-
-	if size <= maxInline {
-		// Tier A: cap the read itself. A file can grow after Stat; if it
-		// crosses the inline ceiling, rewind and continue through tier B.
-		data, err := io.ReadAll(io.LimitReader(f, maxInline+1))
-		if err != nil {
-			a.replyPull(nc, msg.Reply, proto.PullPrepareResp{
-				OK: false, Code: "io_error", Error: err.Error()})
-			return
-		}
-		if int64(len(data)) <= maxInline {
-			sha := hexSHA256(data)
-			a.replyPull(nc, msg.Reply, proto.PullPrepareResp{
-				OK: true, Tier: "a", Size: int64(len(data)),
-				SHA256: sha, InlineData: data,
-			})
-			return
-		}
-		if _, err := f.Seek(0, io.SeekStart); err != nil {
-			a.replyPull(nc, msg.Reply, proto.PullPrepareResp{
-				OK: false, Code: "io_error", Error: err.Error()})
-			return
-		}
-	}
-
-	// Tier B — agent Puts into the broker-pre-created bucket.
-	if a.js == nil {
-		a.replyPull(nc, msg.Reply, proto.PullPrepareResp{
-			OK: false, Code: "jetstream_unavailable"})
-		return
-	}
-	if bucket == "" {
-		a.replyPull(nc, msg.Reply, proto.PullPrepareResp{
-			OK: false, Code: "bucket_unknown",
-			Error: "broker did not supply a bucket name"})
-		return
-	}
-	payloadMax := pullBucketPayloadCeiling(combined.BucketPayloadMaxBytes)
-	if size > payloadMax {
-		a.replyPull(nc, msg.Reply, proto.PullPrepareResp{
-			OK: false, Code: "too_large",
-			Error: fmt.Sprintf("file size=%d > broker bucket payload ceiling %d", size, payloadMax)})
-		return
-	}
-	// batch C: the PULL leg deliberately does NOT use the file's real size, and that asymmetry with
-	// the push leg above is the point.
-	//
-	// proto.PullPrepareReq carries no size, so the BROKER's pull watchdog has none either and budgets
-	// the flat tier floor. Deriving this end from the real size would raise only one side of the same
-	// transfer: a 2 GiB pull would give the agent ~17 minutes while the broker gave up at 5, wrote a
-	// failed terminal, deleted the tracker entry and released the bucket from activeOBJStreams — after
-	// which the home reaper's 2-minute grace can delete the object out from under a ctl that is still
-	// downloading it. That is the "raise only one end and it gets WORSE" argument this batch is built
-	// on, pointing the other way. Getting a real budget onto the pull path needs the size on the wire,
-	// which is the deferred medium half (permanent decision N5).
-	//
-	// XferBudget with size 0 is the tier floor, written this way rather than as the constant so it
-	// tracks whatever the broker's pull watchdog computes.
-	putCtx, cancel := context.WithTimeout(context.Background(), proto.XferBudget("b", 0, 1))
-	defer cancel()
-	store, err := a.js.ObjectStore(putCtx, bucket)
-	if err != nil {
-		a.replyPull(nc, msg.Reply, proto.PullPrepareResp{
-			OK: false, Code: "bucket_unknown", Error: err.Error()})
-		return
-	}
-	h := sha256.New()
-	limited := &io.LimitedReader{R: f, N: payloadMax + 1}
-	tee := io.TeeReader(limited, h)
-	info, err := store.Put(putCtx, jetstream.ObjectMeta{Name: objectKey}, tee)
-	if err != nil {
-		a.replyPull(nc, msg.Reply, proto.PullPrepareResp{
-			OK: false, Code: "object_put_failed", Error: err.Error()})
-		return
-	}
-	uploaded := int64(info.Size)
-	if uploaded > payloadMax {
-		_ = store.Delete(putCtx, objectKey)
-		a.replyPull(nc, msg.Reply, proto.PullPrepareResp{
-			OK: false, Code: "too_large",
-			Error: fmt.Sprintf("file grew beyond broker bucket payload ceiling %d while reading (read=%d)",
-				payloadMax, uploaded)})
-		return
-	}
-	sha := hex.EncodeToString(h.Sum(nil))
-	a.replyPull(nc, msg.Reply, proto.PullPrepareResp{
-		OK: true, Tier: "b", Size: uploaded, SHA256: sha,
-		Bucket: bucket, ObjectKey: objectKey,
-	})
-}
-
-// pubTransferEv publishes ev.transfer.<id>.complete. Tier-aware.
-func (a *Agent) pubTransferEv(nc *nats.Conn, kind, verb string, req *proto.PushPrepareReq,
-	tier string, bytes int64, dur time.Duration) {
-	payload, _ := json.Marshal(proto.TransferEvent{
-		Kind: kind, Verb: verb, TransferID: req.TransferID,
-		Tier: tier, Bucket: req.Bucket, Path: req.Path,
-		Bytes: bytes, DurationMs: dur.Milliseconds(),
-	})
-	subj := proto.SubjEvTransfer(a.cfg.SID, nidOf(a), req.TransferID, kind)
-	if err := nc.Publish(subj, payload); err != nil {
-		a.cfg.Logger.Warn("agent: ev.transfer pub", "err", err, "subj", subj)
-	}
-}
-
-// pubTransferEvFailed mirrors pubTransferEv with kind=failed. Tolerates
-// being called with an empty TransferID (e.g. agent rejected the
-// request before parsing); silently skip in that case so we don't
-// publish an unnamed ev.transfer.
-func (a *Agent) pubTransferEvFailed(nc *nats.Conn, verb string, req *proto.PushPrepareReq,
-	tier, code, errMsg string, dur time.Duration) {
-	if req.TransferID == "" {
-		return
-	}
-	payload, _ := json.Marshal(proto.TransferEvent{
-		Kind: "failed", Verb: verb, TransferID: req.TransferID,
-		Tier: tier, Bucket: req.Bucket, Path: req.Path,
-		Code: code, Error: errMsg, DurationMs: dur.Milliseconds(),
-	})
-	subj := proto.SubjEvTransfer(a.cfg.SID, nidOf(a), req.TransferID, "failed")
-	if err := nc.Publish(subj, payload); err != nil {
-		a.cfg.Logger.Warn("agent: ev.transfer failed pub", "err", err, "subj", subj)
-	}
-}
-
-func (a *Agent) replyPush(nc *nats.Conn, replyTo string, resp proto.PushPrepareResp) {
-	payload, _ := json.Marshal(resp)
-	_ = nc.Publish(replyTo, payload)
-}
-func (a *Agent) replyCommit(nc *nats.Conn, replyTo string, resp proto.TransferCommitResp) {
-	payload, _ := json.Marshal(resp)
-	_ = nc.Publish(replyTo, payload)
-}
-func (a *Agent) replyPull(nc *nats.Conn, replyTo string, resp proto.PullPrepareResp) {
-	payload, _ := json.Marshal(resp)
-	_ = nc.Publish(replyTo, payload)
 }
 
 // pushCommitEntry caches the per-transfer prep state so push-commit
@@ -587,169 +74,67 @@ type pushCommitEntry struct {
 // transfer — the capacity path would silently kill the exact transfer the budget work protects, and a
 // constant-inequality test on the TTL would never see it.
 func (a *Agent) rememberPushCommit(transferID string, e pushCommitEntry) bool {
-	a.pushCacheMu.Lock()
-	defer a.pushCacheMu.Unlock()
-	if a.pushCommitCache == nil {
-		a.pushCommitCache = map[string]pushCommitEntry{}
-	}
-	now := time.Now()
-	for id, cached := range a.pushCommitCache {
-		if pushCommitEntryExpired(cached, now) {
-			delete(a.pushCommitCache, id)
-		}
-	}
-	if len(a.pushCommitCache) >= pushCommitCacheMaxEntries {
-		// Every remaining entry is live. Refusing is honest and retriable; evicting one is a silent
-		// failure whose victim is chosen to be the most expensive transfer in flight.
-		return false
-	}
-	e.added = now
-	a.pushCommitCache[transferID] = e
-	return true
+	e.added = time.Now()
+	return filetransfer.RememberPrepared(&a.pushCacheMu, &a.pushCommitCache, transferID, e, e.added, pushCommitEntryExpired)
 }
 
 func (a *Agent) purgePushCommitCache(transferID string) {
-	a.pushCacheMu.Lock()
-	defer a.pushCacheMu.Unlock()
-	delete(a.pushCommitCache, transferID)
+	filetransfer.PurgePrepared(&a.pushCacheMu, &a.pushCommitCache, transferID)
 }
 
-func hexSHA256(b []byte) string {
-	h := sha256.Sum256(b)
-	return hex.EncodeToString(h[:])
+func (a *Agent) handlePushForwarded(nc *nats.Conn, msg *nats.Msg) {
+	transferHandler(a).HandlePushForwarded(nc, msg)
+}
+func (a *Agent) handlePushTierA(nc *nats.Conn, msg *nats.Msg, req *proto.PushPrepareReq, vp *ValidatedPath) {
+	transferHandler(a).HandlePushTierA(nc, msg, req, vp)
+}
+func (a *Agent) handlePushCommitForwarded(nc *nats.Conn, msg *nats.Msg) {
+	transferHandler(a).HandlePushCommitForwarded(nc, msg)
+}
+func (a *Agent) objectStoreGetAndWrite(ctx context.Context, js jetstream.JetStream, store jetstream.ObjectStore, bucket, objectName string, vp *ValidatedPath, expectedSize int64, expectedSHA string, force bool) (int64, error) {
+	return transferHandler(a).ObjectStoreGetAndWrite(ctx, js, store, bucket, objectName, vp, expectedSize, expectedSHA, force)
+}
+func (a *Agent) handlePullForwarded(nc *nats.Conn, msg *nats.Msg) {
+	transferHandler(a).HandlePullForwarded(nc, msg)
+}
+func (a *Agent) pubTransferEv(nc *nats.Conn, kind, verb string, req *proto.PushPrepareReq,
+	tier string, bytes int64, dur time.Duration) {
+	transferHandler(a).PublishEvent(nc, kind, verb, req, tier, bytes, dur)
+}
+func (a *Agent) pubTransferEvFailed(nc *nats.Conn, verb string, req *proto.PushPrepareReq,
+	tier, code, errMsg string, dur time.Duration) {
+	transferHandler(a).PublishFailedEvent(nc, verb, req, tier, code, errMsg, dur)
+}
+func (a *Agent) replyPush(nc *nats.Conn, replyTo string, resp proto.PushPrepareResp) {
+	transferHandler(a).ReplyPush(nc, replyTo, resp)
+}
+func (a *Agent) replyCommit(nc *nats.Conn, replyTo string, resp proto.TransferCommitResp) {
+	transferHandler(a).ReplyCommit(nc, replyTo, resp)
+}
+func (a *Agent) replyPull(nc *nats.Conn, replyTo string, resp proto.PullPrepareResp) {
+	transferHandler(a).ReplyPull(nc, replyTo, resp)
 }
 
-func randSuffix() string {
-	var b [8]byte
-	_, _ = rand.Read(b[:])
-	return hex.EncodeToString(b[:])
-}
-
-func firstNonNilErr(errs ...error) error {
-	for _, e := range errs {
-		if e != nil {
-			return e
-		}
+// The lifetime belongs to Agent, never to its replaceable NATS session.
+// origin: hot-update S7 plan §8.1 / §11.2 / P20
+func stopAgentTransfers(a *Agent) {
+	a.cutMu.Lock()
+	pristine := a.image != nil && !ownsUpgradeImage(a)
+	a.cutMu.Unlock()
+	if pristine {
+		return // pristine imported resources belong to FinishBoot, not terminal cleanup
 	}
-	return nil
-}
-
-// ─── Path validation (allow_roots + symlink defence) ──────────────────
-
-// PathValidationError carries both a human message and a machine-readable
-// code that lands in the proto.Push/PullPrepareResp.Code field.
-//
-// The code names come from file-transfer-plan §"Refusing dangerous paths"
-// step list and the §Audit code column. Any new code added here must
-// also be documented in the plan.
-type PathValidationError struct {
-	Code string
-	Msg  string
-}
-
-func (e *PathValidationError) Error() string { return e.Code + ": " + e.Msg }
-
-// IsPathValidationError unwraps to bool so callers can do
-// `if errors.As(err, &pve) { ... }` without per-call helper noise.
-func IsPathValidationError(err error) bool {
-	var pve *PathValidationError
-	return errors.As(err, &pve)
-}
-
-// pathErr is a tiny constructor — keeps call sites short.
-func pathErr(code, format string, a ...any) *PathValidationError {
-	return &PathValidationError{Code: code, Msg: fmt.Sprintf(format, a...)}
-}
-
-// CanonAllowRoots cleans + de-duplicates the allow_roots list and
-// returns each entry in EvalSymlinks-resolved form. Any allow_root that
-// fails EvalSymlinks (does not exist, is not a directory, contains an
-// unresolvable symlink) is silently dropped. Dropping shrinks the
-// narrow-mode root list but NEVER widens reach: transferMode is decided
-// upstream from the RAW config presence (resolveTransferMode), so a
-// narrow config whose entries all drop stays modeNarrow with an empty
-// list and rejects every path (fail-closed) — it does not collapse to the
-// whole-FS open mode. The result is always sorted by length descending so
-// the longest match wins (so /srv/local/alice does not get shadowed by
-// /srv).
-//
-// Callers should invoke this ONCE at startup (Agent.New stores the
-// result in a.canonAllowRoots) and pass the result to ValidateForRead /
-// ValidateForWrite — those funcs no longer canonicalize per-call.
-// Audit shard P11 F3: previously these helpers re-evaluated symlinks
-// on every push/pull request, which was both a perf hit and a TOCTOU
-// risk if an operator's allow_root happened to be symlinked.
-func CanonAllowRoots(roots []string) []string {
-	seen := map[string]struct{}{}
-	out := make([]string, 0, len(roots))
-	for _, r := range roots {
-		if r == "" {
-			continue
-		}
-		if !filepath.IsAbs(r) {
-			continue
-		}
-		clean := filepath.Clean(r)
-		resolved, err := filepath.EvalSymlinks(clean)
-		if err != nil {
-			continue
-		}
-		// Must actually be a directory — a regular file as an
-		// allow_root would let the caller "write to /any/path/under/it"
-		// which makes no sense.
-		st, err := os.Stat(resolved)
-		if err != nil || !st.IsDir() {
-			continue
-		}
-		if _, dup := seen[resolved]; dup {
-			continue
-		}
-		seen[resolved] = struct{}{}
-		out = append(out, resolved)
+	// Network joins never run under the host cut mutex. The worker retains the
+	// duty on error and the next authenticated management binding retries it.
+	// origin: S7 internal review rv-lifecycle F4 / rv-jsnats F3
+	if err := xferagent.StopWithConsumerCleanup(transferHandler(a).Runtime, transferHandler(a).Worker, func() error { return filetransfer.StopWorker(transferHandler(a)) }, snapshotAgentJetStream(a)); err != nil {
+		a.cfg.Logger.Error("agent: transfer worker stop incomplete", "err", err)
 	}
-	// Longest-prefix-wins ordering.
-	for i := 0; i < len(out); i++ {
-		for j := i + 1; j < len(out); j++ {
-			if len(out[j]) > len(out[i]) {
-				out[i], out[j] = out[j], out[i]
-			}
-		}
-	}
-	return out
 }
 
-// containedIn returns the matched allow_root or "" if path is not inside
-// any of them. filepath.Rel handles the filesystem root correctly (`/`
-// contains `/etc/hosts`) while still preventing `/srv/localfoo` from
-// matching `/srv/local`. Both sides are EvalSymlinks-resolved already.
-func containedIn(resolvedPath string, roots []string) string {
-	for _, r := range roots {
-		rel, err := filepath.Rel(r, resolvedPath)
-		if err != nil || filepath.IsAbs(rel) {
-			continue
-		}
-		if rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))) {
-			return r
-		}
-	}
-	return ""
-}
-
-// ValidatedPath is what ValidateForRead / ValidateForWrite return on
-// success. It carries both the absolute path the agent should open
-// AND the matched allow_root (so the caller can attribute audit
-// "tier=" / "root=" cleanly).
-type ValidatedPath struct {
-	Abs string // EvalSymlinks-resolved-parent + clean leaf; safe to open with O_NOFOLLOW
-	// Parent and Base preserve the canonical parent/leaf split so the
-	// openat pipeline can pin the directory and never re-traverse an
-	// attacker-swappable parent path.
-	Parent string
-	Base   string
-	// AllowRoot is the matched allow_root in narrow mode; "" in open mode
-	// (no narrowing configured). Informational for audit/log attribution
-	// only — it has zero readers today.
-	AllowRoot string
+func reapRevokedAgentTransfers(a *Agent) {
+	stopAgentTransfers(a)
+	a.reapManagedChildren()
 }
 
 // transferMode is the agent-wide push/pull path policy, resolved once at
@@ -785,472 +170,40 @@ const (
 // during canonicalization still resolves to modeNarrow (reject-all),
 // NEVER to modeOpen — the single most important security invariant of the
 // transfer-unrestrict change.
-func resolveTransferMode(rootsConfigured bool, rawRoots []string) transferMode {
-	if len(rawRoots) > 0 {
-		return modeNarrow
-	}
-	if rootsConfigured {
-		return modeDisabled // explicit allow_roots: []
-	}
-	return modeOpen // key absent → whole-FS default
+func resolveTransferMode(configured bool, roots []string) transferMode {
+	return transferMode(filetransfer.ResolveTransferMode(configured, roots))
 }
 
-// ValidateForWrite is the push-side check: agent is going to create a
-// file at this path and write bytes. Steps follow file-transfer-plan
-// §"Refusing dangerous paths":
-//
-//  1. mode != modeDisabled (explicit `allow_roots: []` → transfer_disabled).
-//  2. absolute path required.
-//  3. EvalSymlinks-resolve the parent dir; ENOENT → path_parent_missing
-//     (parent dirs are NOT auto-created in v2.0).
-//  4. In modeNarrow, <resolved-parent>/<base> must be inside one
-//     allow_root (path_outside_roots on miss). modeOpen skips this step.
-//  5. If destination already exists, must be a regular file (not a
-//     symlink, dir, device, fifo) — symlink → not_a_regular_file.
-//
-// Caller still opens with O_NOFOLLOW|O_EXCL|O_CREAT to defeat any
-// race-window symlink swap between this validation and open. dst-
-// exists is NOT considered an error here (the caller's `--force`
-// logic decides what to do); the leaf-symlink check still happens
-// before that decision so a symlink dest can never silently dereference.
-//
-// `canonRoots` MUST be the result of CanonAllowRoots (called once at
-// agent startup); this function does NOT re-canonicalize.
+// Preserve the agent API while filesystem policy and descriptor ownership live below it.
+// origin: hot-update S4 plan §10.
+type PathValidationError = transferpath.PathValidationError
+type ValidatedPath = transferpath.ValidatedPath
+type AtomicWrite = transferpath.AtomicWrite
+
+func IsPathValidationError(err error) bool    { return transferpath.IsPathValidationError(err) }
+func CanonAllowRoots(roots []string) []string { return transferpath.CanonAllowRoots(roots) }
 func ValidateForWrite(rawPath string, canonRoots []string, mode transferMode) (*ValidatedPath, error) {
-	if mode == modeDisabled {
-		return nil, pathErr("transfer_disabled",
-			"file transfer disabled on this agent (allow_roots: [])")
-	}
-	if !filepath.IsAbs(rawPath) {
-		return nil, pathErr("path_not_absolute",
-			"%s: must be absolute", rawPath)
-	}
-	clean := filepath.Clean(rawPath)
-	parent := filepath.Dir(clean)
-	resolvedParent, err := filepath.EvalSymlinks(parent)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, pathErr("path_parent_missing",
-				"%s: parent directory does not exist (run `tether exec ... mkdir -p` first)", parent)
-		}
-		return nil, pathErr("io_error",
-			"resolve parent of %s: %v", rawPath, err)
-	}
-	abs := filepath.Join(resolvedParent, filepath.Base(clean))
-	// Containment applies only in narrow mode. In open mode matched stays
-	// "" (whole-FS reach); every mechanism check below still runs.
-	matched := ""
-	if mode == modeNarrow {
-		matched = containedIn(abs, canonRoots)
-		if matched == "" {
-			return nil, pathErr("path_outside_roots",
-				"%s: not under any allow_root (%v)", abs, canonRoots)
-		}
-	}
-	// If the leaf already exists, it must be a regular file. A symlink
-	// at the leaf is rejected here so a follow-up O_NOFOLLOW open
-	// failure isn't the operator's only signal.
-	if st, err := os.Lstat(abs); err == nil {
-		if st.Mode()&os.ModeSymlink != 0 {
-			return nil, pathErr("not_a_regular_file",
-				"%s: refuses to follow symlink", abs)
-		}
-		if !st.Mode().IsRegular() {
-			return nil, pathErr("not_a_regular_file",
-				"%s: not a regular file (mode=%s)", abs, st.Mode())
-		}
-	} else if !os.IsNotExist(err) {
-		return nil, pathErr("io_error", "lstat %s: %v", abs, err)
-	}
-	return &ValidatedPath{
-		Abs: abs, Parent: resolvedParent, Base: filepath.Base(clean),
-		AllowRoot: matched,
-	}, nil
+	return transferpath.ValidateForWrite(rawPath, canonRoots, int(mode))
 }
-
-// ValidateForRead is the pull-side check: agent is going to open this
-// path read-only and stream its bytes. Steps mirror ValidateForWrite,
-// plus:
-//
-//   - leaf must exist (else path_not_found);
-//   - leaf must NOT be a symlink (lstat check; O_NOFOLLOW on the open
-//     would also catch it, but lstat gives a clean error code);
-//   - leaf must be a regular file (not a dir / device / fifo /
-//     socket).
-//
-// TOCTOU: the caller is expected to open(O_RDONLY|O_NOFOLLOW) and
-// fstat the resulting fd, comparing dev+inode against the lstat
-// captured here. The race window between lstat and open is small but
-// not zero on adversarial filesystems; dev+inode mismatch surfaces as
-// `path_race` at the open site.
-//
-// `canonRoots` MUST be the result of CanonAllowRoots (called once at
-// agent startup); this function does NOT re-canonicalize.
 func ValidateForRead(rawPath string, canonRoots []string, mode transferMode) (*ValidatedPath, error) {
-	if mode == modeDisabled {
-		return nil, pathErr("transfer_disabled",
-			"file transfer disabled on this agent (allow_roots: [])")
-	}
-	if !filepath.IsAbs(rawPath) {
-		return nil, pathErr("path_not_absolute",
-			"%s: must be absolute", rawPath)
-	}
-	clean := filepath.Clean(rawPath)
-	parent := filepath.Dir(clean)
-	resolvedParent, err := filepath.EvalSymlinks(parent)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, pathErr("path_not_found",
-				"%s: parent directory does not exist", parent)
-		}
-		return nil, pathErr("io_error",
-			"resolve parent of %s: %v", rawPath, err)
-	}
-	abs := filepath.Join(resolvedParent, filepath.Base(clean))
-	// Containment applies only in narrow mode. In open mode matched stays
-	// "" (whole-FS reach); the leaf checks below still run.
-	matched := ""
-	if mode == modeNarrow {
-		matched = containedIn(abs, canonRoots)
-		if matched == "" {
-			return nil, pathErr("path_outside_roots",
-				"%s: not under any allow_root (%v)", abs, canonRoots)
-		}
-	}
-	st, err := os.Lstat(abs)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, pathErr("path_not_found", "%s: not found", abs)
-		}
-		return nil, pathErr("io_error", "lstat %s: %v", abs, err)
-	}
-	if st.Mode()&os.ModeSymlink != 0 {
-		return nil, pathErr("not_a_regular_file",
-			"%s: refuses to follow symlink", abs)
-	}
-	if !st.Mode().IsRegular() {
-		return nil, pathErr("not_a_regular_file",
-			"%s: not a regular file (mode=%s)", abs, st.Mode())
-	}
-	return &ValidatedPath{
-		Abs: abs, Parent: resolvedParent, Base: filepath.Base(clean),
-		AllowRoot: matched,
-	}, nil
+	return transferpath.ValidateForRead(rawPath, canonRoots, int(mode))
 }
-
-func validatedParentAndBase(vp *ValidatedPath) (string, string, error) {
-	parent, base := vp.Parent, vp.Base
-	if parent == "" {
-		var err error
-		parent, err = filepath.EvalSymlinks(filepath.Dir(vp.Abs))
-		if err != nil {
-			return "", "", err
-		}
-	}
-	if base == "" {
-		base = filepath.Base(vp.Abs)
-	}
-	return parent, base, nil
-}
-
-// openDirNoSymlinks opens an already-EvalSymlinks-resolved absolute
-// directory one component at a time. Each component uses O_NOFOLLOW, so a
-// hostile local process cannot replace a validated parent component with a
-// symlink between validation and the eventual file operation.
-func openDirNoSymlinks(absDir string) (int, error) {
-	clean := filepath.Clean(absDir)
-	if !filepath.IsAbs(clean) {
-		return -1, fmt.Errorf("directory is not absolute: %s", absDir)
-	}
-	fd, err := unix.Open(string(filepath.Separator),
-		unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
-	if err != nil {
-		return -1, err
-	}
-	if clean == string(filepath.Separator) {
-		return fd, nil
-	}
-	parts := strings.Split(strings.TrimPrefix(clean, string(filepath.Separator)), string(filepath.Separator))
-	for _, part := range parts {
-		if part == "" || part == "." {
-			continue
-		}
-		next, openErr := unix.Openat(fd, part,
-			unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
-		_ = unix.Close(fd)
-		if openErr != nil {
-			return -1, openErr
-		}
-		fd = next
-	}
-	return fd, nil
-}
-
-func unixModeIsRegular(mode uint32) bool {
-	return mode&unix.S_IFMT == unix.S_IFREG
-}
-
-func unixModeIsSymlink(mode uint32) bool {
-	return mode&unix.S_IFMT == unix.S_IFLNK
-}
-
-func dirFDStillNamesPath(dirFD int, parent string) (bool, error) {
-	currentFD, err := openDirNoSymlinks(parent)
-	if err != nil {
-		return false, err
-	}
-	defer func() { _ = unix.Close(currentFD) }()
-	var pinned, current unix.Stat_t
-	if err := unix.Fstat(dirFD, &pinned); err != nil {
-		return false, err
-	}
-	if err := unix.Fstat(currentFD, &current); err != nil {
-		return false, err
-	}
-	return pinned.Dev == current.Dev && pinned.Ino == current.Ino, nil
-}
-
-// OpenForReadAtomic pins the canonical parent directory with openat,
-// lstats and opens the leaf relative to that fd, then compares dev+inode.
-// Parent and leaf swaps therefore fail closed instead of being followed.
 func OpenForReadAtomic(vp *ValidatedPath) (*os.File, error) {
-	parent, base, err := validatedParentAndBase(vp)
-	if err != nil {
-		return nil, pathErr("path_race", "resolve validated parent of %s: %v", vp.Abs, err)
-	}
-	dirFD, err := openDirNoSymlinks(parent)
-	if err != nil {
-		return nil, pathErr("path_race", "open validated parent %s: %v", parent, err)
-	}
-	defer func() { _ = unix.Close(dirFD) }()
-
-	var pre unix.Stat_t
-	if err := unix.Fstatat(dirFD, base, &pre, unix.AT_SYMLINK_NOFOLLOW); err != nil {
-		if errors.Is(err, unix.ENOENT) {
-			return nil, pathErr("path_not_found", "%s: vanished before open", vp.Abs)
-		}
-		return nil, pathErr("io_error", "lstat-pre %s: %v", vp.Abs, err)
-	}
-	if unixModeIsSymlink(uint32(pre.Mode)) {
-		return nil, pathErr("not_a_regular_file",
-			"%s: refused to follow symlink", vp.Abs)
-	}
-	if !unixModeIsRegular(uint32(pre.Mode)) {
-		return nil, pathErr("not_a_regular_file",
-			"%s: not regular before open (mode=%#o)", vp.Abs, pre.Mode)
-	}
-
-	fd, err := unix.Openat(dirFD, base, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
-	if err != nil {
-		if errors.Is(err, unix.ELOOP) {
-			return nil, pathErr("not_a_regular_file",
-				"%s: refused to follow symlink (O_NOFOLLOW)", vp.Abs)
-		}
-		if errors.Is(err, unix.ENOENT) {
-			return nil, pathErr("path_not_found", "%s: vanished between lstat and open", vp.Abs)
-		}
-		return nil, pathErr("io_error", "open %s: %v", vp.Abs, err)
-	}
-	f := os.NewFile(uintptr(fd), vp.Abs)
-	if f == nil {
-		_ = unix.Close(fd)
-		return nil, pathErr("io_error", "open %s: invalid file descriptor", vp.Abs)
-	}
-	var post unix.Stat_t
-	if err := unix.Fstat(fd, &post); err != nil {
-		_ = f.Close()
-		return nil, pathErr("io_error", "fstat %s: %v", vp.Abs, err)
-	}
-	if pre.Dev != post.Dev || pre.Ino != post.Ino {
-		_ = f.Close()
-		return nil, pathErr("path_race",
-			"%s: dev/inode changed between lstat and open (lstat=%d/%d open=%d/%d)",
-			vp.Abs, pre.Dev, pre.Ino, post.Dev, post.Ino)
-	}
-	if !unixModeIsRegular(uint32(post.Mode)) {
-		_ = f.Close()
-		return nil, pathErr("not_a_regular_file",
-			"%s: not regular after open (mode=%#o)", vp.Abs, post.Mode)
-	}
-	if same, err := dirFDStillNamesPath(dirFD, parent); err != nil || !same {
-		_ = f.Close()
-		return nil, pathErr("path_race",
-			"%s: parent changed while opening (same=%v err=%v)", vp.Abs, same, err)
-	}
-	return f, nil
+	return transferpath.OpenForReadAtomic(vp)
 }
-
-// AtomicWrite retains the validated parent fd from tmp creation through
-// commit. Abort removes the tmp relative to that same fd, so cleanup cannot
-// be redirected by swapping a parent path.
-type AtomicWrite struct {
-	dirFD   int
-	tmpName string
-	dstName string
-	tmpPath string
-	dstPath string
-	parent  string
-	done    bool
-
-	// carryMode is the destination's existing permission bits, captured at OPEN time
-	// (while the destination is known to exist and be regular) and applied at COMMIT
-	// time. origin: prerelease audit round 2, I-F4 — see NewAtomicWrite's comment for
-	// why the two must be separated.
-	carryMode     os.FileMode
-	haveCarryMode bool
-}
-
-func (w *AtomicWrite) Abort() {
-	if w == nil || w.done {
-		return
-	}
-	_ = unix.Unlinkat(w.dirFD, w.tmpName, 0)
-	_ = unix.Close(w.dirFD)
-	w.done = true
-}
-
-func (w *AtomicWrite) finish() {
-	if w.done {
-		return
-	}
-	_ = unix.Close(w.dirFD)
-	w.done = true
-}
-
-// OpenForWriteAtomic creates a tmp sibling relative to a pinned canonical
-// parent fd. The caller writes, fsyncs, closes, then commits through
-// RenameForWriteAtomic. A deferred pending.Abort() is required.
 func OpenForWriteAtomic(vp *ValidatedPath, randSuffix string) (*os.File, *AtomicWrite, error) {
-	parent, base, err := validatedParentAndBase(vp)
-	if err != nil {
-		return nil, nil, pathErr("path_race",
-			"resolve validated parent of %s: %v", vp.Abs, err)
-	}
-	dirFD, err := openDirNoSymlinks(parent)
-	if err != nil {
-		return nil, nil, pathErr("path_race",
-			"open validated parent %s: %v", parent, err)
-	}
-	tmpName := base + ".tmp." + randSuffix
-	tmpPath := filepath.Join(parent, tmpName)
-	fd, err := unix.Openat(dirFD, tmpName,
-		unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|unix.O_NOFOLLOW|unix.O_CLOEXEC,
-		0o600)
-	if err != nil {
-		_ = unix.Close(dirFD)
-		if errors.Is(err, unix.EEXIST) {
-			return nil, nil, pathErr("io_error",
-				"%s: tmp file exists (stale write?)", tmpPath)
-		}
-		if errors.Is(err, unix.ELOOP) {
-			return nil, nil, pathErr("not_a_regular_file",
-				"%s: refused symlink tmp leaf (O_NOFOLLOW)", tmpPath)
-		}
-		return nil, nil, pathErr("io_error", "open %s: %v", tmpPath, err)
-	}
-	f := os.NewFile(uintptr(fd), tmpPath)
-	if f == nil {
-		_ = unix.Close(fd)
-		_ = unix.Unlinkat(dirFD, tmpName, 0)
-		_ = unix.Close(dirFD)
-		return nil, nil, pathErr("io_error", "open %s: invalid file descriptor", tmpPath)
-	}
-
-	// CARRY THE EXISTING FILE'S PERMISSION BITS ONTO THE REPLACEMENT.
-	//
-	// origin: prerelease audit agent-transfer/L3-F1. An atomic replace creates the tmp
-	// at 0600 and renames it over the destination, so `push --force` onto an existing
-	// file silently reset its mode: a 0755 script became non-executable, a 0644 config
-	// became unreadable to the group that had been reading it. The operator asked to
-	// replace the CONTENT.
-	//
-	// Done HERE, on the fd, and not by name after the rename. This function is the one
-	// place that holds the parent dirFD, the destination name and a still-open handle at
-	// the same time, so fstatat-then-fchmod has nothing to race against; a path-based
-	// chmod after the rename is a TOCTOU window on a directory the caller does not
-	// control.
-	//
-	// MASKED TO 0o777, deliberately not 0o7777: setuid, setgid and the sticky bit are
-	// properties of the file that WAS there, and re-applying them to bytes that just
-	// arrived over the network would be handing an uploader whatever privilege the old
-	// file carried.
-	//
-	// HONEST LIMIT: this restores the mode, NOT the owner. A root agent replacing a file
-	// owned by another user still ends up with a root-owned file, because fchown needs
-	// privileges the agent may not have and silently guessing is worse than leaving the
-	// ownership visible. A no-force push cannot hit either case: linkat refuses when the
-	// destination exists.
-	// CAPTURED HERE, APPLIED AT COMMIT — origin: prerelease audit round 2, I-F4. The
-	// first version chmod-ed the tmp right here, i.e. BEFORE a single byte of content had
-	// been written. For the whole duration of a multi-gigabyte transfer a
-	// group- or world-writable file therefore sat in the destination directory under a
-	// predictable name, and because the sha256 is computed over the STREAM and not over
-	// the file, bytes substituted in that window commit as verified. Carrying the mode
-	// forward and setting it at rename time preserves the property the fix is for
-	// (the operator's 0755 script stays executable) without opening the window.
-	//
-	// The READ stays here: this is where the destination is known to exist, and after the
-	// rename it is gone.
-	w := &AtomicWrite{
-		dirFD: dirFD, tmpName: tmpName, dstName: base,
-		tmpPath: tmpPath, dstPath: vp.Abs, parent: parent,
-	}
-	var dst unix.Stat_t
-	if serr := unix.Fstatat(dirFD, base, &dst, unix.AT_SYMLINK_NOFOLLOW); serr == nil &&
-		unixModeIsRegular(uint32(dst.Mode)) {
-		w.carryMode, w.haveCarryMode = os.FileMode(dst.Mode&0o777), true
-	}
-	return f, w, nil
+	return transferpath.OpenForWriteAtomic(vp, randSuffix)
+}
+func RenameForWriteAtomic(vp *ValidatedPath, pending *AtomicWrite, force bool) error {
+	return transferpath.RenameForWriteAtomic(vp, pending, force)
 }
 
-// RenameForWriteAtomic commits a populated tmp. No-force uses linkat as
-// an atomic create-if-absent operation; unlike Lstat+Rename it cannot
-// overwrite a destination created in the check/rename window.
-func RenameForWriteAtomic(vp *ValidatedPath, pending *AtomicWrite, force bool) error {
-	if pending == nil || pending.done || pending.dstPath != vp.Abs {
-		return pathErr("io_error", "invalid or completed atomic write for %s", vp.Abs)
-	}
-	if same, err := dirFDStillNamesPath(pending.dirFD, pending.parent); err != nil || !same {
-		return pathErr("path_race",
-			"%s: parent changed before commit (same=%v err=%v)", vp.Abs, same, err)
-	}
-	// Apply the carried mode to the TMP, immediately before it becomes the destination
-	// (round 2, I-F4). Fchmodat against the pinned dirFD and our own tmp name — not a
-	// path-based chmod after the rename, which would be a TOCTOU window on a directory
-	// the caller does not control, and which is why the original put this on the fd.
-	//
-	// Not fatal if it fails: the CONTENT is what the operator asked for, and a filesystem
-	// that refuses the chmod is not a reason to fail the transfer.
-	if pending.haveCarryMode {
-		_ = unix.Fchmodat(pending.dirFD, pending.tmpName, uint32(pending.carryMode), 0)
-	}
-	if force {
-		if err := unix.Renameat(
-			pending.dirFD, pending.tmpName,
-			pending.dirFD, pending.dstName,
-		); err != nil {
-			return pathErr("io_error", "rename %s -> %s: %v",
-				pending.tmpPath, vp.Abs, err)
-		}
-		pending.finish()
-		return nil
-	}
+type transferWorkerDependencies = filetransfer.WorkerDependencies
+type transferWorkerOwner = filetransfer.WorkerOwner
 
-	if err := unix.Linkat(
-		pending.dirFD, pending.tmpName,
-		pending.dirFD, pending.dstName, 0,
-	); err != nil {
-		if errors.Is(err, unix.EEXIST) {
-			return pathErr("dst_exists",
-				"%s: destination exists; pass --force to overwrite", vp.Abs)
-		}
-		return pathErr("io_error", "link %s -> %s: %v",
-			pending.tmpPath, vp.Abs, err)
-	}
-	// Destination is committed. A failed tmp unlink only leaves a second
-	// hardlink to the same inode; it must not turn a successful commit into
-	// a retry that would report dst_exists.
-	_ = unix.Unlinkat(pending.dirFD, pending.tmpName, 0)
-	pending.finish()
-	return nil
+func logAgentTransferPolicy(a *Agent) {
+	filetransfer.LogTransferPolicy(a.cfg.Logger, int(a.transferMode))
+}
+func marshalAgentTransferRegister(a *Agent, req proto.NodeRegisterReq) ([]byte, error) {
+	return filetransfer.MarshalWorkerRegister(transferHandler(a), req)
 }

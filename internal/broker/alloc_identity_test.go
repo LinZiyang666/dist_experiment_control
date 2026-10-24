@@ -1,16 +1,20 @@
 package broker
 
 import (
+	"bytes"
 	"database/sql"
 	"encoding/json"
 	"go/ast"
 	"go/parser"
 	"go/token"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/port"
+	"github.com/LinZiyang666/tether/internal/session"
+	"github.com/LinZiyang666/tether/internal/upgradeauthority"
 )
 
 // alloc_identity_test.go (batch B, commit 10) — the net for the one real bug this
@@ -51,7 +55,12 @@ import (
 // keys require, so a seed failure here is a real failure and not a fixture accident.
 func seedAllocFKParents(t *testing.T) *sql.DB {
 	t.Helper()
-	db := openDBWithSession(t, "lab")
+	db := openDB(t)
+	// The S8 guard compares the creation salt, including on the narrowed path.
+	// origin: S7 internal review BROKER-REDS F2; hot-update S8 plan §6.2
+	if _, err := session.Create(db, "lab", "lab", "SHA256:test-owner", brokerAuthorityPIN(1), time.Date(2026, 7, 26, 12, 0, 0, 0, time.UTC)); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := db.Exec(
 		`INSERT INTO nodes(sid,nid,status) VALUES(?,?, 'ONLINE')`, "lab", "lab-1",
 	); err != nil {
@@ -60,8 +69,13 @@ func seedAllocFKParents(t *testing.T) *sql.DB {
 	return db
 }
 
-func fullyPopulatedAllocation() port.Allocation {
+func fullyPopulatedAllocation(t *testing.T) port.Allocation {
+	t.Helper()
 	end := time.Date(2026, 7, 26, 12, 0, 0, 0, time.UTC)
+	incarnation, err := upgradeauthority.Derive("lab", "SHA256:test-owner", end.UnixNano(), bytes.Repeat([]byte{1}, 16))
+	if err != nil {
+		t.Fatal(err)
+	}
 	rc := end
 	return port.Allocation{
 		Port:        14000,
@@ -82,15 +96,20 @@ func fullyPopulatedAllocation() port.Allocation {
 		// field cannot be observed to have been dropped. Internal review caught it. Every
 		// non-fenced field must be NON-ZERO here or the narrowing assertions are partly vacuous.
 		RebuildOff: true,
+		// The five allocation columns still fence the row; S8 additionally keeps
+		// the admission's authority on both paths so stale cleanup cannot learn a replacement.
+		// origin: S7 internal review BROKER-REDS F2; hot-update S8 plan §6.2
+		Authority: upgradeauthority.Guard{SID: "lab", Incarnation: incarnation, InstanceID: strings.Repeat("a", 26), ConfiguredNID: "lab-1"},
 	}
 }
 
 // TestFixtureIsActuallyFullyPopulated is the guard for the flaw above. A field added to
 // port.Allocation and not added here would silently reduce what the narrowing tests can see,
 // and nothing else in the file would notice.
+// origin: S7 internal review BROKER-REDS F2
 func TestFixtureIsActuallyFullyPopulated(t *testing.T) {
 	fenced := map[string]bool{"Port": true, "SID": true, "NID": true, "Name": true, "TokenHash": true}
-	v := reflect.ValueOf(fullyPopulatedAllocation())
+	v := reflect.ValueOf(fullyPopulatedAllocation(t))
 	rt := v.Type()
 	if rt.NumField() < 14 {
 		t.Fatalf("port.Allocation has %d fields; the fixture and allocIdentity's godoc both assume "+
@@ -113,19 +132,20 @@ func TestFixtureIsActuallyFullyPopulated(t *testing.T) {
 }
 
 func TestAllocIdentityDropsEverythingBeyondTheFence(t *testing.T) {
-	a := fullyPopulatedAllocation()
+	a := fullyPopulatedAllocation(t)
 	got := allocIdentity(a)
 	want := PortFreeAllocationPayload{
 		Port: 14000, SID: "lab", NID: "lab-1", Name: "svc", TokenHash: "deadbeef",
+		Authority: &a.Authority,
 	}
-	if got != want {
+	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("allocIdentity: got %+v want %+v", got, want)
 	}
 
 	// The round trip must be a fixed point: narrowing an already-narrow allocation is
 	// the identity. If it were not, the leader and the wire would still disagree — just
 	// one projection further down.
-	if again := allocIdentity(got.allocation()); again != got {
+	if again := allocIdentity(got.allocation()); !reflect.DeepEqual(again, got) {
 		t.Errorf("allocIdentity is not idempotent: %+v -> %+v", got, again)
 	}
 }
@@ -150,7 +170,7 @@ func TestAllocIdentityDropsEverythingBeyondTheFence(t *testing.T) {
 // of the property, and the half a revert would break — are guarded structurally by
 // TestAllocationCallSitesPassTheNarrowedValue below.
 func TestAllocIdentitySurvivesTheWireRoundTrip(t *testing.T) {
-	a := fullyPopulatedAllocation()
+	a := fullyPopulatedAllocation(t)
 
 	// What freePortAllocation / revokePortAllocation hand to the leader-local Plan closure.
 	leaderSide := allocIdentity(a).allocation()
@@ -340,7 +360,7 @@ func TestPortFenceColumnsAreStillFive(t *testing.T) {
 	db := seedAllocFKParents(t)
 	now := time.Date(2026, 7, 26, 12, 0, 0, 0, time.UTC)
 
-	full := fullyPopulatedAllocation()
+	full := fullyPopulatedAllocation(t)
 	if _, err := db.Exec(
 		`INSERT INTO port_allocations(port, sid, nid, name, local_port, token_hash, state, created_by_fp, created_at)
 		 VALUES (?,?,?,?,?,?, 'ALLOCATED', ?, ?)`,
@@ -399,7 +419,7 @@ func TestPortFenceColumnsAreStillFive(t *testing.T) {
 // tripwire above does not touch this path at all.
 func TestDirectMutatorsAcceptTheNarrowedAllocation(t *testing.T) {
 	now := time.Date(2026, 7, 26, 12, 0, 0, 0, time.UTC)
-	full := fullyPopulatedAllocation()
+	full := fullyPopulatedAllocation(t)
 
 	seed := func(t *testing.T) *sql.DB {
 		t.Helper()
@@ -471,7 +491,7 @@ func TestDirectMutatorsAcceptTheNarrowedAllocation(t *testing.T) {
 func TestPortFenceTripwireIsNotVacuous(t *testing.T) {
 	db := seedAllocFKParents(t)
 	now := time.Date(2026, 7, 26, 12, 0, 0, 0, time.UTC)
-	full := fullyPopulatedAllocation()
+	full := fullyPopulatedAllocation(t)
 	if _, err := db.Exec(
 		`INSERT INTO port_allocations(port, sid, nid, name, local_port, token_hash, state, created_by_fp, created_at)
 		 VALUES (?,?,?,?,?,?, 'ALLOCATED', ?, ?)`,

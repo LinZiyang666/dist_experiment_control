@@ -16,17 +16,25 @@
 package broker
 
 import (
+	"context"
+	"crypto/rand"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
+	"runtime"
 	"strconv"
 	"time"
 
+	"github.com/LinZiyang666/tether/internal/cluster"
+	"github.com/LinZiyang666/tether/internal/flow"
 	"github.com/LinZiyang666/tether/internal/port"
 	"github.com/LinZiyang666/tether/internal/proto"
 	"github.com/LinZiyang666/tether/internal/schema"
 	"github.com/LinZiyang666/tether/internal/session"
+	"github.com/LinZiyang666/tether/internal/tunnel"
+	"github.com/LinZiyang666/tether/internal/workload"
 	"github.com/nats-io/nats.go"
 )
 
@@ -61,106 +69,78 @@ func (b *Broker) publicHostFor() string {
 // Architecture F.4 — broker is the only side that knows token_hash
 // vs raw token; agent presents raw, broker hashes & looks up.
 func (b *Broker) tunnelTokenLookup(sid, nid string, publicPort int, tokenHash string, epoch int64) error {
-	// Audit shard 02 F6: collapse "absent" and "port-mismatch" into
-	// the same error code so an attacker probing with stolen
-	// tokens can't tell whether the row exists at all. Internally
-	// log the discrimination for operator triage; over the wire
-	// only "token_unknown_or_revoked" leaks.
-	a, err := port.LookupByTokenHash(b.cfg.DB, tokenHash)
-	if err != nil {
-		if !errors.Is(err, port.ErrNotFound) {
-			// A TRANSIENT store fault must NOT masquerade as a revocation: a
-			// reconnecting agent treats token_unknown_or_revoked as terminal
-			// (proxy off) and stops forever — the false-online incident, this
-			// time DB-triggerable. Emit a distinct transient reason the agent
-			// retries. This leaks nothing: try_again fires only on the broker's
-			// own DB fault, never as a function of token validity — the F6
-			// anti-enumeration collapse below (absent/mismatch/off → one code)
-			// is preserved.
-			b.cfg.Logger.Warn("tunnel: token lookup transient store error",
-				"sid", sid, "nid", nid, "port", publicPort, "err", err)
-			return fmt.Errorf("try_again")
-		}
-		// gotcha #86: "no such row" is only authoritative from a replica that has applied everything
-		// the leader committed. A follower that is behind (apply lag under load — the leader has
-		// committed the allocation, forwarded the expose, and the agent dialled here before this
-		// FSM applied it) must answer the TRANSIENT home_catching_up, exactly as the epoch ladder
-		// below does for a not-yet-applied reassign; the agent retries and the row appears. This
-		// leaks nothing: the answer is a function of this replica's own lag, never of the token
-		// (the F6 absent/mismatch/off collapse below is untouched), and a caught-up replica still
-		// says token_unknown_or_revoked. The lag is read in the COMMAND domain (homeApplyLagging):
-		// the raft-domain CaughtUp reads true while the FSM is still inside the SQLite apply, which
-		// is precisely this window (round-2 review R2-F2).
-		if missingTokenIsCatchingUp(b.clusterMode, homeApplyLagging(b.cl, b.cfg.Logger)) {
-			b.cfg.Logger.Warn("tunnel: token unknown on a replica that is still catching up — transient",
-				"sid", sid, "nid", nid, "port", publicPort)
-			return fmt.Errorf("%s", proto.ReasonHomeCatchingUp)
-		}
-		return fmt.Errorf("token_unknown_or_revoked")
+	// The previous agent cannot retry a transient REGISTER denial. Retain
+	// its one request under the ordinary lookup budget, while every attempt
+	// still rejects known lag and reads the full fresh authority transaction.
+	// origin: hot-update S5 plan §2.1 / §4.3 / T29 / DRILL-RUN 39.F.
+	return lookupLegacyTunnelToken(b, tunnel.AuthRequest{Allocation: tunnel.Allocation{
+		SID: sid, NID: nid, Port: publicPort, TokenHash: tokenHash, Epoch: epoch,
+	}})
+}
+
+// Only apply lag is retried: revocation and store faults retain their native
+// classifications. One absolute deadline covers all attempts and pacing; no
+// positive grant is cached across a committed revoke or a later transaction.
+// origin: hot-update S5 plan §4.3 / T29 / DRILL-RUN 39.F.
+func lookupLegacyTunnelToken(b *Broker, req tunnel.AuthRequest) error {
+	return lookupLegacyTunnelTokenAttempts(req, func(next tunnel.AuthRequest) (tunnel.Authority, error) {
+		return tunnelAuthoritySnapshotAttempt(b, next)
+	})
+}
+
+// A synchronous attempt seam lets the expiry regression hold a real SQL pool
+// only after one real read has observed lag; no authority is manufactured.
+// origin: hot-update S5 plan §4.3 / T29 / DRILL-RUN run262.
+func lookupLegacyTunnelTokenAttempts(req tunnel.AuthRequest, attempt func(tunnel.AuthRequest) (tunnel.Authority, error)) error {
+	deadline := time.Now().Add(tunnel.LookupBudget)
+	if !req.Deadline.IsZero() && req.Deadline.Before(deadline) {
+		deadline = req.Deadline
 	}
-	if a.Port != publicPort || a.SID != sid || a.NID != nid {
-		b.cfg.Logger.Warn("tunnel: token sid/nid/port mismatch",
-			"want_sid", sid, "want_nid", nid, "want_port", publicPort,
-			"got_sid", a.SID, "got_nid", a.NID, "got_port", a.Port)
-		return fmt.Errorf("token_unknown_or_revoked")
-	}
-	// round-3 F1: for the system __proxy__ port, the master switch is part of
-	// the authorization boundary. Even if the ALLOCATED row is briefly visible
-	// between CloseProxy and port.Free, a REGISTER must be denied while proxy is
-	// OFF — otherwise the kill switch leaks an exit through a re-REGISTER race.
-	if a.Name == port.ProxyPortName {
-		on, err := session.GetProxyEnabled(b.cfg.DB, sid)
-		if err != nil {
-			// Same transient-vs-authoritative split as the lookup above (Fix C):
-			// a store fault on the dominant __proxy__ reconnect path must NOT be
-			// folded into the terminal token_unknown_or_revoked, or the exact
-			// DB-hiccup false-terminal hole Fix C closes reopens one query later.
-			// try_again leaks nothing — it fires only on the broker's own DB
-			// fault, never as a function of switch state or token validity.
-			b.cfg.Logger.Warn("tunnel: proxy-enabled check transient store error",
-				"sid", sid, "port", publicPort, "err", err)
-			return fmt.Errorf("try_again")
+	req.Deadline = deadline
+	sawLag := false
+	for {
+		select {
+		case <-req.Stop:
+			return errTunnelAuthorityRetry
+		default:
 		}
-		if !on {
-			// Authoritative: the master switch is OFF — terminal kill switch (a
-			// re-REGISTER must NOT resurrect a disabled exit).
-			return fmt.Errorf("token_unknown_or_revoked")
+		// Expiry alone does not prove lag. Preserve a prior native lag refusal
+		// even when the final SQL attempt, rather than its pacing timer, expires.
+		// origin: hot-update S5 plan §4.3 / T29 / DRILL-RUN run262.
+		if !time.Now().Before(deadline) {
+			if sawLag {
+				return errTunnelAuthorityLag
+			}
+			return errTunnelAuthorityRetry
+		}
+		_, err := attempt(req)
+		if errors.Is(err, errTunnelAuthorityExpired) {
+			select {
+			case <-req.Stop:
+				return errTunnelAuthorityRetry
+			default:
+			}
+			if sawLag {
+				return errTunnelAuthorityLag
+			}
+			return errTunnelAuthorityRetry
+		}
+		if !errors.Is(err, errTunnelAuthorityLag) {
+			return err
+		}
+		sawLag = true
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return errTunnelAuthorityLag
+		}
+		timer := time.NewTimer(min(20*time.Millisecond, remaining))
+		select {
+		case <-timer.C:
+		case <-req.Stop:
+			timer.Stop()
+			return errTunnelAuthorityRetry
 		}
 	}
-	// D6 §7.2 home/epoch ladder. INERT when the row carries no cluster home
-	// (home_broker=='', the migration-0010 default / single-node path) — this
-	// branch is skipped entirely, leaving tunnelTokenLookup byte-equivalent to
-	// pre-D6. When the row IS homed, the bind decision is a function of BOTH
-	// (home vs self) AND (agent-presented epoch vs the LOCAL row epoch a.Epoch):
-	if a.HomeBroker != "" {
-		self := b.selfNodeID()
-		switch {
-		case a.Epoch < 0:
-			// Defense-in-depth (review A5 M6): a corrupted negative stored epoch must
-			// not make every honest agent (epoch >= 0) loop on home_catching_up
-			// forever. Treat it as a terminal, anti-enumeration-collapsed deny.
-			return fmt.Errorf("token_unknown_or_revoked")
-		case epoch < a.Epoch:
-			// The agent holds a SUPERSEDED directive (an OpPortReassignHome bumped
-			// the row past it); its higher-epoch directive will rehome it. Terminal
-			// (collapsed to the anti-enumeration code, like absent/mismatch/off).
-			return fmt.Errorf("token_unknown_or_revoked")
-		case epoch > a.Epoch:
-			// This replica has NOT yet applied the latest OpPortReassignHome
-			// (REGARDLESS of home-vs-self — a higher presented epoch can only come
-			// from a leader-committed directive this replica will eventually apply).
-			// TRANSIENT: the agent retries until this home catches up. This IS the
-			// catch-up barrier (§7.2c, epoch-as-local-row-epoch — NOT a raft index).
-			return fmt.Errorf("%s", proto.ReasonHomeCatchingUp)
-		case a.HomeBroker != self:
-			// Same epoch, but this node is genuinely NOT the assigned home (an
-			// ex-home or never-home replica at the same epoch). Terminal.
-			return fmt.Errorf("token_unknown_or_revoked")
-		}
-		// epoch == a.Epoch && a.HomeBroker == self → this IS the home at the right
-		// epoch: allow (fall through to return nil).
-	}
-	return nil
 }
 
 // The expose home-applied barrier (gotcha #86). The budget stays well inside the ctl's 15 s expose
@@ -175,13 +155,13 @@ const (
 
 // missingTokenIsCatchingUp is the pure half of the gotcha-#86 deny classification: a token the local
 // store does not know is TRANSIENT (home_catching_up) only on a clustered replica that is LAGGING
-// (homeApplyLagging); single mode (the store IS the authority) and a replica that owes no committed
+// (applyLagOf); single mode (the store IS the authority) and a replica that owes no committed
 // command keep the terminal answer.
 func missingTokenIsCatchingUp(clusterMode, lagging bool) bool {
 	return clusterMode && lagging
 }
 
-// homeApplyLagging answers "may this replica's store be missing a write the leader has already
+// applyLagOf answers "may this replica's store be missing a write the leader has already
 // committed?" — the #86 home-half predicate. Two readings, either one is lag:
 //
 //   - !Node.CaughtUp (raft domain): never synced with a leader, or a committed batch not yet even
@@ -190,20 +170,10 @@ func missingTokenIsCatchingUp(clusterMode, lagging bool) bool {
 //     committed LogCommand — the FSM is inside (or queued behind) a slow apply. This is the window
 //     #86 describes and the one the raft-domain reading cannot see (CaughtUp's HONEST LIMIT #1).
 //
-// A cluster runtime that is not wired yet, and a read error, both read as lagging: the transient
-// answer costs the agent a bounded retry, the terminal one costs a healthy expose. A package
-// function rather than a Broker method: the Broker method budget is a ratchet, and this needs
-// nothing of the broker but its runtime and its logger.
-func homeApplyLagging(cl *clusterRuntime, logger *slog.Logger) bool {
-	if cl == nil {
-		return false // single mode: the store is the authority
-	}
-	if cl.node == nil {
-		return true
-	}
-	return applyLagOf(cl.node, logger)
-}
-
+// A read error counts as lagging: a transient answer costs the agent a bounded
+// retry, while a terminal answer costs a healthy expose. This package function
+// needs only the command-domain source and its logger, keeping the Broker
+// method budget unchanged.
 // applyLagSource is the two readings applyLagOf combines; *cluster.Node is the production source,
 // a scripted one pins the combination (expose_test.go) without a three-node cluster.
 type applyLagSource interface {
@@ -606,4 +576,393 @@ func (b *Broker) pubAuditPort(sid, kind, nid string, port int, name string, loca
 	if err := b.publishAudit(proto.SubjAuditPort(sid), body); err != nil {
 		b.cfg.Logger.Warn("broker: audit.port pub", "err", err, "sid", sid)
 	}
+}
+
+var (
+	errTunnelAuthorityRevoked = errors.New("token_unknown_or_revoked")
+	errTunnelAuthorityRetry   = errors.New("try_again")
+	errTunnelAuthorityLag     = errors.New(proto.ReasonHomeCatchingUp)
+	// Private provenance distinguishes deadline cancellation from a store fault.
+	// Neither v1 nor legacy may emit this internal classification over the wire.
+	// origin: hot-update S5 plan §4.3 / T29 / DRILL-RUN run262.
+	errTunnelAuthorityExpired = errors.New("authority deadline expired")
+)
+
+// These callbacks have operation deadlines, rather than caller-owned lifetimes.
+// A broker has its own replay budget; it never charges the agent's reservations.
+// Darwin retains the legacy carrier because it cannot own Linux replay sockets.
+// origin: hot-update S5 plan §2.1 / §4.1 / §4.3 / §7.4
+func configureTunnelAuthority(b *Broker, srv *tunnel.Server) error {
+	if runtime.GOOS != "linux" {
+		return nil
+	}
+	// The issuer identity belongs to this server lifetime. A restored database
+	// or repeated node ID must not make a prior process's tickets transferable;
+	// the image path below preserves it across broker exec.
+	// origin: hot-update S5 plan §4.4 / T14
+	var incarnation [16]byte
+	if _, err := rand.Read(incarnation[:]); err != nil {
+		return err
+	}
+	bootID := fmt.Sprintf("broker.%x", incarnation)
+	instanceID := b.selfNodeID()
+	if instanceID == "" {
+		instanceID = bootID
+	}
+	return srv.SetFlowConfig(brokerTunnelFlowConfig(b, bootID, instanceID, 1,
+		&workload.ReplayBudget{Limit: workload.DefaultReplayBudget}))
+}
+
+// Callbacks capture the current broker/store, while identity and budget belong
+// to the imported owner. Calling SetFlowConfig on import would mint a new ticket
+// key; only tunnel.ImportServer may install the sealed key and private fences.
+// origin: hot-update S6 plan §6.3 / T28
+func brokerTunnelFlowConfig(b *Broker, bootID, instanceID string, owner uint64, budget *workload.ReplayBudget) tunnel.FlowConfig {
+	return tunnel.FlowConfig{
+		InstanceID: instanceID, BootID: bootID, OwnerGen: owner,
+		Budget:       budget,
+		MaxEndpoints: tunnel.MaxEndpoints, MaxPendingFDs: flow.MaxPendingFDs,
+		TokenLookup: func(req tunnel.AuthRequest) error {
+			_, err := tunnelAuthorityLookup(b, req)
+			return err
+		},
+		Authorize: func(req tunnel.AuthRequest) (tunnel.Authority, error) {
+			return tunnelAuthorityLookup(b, req)
+		},
+	}
+}
+
+// Build before ImportServer takes any files. The shared receiving budget can
+// already contain other domains; its global Used is never the server's exported
+// reservation. P07 validates the actual private replay-capacity sum on import.
+// OwnerGeneration is the agent-owner fence, not the daemon's image generation.
+// origin: hot-update S6 plan §6.3 / T28
+func brokerTunnelImportConfig(b *Broker, image tunnel.ServerImage, budget *workload.ReplayBudget) (tunnel.ServerImportConfig, error) {
+	if runtime.GOOS != "linux" {
+		return tunnel.ServerImportConfig{}, fmt.Errorf("broker: live tunnel image unsupported on this platform")
+	}
+	// Import only constructs dormant callbacks. The current DB is deliberately
+	// opened later, after ACTIVE; requiring it here makes every real restored
+	// serve launch refuse before taking the store lock.
+	// origin: hot-update S6 plan §4.1 / §6.3 / T28
+	if b == nil || image.IssuerBootID == "" || image.InstanceID == "" || image.OwnerGeneration == 0 || budget == nil {
+		return tunnel.ServerImportConfig{}, fmt.Errorf("broker: missing current tunnel authority or image identity")
+	}
+	limit := budget.Limit
+	if limit == 0 {
+		limit = workload.DefaultReplayBudget
+	}
+	if image.ReplayLimit != limit || image.ReplayUsed < 0 || image.ReplayUsed != image.Flows.ReservedBytes || image.ReplayUsed > limit-budget.Used() {
+		return tunnel.ServerImportConfig{}, fmt.Errorf("broker: tunnel image replay reservation mismatch")
+	}
+	// PublicHost is the listener bind host here, not the advertised expose
+	// hostname. A new post-cut OPEN must use the same cold-start bind policy.
+	// origin: hot-update S6 plan §6.3 / T28
+	publicHost := b.cfg.TunnelPublicHost
+	if publicHost == "" {
+		publicHost = "0.0.0.0"
+	}
+	return tunnel.ServerImportConfig{
+		PublicHost: publicHost, Lookup: b.tunnelTokenLookup,
+		Certificate: b.tunnelCert, Logger: b.cfg.Logger,
+		Flow: brokerTunnelFlowConfig(b, image.IssuerBootID, image.InstanceID, image.OwnerGeneration, budget),
+	}, nil
+}
+
+// Stop's only worker cancels the synchronous SQL operation. Cleanup joins that
+// worker before returning; no timeout can leave an authorization read behind.
+// Pool acquisition, SQLite and all validation spend the same entry-time budget.
+// origin: hot-update S5 plan §4.3 / T29
+func tunnelAuthorityContext(req tunnel.AuthRequest) (context.Context, func()) {
+	deadline := time.Now().Add(tunnel.LookupBudget)
+	if !req.Deadline.IsZero() && req.Deadline.Before(deadline) {
+		deadline = req.Deadline
+	}
+	ctx, cancel := context.WithDeadline(context.Background(), deadline) // ctx-none: frozen AuthRequest supplies Deadline and Stop, not a caller context.
+	joined := make(chan struct{})
+	if req.Stop == nil {
+		close(joined)
+	} else {
+		select {
+		case <-req.Stop:
+			cancel()
+		default:
+		}
+		go func() {
+			defer close(joined)
+			select {
+			case <-req.Stop:
+				cancel()
+			case <-ctx.Done():
+			}
+		}()
+	}
+	return ctx, func() { cancel(); <-joined }
+}
+
+// A committed LogCommand, unlike an election noop, belongs to the SQLite
+// revision domain. Reading its ceiling separately never supplies authority:
+// it only rejects a transaction whose applied cursor has not reached it.
+// In particular, do not call CommandApplyLagging: its second, uncancellable SQL
+// snapshot could both mix revisions and block outside this operation's budget.
+// origin: hot-update S5 plan §4.3 / lead Q1 / T29
+type tunnelCommandSource interface {
+	CommitIndex() uint64
+	RaftAppliedIndex() uint64
+	CommittedCommandAt(uint64) (*cluster.Command, error)
+}
+
+func tunnelAuthorityKnownLag(ctx context.Context, src tunnelCommandSource, applied uint64) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	commit := src.CommitIndex()
+	if commit == 0 || src.RaftAppliedIndex() < commit {
+		return true, nil
+	}
+	for index := commit; index > applied; index-- {
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
+		_, err := src.CommittedCommandAt(index)
+		switch {
+		case err == nil, errors.Is(err, cluster.ErrLogPoison):
+			return true, nil
+		case errors.Is(err, cluster.ErrLogNonCommand):
+			continue
+		case errors.Is(err, cluster.ErrLogTruncated):
+			return false, nil
+		default:
+			return false, err
+		}
+	}
+	return false, ctx.Err()
+}
+
+// The unhomed legacy epoch ladder is intentionally inert. A v1 grant must
+// instead describe the exact five-tuple that its Endpoint and ticket bind;
+// otherwise a caller could authorize an invented epoch against an old row.
+// Both entry points still perform the same complete bounded snapshot read.
+// origin: hot-update S5 plan §2.1 / §4.3 / T29
+func tunnelAuthorityLookup(b *Broker, req tunnel.AuthRequest) (tunnel.Authority, error) {
+	grant, err := tunnelAuthoritySnapshot(b, req)
+	if err != nil {
+		return tunnel.Authority{}, err
+	}
+	if grant.Allocation != req.Allocation {
+		return tunnel.Authority{}, errTunnelAuthorityRevoked
+	}
+	return grant, nil
+}
+
+func tunnelAuthoritySnapshot(b *Broker, req tunnel.AuthRequest) (tunnel.Authority, error) {
+	grant, err := tunnelAuthoritySnapshotAttempt(b, req)
+	if errors.Is(err, errTunnelAuthorityExpired) {
+		return tunnel.Authority{}, errTunnelAuthorityRetry
+	}
+	return grant, err
+}
+
+// Only the legacy retry loop needs deadline provenance to retain an observed
+// lag refusal. Public lookups still collapse expired reads to try_again; real
+// store errors and committed revocations keep their existing classifications.
+// origin: hot-update S5 plan §4.3 / T29 / DRILL-RUN run262.
+func tunnelAuthoritySnapshotAttempt(b *Broker, req tunnel.AuthRequest) (tunnel.Authority, error) {
+	ctx, done := tunnelAuthorityContext(req)
+	defer done()
+	grant, err := readTunnelAuthority(ctx, b, req.Allocation)
+	if err != nil {
+		// A TRANSIENT store fault must NOT masquerade as a revocation: a
+		// reconnecting agent treats token_unknown_or_revoked as terminal
+		// (proxy off) and stops forever — the false-online incident, this
+		// time DB-triggerable. Emit a distinct transient reason the agent
+		// retries. This leaks nothing: try_again fires only on the broker's
+		// own DB fault, never as a function of token validity — the F6
+		// anti-enumeration collapse below (absent/mismatch/off → one code)
+		// is preserved.
+		if errors.Is(err, errTunnelAuthorityRevoked) || errors.Is(err, errTunnelAuthorityLag) {
+			return tunnel.Authority{}, err
+		}
+		if errors.Is(err, context.DeadlineExceeded) ||
+			(errors.Is(err, sql.ErrTxDone) && errors.Is(ctx.Err(), context.DeadlineExceeded)) {
+			return tunnel.Authority{}, errTunnelAuthorityExpired
+		}
+		// Neither SQL driver text nor grant material may escape over DENY/logs.
+		return tunnel.Authority{}, errTunnelAuthorityRetry
+	}
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return tunnel.Authority{}, errTunnelAuthorityExpired
+	}
+	if ctx.Err() != nil {
+		return tunnel.Authority{}, errTunnelAuthorityRetry
+	}
+	return grant, nil
+}
+
+// All durable authorization fields come from one read transaction. busy_timeout
+// is connection-local and the existing pools use five seconds; even QueryContext
+// can spend that interval inside SQLite's busy handler. Use immediate refusal
+// for this read, then restore the borrowed connection's original setting.
+// origin: hot-update S5 plan §4.3 / T29
+func readTunnelAuthority(ctx context.Context, b *Broker, want tunnel.Allocation) (tunnel.Authority, error) {
+	if want.Port < 1 || want.Port > 65535 || want.Epoch < 0 || want.TokenHash == "" ||
+		proto.ValidateSID(want.SID) != nil || proto.ValidateNID(want.NID) != nil {
+		return tunnel.Authority{}, errTunnelAuthorityRevoked
+	}
+	// The accessor names this as a read; the SQL escape hatch is needed for
+	// connection-local busy timeout and the single read-only transaction.
+	// origin: hot-update S5 plan §4.3 / lead Q1
+	conn, err := b.read().SQL().Conn(ctx)
+	if err != nil {
+		return tunnel.Authority{}, err
+	}
+	defer func() { _ = conn.Close() }()
+	tx, release, err := beginBoundedAuthorityRead(ctx, conn)
+	if err != nil {
+		return tunnel.Authority{}, err
+	}
+	defer release()
+	return readTunnelAuthorityTx(ctx, b, tx, want)
+}
+
+// Both authority paths must defeat the connection's longer busy handler before
+// their single snapshot starts. No second SQL path or timeout worker may escape
+// the operation deadline; release restores the setting before pool reuse.
+// origin: hot-update S5 internal review rv-authority-2
+func beginBoundedAuthorityRead(ctx context.Context, conn *sql.Conn) (*sql.Tx, func(), error) {
+	var busy int
+	if err := conn.QueryRowContext(ctx, "PRAGMA busy_timeout").Scan(&busy); err != nil {
+		return nil, nil, err
+	}
+	if _, err := conn.ExecContext(ctx, "PRAGMA busy_timeout=0"); err != nil {
+		return nil, nil, err
+	}
+	restore := func() {
+		// This local PRAGMA does not wait for a database lock. Restore it even
+		// when Stop cancelled the read, before returning the pooled connection.
+		_, _ = conn.ExecContext(context.WithoutCancel(ctx), fmt.Sprintf("PRAGMA busy_timeout=%d", busy))
+	}
+	tx, err := conn.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		restore()
+		return nil, nil, err
+	}
+	return tx, func() { _ = tx.Rollback(); restore() }, nil
+}
+
+func readTunnelAuthorityTx(ctx context.Context, b *Broker, tx *sql.Tx, want tunnel.Allocation) (tunnel.Authority, error) {
+	grant := tunnel.Authority{Allocation: want}
+	var revision string
+	err := tx.QueryRowContext(ctx, `SELECT value FROM cluster_meta WHERE key='applied_index'`).Scan(&revision)
+	if err == nil {
+		grant.AppliedRevision, err = strconv.ParseUint(revision, 10, 64)
+	}
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return tunnel.Authority{}, err
+	}
+	// A positive token row on a known-lagging replica is no proof that a
+	// committed revocation has applied. Check before both presence outcomes.
+	// origin: hot-update S5 plan §4.3 / T29
+	if b.clusterMode {
+		if b.cl == nil || b.cl.node == nil {
+			return tunnel.Authority{}, errTunnelAuthorityLag
+		}
+		lag, err := tunnelAuthorityKnownLag(ctx, b.cl.node, grant.AppliedRevision)
+		if err != nil {
+			return tunnel.Authority{}, err
+		}
+		if lag {
+			return tunnel.Authority{}, errTunnelAuthorityLag
+		}
+	}
+	var name, home, sessionState, nodeState string
+	var storedEpoch int64
+	var enabled, capable int
+	err = tx.QueryRowContext(ctx, `SELECT a.name,a.home_broker,a.epoch,s.state,n.status,s.proxy_enabled,s.proxy_epoch,n.proxy_capable
+		FROM port_allocations a JOIN sessions s ON s.sid=a.sid
+		JOIN nodes n ON n.sid=a.sid AND n.nid=a.nid
+		WHERE a.token_hash=? AND a.state='ALLOCATED' AND a.sid=? AND a.nid=? AND a.port=?`,
+		want.TokenHash, want.SID, want.NID, want.Port).
+		Scan(&name, &home, &storedEpoch, &sessionState, &nodeState, &enabled, &grant.ProxyEpoch, &capable)
+	if errors.Is(err, sql.ErrNoRows) {
+		return tunnel.Authority{}, errTunnelAuthorityRevoked
+	}
+	if err != nil {
+		return tunnel.Authority{}, err
+	}
+	// Defense-in-depth (review A5 M6): a corrupted negative stored epoch must
+	// not make every honest agent (epoch >= 0) loop on home_catching_up
+	// forever. Treat it as a terminal, anti-enumeration-collapsed deny.
+	if sessionState != "ACTIVE" || (nodeState != "ONLINE" && nodeState != "STALE") ||
+		storedEpoch < 0 || grant.ProxyEpoch < 0 || (enabled != 0 && enabled != 1) {
+		return tunnel.Authority{}, errTunnelAuthorityRevoked
+	}
+	// D6 home/epoch ladder: a newer presented epoch is transient, a superseded
+	// epoch or wrong home is terminal. The unhomed legacy epoch remains inert.
+	if home != "" {
+		switch {
+		case want.Epoch < storedEpoch:
+			// The agent holds a SUPERSEDED directive (an OpPortReassignHome bumped
+			// the row past it); its higher-epoch directive will rehome it. Terminal
+			// (collapsed to the anti-enumeration code, like absent/mismatch/off).
+			return tunnel.Authority{}, errTunnelAuthorityRevoked
+		case want.Epoch > storedEpoch:
+			// This replica has NOT yet applied the latest OpPortReassignHome
+			// (REGARDLESS of home-vs-self — a higher presented epoch can only come
+			// from a leader-committed directive this replica will eventually apply).
+			// TRANSIENT: the agent retries until this home catches up. This IS the
+			// catch-up barrier (§7.2c, epoch-as-local-row-epoch — NOT a raft index).
+			return tunnel.Authority{}, errTunnelAuthorityLag
+		case home != b.selfNodeID():
+			// Same epoch, but this node is genuinely NOT the assigned home (an
+			// ex-home or never-home replica at the same epoch). Terminal.
+			return tunnel.Authority{}, errTunnelAuthorityRevoked
+		}
+	}
+	grant.Allocation.Epoch = storedEpoch
+	grant.Enabled = true // A normal expose does not depend on the SS master switch.
+	if name != port.ProxyPortName {
+		return grant, ctx.Err()
+	}
+	// round-3 F1: for the system __proxy__ port, the master switch is part of
+	// the authorization boundary. Even if the ALLOCATED row is briefly visible
+	// between CloseProxy and port.Free, a REGISTER must be denied while proxy is
+	// OFF — otherwise the kill switch leaks an exit through a re-REGISTER race.
+	// The same boundary now dominates each fresh RESUME grant as well.
+	// origin: hot-update S5 plan §4.3
+	// The retained allocation is insufficient after node participation changes.
+	// Read that predicate from this same snapshot, matching proxy push authority.
+	// origin: hot-update S5 internal review rv-authority-1
+	if !proxyParticipationEnabled(enabled, capable, nodeState) {
+		return tunnel.Authority{}, errTunnelAuthorityRevoked
+	}
+	if !b.clusterMode {
+		if err := tx.QueryRowContext(ctx, `SELECT generation FROM proxy_meta WHERE id=1`).Scan(&grant.Generation); err != nil {
+			return tunnel.Authority{}, err
+		}
+		if grant.Generation < 0 || grant.Generation >= maxProxyGeneration {
+			return tunnel.Authority{}, errTunnelAuthorityRevoked
+		}
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT sub_id,psk FROM proxy_subscribers WHERE sid=? AND state='ACTIVE' ORDER BY sub_id`, want.SID)
+	if err != nil {
+		return tunnel.Authority{}, err
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var id, secret string
+		if err := rows.Scan(&id, &secret); err != nil {
+			return tunnel.Authority{}, err
+		}
+		if id == "" || secret == "" {
+			return tunnel.Authority{}, errTunnelAuthorityRevoked
+		}
+		// Secret retains the password representation used by ProxyKey/SS Key;
+		// key derivation stays in ssproxy, never in the authorization adapter.
+		grant.Keys = append(grant.Keys, tunnel.AuthorizedKey{ID: id, Secret: []byte(secret)})
+	}
+	if err := rows.Err(); err != nil {
+		return tunnel.Authority{}, err
+	}
+	return grant, ctx.Err()
 }

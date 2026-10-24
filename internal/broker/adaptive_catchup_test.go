@@ -9,16 +9,20 @@ import (
 // large/slow-but-healthy joiner is not false-BLOCKED, while a genuinely dead one still hits the max clamp.
 
 func TestAdaptiveCatchupDeadline_InvariantsHold(t *testing.T) {
+	// origin: hot-update S10 plan §11.1 / TEST-BUDGET
+	if runIsolatedBrokerTest(t) {
+		return
+	}
 	n, _ := d7SingleNode(t, "ctl-1")
 	admin := NewClusterAdmin(n, nil)
 
-	bytes, err := admin.commandDomainDBBytes()
+	bytes, err := admin.CommandDomainDBBytes()
 	if err != nil || bytes <= 0 {
 		t.Fatalf("command-domain DB size must be readable + positive (it sizes the deadline): got %d, err %v", bytes, err)
 	}
 
 	before := time.Now()
-	d := admin.adaptiveCatchupDeadline()
+	d := admin.AdaptiveCatchupDeadline()
 	after := time.Now()
 
 	// Never SHORTER than the base 2-min deadline (a size-scaled deadline only ever extends). Allow the tick

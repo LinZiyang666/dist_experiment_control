@@ -44,10 +44,11 @@ func TestClusterStatusProducersAgreeOnTheSchemaVersion(t *testing.T) {
 	}
 
 	// The offline producer lives in cmd/tether, which this package cannot import (it is package main).
-	// Read it as source: the check is that it does NOT stamp an integer literal, because a literal is
-	// exactly the drift this test exists to prevent.
+	// Read it as source: require the shared constant, since any independent
+	// literal or symbol can drift when the wire schema changes.
 	root := repoRootForSchemaAgreement(t)
-	path := filepath.Join(root, "cmd", "tether", "cluster.go")
+	// origin: hot-update S6 plan §9.3 / TESTFIX; follow the offline producer.
+	path := filepath.Join(root, "cmd", "tether", "cluster_status.go")
 	src, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("read %s: %v", path, err)
@@ -68,11 +69,14 @@ func TestClusterStatusProducersAgreeOnTheSchemaVersion(t *testing.T) {
 			return true
 		}
 		found++
-		if lit, isLit := kv.Value.(*ast.BasicLit); isLit && lit.Kind == token.INT {
-			t.Errorf("cmd/tether/cluster.go stamps SchemaVersion as the literal %s. The offline view emits "+
-				"the SAME adminsock.ClusterStatusReport as the socket view, so a literal here drifts the "+
-				"moment the socket view bumps — which is exactly what happened at v1->v2. Reference "+
-				"adminsock.ClusterStatusSchemaVersion instead.", lit.Value)
+		version, selector := kv.Value.(*ast.SelectorExpr)
+		if !selector {
+			t.Error("offline SchemaVersion must reference adminsock.ClusterStatusSchemaVersion")
+			return true
+		}
+		owner, named := version.X.(*ast.Ident)
+		if !named || owner.Name != "adminsock" || version.Sel.Name != "ClusterStatusSchemaVersion" {
+			t.Error("offline SchemaVersion must reference adminsock.ClusterStatusSchemaVersion")
 		}
 		return true
 	})

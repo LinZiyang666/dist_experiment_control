@@ -53,6 +53,8 @@ func TestConnOptionsSetTheLivenessProbe(t *testing.T) {
 // because it never fails to answer; set the CLIENT to not answer (impossible in nats.go) is the
 // only thing that would — which is the point: the old client is safe by construction.
 func TestOldClientSurvivesServerPingSettings(t *testing.T) {
+	// Ephemeral listener and connection owned solely by this test.
+	t.Parallel()
 	opts := natstest.DefaultTestOptions
 	opts.Port = -1
 	opts.PingInterval = 2 * time.Second // scaled: 20s → 2s, MaxPingsOut unchanged; the RATIO is the contract
@@ -106,6 +108,8 @@ func TestOldClientSurvivesServerPingSettings(t *testing.T) {
 //     (MaxPingsOut+2)×interval, which is the bound the operator docs quote (20 s × 2 → ≤ 80 s worst case,
 //     ≈ 64 s in practice), not a "generous slack" that would also admit a wrong ping_max.
 func TestServerDropsASilentRawClient(t *testing.T) {
+	// Ephemeral listener and connection owned solely by this test.
+	t.Parallel()
 	opts := natstest.DefaultTestOptions
 	opts.Port = -1
 	opts.PingInterval = 2 * time.Second

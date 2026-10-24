@@ -94,13 +94,21 @@ func TestG67EveryTransferRefusalGoesThroughTransferRefusalErr(t *testing.T) {
 // what THIS client may publish and is populated from server INFO on any connected conn. It is the
 // ONLY measurement available when the caps probe fails, which is the #67 face-B case; passing a
 // literal instead re-opens the silent widening of the tier-A/B boundary that the fix removed.
+//
+// S7: the cap0 tier boundary moved with the one-shot legacy owner into internal/cli. Its push tier
+// choice and its pull MaxInline are each a min() of the protocol ceiling and the CONTROL connection's
+// MaxPayload(); a capable transfer takes the boundary from the authenticated agent probe instead.
+// origin: hot-update S7 plan §9 / P31 (re-pointed from runPush/runPull)
 func TestG67TierACeilingCallSitesUseTheConnectionMeasurement(t *testing.T) {
-	fset, f := g67ParseTransferGo(t)
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "../../internal/cli/transfer_legacy.go", nil, 0)
+	if err != nil {
+		t.Fatalf("parse transfer_legacy.go: %v", err)
+	}
 	seen := map[string]int{}
 	for _, decl := range f.Decls {
 		fn, ok := decl.(*ast.FuncDecl)
-		// Only the COMMAND entry points. chooseTier's own body legitimately forwards its parameter.
-		if !ok || (fn.Name.Name != "runPush" && fn.Name.Name != "runPull") {
+		if !ok || (fn.Name.Name != "legacyOnce" && fn.Name.Name != "legacyPush") {
 			continue
 		}
 		ast.Inspect(fn.Body, func(n ast.Node) bool {
@@ -108,120 +116,70 @@ func TestG67TierACeilingCallSitesUseTheConnectionMeasurement(t *testing.T) {
 			if !ok {
 				return true
 			}
-			id, ok := call.Fun.(*ast.Ident)
-			if !ok || (id.Name != "chooseTier" && id.Name != "tierAInlineCeiling") {
+			if id, ok := call.Fun.(*ast.Ident); !ok || id.Name != "min" || !strings.Contains(exprString(fset, call), "XferTierAMaxBytes") {
 				return true
 			}
-			hasConnMeasurement := false
-			for _, a := range call.Args {
-				inner, ok := a.(*ast.CallExpr)
-				if !ok {
-					continue
+			measured := false
+			ast.Inspect(call, func(m ast.Node) bool {
+				if inner, ok := m.(*ast.CallExpr); ok {
+					if s, ok := inner.Fun.(*ast.SelectorExpr); ok && s.Sel.Name == "MaxPayload" && strings.HasSuffix(exprString(fset, s.X), "control") {
+						measured = true
+					}
 				}
-				if s, ok := inner.Fun.(*ast.SelectorExpr); ok && s.Sel.Name == "MaxPayload" {
-					hasConnMeasurement = true
-				}
+				return true
+			})
+			if !measured {
+				t.Errorf("%s: the tier-A ceiling in %s is %q, not clamped by the control connection's "+
+					"MaxPayload(); a missing measurement must never WIDEN the inline ceiling",
+					fset.Position(call.Pos()), fn.Name.Name, exprString(fset, call))
 			}
-			if !hasConnMeasurement {
-				t.Errorf("%s: %s in %s is called without nc.MaxPayload(); a missing measurement must never "+
-					"WIDEN the inline ceiling, and the connection's own max_payload is the one measurement "+
-					"that is always available", fset.Position(call.Pos()), id.Name, fn.Name.Name)
-			}
-			seen[id.Name]++
+			seen[fn.Name.Name]++
 			return true
 		})
 	}
-	// Anti-vacuity: this test must fail if the call sites are renamed or removed rather than passing
-	// because it found nothing to check. push calls chooseTier, pull calls tierAInlineCeiling.
-	if seen["chooseTier"] < 1 || seen["tierAInlineCeiling"] < 1 {
-		t.Fatalf("expected at least one chooseTier and one tierAInlineCeiling CALL SITE in transfer.go, "+
-			"found %v — the pin has nothing to hold down", seen)
+	// Anti-vacuity: push chooses its tier, pull bounds MaxInline — one clamp each.
+	if seen["legacyPush"] < 1 || seen["legacyOnce"] < 1 {
+		t.Fatalf("expected a tier-A ceiling clamp in both legacyPush and legacyOnce, found %v — the pin has nothing to hold down", seen)
 	}
 }
 
-// TestG67TLProbeWarningIsAnnouncedAtBothCallSites: proceeding on a guess (an undetermined or refused
-// caps probe) is only acceptable because the operator is TOLD. capsProbe.warning() returning the
-// right string is asserted; that anyone prints it is not.
-func TestG67ProbeWarningIsAnnouncedAtBothCallSites(t *testing.T) {
-	_, f := g67ParseTransferGo(t)
-	uses := 0
-	ast.Inspect(f, func(n ast.Node) bool {
-		sel, ok := n.(*ast.SelectorExpr)
-		if ok && sel.Sel.Name == "warning" {
-			uses++
-		}
-		return true
-	})
-	// one per verb (push, pull); the method declaration itself is not a SelectorExpr.
-	if uses < 2 {
-		t.Fatalf("capsProbe.warning() is consulted %d time(s) in transfer.go, want >= 2 (push and pull). "+
-			"chooseTier now proceeds OPTIMISTICALLY to tier B whenever the probe produced no authoritative "+
-			"answer; that is only honest while the guess is announced on stderr", uses)
-	}
-}
-
-// TestTierBEntryPointsDeriveTheirPhaseTimeoutFromTheSize pins the CALL SITES of phaseTimeoutFor, the
-// same shape of hole the G67 pins above close for transferRefusalErr: TestPhaseTimeoutForDerivesFromSize
-// exercises the function, and mutation PT-3 (internal review round 1 R4-F6) showed that passing the raw
-// `timeout` flag to finishPullTierB instead of phaseTimeoutFor(cmd, pr.Size, timeout) leaves every test
-// green — the 37-minute flat budget drill 67 measured would be back on the pull side with nothing
-// noticing. The pin: the two tier-B entry points are each called exactly once, and the LAST argument of
-// each call is phaseTimeoutFor(cmd, <the size that call itself carries>, timeout) — for push the size is
-// the argument at the size position of the same pushTierB call, for pull it is `<prepare-reply>.Size`
-// where the prepare reply is the argument passed at its own position of the finishPullTierB call.
-// origin: simcluster-speed internal review round 1 R4-F6
+// TestTierBEntryPointsDeriveTheirPhaseTimeoutFromTheSize pins the CALL SITE of the cap0 push phase
+// bound: TestPhaseTimeoutForDerivesFromSize exercises the function, and mutation PT-3 (internal review
+// round 1 R4-F6) showed that dropping the call leaves every test green — the 37-minute flat budget drill
+// 67 measured would be back. S7: the only cap0 push entry is RunTransferCommand's legacy branch; it must
+// call LegacyPhaseTimeout exactly once with the size of THIS transfer and the --timeout flag value.
+// origin: simcluster-speed internal review round 1 R4-F6; hot-update S7 plan §9 / P31 (re-pointed)
 func TestTierBEntryPointsDeriveTheirPhaseTimeoutFromTheSize(t *testing.T) {
-	fset, f := g67ParseTransferGo(t)
-	// The positional contract, read off the two signatures:
-	//   pushTierB(cmd, nc, actor, sid, spec, transferID, localAbs, size, force, timeout)
-	//   finishPullTierB(cmd, nc, actor, sid, spec, transferID, localAbs, startedAt, pr, force, timeout)
-	want := map[string]struct {
-		nargs   int
-		sizeArg func(call *ast.CallExpr) string // the expression phaseTimeoutFor's size must equal
-	}{
-		"pushTierB": {nargs: 10, sizeArg: func(c *ast.CallExpr) string { return exprString(fset, c.Args[7]) }},
-		"finishPullTierB": {nargs: 11, sizeArg: func(c *ast.CallExpr) string {
-			return exprString(fset, c.Args[8]) + ".Size"
-		}},
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "../../internal/cli/transfer_command.go", nil, 0)
+	if err != nil {
+		t.Fatalf("parse transfer_command.go: %v", err)
 	}
-	seen := map[string]int{}
-	ast.Inspect(f, func(n ast.Node) bool {
-		call, ok := n.(*ast.CallExpr)
-		if !ok {
+	calls := 0
+	for _, decl := range f.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if !ok || fn.Name.Name != "RunTransferCommand" {
+			continue
+		}
+		ast.Inspect(fn.Body, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			if id, ok := call.Fun.(*ast.Ident); !ok || id.Name != "LegacyPhaseTimeout" {
+				return true
+			}
+			calls++
+			at := fset.Position(call.Pos()).String()
+			if len(call.Args) != 3 || exprString(fset, call.Args[1]) != "cfg.Intent.Size" || exprString(fset, call.Args[2]) != "timeout" {
+				t.Fatalf("%s: the cap0 push bound is %q, want LegacyPhaseTimeout(<explicit>, cfg.Intent.Size, timeout) — "+
+					"the budget must be sized for THIS transfer and an explicit flag must still win", at, exprString(fset, call))
+			}
 			return true
-		}
-		id, ok := call.Fun.(*ast.Ident)
-		if !ok {
-			return true
-		}
-		spec, ok := want[id.Name]
-		if !ok {
-			return true
-		}
-		seen[id.Name]++
-		at := fset.Position(call.Pos()).String()
-		if len(call.Args) != spec.nargs {
-			t.Fatalf("%s: %s takes %d arguments, this pin was written for %d — re-derive the positions", at, id.Name, len(call.Args), spec.nargs)
-		}
-		last, ok := call.Args[len(call.Args)-1].(*ast.CallExpr)
-		if !ok {
-			t.Fatalf("%s: %s's timeout argument is %q, not a phaseTimeoutFor(...) call — the tier-B phase budget "+
-				"is the flat flag again (37 min for every size)", at, id.Name, exprString(fset, call.Args[len(call.Args)-1]))
-		}
-		if fn, ok := last.Fun.(*ast.Ident); !ok || fn.Name != "phaseTimeoutFor" || len(last.Args) != 3 {
-			t.Fatalf("%s: %s's timeout argument is %q, want phaseTimeoutFor(cmd, <size>, timeout)", at, id.Name, exprString(fset, last))
-		}
-		if got, wantSize := exprString(fset, last.Args[1]), spec.sizeArg(call); got != wantSize {
-			t.Fatalf("%s: %s derives its phase timeout from %q but transfers %q — the budget must be sized for THIS transfer", at, id.Name, got, wantSize)
-		}
-		if got := exprString(fset, last.Args[2]); got != "timeout" {
-			t.Fatalf("%s: phaseTimeoutFor's flag argument is %q, want the --timeout flag value `timeout` (an explicit flag must still win)", at, got)
-		}
-		return true
-	})
-	// Anti-vacuity: exactly one call site per verb — a second one would be a second budget to pin.
-	if seen["pushTierB"] != 1 || seen["finishPullTierB"] != 1 {
-		t.Fatalf("expected exactly one pushTierB and one finishPullTierB call site in transfer.go, found %v", seen)
+		})
+	}
+	if calls != 1 {
+		t.Fatalf("expected exactly one LegacyPhaseTimeout call in RunTransferCommand, found %d", calls)
 	}
 }
 
@@ -232,76 +190,4 @@ func exprString(fset *token.FileSet, e ast.Expr) string {
 		return "<unprintable>"
 	}
 	return sb.String()
-}
-
-// TestPushTierBWiresTheWatchdogAndTheRetryLadder pins the #84 ladder at its ONLY call site (round-2
-// review R4-2-F2, the same hole class as round-1 R4-F6): inside pushTierB there is exactly one
-// putWithJSRetry call, its arguments are the production classifier and the production constants,
-// and exactly one putWithJSWatchdog call whose clocks are the production constants and whose probe
-// closure calls probeJetStreamForBucket. Handing the ladder a never-transient classifier, an
-// unreachable strike count, or a probe that is not the ACL-bounded STREAM.INFO one left every
-// hermetic test green — only drill 67 (deploy tier, on demand) would have noticed.
-// origin: simcluster-speed review round 2 R4-2-F2
-func TestPushTierBWiresTheWatchdogAndTheRetryLadder(t *testing.T) {
-	fset, f := g67ParseTransferGo(t)
-	var push *ast.FuncDecl
-	for _, d := range f.Decls {
-		if fd, ok := d.(*ast.FuncDecl); ok && fd.Name.Name == "pushTierB" {
-			push = fd
-		}
-	}
-	if push == nil {
-		t.Fatal("pushTierB not found in transfer.go")
-	}
-	retries, watchdogs := 0, 0
-	ast.Inspect(push.Body, func(n ast.Node) bool {
-		call, ok := n.(*ast.CallExpr)
-		if !ok {
-			return true
-		}
-		id, ok := call.Fun.(*ast.Ident)
-		if !ok {
-			return true
-		}
-		at := fset.Position(call.Pos()).String()
-		switch id.Name {
-		case "putWithJSRetry":
-			retries++
-			want := []string{"putCtx", "attemptPut", "jetStreamUnavailableFace", "jsPutRetryAttempts", "jsPutRetryBackoff", "sleepCtx"}
-			if len(call.Args) != len(want) {
-				t.Fatalf("%s: putWithJSRetry takes %d arguments, this pin was written for %d", at, len(call.Args), len(want))
-			}
-			for i, w := range want {
-				if got := exprString(fset, call.Args[i]); got != w {
-					t.Fatalf("%s: putWithJSRetry argument %d is %q, want %q — the retry ladder is no longer driven by the production classifier/constants", at, i, got, w)
-				}
-			}
-		case "putWithJSWatchdog":
-			watchdogs++
-			if len(call.Args) != 6 {
-				t.Fatalf("%s: putWithJSWatchdog takes %d arguments, this pin was written for 6", at, len(call.Args))
-			}
-			for i, w := range map[int]string{3: "jsPutProbeInterval", 4: "jsPutProbeTimeout", 5: "jsPutProbeStrikes"} {
-				if got := exprString(fset, call.Args[i]); got != w {
-					t.Fatalf("%s: putWithJSWatchdog clock argument %d is %q, want %q", at, i, got, w)
-				}
-			}
-			probes := 0
-			ast.Inspect(call.Args[2], func(m ast.Node) bool {
-				if c, ok := m.(*ast.CallExpr); ok {
-					if fn, ok := c.Fun.(*ast.Ident); ok && fn.Name == "probeJetStreamForBucket" {
-						probes++
-					}
-				}
-				return true
-			})
-			if probes != 1 {
-				t.Fatalf("%s: putWithJSWatchdog's probe closure calls probeJetStreamForBucket %d times, want exactly 1 (the ACL-bounded STREAM.INFO probe is the only permitted one)", at, probes)
-			}
-		}
-		return true
-	})
-	if retries != 1 || watchdogs != 1 {
-		t.Fatalf("pushTierB must call putWithJSRetry once and putWithJSWatchdog once; found %d and %d", retries, watchdogs)
-	}
 }

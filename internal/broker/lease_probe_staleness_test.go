@@ -103,6 +103,10 @@ func TestGrantInvalidatesTheFreeObservationThatAuthorisedIt(t *testing.T) {
 // mutation (plan §4 B3 ②) is recorded as NOT caught. If that ever changes — a second cache writer
 // — this paragraph is the first thing to delete, and the mutation is the test to write.
 func TestBackgroundProbeMustNotOverwriteANewerObservation(t *testing.T) {
+	// origin: hot-update S10 plan §11.1 / TEST-BUDGET
+	if runIsolatedBrokerTest(t) {
+		return
+	}
 	b, _, url := leaseBrokerWithBus(t)
 	seedBeat(t, b, "gpu1", 0)
 

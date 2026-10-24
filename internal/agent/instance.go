@@ -2,16 +2,15 @@ package agent
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/base32"
 	"encoding/json"
-	"fmt"
-	"os"
-	"strings"
-	"sync/atomic"
 	"time"
 
+	"github.com/LinZiyang666/tether/internal/agentidentity"
+	"github.com/LinZiyang666/tether/internal/agentupgrade"
+	"github.com/LinZiyang666/tether/internal/agentupgradeport"
+	"github.com/LinZiyang666/tether/internal/drillobserve"
 	"github.com/LinZiyang666/tether/internal/proto"
+
 	"github.com/nats-io/nats.go"
 )
 
@@ -77,142 +76,25 @@ import (
 const (
 	// instanceIDEnv carries the lineage across syscall.Exec. It is read at
 	// startup and injected at every exec site.
-	instanceIDEnv = "TETHER_INSTANCE_ID"
+	instanceIDEnv = agentidentity.InstanceIDEnv
 	// routingNIDEnv carries the currently-adopted routing name across
 	// syscall.Exec, so an upgrade of a leased instance re-registers under the
 	// name it already holds instead of re-contesting for the basename.
-	routingNIDEnv = "TETHER_ROUTING_NID"
+	routingNIDEnv = agentidentity.RoutingNIDEnv
 )
 
-// instanceIDLen is the character length of an instance id: 16 crypto/rand bytes
-// rendered as unpadded lowercase base32.
-const instanceIDLen = 26
+// LineageEnvKeys names the environment variables that carry a process
+// lineage across exec, for the bootstrap to snapshot BEFORE this package
+// consumes them (hot-update S3 §1.7): a re-dispatch of a held image after a
+// failure deep inside New must still hand the previous binary the lineage
+// this process arrived with, and by then both variables have been unset.
+func LineageEnvKeys() []string { return []string{instanceIDEnv, routingNIDEnv} }
 
-// lowerBase32 renders bytes with the standard base32 alphabet lowercased and
-// without padding, giving [0-9a-z] — subject-safe, and the same character class
-// the lowercase ULIDs in internal/proc already use for pids.
-var lowerBase32 = base32.NewEncoding("abcdefghijklmnopqrstuvwxyz234567").WithPadding(base32.NoPadding)
+const instanceIDLen = agentidentity.InstanceIDLen
 
-// mintInstanceID returns this process's instance id, adopting an inherited
-// lineage when one is present and generating a fresh one otherwise.
-//
-// The inherited value is validated before use: it arrives through the
-// environment, which any parent process can set.
-func mintInstanceID() (string, error) {
-	// NO PROCESS-WIDE CACHE. A round-2 revision memoized this so a boot-time
-	// caller and Agent.New would agree; that made every Agent constructed in one
-	// process share an id, and two instances sharing an id read to the broker as
-	// one instance reconnecting — the fan-out this increment exists to remove.
-	// The boot shim no longer needs an id at all (external review F7), so the
-	// question is moot and the simple reading stands.
-	id, _, err := mintInstanceIDLocked()
-	return id, err
-}
-
-func mintInstanceIDLocked() (string, bool, error) {
-	v := strings.TrimSpace(os.Getenv(instanceIDEnv))
-	// CONSUME the variable: once its value is in memory it must not remain in
-	// this process's environment, because managed children inherit os.Environ()
-	// by default and several spawn paths deliberately leave cmd.Env nil to stay
-	// byte-identical to pre-feature behaviour (remote-fs-resilience pins that).
-	//
-	// Unsetting here is what makes the guarantee total instead of per-call-site:
-	// a child cannot inherit what the parent no longer has, so a spawn path
-	// added later cannot forget the rule. Without it, a user command that starts
-	// an agent (`tether run node -- bash`, then a daemon in that shell) would
-	// inherit this process's lineage and the broker would read the two of them
-	// as one instance reconnecting — the clone fan-out, restored through the
-	// environment.
-	//
-	// The value is re-injected explicitly at the two syscall.Exec sites (see
-	// execEnv), which is the only place it is legitimately handed forward.
-	_ = os.Unsetenv(instanceIDEnv)
-	if v != "" && len(v) == instanceIDLen && isLowerBase32(v) {
-		return v, true, nil
-	}
-	// A malformed inherited value is discarded rather than propagated: a bad id
-	// would be rejected by the broker on every register, and silently running
-	// with one is worse than starting a fresh lineage.
-	id, err := newInstanceID()
-	return id, false, err
-}
-
-func newInstanceID() (string, error) {
-	var b [16]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		return "", fmt.Errorf("agent: mint instance id: %w", err)
-	}
-	return lowerBase32.EncodeToString(b[:]), nil
-}
-
-func isLowerBase32(s string) bool {
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		if (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') {
-			continue
-		}
-		return false
-	}
-	return true
-}
-
-// execLineage carries what the two syscall.Exec sites must hand forward.
-//
-// It is PROCESS-level state rather than a field on Agent because one of the two
-// sites (realExec in upgrade_state.go) is a package-level function with no
-// receiver, and because the thing being modelled genuinely is per-process: a
-// process has exactly one instance lineage. Tests never traverse the exec path,
-// so a shared value cannot leak between concurrently-constructed Agents there.
-var execLineage struct {
-	instanceID atomic.Pointer[string]
-	routingNID atomic.Pointer[string]
-}
-
-// setExecLineage records what a subsequent re-exec must carry forward.
-func setExecLineage(instanceID, routingNID string) {
-	if instanceID != "" {
-		execLineage.instanceID.Store(&instanceID)
-	}
-	if routingNID != "" {
-		execLineage.routingNID.Store(&routingNID)
-	}
-}
-
-// execEnv returns the environment for a syscall.Exec of this binary: the
-// current environment with the instance lineage attached, so the re-executed
-// image continues the SAME instance instead of arriving as a stranger and
-// contesting the name its own predecessor still holds.
-//
-// Without this, `node upgrade` would rename every node it upgraded.
-func execEnv() []string {
-	out := stripInstanceEnv(os.Environ())
-	// Fall back to the raw environment when no Agent has recorded a lineage yet.
-	//
-	// The boot-time upgrade check runs BEFORE Agent.New — a rollback there
-	// re-execs from a process that never called mintInstanceID, so execLineage
-	// is empty while the inherited variables are still in os.Environ(). Without
-	// this fallback the rollback would strip the lineage and never re-add it,
-	// and the recovered agent would arrive as a stranger contesting its own
-	// name.
-	inst := loadedLineage(execLineage.instanceID.Load(), instanceIDEnv)
-	route := loadedLineage(execLineage.routingNID.Load(), routingNIDEnv)
-	if inst != "" {
-		out = append(out, instanceIDEnv+"="+inst)
-	}
-	if route != "" {
-		out = append(out, routingNIDEnv+"="+route)
-	}
-	return out
-}
-
-// loadedLineage prefers a recorded lineage value and falls back to the ambient
-// environment, which is the only source available before Agent.New has run.
-func loadedLineage(recorded *string, env string) string {
-	if recorded != nil && *recorded != "" {
-		return *recorded
-	}
-	return strings.TrimSpace(os.Getenv(env))
-}
+func mintInstanceID() (string, error) { return agentidentity.MintInstanceID() }
+func newInstanceID() (string, error)  { return agentidentity.NewInstanceID() }
+func isLowerBase32(s string) bool     { return agentidentity.IsLowerBase32(s) }
 
 // nidOf returns the name this agent currently routes under — the lease name
 // when one has been adopted, otherwise the agent.yaml basename.
@@ -235,24 +117,9 @@ func nidOf(a *Agent) string {
 	return a.cfg.NID
 }
 
-// replyClaimProbe answers a lease claim probe with this process's instance id.
-//
-// The id is what lets the broker distinguish "someone else holds this name"
-// from "the thing answering is the very process that is re-registering" — the
-// case that would otherwise rename a device on every network blip, because
-// nats.go replays subscriptions before it invokes the reconnect handler.
-//
-// A package-level function, not a method: the structural-budget ratchet pins
-// internal/agent.Agent's method count exactly.
 func replyClaimProbe(a *Agent, nc *nats.Conn, msg *nats.Msg) {
-	if msg.Reply == "" {
-		return
-	}
-	payload, err := json.Marshal(proto.ClaimProbeResp{InstanceID: a.instanceID})
-	if err != nil {
-		return
-	}
-	_ = nc.Publish(msg.Reply, payload)
+	agentupgradeport.ReplyClaimProbe(nc, msg, a.instanceID, a.cfg.SID, func() string { return nidOf(a) }, &a.sessionGen,
+		func() []byte { return heartbeatPayload(a, time.Now()) })
 }
 
 // previousNIDOnce returns the name adopted away from, and clears it, so it
@@ -414,101 +281,17 @@ func requestLeaseRebuild(a *Agent, assigned string) {
 		a.cfg.Logger.Info("agent: name contested; rebuilding session under the assigned lease name",
 			"sid", a.cfg.SID, "basename", a.cfg.NID, "assigned_nid", assigned)
 	}
-	if fin := a.loadSessionFinalizer(); fin != nil {
-		fin.Do(teardownRebuild)
-		return
-	}
-	a.sessCancelMu.Lock()
-	cancel := a.sessCancel
-	a.sessCancelMu.Unlock()
-	if cancel != nil {
-		cancel()
-		return
-	}
 	// Nothing to tear down yet. Leaving the flags latched would disarm the NEXT
 	// session, so unwind them exactly as fireRedial does.
-	a.rebuilding.Store(false)
-	a.rebuildRequested.Store(false)
+	finishSessionRebuild(a, a.loadSessionFinalizer())
 }
 
-// acceptableLeaseName reports whether a broker-supplied lease name is one this
-// agent may adopt.
-//
-// The name arrives over the network and becomes this agent's CONNECT name and
-// every subject token it publishes on, so it is validated before use — the
-// sibling path that restores a name from the environment already validates, and
-// the LESS trusted source must not be the unchecked one. Two conditions:
-// it must be a syntactically legal nid (four subject parsers re-validate it),
-// and it must be a lease OF THIS AGENT'S OWN BASENAME — a broker has no business
-// moving an agent onto an unrelated device's name.
 func acceptableLeaseName(a *Agent, assigned string) bool {
-	if assigned == "" || assigned == nidOf(a) {
-		return false
-	}
-	if proto.ValidateNID(assigned) != nil {
-		return false
-	}
-	// A DIRECT LEASE OF THE CONFIGURED NAME, nothing else.
-	//
-	// The earlier rule compared against proto.BasenameOf(a.cfg.NID) so that the
-	// agent would agree with a broker that folded `gpu-02` into the `gpu`
-	// family. Agreeing was the wrong repair: the two sides then agreed on a name
-	// in the WRONG credential family, and the disagreement simply moved to auth
-	// — `gpu-03` is not covered by gpu-02's provisioning row, so the reconnect
-	// is denied (external review F2). The broker no longer folds; the configured
-	// name is an opaque root on both sides, and `gpu-02`'s lease is
-	// `gpu-02-02`.
-	base, _, leased := proto.SplitLeaseName(assigned)
-	if !leased || base != a.cfg.NID {
-		return false
-	}
-	// BOUND THE ADOPTIONS. Every adoption tears down and rebuilds the session,
-	// so a broker that keeps assigning a different name each time would spin the
-	// session loop as fast as the network allows — measured at ~700 rebuilds per
-	// second, which is unbounded goroutine and fd churn dressed up as progress.
-	//
-	// After the cap the agent stays on the name it has and says so. That is the
-	// safe direction: it is still a functioning node, and the suffix is never
-	// persisted, so a restart re-competes cleanly.
-	return a.leaseAdoptions.Load() < maxLeaseAdoptions
+	return agentidentity.AcceptableLeaseName(a.cfg.NID, nidOf(a), assigned, a.leaseAdoptions.Load())
 }
 
-// maxLeaseAdoptions caps how many times one agent process will accept a new
-// routing name. Three is enough for any legitimate sequence (contest, adopt,
-// and one more if the assigned name was itself taken in the meantime) and small
-// enough that a misbehaving or flapping broker cannot spin the session loop.
-const maxLeaseAdoptions = 3
-
-// leaseRefusalBackoff returns how long to wait before re-competing after a
-// verdict this process cannot use, and whether the agent should stop competing
-// and stay put.
-//
-// external review F17. A refusal retires the session (that is the F3 fix — the
-// replayed subscriptions of a name this process does not hold must not survive
-// the verdict), and the natural consequence is a re-connect. With nothing
-// damping it, an instance meeting a full suffix space re-competes at connect
-// speed forever: a full auth_callout round per attempt, from every clone in the
-// image, aimed at the one broker that just told them all there is no room.
-//
-// The shape is exponential-with-a-floor and then a STOP. Stopping is the honest
-// end state: the answer is not going to change until an operator raises
-// MaxInstancesPerBasename or something else exits, and an agent that keeps
-// asking is a load generator, not a retry.
-func leaseRefusalBackoff(refusals int32) (wait time.Duration, giveUp bool) {
-	switch {
-	case refusals <= 0:
-		return 0, false
-	case refusals >= maxLeaseRefusals:
-		return 0, true
-	default:
-		// 2s, 4s, 8s, … capped — the same shape as the register backoff, so the
-		// two do not beat against each other.
-		wait = time.Duration(1<<uint(refusals-1)) * 2 * time.Second
-		if wait > leaseRefusalBackoffMax {
-			wait = leaseRefusalBackoffMax
-		}
-		return wait, false
-	}
+func leaseRefusalBackoff(refusals int32) (time.Duration, bool) {
+	return agentidentity.LeaseRefusalBackoff(refusals)
 }
 
 // recordLeaseRefusal advances the ONE refusal budget shared by initial
@@ -537,11 +320,11 @@ func resetLeaseRefusals(a *Agent) {
 // maxLeaseRefusals is how many unusable verdicts this process accepts before it
 // stops competing. Small: the condition it models (no free suffix, or a broker
 // offering names from another family) does not clear on its own.
-const maxLeaseRefusals = 5
+const maxLeaseRefusals = agentidentity.MaxLeaseRefusals
 
 // leaseRefusalBackoffMax caps the wait so an operator freeing a slot is not
 // waiting minutes for anyone to notice.
-const leaseRefusalBackoffMax = 60 * time.Second
+const leaseRefusalBackoffMax = agentidentity.LeaseRefusalBackoffMax
 
 // dropLease returns this agent to its configured basename.
 //
@@ -637,95 +420,20 @@ func resumeRoutingNID(a *Agent, nid string) {
 	}
 }
 
-// stripInstanceEnv removes the lineage variables from an environment.
-//
-// This is applied to the environment handed to MANAGED CHILD PROCESSES. Without
-// it, a user command that itself starts a tether agent — `tether run node --
-// bash`, then launching an agent in that shell — would inherit this agent's
-// lineage, and the broker would read the two of them as one instance
-// reconnecting and hand them a single name. That is the fan-out defect,
-// restored through the environment.
-func stripInstanceEnv(env []string) []string {
-	out := make([]string, 0, len(env))
-	for _, kv := range env {
-		if strings.HasPrefix(kv, instanceIDEnv+"=") || strings.HasPrefix(kv, routingNIDEnv+"=") {
-			continue
-		}
-		out = append(out, kv)
-	}
-	return out
-}
+func stripInstanceEnv(env []string) []string { return agentidentity.StripInstanceEnv(env) }
 
-// releaseLeaseName tells the broker this process is stopping cleanly and is
-// giving its node name back.
-//
-// WHY THIS EXISTS. Adjudication has to separate two situations that are
-// indistinguishable from the broker's side: two clones launched together (the
-// second must be suffixed) and one agent restarting quickly (it must keep its
-// name). Both present a warm heartbeat, a recently granted holder, and — for
-// the few hundred milliseconds before the server reaps the dead process's
-// subscription — live interest that nobody answers. The departing process is
-// the only party that knows which situation this is, so it says so.
-//
-// STRICTLY BEST-EFFORT. A crash, a kill -9, a severed link or a wedged teardown
-// sends nothing, and adjudication still converges through the grant window, the
-// interest probe and the heartbeat clock. Nothing may be built that DEPENDS on
-// this arriving. That is also why it is a bare Publish with a short Flush rather
-// than a request/reply: a shutdown path must not be able to hang on the network,
-// and the caller is already inside a bounded teardown budget.
 func releaseLeaseName(a *Agent, nc *nats.Conn) {
-	if a == nil || nc == nil || a.instanceID == "" || nc.IsClosed() {
+	if a == nil {
 		return
 	}
-	// ProtoVersion and NID are NOT optional decoration: handleRegister rejects a
-	// body whose NID does not match the subject, and rejects a proto epoch that
-	// is not exactly this one, both BEFORE any lease logic runs. A farewell that
-	// omits them is dropped as nid_mismatch and the name is never released.
-	//
-	// RosterRefreshOnly is what makes this INERT on a broker that predates the
-	// feature, and it is load-bearing.
-	//
-	// "Additive and omitempty" only means an old broker IGNORES the new key —
-	// not that it ignores the message. Without this flag a pre-feature broker
-	// decodes the farewell as an ordinary register carrying an EMPTY snapshot,
-	// and runs it: node.Register's ON CONFLICT wipes release_version/boot_id,
-	// clears proxy_capable, and stamps status=ONLINE with a FRESH heartbeat for
-	// a process that is exiting — then reconcileOnRegister sees no local
-	// processes and closes every RUNNING row this node has, after which the
-	// surviving children come back as pids with no rows, i.e. orphans, and get
-	// SIGKILLed. A courtesy message would have destroyed the operator's work.
-	//
-	// That is not a hypothetical rollback story: this feature exists because the
-	// agent is BAKED INTO AN IMAGE, so "brokers first, then agents" is the one
-	// ordering these users cannot guarantee.
-	//
-	// A pre-feature broker short-circuits RosterRefreshOnly as a pure read
-	// before touching anything. A current broker checks ReleasingName ahead of
-	// that short-circuit, so the flag costs the farewell nothing here.
-	body, err := json.Marshal(proto.NodeRegisterReq{
-		ProtoVersion:      proto.ProtoVersion,
-		NID:               nidOf(a),
-		InstanceID:        a.instanceID,
-		ReleasingName:     true,
-		RosterRefreshOnly: true,
-		// origin: prerelease audit broker-core/BC-F1. This field was never set here,
-		// which made the broker's release-the-row branch dead code in production for
-		// the whole v0.5.1 line. It is the SECONDARY half of the fix — the broker now
-		// decides from agent_provisioning and only consults this when that table
-		// cannot be read — because a field only new agents send cannot repair a fleet
-		// of old ones. Additive and omitempty, so an N-1 broker ignores it.
-		LeasedNID: nidOf(a) != a.cfg.NID,
-	})
-	if err != nil {
-		return
-	}
-	// nidOf, not cfg.NID: an agent that adopted a lease must release the name it
-	// actually holds, not the one it was configured with.
-	if err := nc.Publish(proto.SubjNodeRegister(a.cfg.SID, nidOf(a)), body); err != nil {
-		return
-	}
-	// Bounded: give the farewell a moment to leave the socket, then stop caring.
-	_ = nc.FlushTimeout(leaseReleaseFlush)
+	// A farewell keeps the authority incarnation but never advertises the
+	// transfer capability: only a normal register installs it, so a releasing
+	// name cannot re-arm continuation on the broker while it leaves.
+	// origin: hot-update S7 plan §6.2 / §8.4; S8 FIX-FIXTURES R1
+	agentupgrade.ReleaseLease(nc, a.cfg.SID, nidOf(a), a.cfg.NID, a.instanceID, func(req proto.NodeRegisterReq) ([]byte, error) {
+		req.Incarnation = agentIncarnation(a)
+		return json.Marshal(req)
+	}, leaseReleaseFlush)
 }
 
 // leaseReleaseFlush bounds the farewell's time on the shutdown path. It buys the
@@ -733,38 +441,34 @@ func releaseLeaseName(a *Agent, nc *nats.Conn) {
 // network that may already be gone.
 const leaseReleaseFlush = 250 * time.Millisecond
 
-// awaitLeaseRefusalBackoff waits out the delay owed for an unusable lease
-// verdict, returning false if the run context ended first.
-//
-// The wait lives HERE, between sessions, rather than in the reconnect handler
-// that observed the verdict: by the time this runs the contested session has
-// already been torn down, so nothing is serving a name this process does not
-// hold while it waits (external review F3). Zero when nothing is owed, which is
-// every ordinary rebuild.
-// A package-level function taking *Agent, not a method: the structural-budget
-// ratchet pins this type's method count exactly.
 func awaitLeaseRefusalBackoff(ctx context.Context, a *Agent) bool {
-	if a.leaseRefusalTerminal.Load() {
-		a.cfg.Logger.Error("agent: lease refusal budget exhausted; staying disconnected until restart",
-			"sid", a.cfg.SID, "configured_nid", a.cfg.NID,
-			"refusals", a.leaseRefusals.Load())
-		<-ctx.Done()
-		return false
-	}
-	until := a.leaseRefusalUntil.Swap(0)
-	if until == 0 {
+	return agentupgrade.AwaitLeaseRefusal(ctx, agentupgrade.LeaseWaitPort{Terminal: &a.leaseRefusalTerminal, Until: &a.leaseRefusalUntil, Refusals: &a.leaseRefusals, Logger: a.cfg.Logger, SID: a.cfg.SID, NID: a.cfg.NID})
+}
+
+// All rebuild triggers use the same cancel-first fallback. With no session
+// owner, unwind both intent flags so a stale callback cannot disarm a successor.
+// origin: hot-update S8 plan §11.2 P14; hot-update S5 internal review CT-2.
+func finishSessionRebuild(a *Agent, finalizer *sessionFinalizer) bool {
+	if finalizer != nil {
+		finalizer.Do(teardownRebuild)
 		return true
 	}
-	wait := time.Until(time.Unix(0, until))
-	if wait <= 0 {
+	a.sessCancelMu.Lock()
+	cancel := a.sessCancel
+	a.sessCancelMu.Unlock()
+	if cancel != nil {
+		cancel()
 		return true
 	}
-	a.cfg.Logger.Info("agent: waiting before competing for a name again",
-		"sid", a.cfg.SID, "configured_nid", a.cfg.NID, "wait", wait.String())
-	select {
-	case <-ctx.Done():
-		return false
-	case <-time.After(wait):
-		return true
-	}
+	a.rebuilding.Store(false)
+	a.rebuildRequested.Store(false)
+	return false
+}
+
+func execEnvFor(instanceID, routingNID string) []string {
+	return drillobserve.ExecEnvironment(agentidentity.ExecEnvFor(instanceID, routingNID))
+}
+
+func loadedLineage(recorded *string, env string) string {
+	return agentidentity.LoadedLineage(recorded, env)
 }

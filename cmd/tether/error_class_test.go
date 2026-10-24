@@ -201,3 +201,18 @@ func TestExternalReviewUnresolvedCodeExemptionsAreSiteScopedAndLive(t *testing.T
 		}
 	}
 }
+
+// Probing a PTY may reach every finite runtime refusal before a create. Their
+// meanings must remain explicit in the shared table, independent of prose.
+// origin: hot-update S4 plan §2.2 / T49
+func TestProcessRefusalExitClassesMatchAdmissionPhase(t *testing.T) {
+	for code, class := range map[string]int{
+		"process_busy": 75, "process_recovering": 75, "process_capacity": 75, "process_runtime_closed": 75,
+		"process_revoked": 77, "process_identity": 64, "process_conflict": 64, "process_stale": 64,
+		"process_instance_lost": 64, "process_expired": 64, "process_output_discarded": 64,
+	} {
+		if got, present := brokerCodeExitClasses[code]; !present || got != class {
+			t.Errorf("%s: explicit exit class=%d present=%v, want %d", code, got, present, class)
+		}
+	}
+}

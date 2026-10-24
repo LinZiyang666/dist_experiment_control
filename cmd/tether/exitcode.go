@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/LinZiyang666/tether/internal/infracli"
 	"github.com/nats-io/nats.go"
 )
 
@@ -40,40 +41,23 @@ const (
 	exitUsage       = 64 // EX_USAGE: bad arg / missing flag / mutually-exclusive
 	exitUnavailable = 69 // EX_UNAVAILABLE: broker/NATS unreachable, no-responder, admin socket down
 	exitInternal    = 70 // EX_SOFTWARE: malformed reply / decode error / UNCLASSIFIED (default)
-	exitTransient   = 75 // EX_TEMPFAIL: positively-identified transient (retry-later)
-	exitNoPerm      = 77 // EX_NOPERM: not_owner / not_a_member / not_leader-on-mutate
+	// exitUnsettled (hot-update S1) is EX_IOERR reused for one meaning: the
+	// remote command was ACCEPTED (its create reached the transport) but the
+	// result is not in hand — a stream aborted, the ctl gave up waiting, the
+	// owning agent instance changed, the agent went OFFLINE, the session was
+	// deleted. The command may have run with side effects, so usage §9.13
+	// lists 74 as TERMINAL: a rerun mints a new RequestID and executes again.
+	// Reliable exec uses it as a presentation-layer class after acceptance.
+	// Transfer continuation also maps explicit unresolved receipt/commit/history
+	// wire codes to 74: those refusals retain already accepted responsibility.
+	// origin: hot-update S7 plan §7 / T34. origin: docs/reviews/hot-update-reliable-exec-plan.md §1.1.
+	exitUnsettled = 74 // EX_IOERR: accepted, result unknown — never retry blindly
+	exitTransient = 75 // EX_TEMPFAIL: positively-identified transient (retry-later)
+	exitNoPerm    = 77 // EX_NOPERM: not_owner / not_a_member / not_leader-on-mutate
 )
 
-// ExitError carries an explicit exit class through the error chain. The central classifier
-// honors it before any heuristic, so a class set at the SOURCE (positive evidence) always wins.
-type ExitError struct {
-	Class int
-	Err   error
-	// Quiet suppresses the main sink's human-readable "error: ..." stderr line. Set by commands whose
-	// FAILURE is already carried on stdout as MACHINE output (e.g. `cluster doctor --json`, whose JSON
-	// has summary.fatal): a prose line to stderr would corrupt a caller that MERGES the streams —
-	// `... --json 2>&1 | jq` gets the JSON followed by "error: ..." and fails to parse it (the exact
-	// R11 deploy-tier failure, drill 52 B3/55c). The non-zero exit + the JSON already convey the
-	// failure, so the prose is redundant AND harmful there.
-	Quiet bool
-	// Code is the WIRE code this error was built from ("download_http_status", "not_owner", …), carried
-	// structurally so a caller can branch on it without reading the prose. Empty for errors that have no
-	// wire code (a NATS transport failure, a decode error, a CLI usage error).
-	//
-	// origin: line-2 external review 疑惑 #2. `node upgrade --all`'s isTransientError/isConfigError
-	// classified by strings.Contains(err.Error(), code) — the exact practice this file's own comment 10
-	// lines below forbids ("The classifier never string-sniffs prose for a class"). The failure it invites
-	// is not theoretical: broker prose is operator-facing and gets reworded, and a hint that happens to
-	// mention a code name flips a fleet rollout between "skip this node" and "abort the fleet". Setting
-	// the code at the source makes the branch positive evidence.
-	//
-	// The agent_rejected: wrapper is STRIPPED before this is set, so a caller matches the underlying code
-	// exactly and does not have to know which errors travelled wrapped.
-	Code string
-}
-
-func (e *ExitError) Error() string { return e.Err.Error() }
-func (e *ExitError) Unwrap() error { return e.Err }
+// ExitError keeps the central CLI class while presentation lives in the leaf.
+type ExitError = infracli.ExitError
 
 // wireCodeOf returns the structurally-carried wire code of err, or "" when err carries none.
 func wireCodeOf(err error) string {

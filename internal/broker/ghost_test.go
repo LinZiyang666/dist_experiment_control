@@ -14,6 +14,10 @@ import (
 // a force-single ghost and MUST be deletable online (the live racknerd pc732 deadlock), while a genuinely
 // IN-CONFIG live VOTER must STILL hit the anti-fork phase-gate refusal.
 func TestG2RemoveNodeGhostPassthrough(t *testing.T) {
+	// origin: hot-update S10 plan §11.1 / TEST-BUDGET
+	if runIsolatedBrokerTest(t) {
+		return
+	}
 	n, addr := d7SingleNode(t, "self-1")
 	admin := NewClusterAdmin(n, nil)
 	caughtUp := func(barrier uint64) (bool, error) { cur, err := n.AppliedIndex(); return cur >= barrier, err }

@@ -5,9 +5,12 @@ import (
 	"errors"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/LinZiyang666/tether/internal/testharness"
 )
 
 const upgradeLockOrderHelperEnv = "TETHER_TEST_UPGRADE_LOCK_ORDER_HELPER"
@@ -19,6 +22,9 @@ const upgradeLockOrderHelperEnv = "TETHER_TEST_UPGRADE_LOCK_ORDER_HELPER"
 // late register. Run the exact lock cycle in a subprocess so the expected
 // current deadlock can be killed without leaking goroutines into this suite.
 func TestUpgradeHostLockOrderDoesNotDeadlock(t *testing.T) {
+	// origin: hot-update S5 PROC-LEAK / final process census.
+	testharness.GuardProcessDirectory(t, filepath.Dir(t.TempDir()))
+
 	if os.Getenv(upgradeLockOrderHelperEnv) == "1" {
 		runUpgradeLockOrderHelper(t)
 		return
@@ -26,7 +32,9 @@ func TestUpgradeHostLockOrderDoesNotDeadlock(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
 	defer cancel()
+	dir := t.TempDir()
 	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestUpgradeHostLockOrderDoesNotDeadlock$")
+	cmd.Dir = dir
 	cmd.Env = append(os.Environ(), upgradeLockOrderHelperEnv+"=1")
 	out, err := cmd.CombinedOutput()
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) {

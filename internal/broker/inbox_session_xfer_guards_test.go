@@ -13,6 +13,7 @@ import (
 	"github.com/LinZiyang666/tether/internal/schema"
 	"github.com/LinZiyang666/tether/internal/session"
 	"github.com/LinZiyang666/tether/internal/testharness"
+	"github.com/LinZiyang666/tether/internal/xfertrack"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 )
@@ -181,11 +182,14 @@ func TestSingleBrokerTerminalReplayAfterDedupWindowDoesNotDuplicate(t *testing.T
 		V: schema.AuditSchemaVersion, Kind: "complete", Verb: "push", Ts: now,
 		Session: "lab", Node: "n1", TransferID: "tid-window", Tier: "a",
 	}
-	b := &Broker{transfers: newTransferTracker()}
+	b := &Broker{transfers: xfertrack.NewLegacyTracker()}
 	b.cfg = Config{ClusterDataDir: t.TempDir(), Logger: silentLogger(), Now: time.Now}
 	setBrokerJS(b, js)
 	t.Cleanup(func() { setBrokerJS(b, nil) })
-	b.pubAuditTransfer(rec)
+	// origin: hot-update S10 lint L3a / errcheck
+	if err := b.pubAuditTransfer(rec); err != nil {
+		t.Fatal(err)
+	}
 
 	// Model a process that stayed down beyond the configured history-stream window.
 	time.Sleep(3 * duplicateWindow)
@@ -193,9 +197,11 @@ func TestSingleBrokerTerminalReplayAfterDedupWindowDoesNotDuplicate(t *testing.T
 		TransferID: rec.TransferID, Session: rec.Session, Node: rec.Node,
 		Verb: rec.Verb, Tier: rec.Tier, StartedAt: now.Add(-time.Minute), Terminal: &rec,
 	}
+	row := stageReplayRow(t, b, staged)
 	if !b.replayStagedTerminal(ctx, staged) {
 		t.Fatal("recovery did not dispose of the staged terminal")
 	}
+	assertReplayRowConsumed(t, row)
 	info, err := stream.Info(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -237,11 +243,14 @@ func TestSingleBrokerRecoveryDoesNotAppendAContradictoryTerminal(t *testing.T) {
 		V: schema.AuditSchemaVersion, Kind: "complete", Verb: "push", Ts: now,
 		Session: "lab", Node: "n1", TransferID: "tid-contradict", Tier: "a",
 	}
-	b := &Broker{transfers: newTransferTracker()}
+	b := &Broker{transfers: xfertrack.NewLegacyTracker()}
 	b.cfg = Config{ClusterDataDir: t.TempDir(), Logger: silentLogger(), Now: time.Now}
 	setBrokerJS(b, js)
 	t.Cleanup(func() { setBrokerJS(b, nil) })
-	b.pubAuditTransfer(complete)
+	// origin: hot-update S10 lint L3a / errcheck
+	if err := b.pubAuditTransfer(complete); err != nil {
+		t.Fatal(err)
+	}
 
 	failed := complete
 	failed.Kind = "failed"
@@ -250,9 +259,11 @@ func TestSingleBrokerRecoveryDoesNotAppendAContradictoryTerminal(t *testing.T) {
 		TransferID: failed.TransferID, Session: failed.Session, Node: failed.Node,
 		Verb: failed.Verb, Tier: failed.Tier, StartedAt: now.Add(-time.Minute), Terminal: &failed,
 	}
+	row := stageReplayRow(t, b, staged)
 	if !b.replayStagedTerminal(ctx, staged) {
 		t.Fatal("recovery did not dispose of the staged terminal")
 	}
+	assertReplayRowConsumed(t, row)
 	info, err := stream.Info(ctx)
 	if err != nil {
 		t.Fatal(err)

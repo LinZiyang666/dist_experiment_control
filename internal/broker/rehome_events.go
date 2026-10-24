@@ -1,10 +1,6 @@
 package broker
 
-import (
-	"errors"
-
-	"github.com/LinZiyang666/tether/internal/cluster"
-)
+import "github.com/LinZiyang666/tether/internal/brokercontrol"
 
 // rehome_events.go (C6 建议5) — the leader-gated, change-keyed, SECRET-FREE rehome/proxy observability
 // event helpers. All emits go through b.pubSysEvent (which stamps v/type/ts onto the existing
@@ -12,27 +8,15 @@ import (
 // (token/PSK/cert key/session secret) can never enter because we never struct-splat an Allocation /
 // ProxyDirective and `reason` is a CLOSED ENUM (raw errors go to the logger only).
 
-// rehome event kinds + closed reason enum.
-const (
-	evHomeReassignStarted   = "home_reassign_started"
-	evHomeReassignSucceeded = "home_reassign_succeeded"
-	evHomeReassignFailed    = "home_reassign_failed"
-	evRehomeStalled         = "rehome_stalled"
-	evBrokerDownRehomeSum   = "broker_down_rehome_summary"
+const evHomeReassignStarted = brokercontrol.EvHomeReassignStarted
+const evHomeReassignSucceeded = brokercontrol.EvHomeReassignSucceeded
+const evHomeReassignFailed = brokercontrol.EvHomeReassignFailed
+const evRehomeStalled = brokercontrol.EvRehomeStalled
+const evBrokerDownRehomeSum = brokercontrol.EvBrokerDownRehomeSum
+const reasonNoEligibleTarget = brokercontrol.ReasonNoEligibleTarget
+const reasonTargetNotReady = brokercontrol.ReasonTargetNotReady
 
-	reasonNoEligibleTarget = "no_eligible_target"
-	reasonTargetNotReady   = "target_not_ready"
-	reasonNotLeader        = "not_leader"
-	reasonStoreError       = "store_error"
-)
-
-// classifyRehomeErr maps a Propose failure to the closed reason enum (never the raw error string).
-func classifyRehomeErr(err error) string {
-	if errors.Is(err, cluster.ErrForwardNotLeader) || cluster.IsNotLeader(err) {
-		return reasonNotLeader
-	}
-	return reasonStoreError
-}
+func classifyRehomeErr(err error) string { return brokercontrol.ClassifyRehomeErr(err) }
 
 // emitRehomeOnce emits kind with fields ONLY when the change-key mark for this port differs from the
 // last one — so the ~5s reaper re-entry does not re-announce a steady condition (idle-zero-writes).

@@ -34,6 +34,14 @@
 package broker
 
 import (
+	"database/sql"
+	"github.com/LinZiyang666/tether/internal/cluster"
+	"github.com/LinZiyang666/tether/internal/controlbudget"
+	"github.com/LinZiyang666/tether/internal/node"
+	"github.com/LinZiyang666/tether/internal/session"
+	"github.com/LinZiyang666/tether/internal/upgradeauthority"
+	"github.com/LinZiyang666/tether/internal/xferauth"
+	"slices"
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/port"
@@ -84,40 +92,34 @@ func resolveReconcile(sid, nid string, req proto.NodeRegisterReq, procs []proc.P
 		if p.Status != proc.StateRunning && p.Status != proc.StateLost {
 			continue
 		}
+		// Re-treat the reused pid as an orphan (mirrors the live re-add).
+		// accepted: no mark, no audit
 		lp, hasIt := agentByPID[p.PID]
 		if hasIt {
 			delete(agentByPID, p.PID)
-			switch lp.State {
-			case "running":
-				if pidReused(req.BootID, p.BootID, lp.StartTimeTicks, p.StartTimeTicks) {
-					out.Marks = append(out.Marks, proc.ExitMark{PID: p.PID, ExitCode: -1, When: now})
-					out.ProcAudit = append(out.ProcAudit, proc.ReconProcAudit{NID: nid, PID: p.PID, Kind: "reconciled_closed", RC: intp(-1), Ts: now})
-					// Re-treat the reused pid as an orphan (mirrors the live re-add).
-					agentByPID[p.PID] = lp
-					continue
-				}
-				// accepted: no mark, no audit
-			case "exited":
-				rc := -1
-				if lp.RC != nil {
-					rc = *lp.RC
-				}
-				when := exitStamp(lp, now)
-				out.Marks = append(out.Marks, proc.ExitMark{PID: p.PID, ExitCode: rc, When: when})
-				out.ProcAudit = append(out.ProcAudit, proc.ReconProcAudit{NID: nid, PID: p.PID, Kind: "reconciled_closed", RC: intp(rc), Ts: when})
-			default:
-				out.Marks = append(out.Marks, proc.ExitMark{PID: p.PID, ExitCode: -1, When: now})
-				out.ProcAudit = append(out.ProcAudit, proc.ReconProcAudit{NID: nid, PID: p.PID, Kind: "reconciled_closed", RC: intp(-1), Ts: now})
-			}
-		} else {
-			out.Marks = append(out.Marks, proc.ExitMark{PID: p.PID, ExitCode: -1, When: now})
-			out.ProcAudit = append(out.ProcAudit, proc.ReconProcAudit{NID: nid, PID: p.PID, Kind: "reconciled_closed", RC: intp(-1), Ts: now})
 		}
+		mark, reused, closeRow := reconcileExitDecision(p, lp, hasIt, req.BootID, now)
+		if closeRow {
+			out.Marks = append(out.Marks, mark)
+			out.ProcAudit = append(out.ProcAudit, proc.ReconProcAudit{NID: nid, PID: p.PID, Kind: "reconciled_closed", RC: intp(mark.ExitCode), Ts: mark.When})
+		}
+		if reused {
+			agentByPID[p.PID] = lp
+		}
+
 	}
 	// Orphans: agent claims a running pid the broker has no record of (or a PID-reuse
 	// pid re-added above) -> killed_orphan (NO rc, no mark).
 	for pid, lp := range agentByPID {
 		if lp.State != "running" {
+			continue
+		}
+		if lp.StartedUnacked {
+			// C-5 (hot-update S1): the agent adopted this child but its courier
+			// still owes us the proc.started — the row simply may not exist yet.
+			// Killing it here is the G.1 false-orphan window drainStarted only
+			// narrows. Neither accepted nor dropped; the courier keeps the
+			// started pending. origin: hot-update reliable-exec plan §2.5.
 			continue
 		}
 		out.ProcAudit = append(out.ProcAudit, proc.ReconProcAudit{NID: nid, PID: pid, Kind: "killed_orphan", RC: nil, Ts: now})
@@ -145,21 +147,6 @@ func resolveReconcile(sid, nid string, req proto.NodeRegisterReq, procs []proc.P
 	return out
 }
 
-// exitStamp picks the ended_at instant for an agent-reported "exited" row
-// (h1 C4): the agent's TRUE end instant when it carried one (the courier's
-// snapshot rows do), clamped to `now` so a skewed agent clock can never write
-// a FUTURE ended_at into replicated state; a pre-h1 agent omits EndedAt and
-// falls back to register-time now — exactly today's semantics. Used
-// IDENTICALLY by both classifier paths (resolveReconcile for the cluster
-// batch, reconcileOnRegister's inline single-mode branch) so the
-// reconcile-marks equivalence tests keep holding.
-func exitStamp(lp proto.LocalProcess, now time.Time) time.Time {
-	if lp.EndedAt != nil && lp.EndedAt.Before(now) {
-		return lp.EndedAt.UTC()
-	}
-	return now
-}
-
 // reconcileOnRegister runs G.1 over (sid, nid) using req.LocalProcesses /
 // req.LocalPorts as the agent's truth. Side effects:
 //   - SQLite UPDATEs for processes that need to leave RUNNING/LOST,
@@ -180,14 +167,18 @@ func (b *Broker) reconcileOnRegister(sid, nid string, req proto.NodeRegisterReq)
 	// ended_at, which SQLite's lexical TEXT compare (retention GC's leader
 	// SELECT) cannot order against UTC rows.
 	now := b.cfg.Now().UTC()
+	if req.Incarnation != "" {
+		if _, err := upgradeauthority.ReadCreation(b.read().SQL(), upgradeauthority.RequestGuard(sid, nid, req)); err != nil {
+			return retainPendingExits(req.LocalProcesses), nil, nil, nil, nil
+		}
+	}
 
 	// Reconcile only consumes RUNNING/LOST rows (see the explicit
 	// filter below at `if p.Status != proc.StateRunning && p.Status
 	// != proc.StateLost`). Reading EXITED rows from disk used to be
 	// dead weight that grew with session history; the bounded helper
 	// keeps reconnect O(active processes) regardless of session age.
-	procs, err := proc.ListBySessionFiltered(b.cfg.DB, sid,
-		proc.ListBySessionOpts{IncludeExited: false})
+	procs, err := proc.ListBySessionFiltered(b.cfg.DB, sid, proc.ListBySessionOpts{IncludeExited: false})
 	if err != nil {
 		b.cfg.Logger.Warn("broker: reconcileOnRegister list procs", "err", err, "sid", sid)
 		return retainPendingExits(req.LocalProcesses), nil, nil, nil, nil
@@ -199,113 +190,51 @@ func (b *Broker) reconcileOnRegister(sid, nid string, req proto.NodeRegisterReq)
 	}
 
 	adopted := adoptRowsCarriedAcrossARename(b, sid, nid, req, procs, agentByPID)
-	for _, p := range procs {
-		if p.NID != nid {
-			continue
-		}
-		if p.Status != proc.StateRunning && p.Status != proc.StateLost {
-			continue
-		}
-		lp, hasIt := agentByPID[p.PID]
-		if hasIt {
-			delete(agentByPID, p.PID)
-			switch lp.State {
-			case "running":
-				if pidReused(req.BootID, p.BootID, lp.StartTimeTicks, p.StartTimeTicks) {
-					// G.1 PID-reuse: the SQLite row and the agent
-					// describe two different OS processes that just
-					// happen to share the tether ULID. Original row
-					// → EXITED(-1, reconciled_closed). The new
-					// process is then treated as an orphan and
-					// scheduled for kill below (we re-add it to
-					// agentByPID so the orphan loop picks it up).
-					// D9 round-1 BLOCKER: route through raft in cluster mode (was a direct
-					// b.cfg.DB==RODB write that silently failed). Audit only on a committed
-					// transition (don't emit reconciled_closed for a write that didn't land).
-					// round-2 MINOR: on a close error STILL re-add the reused PID as an orphan
-					// (the kill is independent of the old row's close) — preserving the pre-D9
-					// swallow-and-schedule behavior; only the audit is gated on success.
-					if err := b.markProcExited(p.PID, sid, -1, now); err != nil {
-						b.cfg.Logger.Warn("broker: reconcile pid-reuse close", "err", err, "pid", p.PID)
-						// Deliberately NOT added to `accepted` (contrast the two
-						// F1 sites below): this pid is being re-treated as an
-						// orphan on the next line, and one pid may never appear
-						// in accepted AND dropProcesses at once. It also cannot
-						// strand a courier exit: a tether PID is a ULID minted
-						// once per run, so a pid the agent reports as RUNNING has
-						// not been unregistered and therefore has no pending exit
-						// event. (The "reuse" here is OS-pid recycling detected
-						// via the boot/start-ticks triple, not tether-PID reuse.)
-						agentByPID[p.PID] = lp
-						continue
-					}
-					reconciled = append(reconciled, proto.ReconciledProc{
-						PID: p.PID, NewState: "EXITED", RC: -1,
-					})
-					b.pubAuditProc(sid, "reconciled_closed", nid, p.PID, nil, -1, now)
-					agentByPID[p.PID] = lp
-					continue
-				}
-				accepted = append(accepted, p.PID)
-				continue
-			case "exited":
-				rc := -1
-				if lp.RC != nil {
-					rc = *lp.RC
-				}
-				when := exitStamp(lp, now)
-				if err := b.markProcExited(p.PID, sid, rc, when); err != nil {
-					b.cfg.Logger.Warn("broker: reconcile mark exited", "err", err, "pid", p.PID)
-					// origin: h1 external review F1 (Blocker). A bare `continue`
-					// left this pid in NEITHER response set, and the agent's
-					// courier reads "absent from AcceptedProcesses" as SETTLED —
-					// so it deleted the only copy of the real exit code while the
-					// broker row stayed RUNNING. A transient SQLite/raft fault
-					// thus manufactured exactly the zombie row this increment
-					// exists to abolish.
-					//
-					// The write failed, so the row IS still RUNNING, and
-					// `accepted` means precisely "the broker still believes this
-					// pid is running". Saying so is the truth AND makes the
-					// courier keep its pending exit for the next attempt.
-					accepted = append(accepted, p.PID)
-					continue
-				}
-				reconciled = append(reconciled, proto.ReconciledProc{
-					PID: p.PID, NewState: "EXITED", RC: rc,
-				})
-				b.pubAuditProc(sid, "reconciled_closed", nid, p.PID, nil, rc, when)
-			default:
-				// Unknown state from agent — treat as missed-exit so we
-				// don't leave the row stuck RUNNING forever.
-				if err := b.markProcExited(p.PID, sid, -1, now); err != nil {
-					b.cfg.Logger.Warn("broker: reconcile unknown-state close", "err", err, "pid", p.PID)
-					// Same F1 reasoning as the "exited" branch above: the write
-					// failed, the row is still RUNNING, so report it as accepted
-					// rather than letting silence read as "settled".
-					accepted = append(accepted, p.PID)
-					continue
-				}
-				reconciled = append(reconciled, proto.ReconciledProc{
-					PID: p.PID, NewState: "EXITED", RC: -1,
-				})
-				b.pubAuditProc(sid, "reconciled_closed", nid, p.PID, nil, -1, now)
-			}
-		} else {
-			// Broker thinks RUNNING/LOST but agent didn't list it →
-			// missed-exit. Architecture G.1: rc=-1, audit.proc{kind:
-			// reconciled_closed}.
-			if err := b.markProcExited(p.PID, sid, -1, now); err != nil {
-				b.cfg.Logger.Warn("broker: reconcile missed-exit", "err", err, "pid", p.PID)
-				continue
-			}
-			reconciled = append(reconciled, proto.ReconciledProc{
-				PID: p.PID, NewState: "EXITED", RC: -1,
-			})
-			b.pubAuditProc(sid, "reconciled_closed", nid, p.PID, nil, -1, now)
-		}
-	}
-
+	// The cases still share their original failure/ACK rules below; one writer
+	// now carries the same captured authority for every destructive G.1 mark.
+	// origin: hot-update S8 plan §6.2 / P16
+	// G.1 PID-reuse: the SQLite row and the agent
+	// describe two different OS processes that just
+	// happen to share the tether ULID. Original row
+	// → EXITED(-1, reconciled_closed). The new
+	// process is then treated as an orphan and
+	// scheduled for kill below (we re-add it to
+	// agentByPID so the orphan loop picks it up).
+	// D9 round-1 BLOCKER: route through raft in cluster mode (was a direct
+	// b.cfg.DB==RODB write that silently failed). Audit only on a committed
+	// transition (don't emit reconciled_closed for a write that didn't land).
+	// round-2 MINOR: on a close error STILL re-add the reused PID as an orphan
+	// (the kill is independent of the old row's close) — preserving the pre-D9
+	// swallow-and-schedule behavior; only the audit is gated on success.
+	// Deliberately NOT added to `accepted` (contrast the two
+	// F1 sites below): this pid is being re-treated as an
+	// orphan on the next line, and one pid may never appear
+	// in accepted AND dropProcesses at once. It also cannot
+	// strand a courier exit: a tether PID is a ULID minted
+	// once per run, so a pid the agent reports as RUNNING has
+	// not been unregistered and therefore has no pending exit
+	// event. (The "reuse" here is OS-pid recycling detected
+	// via the boot/start-ticks triple, not tether-PID reuse.)
+	// origin: h1 external review F1 (Blocker). A bare `continue`
+	// left this pid in NEITHER response set, and the agent's
+	// courier reads "absent from AcceptedProcesses" as SETTLED —
+	// so it deleted the only copy of the real exit code while the
+	// broker row stayed RUNNING. A transient SQLite/raft fault
+	// thus manufactured exactly the zombie row this increment
+	// exists to abolish.
+	//
+	// The write failed, so the row IS still RUNNING, and
+	// `accepted` means precisely "the broker still believes this
+	// pid is running". Saying so is the truth AND makes the
+	// courier keep its pending exit for the next attempt.
+	// Unknown state from agent — treat as missed-exit so we
+	// don't leave the row stuck RUNNING forever.
+	// Same F1 reasoning as the "exited" branch above: the write
+	// failed, the row is still RUNNING, so report it as accepted
+	// rather than letting silence read as "settled".
+	// Broker thinks RUNNING/LOST but agent didn't list it →
+	// missed-exit. Architecture G.1: rc=-1, audit.proc{kind:
+	// reconciled_closed}.
 	// Anything left in agentByPID is a pid the agent claims to be
 	// running but the broker has no record of (or that we just
 	// flagged as PID-reuse above) → orphan. Architecture G.1: v1
@@ -325,28 +254,37 @@ func (b *Broker) reconcileOnRegister(sid, nid string, req proto.NodeRegisterReq)
 	// taken — was never ordered killed (drill 94 arm B, red on every sweep since
 	// the gate landed on 2026-08-19, misfiled as "stale table"). A read failure is
 	// fail-closed: no evidence, no kill.
+	// C-5 (hot-update S1): same rule as the pure classifier above —
+	// a pid whose proc.started is still in flight is not an orphan.
+	batch := resolveReconcile(sid, nid, req, procs, nil, now)
+	for _, mark := range batch.Marks {
+		if err := markProcExitAuthority(b, ProcMarkExitedPayload(upgradeauthority.ExitRequest(sid, nid, req, mark.PID, mark.ExitCode, mark.When))); err != nil {
+			b.cfg.Logger.Warn("broker: reconcile mark exited", "err", err, "pid", mark.PID)
+			if lp, hasIt := agentByPID[mark.PID]; hasIt && lp.State != "running" {
+				accepted = append(accepted, mark.PID)
+			}
+			continue
+		}
+		reconciled = append(reconciled, proto.ReconciledProc{PID: mark.PID, NewState: "EXITED", RC: mark.ExitCode})
+		b.pubAuditProc(sid, "reconciled_closed", nid, mark.PID, nil, mark.ExitCode, mark.When)
+	}
+	for _, p := range procs {
+		lp, hasIt := agentByPID[p.PID]
+		if p.NID == nid && (p.Status == proc.StateRunning || p.Status == proc.StateLost) && hasIt && lp.State == "running" && !pidReused(req.BootID, p.BootID, lp.StartTimeTicks, p.StartTimeTicks) {
+			accepted = append(accepted, p.PID)
+		}
+	}
 	history, herr := proc.NodeHasHistory(b.read(), sid, nid)
 	if herr != nil {
 		b.cfg.Logger.Warn("broker: reconcile node history read failed — declining orphan kills this register", "sid", sid, "nid", nid, "err", herr)
 	}
 	sawAnyRow := adopted > 0 || anyRowMatches(procs, nid) || (herr == nil && history)
 	knownPID := livePIDsByRow(procs, agentByPID, req.BootID)
-	for pid, lp := range agentByPID {
-		if lp.State != "running" {
-			continue
+	for _, audit := range batch.ProcAudit {
+		if audit.Kind == "killed_orphan" && !knownPID[audit.PID] && sawAnyRow {
+			dropProcesses = append(dropProcesses, audit.PID)
+			b.pubAuditProc(sid, "killed_orphan", nid, audit.PID, nil, 0, now)
 		}
-		if knownPID[pid] {
-			b.cfg.Logger.Warn("broker: pid is filed under another node name; not an orphan",
-				"sid", sid, "nid", nid, "pid", pid)
-			continue
-		}
-		if !sawAnyRow {
-			b.cfg.Logger.Warn("broker: declining to orphan-kill on a nid with no process history",
-				"sid", sid, "nid", nid, "pid", pid)
-			continue
-		}
-		dropProcesses = append(dropProcesses, pid)
-		b.pubAuditProc(sid, "killed_orphan", nid, pid, nil, 0, now)
 	}
 
 	// ---- ports -----------------------------------------------------
@@ -416,12 +354,7 @@ func retainPendingExits(lps []proto.LocalProcess) []string {
 // register reconciles. It is also the belt for PreviousNID: an agent too old to
 // send that field still does not get its processes killed.
 func anyRowMatches(procs []proc.Process, nid string) bool {
-	for _, p := range procs {
-		if p.NID == nid {
-			return true
-		}
-	}
-	return false
+	return slices.ContainsFunc(procs, func(p proc.Process) bool { return p.NID == nid })
 }
 
 func pidReused(agentBootID, dbBootID string, agentTicks, dbTicks int64) bool {
@@ -515,7 +448,7 @@ func adoptRowsCarriedAcrossARename(b *Broker, sid, nid string, req proto.NodeReg
 		if _, rePresented := agentByPID[p.PID]; !rePresented {
 			continue
 		}
-		moved, err := refileProc(b, sid, p.PID, req.PreviousNID, nid)
+		moved, err := refileReconcileAuthority(b, sid, nid, req, p.PID)
 		if err != nil {
 			b.cfg.Logger.Warn("broker: could not re-file an adopted process row",
 				"err", err, "sid", sid, "pid", p.PID, "from", req.PreviousNID, "to", nid)
@@ -554,32 +487,24 @@ func reconcilePortsOnRegister(b *Broker, sid, nid string, req proto.NodeRegister
 		b.cfg.Logger.Warn("broker: reconcileOnRegister list ports", "err", err, "sid", sid)
 		return nil, nil, false
 	}
-	portByHash := map[string]*port.Allocation{}
-	for i := range portRows {
-		if portRows[i].NID != nid {
-			continue
+	// Agent claims a tunnel the broker has no record of → orphan.
+	// Token matches but port reassigned (shouldn't happen in
+	// v1 — token rotates with port — defensive). Drop.
+	// State is REVOKED or FREED — broker decided to drop while
+	// agent was offline. Tell agent to tear it down now.
+	portByHash := map[string]port.Allocation{}
+	for _, a := range portRows {
+		if a.NID == nid {
+			portByHash[a.TokenHash] = a
 		}
-		portByHash[portRows[i].TokenHash] = &portRows[i]
 	}
 	for _, lp := range req.LocalPorts {
 		alloc, ok := portByHash[lp.TokenHash]
-		switch {
-		case !ok:
-			// Agent claims a tunnel the broker has no record of → orphan.
+		if !ok || alloc.Port != lp.Port || alloc.State != port.StateAllocated {
 			revokePorts = append(revokePorts, lp.Port)
 			b.pubAuditPort(sid, "reconciled", nid, lp.Port, lp.Name, lp.LocalPort, "", now)
-		case alloc.Port != lp.Port:
-			// Token matches but port reassigned (shouldn't happen in
-			// v1 — token rotates with port — defensive). Drop.
-			revokePorts = append(revokePorts, lp.Port)
-			b.pubAuditPort(sid, "reconciled", nid, lp.Port, lp.Name, lp.LocalPort, "", now)
-		case alloc.State == port.StateAllocated:
+		} else {
 			keepPorts = append(keepPorts, alloc.Port)
-		default:
-			// State is REVOKED or FREED — broker decided to drop while
-			// agent was offline. Tell agent to tear it down now.
-			revokePorts = append(revokePorts, lp.Port)
-			b.pubAuditPort(sid, "reconciled", nid, lp.Port, lp.Name, lp.LocalPort, "", now)
 		}
 	}
 
@@ -591,4 +516,108 @@ func reconcilePortsOnRegister(b *Broker, sid, nid string, req proto.NodeRegister
 	// state.json was first written" — punishing that with revocation
 	// would force operators to re-expose by hand on every restart.
 	return keepPorts, revokePorts, true
+}
+
+// The mode guard must select a writer before any authoritative mutation.
+// origin: S7 internal review GATES-PROD F5
+func refileReconcileAuthority(b *Broker, sid, nid string, req proto.NodeRegisterReq, pid string) (bool, error) {
+	if db, ok := b.singleWriter(); ok && req.Incarnation != "" {
+		moved, _, err := proc.RefileGuarded(db, upgradeauthority.RequestGuard(sid, nid, req), pid, req.PreviousNID, nid)
+		return moved, err
+	}
+	return refileProc(b, sid, pid, req.PreviousNID, nid)
+}
+
+func planReconcileAuthority(db *sql.DB, p ReconcilePayload, procs []proc.Process, ports []port.Allocation, now time.Time) (*cluster.Command, error) {
+	batch := resolveReconcile(p.SID, p.NID, p.Req, procs, ports, now)
+	if p.Req.Incarnation == "" {
+		return proc.PlanReconcileBatch(batch)
+	}
+	_, cmd, err := proc.PlanReconcileBatchGuarded(db, upgradeauthority.RequestGuard(p.SID, p.NID, p.Req), batch)
+	return cmd, err
+}
+
+// A single decision owns PID reuse, old-wire defaults, and the exit timestamp;
+// the callers still own their respective committed writes and courier ACKs.
+// origin: hot-update S8 plan §6.2 / P16
+func reconcileExitDecision(p proc.Process, lp proto.LocalProcess, hasIt bool, boot string, now time.Time) (proc.ExitMark, bool, bool) {
+	reused := hasIt && lp.State == "running" && pidReused(boot, p.BootID, lp.StartTimeTicks, p.StartTimeTicks)
+	mark := proc.ExitMark{PID: p.PID, ExitCode: -1, When: now}
+	if hasIt && lp.State == "exited" {
+		if lp.RC != nil {
+			mark.ExitCode = *lp.RC
+		}
+		mark.When = exitStamp(lp, now)
+	}
+	return mark, reused, !hasIt || lp.State != "running" || reused
+}
+
+// A cold resumer captures before settlement, then retains that exact creation
+// throughout the final cleanup. Re-reading SID after a barrier is too late.
+// origin: hot-update S8 plan §6.2 / P16
+func resumeSessionAuthority(b *Broker, d controlbudget.Deadline, stop <-chan struct{}, sid string) error {
+	guard, err := upgradeauthority.Capture(b.read().SQL(), upgradeauthority.Guard{SID: sid})
+	if err != nil {
+		return err
+	}
+	return xferauth.ResumeDeletingSession(d, stop, b.read().SQL(), sid,
+		func(d controlbudget.Deadline, stop <-chan struct{}) error {
+			return settleSessionDeadline(b, d, stop, sid, false)
+		},
+		func(d controlbudget.Deadline, stop <-chan struct{}) error {
+			return cascadeSessionAuthority(b, d, stop, guard)
+		})
+}
+
+// A write reservation holds the original tombstone during external cleanup;
+// the session owner retains the final guarded SQL transaction after it.
+// origin: hot-update S8 plan §6.2 / P16
+// origin: S7 internal review GATES-PROD F5
+func cascadeSessionSingleAuthority(b *Broker, d controlbudget.Deadline, stop <-chan struct{}, guard upgradeauthority.Guard) error {
+	db, ok := b.singleWriter()
+	if !ok {
+		return singleWriteRefusal()
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	creation, err := upgradeauthority.ReadCreation(tx, guard)
+	if err != nil {
+		return err
+	}
+	predicate, args, err := upgradeauthority.CreationPredicate(creation)
+	if err != nil {
+		return err
+	}
+	var sid string
+	if err := tx.QueryRow(`UPDATE sessions SET state=state WHERE state='DELETING' AND `+predicate+` RETURNING sid`, args...).Scan(&sid); err != nil {
+		return err
+	}
+
+	return finishSessionAuthority(b, d, stop, guard, func() error {
+		if err := tx.Commit(); err != nil {
+			return err
+		}
+		_, err := session.HardDeleteGuarded(db, guard)
+		return err
+	})
+}
+
+// The post-commit liveness write must not refresh a replacement that appeared
+// after the identity proposal. Its actual UPDATE retains the original creation.
+// origin: hot-update S8 plan §6.2 / P16
+func heartbeatNodeAuthority(b *Broker, in node.RegisterInput, now time.Time) error {
+	if in.Authority == nil {
+		return node.Heartbeat(b.livenessDB(), in.SID, in.NID, now)
+	}
+	if in.Authority.ConfiguredNID != in.NID && in.Authority.ConfiguredNID != proto.BasenameOf(in.NID) {
+		return upgradeauthority.Match("", "")
+	}
+	predicate, err := upgradeauthority.MutationPredicate(b.livenessDB(), upgradeauthority.SessionMutation{SID: in.SID, Authority: in.Authority}, cluster.LitText)
+	if err != nil {
+		return err
+	}
+	return b.livenessDB().QueryRow(`UPDATE nodes SET last_heartbeat_at=?,status='ONLINE' WHERE sid=? AND nid=? AND `+predicate+` RETURNING nid`, now.UTC(), in.SID, in.NID).Scan(new(string))
 }

@@ -2,20 +2,35 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"os"
 	"os/signal"
 	"runtime"
-	"strconv"
 	"strings"
 	"syscall"
 
 	"github.com/LinZiyang666/tether/internal/agent"
+	"github.com/LinZiyang666/tether/internal/agentboot"
+	"github.com/LinZiyang666/tether/internal/agentimage"
+	"github.com/LinZiyang666/tether/internal/brokerimage"
+	"github.com/LinZiyang666/tether/internal/cli"
+	"github.com/LinZiyang666/tether/internal/drillobserve"
 	"github.com/LinZiyang666/tether/internal/proto"
+	"github.com/LinZiyang666/tether/internal/spawnsafe"
+	"github.com/LinZiyang666/tether/internal/upgradecli"
+	"github.com/LinZiyang666/tether/internal/upgradetx"
+	"github.com/LinZiyang666/tether/internal/upgradewire"
 	"github.com/spf13/cobra"
 )
+
+// brokerBoot owns the one envelope transferred before Cobra can fail. The
+// serve validates through this owner; Finish is the preactivation exit
+// funnel, including invocations whose argv never reaches serve.
+// origin: hot-update S6 plan §4.1 / T03
+var brokerBoot *brokerimage.BootImage
 
 func newRootCmd() *cobra.Command {
 	root := &cobra.Command{
@@ -24,9 +39,8 @@ func newRootCmd() *cobra.Command {
 		SilenceUsage:  true,
 		SilenceErrors: true,
 	}
-	root.AddCommand(newVersionCmd())
-	root.AddCommand(newServeCmd())
-	root.AddCommand(newAgentCmd())
+	root.AddCommand(newVersionCmd(), newServeCmd())
+	root.AddCommand(newBrokerImagePreflightCmd(), newAgentCmd())
 	root.AddCommand(newAdminCmd())
 	root.AddCommand(newSessionCmd())
 	root.AddCommand(newWhoamiCmd())
@@ -40,9 +54,11 @@ func newRootCmd() *cobra.Command {
 	root.AddCommand(newProxyCmd())
 	root.AddCommand(newHistoryCmd())
 	root.AddCommand(newNodeCmd())
-	root.AddCommand(newPushCmd())
-	root.AddCommand(newPullCmd())
+	// origin: hot-update S7 plan §7 / T34
+	root.AddCommand(newPushCmd(), newPullCmd(), newTransferCmd(transferCLI))
 	root.AddCommand(newClusterCmd())
+	// origin: hot-update S6 plan §5 / lead L3; S8 plan §5.2 / LQ1 (explicit root stage)
+	root.AddCommand(newBrokerCmd(), upgradecli.NewUpgradeCommand(upgradeStagePorts()))
 	root.AddCommand(newAlertCmd())
 	return root
 }
@@ -56,16 +72,43 @@ func newVersionCmd() *cobra.Command {
 			// First line via proto.VersionLine — a frozen cross-version seam
 			// (deployed agents' smoke gates parse it; see its doc comment),
 			// not a printf to be reworded here.
+			// The image-ABI line is LAST and append-only (proto.ImageABILine):
+			// the smoke gate of an older agent reads the first line only, the
+			// hot-update candidate gate of a newer one reads this one.
+			// origin: hot-update S5 plan §5.2; hot-update S4 plan §5.2 / T46. Domains extend reader
+			// capability while the original ABI remains the final output line.
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(),
-				"%s\n%s/%s\n%s\n",
+				"%s\n%s/%s\n%s\n%s\n",
 				proto.VersionLine(),
-				runtime.GOOS, runtime.GOARCH, runtime.Version())
+				runtime.GOOS, runtime.GOARCH, runtime.Version(), strings.Join(proto.ImageVersionLines(), "\n"))
 			return nil
 		},
 	}
 }
 
 func main() {
+	img := agentboot.Begin(slog.New(slog.NewTextHandler(os.Stderr, nil)), agent.LineageEnvKeys()...)
+	// origin: hot-update S6 plan §4.1 / T03
+	// Dispatch from the validated role before the agent's non-daemon guard.
+	// Wrong argv and a missing chooser hint must still reach broker salvage.
+	restored, bootErr := agentboot.TakeRole(brokerimage.ImageRole)
+	if restored != nil {
+		brokerBoot, bootErr = brokerimage.Boot(restored)
+		if brokerBoot == nil {
+			_ = restored.Close()
+			if bootErr == nil {
+				bootErr = fmt.Errorf("broker: dispatched image has no boot owner")
+			}
+		}
+	}
+	if brokerBoot != nil && bootErr == nil {
+		bootErr = brokerBoot.CheckInvocation(os.Args)
+	}
+	// origin: hot-update S3 plan §1.2. Claim carried descriptors before any
+	// env consumer or goroutine, even when argv no longer names a daemon.
+	if restored == nil && img != nil && img.Phase() == agentboot.PhaseHeld && !isAgentDaemonInvocation(os.Args) {
+		img.Abandon(slog.New(slog.NewTextHandler(os.Stderr, nil)), agentboot.CrashWindowNonDaemon, "dispatched image reached a non-daemon invocation")
+	}
 	// origin: upgrade-safety external review F2. The boot half of the
 	// upgrade state machine must run BEFORE Cobra parsing and before any
 	// config/YAML/logger step: a staged binary that regresses on flag
@@ -75,7 +118,7 @@ func main() {
 	// rollback machinery never engaging. Recognition is deliberately
 	// pre-parse and conservative (argv shape only); the check itself is a
 	// no-op without a pending marker next to the executable.
-	if isAgentDaemonInvocation(os.Args) {
+	if restored == nil && isAgentDaemonInvocation(os.Args) {
 		agent.BootUpgradeCheck(slog.New(slog.NewTextHandler(os.Stderr, nil)))
 	}
 	// ExecuteContext + signal.NotifyContext so Ctrl-C / SIGTERM tear
@@ -85,10 +128,23 @@ func main() {
 	// gave subcommands `cmd.Context() == Background()`, so signal
 	// handling was a no-op everywhere. The signal-aware ctx is
 	// observed by every cobra command via cmd.Context().
-	ctx, stop := signal.NotifyContext(context.Background(),
+	ctx, stop := signal.NotifyContext(context.Background(), // ctx-root: CLI process signal root
 		syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	if err := newRootCmd().ExecuteContext(ctx); err != nil {
+	err := bootErr
+	if err == nil {
+		err = newRootCmd().ExecuteContext(ctx)
+	}
+	if brokerBoot != nil {
+		// A successful redispatch never returns. Errors retain the current
+		// boot owner; Finish must not replace ACTIVE state with the held cut.
+		if finishErr := brokerBoot.Finish(err); finishErr != nil {
+			err = finishErr
+		}
+	} else if restored == nil {
+		agent.FinishBoot(err)
+	}
+	if err != nil {
 		renderTerminalError(os.Stderr, err)
 		// B2 item 3: classify the terminal error into a sysexits-style code so a monitor can
 		// tell "broker unreachable" (69) from "bad arg" (64) from "permission" (77) from an
@@ -104,164 +160,48 @@ func main() {
 		// `os.Exit(run())` would satisfy the shape, but cobra's ExecuteContext already owns this frame
 		// and the exit code is derived from its error -- the wrapper would move the same two lines
 		// somewhere else and gain nothing.
-		os.Exit(classifyExit(err))
+		// origin: S7 internal review rv-drill F1: keep the native result through the final custody barrier.
+		os.Exit(drillobserve.FinishNativeExit(classifyExit(err)))
 	}
+	drillobserve.FinishNativeExit(0)
 }
 
-// isAgentDaemonInvocation recognizes `tether agent ...` BY ARGV SHAPE ONLY —
-// it must work before Cobra parses anything (external review F2: the whole
-// point is to consume boot budget even when parsing itself is what the
-// staged binary breaks on). Conservative exclusions: help output and the
-// install/uninstall service paths never touch the upgrade marker (the smoke
-// gate's own `version` probe is already excluded by args[1] != "agent").
+// The pre-parse daemon chooser lives with the upgrade boot logic it feeds
+// (internal/upgradecli/daemon_argv.go, comments moved verbatim). These names keep
+// main's call site and the agentboot wiring scanner on isAgentDaemonInvocation.
+// origin: hot-update S8 plan §11.2 P19 (main slim move)
+var (
+	isAgentDaemonInvocation   = upgradecli.AgentDaemonInvocation
+	agentValueTakingFlags     = upgradecli.AgentValueTakingFlags
+	agentNonDaemonSubcommands = upgradecli.AgentNonDaemonSubcommands
+)
 
-// agentNonDaemonSubcommands are the `tether agent <name>` forms that are NOT the
-// long-running daemon. Kept as a table so the reconciliation test can walk the real
-// command tree and require every child to appear here or in its explicit daemon-like
-// list — a new subcommand added without a decision would otherwise silently start
-// consuming the daemon's boot budget.
-// argvHasStart reports whether `--start` is set in argv, honouring the bool-flag
-// spellings cobra accepts. `--start=false` is NOT set; an unparsable value is treated as
-// set, which is the conservative direction here — a daemon misread as a subcommand loses
-// its boot budget and cannot commit an upgrade, while the reverse only spends one tick.
-func argvHasStart(rest []string) bool {
-	for _, a := range rest {
-		name, val, hasVal := strings.Cut(a, "=")
-		if name != "--start" {
-			continue
-		}
-		if !hasVal {
-			return true
-		}
-		if b, err := strconv.ParseBool(val); err != nil || b {
-			return true
-		}
+// upgradeExit maps a transaction error into the exit taxonomy: S8 codes use
+// the transaction policy (an accepted deferral is 74, never 75), and older
+// refusal codes keep their registered classes and hints.
+// origin: hot-update S8 plan §7.1 / §11.2 P19
+func upgradeExit(verb string, err error) error {
+	var failure *upgradetx.Error
+	if err == nil || !errors.As(err, &failure) {
+		return err
 	}
-	return false
+	if _, s8 := upgradewire.ErrorExit(failure.Code); s8 || failure.Code == upgradetx.CodeNotWired {
+		return &ExitError{Class: upgradecli.ExitCode(err), Code: failure.Code, Err: fmt.Errorf("%s: %w", verb, err)}
+	}
+	return brokerErrorMessage(verb, failure.Code, failure.Detail)
 }
 
-// agentValueTakingFlags are the `tether agent` flags whose SEPARATED spelling
-// (`--nid gpu1`) consumes the next argv token. origin: prerelease audit round 2,
-// J2.
-//
-// A table rather than a read of the real flag set, because this runs BEFORE cobra
-// parses anything — that is the entire premise of isAgentDaemonInvocation (external
-// review F2: the boot-budget tick must be spent even when parsing is what the
-// staged binary breaks on). The drift risk a hand-kept table carries is answered by
-// TestAgentValueTakingFlagsMatchTheRealCommand, which walks the actual command and
-// fails on any flag added, removed or changed between bool and value.
-var agentValueTakingFlags = map[string]bool{
-	"--nats-url":          true,
-	"--session":           true,
-	"--nid":               true,
-	"--pin":               true,
-	"--tunnel-addr":       true,
-	"--upgrade-url-allow": true,
-	"--log-file":          true,
-	"--log-level":         true,
+// upgradeStagePorts binds the root stage to this process's home, the exit
+// taxonomy and the isolated version probe.
+// origin: hot-update S8 plan §5.2 / LQ1 / §11.2 P19
+func upgradeStagePorts() upgradecli.StagePorts {
+	return upgradecli.StagePorts{Exit: upgradeExit, Probe: probeUpgradeImage,
+		ControlDir: func(key upgradetx.Key) (string, error) { return upgradecli.ControlDirFor(key, cli.DefaultHome()) }}
 }
 
-// agentSubcommandToken returns the first token cobra would treat as a SUBCOMMAND
-// NAME, skipping flags and the values they consume. origin: prerelease audit round
-// 2, J2.
-//
-// This is cobra's stripFlags reasoning reproduced on raw argv, which is what makes
-// `tether agent --log-level debug doctor` (a subcommand) and `tether agent --nid
-// doctor` (the daemon, with a flag value that happens to read like one) come out
-// differently — the first version treated both as the daemon by looking only at
-// args[2].
-//
-// An UNKNOWN flag is assumed not to take a value. That is the conservative
-// direction: it can only make a token look like a subcommand, and a daemon misread
-// as a subcommand loses one boot-budget tick, while the reverse spends the budget
-// that has to prove a staged binary boots.
-func agentSubcommandToken(rest []string) (string, bool) {
-	for i := 0; i < len(rest); i++ {
-		a := rest[i]
-		if a == "--" {
-			// Everything after the terminator is positional.
-			if i+1 < len(rest) {
-				return rest[i+1], true
-			}
-			return "", false
-		}
-		if !strings.HasPrefix(a, "-") {
-			return a, true
-		}
-		if name, _, hasVal := strings.Cut(a, "="); !hasVal && agentValueTakingFlags[name] {
-			i++ // this flag eats the token behind it
-		}
-	}
-	return "", false
-}
-
-var agentNonDaemonSubcommands = map[string]bool{
-	"doctor": true,
-	"join":   true,
-	"config": true,
-	"help":   true,
-}
-
-func isAgentDaemonInvocation(args []string) bool {
-	if len(args) < 2 || args[1] != "agent" {
-		return false
-	}
-	// A SUBCOMMAND IS NOT THE DAEMON. origin: prerelease audit
-	// cli-serve-agent-cluster/L4-F3. `tether agent doctor`, `tether agent join` and
-	// `tether agent config refresh` all reached this function's `return true`, so each
-	// of them consumed a boot-budget tick belonging to the daemon's upgrade state
-	// machine — a `tether agent doctor` run during a rollback could spend the budget
-	// that was meant to prove the new binary boots.
-	//
-	// The predicate deliberately looks at the first POSITIONAL token, not at args[2].
-	// `tether agent --nid doctor` is the daemon with a flag VALUE that happens to be a
-	// subcommand name, and excluding it would be the same class of mistake in reverse.
-	//
-	// POSITION IS NOT THE TEST — origin: prerelease audit round 2, J2. The first
-	// version only inspected args[2], so `tether agent --log-level debug doctor` —
-	// which cobra genuinely routes to the doctor subcommand, because stripFlags
-	// consumes `--log-level`'s value and finds `doctor` behind it — was still read as
-	// the daemon and still spent a boot-budget tick belonging to the upgrade state
-	// machine. That is the very defect L4-F3 set out to close, closed for one spelling
-	// and left open for its sibling.
-	if tok, found := agentSubcommandToken(args[2:]); found && agentNonDaemonSubcommands[tok] {
-		// `agent join --start` IS the daemon: it runs the agent in-process, in the
-		// foreground, for the life of the host. Excluding it stopped
-		// agent.BootUpgradeCheck from running on that launch shape, so every
-		// `node upgrade` against such an agent became structurally unable to commit and
-		// was force-rolled-back at the register deadline (round 2, J1).
-		//
-		// Scanned across all of args[2:] rather than checked positionally, because the
-		// flag can appear anywhere after the subcommand and in either spelling cobra
-		// accepts.
-		if tok == "join" && argvHasStart(args[2:]) {
-			return true
-		}
-		return false
-	}
-	for _, arg := range args[2:] {
-		name, val, hasVal := strings.Cut(arg, "=")
-		switch name {
-		case "--help", "-h", "--install-user-service", "--uninstall":
-			// external re-review F10: honor the bool-flag forms Cobra
-			// accepts — `--flag=true` is set, `--flag=false` is not. An
-			// unparsable value is treated as set (conservative: Cobra will
-			// reject it before RunE, and a non-daemon misread only skips a
-			// boot-budget tick; the reverse misread would burn budget on a
-			// service-install invocation).
-			if !hasVal {
-				return false
-			}
-			if b, err := strconv.ParseBool(val); err != nil || b {
-				return false
-			}
-		case "help":
-			if !hasVal {
-				return false
-			}
-		}
-	}
-	return true
+// probeUpgradeImage is the isolated, bounded `version` probe of exact bytes.
+func probeUpgradeImage(path string) (string, agentimage.Capabilities, error) {
+	return agentimage.ProbeCapabilities(path, spawnsafe.RunVersionProbe)
 }
 
 // renderTerminalError is the main sink's stderr print, factored out so it is testable and so a QUIET

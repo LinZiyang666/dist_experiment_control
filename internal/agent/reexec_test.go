@@ -50,6 +50,11 @@ func reExecOnlyReply(t *testing.T, req proto.UpgradeForwardedReq, exePath string
 	a := &Agent{}
 	a.cfg.UpgradeNoExit = true
 	a.cfg.UpgradeExecutablePath = exePath
+	// Any exec attempt is a refusal failure, whatever the reply says.
+	a.cfg.UpgradeExecFn = func(path string) error {
+		t.Errorf("refused re-exec executed %s", path)
+		return nil
+	}
 	sub, err := nc.Subscribe("test.reexec", func(msg *nats.Msg) { a.handleReExecOnly(msg, req) })
 	if err != nil {
 		t.Fatalf("subscribe: %v", err)
@@ -68,26 +73,32 @@ func reExecOnlyReply(t *testing.T, req proto.UpgradeForwardedReq, exePath string
 
 // TestReExecOnlyRefusesEmptySHA pins the External-review fail-closed symmetry fix: an unguarded re-exec (no
 // sha256) must be refused, never launch whatever is on disk.
+//
+// origin: hot-update S8 plan §3.3 / §5.2; S8 FIX-FIXTURES. Intentional change: root staging supplies bytes,
+// not execution authority, so every grantless ReExecOnly is refused upgrade_deferred before its digest is
+// even read. The digest binding moved into the grant/artifact receipt; the old sha256_* codes are retired.
 func TestReExecOnlyRefusesEmptySHA(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "bin")
 	if err := os.WriteFile(p, []byte("staged"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	resp := reExecOnlyReply(t, proto.UpgradeForwardedReq{ReExecOnly: true, SHA256: ""}, p)
-	if resp.OK || resp.Code != "sha256_required" {
-		t.Fatalf("an unguarded re-exec (empty sha) must be refused sha256_required: %+v", resp)
+	if resp.OK || resp.Code != "upgrade_deferred" {
+		t.Fatalf("an unguarded re-exec (empty sha) must be refused upgrade_deferred: %+v", resp)
 	}
 }
 
 // TestReExecOnlyRefusesShaMismatch: a wrong staged digest must refuse (staging did not land the target).
+// origin: hot-update S8 plan §3.3 / §5.2; S8 FIX-FIXTURES. A matching or stale digest alike confers no grant.
 func TestReExecOnlyRefusesShaMismatch(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "bin")
 	if err := os.WriteFile(p, []byte("staged"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	resp := reExecOnlyReply(t, proto.UpgradeForwardedReq{ReExecOnly: true,
-		SHA256: "0000000000000000000000000000000000000000000000000000000000000000"}, p)
-	if resp.OK || resp.Code != "sha256_mismatch" {
-		t.Fatalf("a stale/unstaged on-disk binary must refuse sha256_mismatch: %+v", resp)
+	for _, digest := range []string{"0000000000000000000000000000000000000000000000000000000000000000", sha256OfBytes([]byte("staged"))} {
+		resp := reExecOnlyReply(t, proto.UpgradeForwardedReq{ReExecOnly: true, SHA256: digest}, p)
+		if resp.OK || resp.Code != "upgrade_deferred" {
+			t.Fatalf("a staged binary without a grant must refuse upgrade_deferred (sha=%s): %+v", digest, resp)
+		}
 	}
 }

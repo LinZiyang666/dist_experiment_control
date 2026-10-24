@@ -8,6 +8,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/LinZiyang666/tether/internal/xferserve"
+	"github.com/LinZiyang666/tether/internal/xfertrack"
 	natstest "github.com/nats-io/nats-server/v2/test"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
@@ -95,7 +97,7 @@ func TestOrphanChunkGroupsArePurgedByTheBucketReap(t *testing.T) {
 	}
 
 	now := time.Now().UTC()
-	b := &Broker{transfers: newTransferTracker()}
+	b := &Broker{transfers: xfertrack.NewLegacyTracker()}
 	b.cfg = Config{Logger: silentLogger(), Now: func() time.Time { return now }, ClusterDataDir: t.TempDir()}
 	setBrokerJS(b, js)
 	t.Cleanup(func() { setBrokerJS(b, nil) })
@@ -142,4 +144,46 @@ func TestOrphanChunkGroupsArePurgedByTheBucketReap(t *testing.T) {
 	if _, err := store.GetInfo(ctx, "tid-live"); err != nil {
 		t.Fatalf("the live object must still be readable after the sweep: %v", err)
 	}
+}
+
+// Only these tests call the chunk-only adapter; production uses the reaper owner.
+// origin: S7 internal review GATES-PROD F1 / broker code ceiling
+// xferChunkSize is nats.go's object-store chunk size (objDefaultChunkSize, 128 KiB); tether never sets
+// ObjectMeta.Opts.ChunkSize, so a chunk group's byte size is its message count times this. It is only an
+// estimate fed to the size-aware floor, never a correctness input.
+const xferChunkSize = 128 << 10
+
+// reapOrphanChunks purges the chunk groups of the OBJ_xfer bucket `name` that NO object references — the
+// storage half of an abandoned tier-B Put (gotcha #85).
+//
+// WHY THE OBJECT REAPER CANNOT SEE THEM. nats.go's ObjectStore.Put publishes the chunks first, on ONE
+// subject per object (`$O.<bucket>.C.<nuid>`), and the meta entry (`$O.<bucket>.M.<name>`) last. A Put
+// that is cancelled (the #84 watchdog / bounded retry), that times out, or whose ctl dies mid-upload
+// leaves the chunks with no meta; nats.go's own cleanup for that case is `STREAM.PURGE` with a subject
+// filter, which the ctl's and the agent's ACLs DENY by design (file-transfer-plan Round-4 #3: bucket
+// lifecycle is the broker's). That denial was harmless when a bucket was per-transfer and the broker
+// deleted the whole bucket on failure. Since v0.2.2 the bucket is per-SESSION and lives for ever, the
+// broker reaps per OBJECT through store.List — and a chunk group with no meta is not an object, so
+// nobody has ever deleted one: every failed Put has been leaving up to its full size behind, counted
+// against the bucket's MaxBytes, until the refusals turned into `insufficient storage`. A deleted object
+// has the same shape: the ctl/agent Delete writes the tombstone, its PURGE is denied, the chunks stay.
+//
+// WHAT IS SAFE TO PURGE. A chunk group whose NUID no live object references AND whose NEWEST chunk is
+// older than the caller's floor. The floor is the same one the object reaper applies (per-home grace,
+// cross-home extra, the uptime term that shields a previous incarnation's live uploads) — an upload in
+// flight keeps writing chunks (a 2 GiB Put at the 2 MiB/s admission floor writes one every 60 ms; one
+// stalled longer than 30 s is being cancelled by the ctl's watchdog), so "newest chunk older than the
+// grace" is what distinguishes abandoned from live without knowing the transfer id, which the chunk
+// group does not carry. The per-bucket busy skip at the call site (any local in-flight transfer → the
+// whole bucket is skipped) still applies above this function.
+//
+// A package-level function taking the JetStream handle, not a Broker method: the structural-budget
+// ratchet pins the type's method count (see brokerUptime).
+func reapOrphanChunks(ctx context.Context, js jetstream.JetStream, name string, objs []*jetstream.ObjectInfo,
+	floorFor func(int64) time.Duration, now time.Time, logger interface {
+		Warn(string, ...any)
+		Info(string, ...any)
+	}) int {
+	until, _ := ctx.Deadline()
+	return xferserve.ReapOrphanChunks(until, ctx.Done(), js, name, objs, floorFor, now, logger)
 }
