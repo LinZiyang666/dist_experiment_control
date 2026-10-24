@@ -28,12 +28,14 @@
 package proxydial
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"net/url"
 	"os"
 	"time"
 
+	"github.com/LinZiyang666/tether/internal/infratransport"
 	"github.com/nats-io/nats.go"
 )
 
@@ -43,11 +45,6 @@ type Env func(key string) (string, bool)
 
 // OSEnv is the production Env backed by the process environment.
 func OSEnv(key string) (string, bool) { return os.LookupEnv(key) }
-
-// supportedSchemes are the proxy URL schemes this package understands.
-var supportedSchemes = map[string]bool{
-	"http": true, "https": true, "socks5": true, "socks5h": true,
-}
 
 // Options returns the nats.Options that make the connection proxy-aware, based
 // ONLY on the presence of a proxy env var. It is the single decision point for
@@ -74,19 +71,9 @@ func Options(env Env, dialTimeout time.Duration) ([]nats.Option, error) {
 	if raw == "" {
 		return nil, nil // zero-regression path
 	}
-	pu, err := url.Parse(raw)
+	pu, err := infratransport.ParseProxy(raw)
 	if err != nil {
-		// NEVER echo the raw proxy env value — it can carry credentials
-		// (socks5://user:pass@host) and this error flows to CLI/agent error
-		// paths (the systemd journal for agents).
-		return nil, fmt.Errorf("proxydial: could not parse the proxy URL from the proxy env var " +
-			"(set HTTPS_PROXY/ALL_PROXY to http(s)://host:port or socks5(h)://host:port)")
-	}
-	if pu.Host == "" || !supportedSchemes[pu.Scheme] {
-		// Report only the scheme (the actionable part); never the host or
-		// userinfo, which may be sensitive (same leak concern as above).
-		return nil, fmt.Errorf("proxydial: unsupported or malformed proxy URL (scheme %q) "+
-			"— set HTTPS_PROXY/ALL_PROXY to http(s)://host:port or socks5(h)://host:port", pu.Scheme)
+		return nil, err
 	}
 	d := &dialer{
 		proxy:   pu,
@@ -102,21 +89,12 @@ func Options(env Env, dialTimeout time.Duration) ([]nats.Option, error) {
 // sees host:port and cannot tell a plaintext target apart, and proxy setups
 // commonly export all three to the same value). Uppercase beats lowercase.
 func selectProxyURL(env Env) string {
-	return firstEnv(env,
-		"HTTPS_PROXY", "https_proxy",
-		"ALL_PROXY", "all_proxy",
-		"HTTP_PROXY", "http_proxy",
-	)
+	return infratransport.SelectProxyURL(env)
 }
 
 // firstEnv returns the first non-empty value among keys.
 func firstEnv(env Env, keys ...string) string {
-	for _, k := range keys {
-		if v, ok := env(k); ok && v != "" {
-			return v
-		}
-	}
-	return ""
+	return infratransport.FirstProxyEnv(env, keys...)
 }
 
 // dialer implements nats.CustomDialer. It deliberately does NOT implement
@@ -126,6 +104,11 @@ type dialer struct {
 	proxy   *url.URL
 	noProxy string
 	timeout time.Duration
+	hop     *pendingConn
+	budget  *admissionBudget
+	lookup  func(context.Context, string) ([]string, error)
+	ctx     context.Context
+	joinRaw func()
 }
 
 // Dial routes a single TCP connection to address through the configured proxy,
@@ -133,6 +116,14 @@ type dialer struct {
 // which case it dials directly. address is the clean host:port nats.go derived
 // from the broker URL.
 func (d *dialer) Dial(network, address string) (net.Conn, error) {
+	if d.budget != nil {
+		if err := d.budget.terminalError(); err != nil {
+			return nil, err
+		}
+	}
+	if d.budget != nil && d.budget.active() {
+		return d.dialWithin(network, address)
+	}
 	host, _, err := net.SplitHostPort(address)
 	if err != nil {
 		return nil, fmt.Errorf("proxydial: bad target address %q: %w", address, err)
@@ -140,7 +131,10 @@ func (d *dialer) Dial(network, address string) (net.Conn, error) {
 	// NO_PROXY (incl. the built-in loopback bypass) is evaluated ONLY against
 	// the target host, never against the proxy hop (the proxy itself is dialed
 	// directly below — e.g. Clash on 127.0.0.1:7897 is normal).
-	if bypassProxy(host, d.noProxy) {
+	if d.proxy == nil || bypassProxy(host, d.noProxy) {
+		if d.ctx != nil {
+			return (&net.Dialer{Resolver: &net.Resolver{PreferGo: true}, Timeout: d.timeout}).DialContext(d.ctx, network, address)
+		}
 		return (&net.Dialer{Timeout: d.timeout}).Dial(network, address)
 	}
 	// ONE end-to-end deadline for the whole proxy dial (proxy-hop TCP dial +
@@ -149,6 +143,11 @@ func (d *dialer) Dial(network, address string) (net.Conn, error) {
 	var deadline time.Time
 	if d.timeout > 0 {
 		deadline = time.Now().Add(d.timeout)
+	}
+	if d.ctx != nil {
+		if end, ok := d.ctx.Deadline(); ok && (deadline.IsZero() || end.Before(deadline)) {
+			deadline = end
+		}
 	}
 	switch d.proxy.Scheme {
 	case "http", "https":
@@ -163,12 +162,7 @@ func (d *dialer) Dial(network, address string) (net.Conn, error) {
 
 // proxyAuth returns (user, pass, ok) from the proxy URL userinfo.
 func (d *dialer) proxyAuth() (user, pass string, ok bool) {
-	if d.proxy.User == nil {
-		return "", "", false
-	}
-	user = d.proxy.User.Username()
-	pass, _ = d.proxy.User.Password()
-	return user, pass, true
+	return infratransport.ProxyCredentials(d.proxy)
 }
 
 // dialProxyHop dials the proxy server itself (direct, never via NO_PROXY),
@@ -186,11 +180,29 @@ func (d *dialer) dialProxyHop(deadline time.Time) (net.Conn, error) {
 			addr = net.JoinHostPort(addr, "1080")
 		}
 	}
-	c, err := (&net.Dialer{Deadline: deadline}).Dial("tcp", addr)
+	var c net.Conn
+	var err error
+	if d.budget != nil && d.budget.active() {
+		c, err = d.dialDirectWithin("tcp", addr, deadline)
+		d.hop, _ = c.(*pendingConn)
+	} else if d.ctx != nil {
+		c, err = (&net.Dialer{Resolver: &net.Resolver{PreferGo: true}, Deadline: deadline}).DialContext(d.ctx, "tcp", addr)
+	} else {
+		c, err = (&net.Dialer{Deadline: deadline}).Dial("tcp", addr)
+	}
 	if err != nil {
 		// addr is host:port only — url.URL.Host never carries userinfo (that's
 		// in url.URL.User), so there's nothing to redact here.
 		return nil, fmt.Errorf("proxydial: dial proxy %s: %w", addr, err)
+	}
+	if d.ctx != nil {
+		done := make(chan struct{})
+		stop := context.AfterFunc(d.ctx, func() { _ = c.Close(); close(done) })
+		d.joinRaw = func() {
+			if !stop() {
+				<-done
+			}
+		}
 	}
 	if !deadline.IsZero() {
 		_ = c.SetDeadline(deadline)

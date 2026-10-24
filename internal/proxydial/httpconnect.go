@@ -8,21 +8,9 @@ import (
 	"net"
 	"net/http"
 	"time"
+
+	"github.com/LinZiyang666/tether/internal/infratransport"
 )
-
-// bufConn wraps a conn whose initial bytes may have been buffered by the
-// bufio.Reader used to parse the CONNECT response. Read drains the buffer first.
-//
-// LOAD-BEARING: http.ReadResponse can read ahead past the response's blank line
-// into the first tunnel bytes, and a NATS server sends its INFO line IMMEDIATELY
-// on connect (very likely in the same TCP segment as the 200 CONNECT response),
-// so returning a bare conn would silently swallow INFO and hang the handshake.
-type bufConn struct {
-	net.Conn
-	r *bufio.Reader
-}
-
-func (b *bufConn) Read(p []byte) (int, error) { return b.r.Read(p) }
 
 // dialHTTPConnect opens a tunnel to target via an HTTP(S) CONNECT proxy,
 // bounded by the shared end-to-end deadline.
@@ -73,7 +61,12 @@ func (d *dialer) dialHTTPConnect(target string, deadline time.Time) (net.Conn, e
 	// On 2xx the connection BECOMES the tunnel, so resp.Body is deliberately not closed here: Go gives
 	// a successful CONNECT response no body (http.NoBody), and closing a body layered over `br` would
 	// mean closing the very connection we are about to hand back to the caller.
-	// Clear the dial deadline so it does not bleed into nats.go's later I/O.
-	_ = conn.SetDeadline(time.Time{})
-	return &bufConn{Conn: conn, r: br}, nil
+	// Legacy callers clear the dial deadline so it does not bleed into later I/O.
+	// origin: hot-update S6 plan §8.2 / T34Proxy
+	// CONNECT/SOCKS success is only the proxy hop: TLS/WSS and NATS
+	// CONNECT still owe the same deadline. Legacy callers detach here.
+	if d.budget == nil || !d.budget.active() {
+		_ = conn.SetDeadline(time.Time{})
+	}
+	return infratransport.Buffered(conn, br), nil
 }

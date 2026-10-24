@@ -48,7 +48,12 @@ func (d *dialer) dialSOCKS5(target string, deadline time.Time) (net.Conn, error)
 		_ = conn.Close()
 		return nil, err
 	}
-	_ = conn.SetDeadline(time.Time{})
+	// origin: hot-update S6 plan §8.2 / T34Proxy
+	// CONNECT/SOCKS success is only the proxy hop: TLS/WSS and NATS
+	// CONNECT still owe the same deadline. Legacy callers detach here.
+	if d.budget == nil || !d.budget.active() {
+		_ = conn.SetDeadline(time.Time{})
+	}
 	return conn, nil
 }
 
@@ -87,7 +92,7 @@ func (d *dialer) socks5Handshake(conn net.Conn, host string, port int) error {
 	}
 
 	// CONNECT. Hostnames go as ATYP=domain (remote resolution = the fake-ip
-	// 命门); IP literals go as proper ATYP=IPv4/IPv6 (RFC1928 — remote resolution
+	// critical bypass); IP literals go as proper ATYP=IPv4/IPv6 (RFC1928 — remote resolution
 	// is meaningless for an IP and a strict server may reject a domain-wrapped IP).
 	req := []byte{socks5Ver, socks5CmdConn, 0x00}
 	if ip := net.ParseIP(host); ip != nil {

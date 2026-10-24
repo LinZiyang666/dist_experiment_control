@@ -23,8 +23,7 @@
 #   curl -fsSL "$BASE/install.sh" | sudo sh -s -- --role broker --domain tether.example.com --acme-email admin@example.com
 #
 # Test / dev knobs (not for production callers):
-#   --dry-run           do everything except download + chmod + write
-#                       outside the work-root; useful for CI assertions.
+#   --dry-run           preview only; no filesystem or host mutations.
 #   --source-base URL   override the release tarball base URL (default:
 #                       https://github.com/LinZiyang666/dist_experiment_control/releases/download/<ver>).
 #   --version VER       pin the release version (default: latest tag).
@@ -48,6 +47,19 @@ PREFIX=""
 SKIP_DOWNLOAD=0
 UNINSTALL=0
 NO_ENABLE=0
+HOT_UPDATE_RETROFIT=0
+HOT_UPDATE_REGISTRATION=""
+LOCAL_BIN=""
+INSTALL_STAGE_ONLY=0
+# Release archives carry these files at their root. Offline broker installs use
+# the same set in TETHER_INFRA_SUPPORT_DIR; skipping a download never skips its
+# hashes or platform checks. Neither support executable is run by the installer.
+# origin: hot-update S9 plan §6.4 / §6.5 / T54
+INFRA_SUPPORT_DIR="${TETHER_INFRA_SUPPORT_DIR:-}"
+INFRA_WORKER_LIFETIME_S=15
+INFRA_WORKER_STOP_S=5
+INFRA_MAX_CONNECTIONS=4
+INSTALL_TEMP_PATHS=""
 # Client liveness, server half — ONE definition, used by the nats.conf template AND the KEPT report's
 # merge hint below, so the two can never drift apart (internal review round 1 R3-5 / R4-F4: the hint
 # used to hand-copy the values). The agent half is internal/agent AgentPingInterval / AgentMaxPingsOut;
@@ -100,6 +112,10 @@ Common:
   --skip-download
   --uninstall
   --force-config      overwrite existing config/unit files instead of writing <file>.new beside them
+  --bin FILE          install a locally verified tether binary without any downloads
+  --hot-update-registration FILE  complete deployment declaration for retrofit (all siblings and UIDs)
+  --hot-update-retrofit  prepare hot-update directories and canonical startup templates only
+                        (default role: broker; no binary replacement or service start)
 EOF
 }
 
@@ -120,6 +136,9 @@ while [ $# -gt 0 ]; do
         --skip-download) SKIP_DOWNLOAD=1;    shift ;;
         --no-enable)     NO_ENABLE=1;        shift ;;
         --uninstall)     UNINSTALL=1;        shift ;;
+        --bin)           LOCAL_BIN="$2";     SKIP_DOWNLOAD=1; shift 2 ;;
+        --hot-update-retrofit) HOT_UPDATE_RETROFIT=1; shift ;;
+        --hot-update-registration) HOT_UPDATE_REGISTRATION="$2"; shift 2 ;;
         -h|--help)       usage; exit 0 ;;
         *)
             echo "install.sh: unknown flag: $1" >&2
@@ -132,7 +151,7 @@ done
 # Architecture K.2 default: bare `curl install.sh | sh` installs ctl.
 # Operators distinguish agent / broker by always passing --role.
 if [ -z "$ROLE" ]; then
-    ROLE="ctl"
+    if [ "$HOT_UPDATE_RETROFIT" -eq 1 ]; then ROLE="broker"; else ROLE="ctl"; fi
 fi
 
 # -- common helpers --------------------------------------------------------
@@ -149,10 +168,10 @@ KEPT_CONFIGS=""
 # origin: prerelease audit round 2, C7.
 KEPT_ANY=0
 
-# config_dest decides where a generated config should actually be written and puts the
-# answer in CONFIG_DEST: the real path when the file does not exist yet or
-# --force-config was given, `<path>.new` otherwise. A kept file is recorded for the
-# banner.
+# config_dest selects CONFIG_TARGET: the real path when the file does not exist
+# yet or --force-config was given, `<path>.new` otherwise. A kept file is recorded
+# for the banner. CONFIG_DEST is the broker's private generation inode, published
+# by publish_config; unprivileged agent writes retain their existing destination.
 #
 # IT SETS A VARIABLE RATHER THAN ECHOING, deliberately. `$(config_dest …)` would run it
 # in a SUBSHELL, so every KEPT_CONFIGS append would be discarded the moment the
@@ -162,8 +181,73 @@ KEPT_ANY=0
 #
 # origin: prerelease audit deploy-release-docs/DRD-F1 + DRD-F5. See FORCE_CONFIG above
 # for why "keep it AND write the new one beside it" rather than either extreme.
+# Only first-install management templates may bypass stage-only sidecars. Business
+# configurations and existing support templates retain their review boundary.
+# origin: S9 internal review rv-priv F4
+infra_missing_template() {
+    case "$1" in
+        "$INFRA_ETC_DIR/templates/tether-infra-helper.socket"|"$INFRA_ETC_DIR/templates/tether-infra-helper@.service"|\
+        "$INFRA_ETC_DIR/templates/nats-server.service.d/90-tether-infra.conf"|"$INFRA_ETC_DIR/templates/caddy.service.d/90-tether-infra.conf")
+            [ ! -e "$1" ] && [ ! -L "$1" ] ;;
+        *) return 1 ;;
+    esac
+}
+
 config_dest() {
+    config_target "$1"
+    stage_config
+}
+# Share atomic, installer-owned staging between rendered templates and copies.
+# origin: S9 internal review INFRA-SUITE-SUPPLIES F2 / S9 plan §6.4 / T54
+stage_config() {
+    CONFIG_TARGET="$CONFIG_DEST"
+    [ "$ROLE" = broker ] && [ "$DRY_RUN" -eq 0 ] || return 0
+    # nats.d is broker-writable. Generate in its trusted parent, never open or
+    # chmod the selected final pathname. A late symlink can only be replaced.
+    # Other broker targets already have a root-controlled containing directory.
+    # origin: S9 internal review rv-priv F1
+    _cd_stage=${CONFIG_TARGET%/*}
+    case "$CONFIG_TARGET" in "$ETC_DIR/nats.d/"*) _cd_stage="$ETC_DIR" ;; esac
+    infra_safe_path "$_cd_stage"
+    [ "$(stat -c '%u' "$_cd_stage")" = "$(id -u)" ] || die "config staging parent must be installer-owned"
+    _cd_mode=$(stat -c '%a' "$_cd_stage")
+    [ "$((0$_cd_mode & 0002))" -eq 0 ] && { [ "$((0$_cd_mode & 0020))" -eq 0 ] || [ "$(stat -c '%g' "$_cd_stage")" = "$(id -g)" ]; } || die "config staging parent must not be writable by another identity"
+    CONFIG_DEST=$(mktemp "$_cd_stage/.tether-config.XXXXXX")
+    register_install_temp "$CONFIG_DEST"
+}
+
+publish_config() {
+    chmod "$1" "$CONFIG_DEST"
+    if [ "$ROLE" = broker ]; then
+        sync "$CONFIG_DEST"
+        # Pin the destination directory as cwd. Renaming one basename never
+        # follows the old target (including a symlink installed after validation).
+        # Refuse cross-filesystem fallback: publication must be one rename.
+        (
+            cd -P "${CONFIG_TARGET%/*}" || exit 1
+            [ "$(stat -c '%d' .)" = "$(stat -c '%d' "$CONFIG_DEST")" ] || exit 1
+            mv -Tf "$CONFIG_DEST" "./${CONFIG_TARGET##*/}" || exit 1
+            sync .
+        ) || die "atomic config publication failed"
+        CONFIG_DEST="$CONFIG_TARGET"
+        record_owned_file "$CONFIG_TARGET"
+    fi
+}
+
+config_target() {
     _cd_path="$1"
+    if [ "$ROLE" = broker ]; then
+        infra_safe_path "$_cd_path"
+        infra_safe_path "${_cd_path}.new"
+    fi
+    if [ "$INSTALL_STAGE_ONLY" -eq 1 ] && ! infra_missing_template "$_cd_path"; then
+        KEPT_CONFIGS="${KEPT_CONFIGS}${_cd_path}
+"
+        KEPT_ANY=1
+        CONFIG_DEST="${_cd_path}.new"
+        [ ! -e "$CONFIG_DEST" ] || owned_file "$CONFIG_DEST" || die "operator sidecar already exists: $CONFIG_DEST"
+        return 0
+    fi
     if [ "$FORCE_CONFIG" -eq 1 ] || [ ! -e "$_cd_path" ]; then
         CONFIG_DEST="$_cd_path"
         # A `.new` left by an EARLIER kept re-run is now stale: this run is about to
@@ -178,8 +262,12 @@ config_dest() {
         # next report would not mention it at all (nothing was kept), so there was
         # nothing left to tell them apart.
         if [ "$DRY_RUN" -eq 0 ] && [ -e "${_cd_path}.new" ]; then
-            rm -f "${_cd_path}.new"
-            log "  - removed the superseded ${_cd_path}.new (its content is now the live file)"
+            if [ "$ROLE" != broker ] || owned_file "${_cd_path}.new"; then
+                rm -f "${_cd_path}.new"
+                log "  - removed the superseded ${_cd_path}.new (its content is now the live file)"
+            else
+                log "  + kept operator sidecar: ${_cd_path}.new"
+            fi
         fi
         return 0
     fi
@@ -187,6 +275,9 @@ config_dest() {
 "
     KEPT_ANY=1
     CONFIG_DEST="${_cd_path}.new"
+    if [ "$ROLE" = broker ] && [ -e "$CONFIG_DEST" ]; then
+        owned_file "$CONFIG_DEST" || die "operator sidecar already exists: $CONFIG_DEST"
+    fi
 }
 
 # dryrun_config_policy states what a real run would do to files that ALREADY EXIST.
@@ -264,6 +355,26 @@ report_kept_configs() {
 }
 die() { printf 'install.sh: %s\n' "$*" >&2; exit 1; }
 
+# Track only this invocation's mktemp paths. Failed validation/copy must not
+# leave writable partial slots for a later install to mistake for published
+# artifacts. Permanent locks and selected slots never enter this list.
+# origin: hot-update S9 plan §6.4 / T54
+register_install_temp() {
+    INSTALL_TEMP_PATHS="${INSTALL_TEMP_PATHS}$1
+"
+}
+
+cleanup_install_temps() {
+    printf '%s' "$INSTALL_TEMP_PATHS" | while IFS= read -r _cit_tmp; do
+        [ -n "$_cit_tmp" ] && [ -e "$_cit_tmp" ] || continue
+        # A failed private copy may already have made its directory immutable.
+        # Restoring write access only on this unselected temporary is cleanup.
+        if [ -d "$_cit_tmp" ]; then chmod u+w "$_cit_tmp"; fi
+        rm -rf "$_cit_tmp"
+    done
+}
+trap cleanup_install_temps 0
+
 run() {
     if [ "$DRY_RUN" -eq 1 ]; then
         log "  + (dry-run) $*"
@@ -329,6 +440,7 @@ maybe_resolve_version() {
     # review附记(g75-g78): uninstall never downloads anything, so it must not
     # depend on resolving a release tag — an OFFLINE host could not uninstall
     # (the resolver died before any removal ran).
+    [ "$HOT_UPDATE_RETROFIT" -eq 1 ] && return 0
     [ "$UNINSTALL" -eq 1 ] && return 0
     [ "$DRY_RUN" -eq 1 ] && return 0
     [ "$SKIP_DOWNLOAD" -eq 1 ] && return 0
@@ -356,7 +468,7 @@ fetch() {
 # Caddy caddy_<ver>_checksums.txt is sha512; tether's own
 # SHA256SUMS (goreleaser default) is sha256.
 verify_sha() {
-    if [ "$DRY_RUN" -eq 1 ] || [ "$SKIP_DOWNLOAD" -eq 1 ]; then
+    if [ "$DRY_RUN" -eq 1 ]; then
         log "  + (skip) verify_sha $1"
         return 0
     fi
@@ -385,21 +497,46 @@ extract_to() {
 }
 
 # place_binary <src_tarball> <dest_dir>: extract tether to dest.
-# Tarball layout from goreleaser: tether (a single binary at the
-# archive root) + LICENSE + README.
+# Goreleaser keeps tether, LICENSE and README at the archive root; Linux
+# releases also carry the support binaries, catalog and release manifest.
 place_binary() {
-    src="$1"
-    dest="$2"
-    run "mkdir -p '$dest'"
+    _pb_src="$1"
+    _pb_dest="$2"
+    run "mkdir -p '$_pb_dest'"
     if [ "$DRY_RUN" -eq 1 ] || [ "$SKIP_DOWNLOAD" -eq 1 ]; then
-        log "  + (skip) extract '$src' → '$dest/tether'"
+        log "  + (skip) extract '$_pb_src' → '$_pb_dest/tether'"
         return 0
     fi
-    tmp=$(mktemp -d)
-    tar -xzf "$src" -C "$tmp"
-    mv "$tmp/tether" "$dest/tether"
-    chmod +x "$dest/tether"
-    rm -rf "$tmp"
+    _pb_tmp=$(mktemp -d)
+    register_install_temp "$_pb_tmp"
+    # A verified archive must still have a safe layout: symlinks/hardlinks and
+    # traversal must never turn extraction into writes outside the staging tree.
+    # origin: hot-update S9 plan §3.1 / §6.5 / T54
+    tar -tzf "$_pb_src" | awk '/^\// || /(^|\/)\.\.(\/|$)/ {bad=1} {if (seen[$0]++) bad=1} END {exit bad}' || die "unsafe or duplicate release archive path"
+    tar -tvzf "$_pb_src" | awk 'substr($0,1,1) != "-" && substr($0,1,1) != "d" {bad=1} END {exit bad}' || die "release archive contains links or special files"
+    tar -xzf "$_pb_src" -C "$_pb_tmp"
+    [ -f "$_pb_tmp/tether" ] && [ ! -L "$_pb_tmp/tether" ] || die "release archive is missing tether"
+    if [ "$ROLE" = broker ]; then stage_infra_support "$_pb_tmp"; fi
+    install -m 0755 "$_pb_tmp/tether" "$_pb_dest/.tether.new"
+    mv -f "$_pb_dest/.tether.new" "$_pb_dest/tether"
+    record_owned_file "$_pb_dest/tether"
+    rm -rf "$_pb_tmp"
+}
+
+# A local binary is already verified by the operator's supply manifest. Copy it
+# beside the canonical entry and rename, so a running inode is never truncated.
+# This is an explicit cold installation, not a hot upgrade or artifact receipt.
+# origin: hot-update S8 plan §5.2 / §7.2 / P20
+install_local_binary() {
+    [ -n "$LOCAL_BIN" ] || return 0
+    [ -f "$LOCAL_BIN" ] || die "--bin must name a regular local file"
+    if [ "$DRY_RUN" -eq 1 ]; then
+        log "  + (dry-run) install -m 0755 $LOCAL_BIN $1/.tether.new"
+        log "  + (dry-run) mv -f $1/.tether.new $1/tether"
+    else
+        install -m 0755 "$LOCAL_BIN" "$1/.tether.new"
+        mv -f "$1/.tether.new" "$1/tether"
+    fi
 }
 
 # place_completion <src_tarball>: extract the bundled zsh completion
@@ -417,6 +554,7 @@ place_completion() {
         return 0
     fi
     tmp=$(mktemp -d)
+    register_install_temp "$tmp"
     if ! tar -xzf "$src" -C "$tmp" "completions/_tether" 2>/dev/null; then
         rm -rf "$tmp"
         log "  + (skip) zsh completion (not bundled in this release)"
@@ -483,11 +621,13 @@ install_agent() {
 
     if [ "$SKIP_DOWNLOAD" -eq 0 ] && [ "$DRY_RUN" -eq 0 ]; then
         TARBALL=$(mktemp)
+        register_install_temp "$TARBALL"
         TARBALL_URL=$(source_tarball_url)
         SHA_URL=$(source_sha_url)
         log "  + downloading $TARBALL_URL"
         fetch "$TARBALL_URL" "$TARBALL"
         SHA_FILE=$(mktemp)
+        register_install_temp "$SHA_FILE"
         fetch "$SHA_URL" "$SHA_FILE"
         EXPECT=$(grep "$(basename "$TARBALL_URL")" "$SHA_FILE" | awk '{print $1}')
         [ -n "$EXPECT" ] || die "no sha256 for $(basename "$TARBALL_URL") in SHA256SUMS"
@@ -497,6 +637,8 @@ install_agent() {
     else
         log "  + (skip) binary install"
     fi
+
+    install_local_binary "$BIN_DIR"
 
     # Derive tunnel_addr from broker URL: split-ports model (A.3)
     # puts frps on host:7000. Host extraction handles wss://, ws://,
@@ -642,10 +784,12 @@ install_ctl() {
 
     if [ "$SKIP_DOWNLOAD" -eq 0 ] && [ "$DRY_RUN" -eq 0 ]; then
         TARBALL=$(mktemp)
+        register_install_temp "$TARBALL"
         TARBALL_URL=$(source_tarball_url)
         SHA_URL=$(source_sha_url)
         fetch "$TARBALL_URL" "$TARBALL"
         SHA_FILE=$(mktemp)
+        register_install_temp "$SHA_FILE"
         fetch "$SHA_URL" "$SHA_FILE"
         EXPECT=$(grep "$(basename "$TARBALL_URL")" "$SHA_FILE" | awk '{print $1}')
         [ -n "$EXPECT" ] || die "no sha256 in SHA256SUMS"
@@ -657,6 +801,8 @@ install_ctl() {
         log "  + (skip) binary install"
         place_completion ""
     fi
+
+    install_local_binary "$BIN_DIR"
 
     # UNQUOTED heredoc ON PURPOSE: expands $BIN_DIR (the probed install dir).
     cat <<EOF
@@ -736,6 +882,13 @@ log_would_run_systemctl() {
 }
 
 enable_broker_units() {
+    # Reinstall does not publish effective units or change enablement. Staged
+    # templates take effect only after the product's authorized domain CAS.
+    # origin: hot-update S9 plan §6.4 / T54 / M27
+    if [ "$INSTALL_STAGE_ONLY" -eq 1 ]; then
+        log "  + stage-only: service manager and boot enablement kept"
+        return 0
+    fi
     if ! host_systemd_is_the_target; then
         log_would_run_systemctl "systemctl daemon-reload && systemctl enable nats-server tether-broker caddy"
         return 0
@@ -772,6 +925,7 @@ enable_broker_units() {
 # TETHER_JOURNALD_ROOT is a TEST-ONLY seam (hermetic tests point it at a
 # tmpdir); production always resolves /etc/systemd.
 write_journald_dropin() {
+    [ "$INSTALL_STAGE_ONLY" -eq 0 ] || return 0
     # TETHER_INSTALL_ROOT (round 2, G2/K-F10) redirects it too, so ONE variable makes
     # a whole broker install hermetic. The dedicated TETHER_JOURNALD_ROOT still wins —
     # tests that only need this one file keep pointing it wherever they like.
@@ -856,17 +1010,468 @@ JEOF
     WROTE_JOURNALD_DROPIN=1
 }
 
+# All infrastructure paths resolve from one seam. Policy, journal, credentials,
+# ACME selectors and lifetime store locks are bootstrap/runtime responsibilities;
+# installing templates must never synthesize any of those authorities.
+# origin: hot-update S9 plan §6.4 / T54
+broker_paths() {
+    BIN_DIR="${PREFIX:-${TETHER_INSTALL_ROOT:-}/usr/local/bin}"
+    ETC_DIR="${TETHER_INSTALL_ROOT:-}/etc/tether"
+    LIB_DIR="${TETHER_INSTALL_ROOT:-}/var/lib/tether"
+    LOG_DIR="${TETHER_INSTALL_ROOT:-}/var/log/tether"
+    RUN_DIR="${TETHER_INSTALL_ROOT:-}/var/run/tether"
+    SYSTEMD_DIR="${TETHER_INSTALL_ROOT:-}/etc/systemd/system"
+    LIBEXEC_DIR="${TETHER_INSTALL_ROOT:-}/usr/local/libexec"
+    INFRA_DIR="${TETHER_INSTALL_ROOT:-}/var/lib/tether-infra"
+    INFRA_ETC_DIR="$ETC_DIR/infra"
+    INFRA_RUN_DIR="${TETHER_INSTALL_ROOT:-}/run/tether-infra"
+}
+# New root paths cannot alias operator trees. Check every existing ancestor,
+# including dangling symlinks, before creating directories or changing modes.
+# Fixed systemd paths also cannot contain shell or systemd substitutions.
+# origin: hot-update S9 plan §6.4 / T54
+infra_safe_path() {
+    case "$1" in /*) ;; *) die "infrastructure path must be absolute: $1" ;; esac
+    case "$1" in *[!A-Za-z0-9_./@-]*|*/../*|*/./*|*/..|*/.|*//*) die "infrastructure path must be clean: $1" ;; esac
+    _isp="$1"
+    while [ "$_isp" != / ]; do
+        [ ! -L "$_isp" ] || die "infrastructure path must not be a symlink: $_isp"
+        _isp=${_isp%/*}
+        [ -n "$_isp" ] || _isp=/
+    done
+}
+file_sha256() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | awk '{print $1}'
+    else
+        shasum -a 256 "$1" | awk '{print $1}'
+    fi
+}
+# A filename never proves ownership. The root-private receipt binds its exact
+# path and current bytes; changed files and same-name operator files survive.
+# Receipts have their own content marker, including for binary targets that
+# cannot embed a shell comment. No recursive deletion touches business data.
+# origin: hot-update S9 plan §6.4 / T54 / M27
+record_owned_file() {
+    [ "${ROLE:-}" = broker ] && [ -n "${INFRA_DIR:-}" ] || return 0
+    [ "$DRY_RUN" -eq 0 ] || return 0
+    _rof_path="$1"
+    [ -f "$_rof_path" ] && [ ! -L "$_rof_path" ] || die "managed target is not a regular file"
+    _rof_key=$(printf '%s' "$_rof_path" | sha256sum | awk '{print $1}')
+    _rof_hash=$(file_sha256 "$_rof_path")
+    _rof_tmp=$(mktemp "$INFRA_DIR/ownership/.receipt.XXXXXX")
+    register_install_temp "$_rof_tmp"
+    _rof_metadata=$(stat -c '%u:%g:%a:%h' "$_rof_path")
+    printf '# managed-by: tether-install.sh (content ownership v1)\n%s\n%s\n%s\n' "$_rof_path" "$_rof_hash" "$_rof_metadata" > "$_rof_tmp"
+    chmod 600 "$_rof_tmp"
+    mv -f "$_rof_tmp" "$INFRA_DIR/ownership/$_rof_key"
+}
+owned_file() {
+    [ -n "${INFRA_DIR:-}" ] && [ -f "$1" ] && [ ! -L "$1" ] || return 1
+    _of_key=$(printf '%s' "$1" | sha256sum | awk '{print $1}')
+    _of_receipt="$INFRA_DIR/ownership/$_of_key"
+    [ -f "$_of_receipt" ] && [ ! -L "$_of_receipt" ] || return 1
+    [ "$(head -n 1 "$_of_receipt")" = '# managed-by: tether-install.sh (content ownership v1)' ] || return 1
+    [ "$(sed -n '2p' "$_of_receipt")" = "$1" ] || return 1
+    [ "$(sed -n '3p' "$_of_receipt")" = "$(file_sha256 "$1")" ] || return 1
+    [ "$(sed -n '4p' "$_of_receipt")" = "$(stat -c '%u:%g:%a:%h' "$1")" ]
+}
+remove_owned_file() {
+    if [ "$DRY_RUN" -eq 1 ]; then
+        log "  + (dry-run) rm -f '$1' (only with matching content ownership receipt)"
+    elif owned_file "$1"; then
+        rm -f "$1"
+        rm -f "$_of_receipt"
+    elif [ -e "$1" ] || [ -L "$1" ]; then
+        log "  + kept operator or modified file: $1"
+    fi
+}
+infra_install_directories() {
+    for _iid in "$INFRA_DIR" "$INFRA_DIR/ownership" "$INFRA_DIR/artifacts"; do
+        infra_safe_path "$_iid"
+        if [ "$DRY_RUN" -eq 1 ]; then
+            log "  + (dry-run) install -d -m 0700 $_iid"
+        elif [ -d "$_iid" ]; then
+            [ "$(stat -c '%a' "$_iid")" = 700 ] || die "infrastructure directory must have mode 0700: $_iid"
+            if host_systemd_is_the_target; then
+                [ "$(stat -c '%u' "$_iid")" = 0 ] || die "infrastructure directory must be root-owned: $_iid"
+            fi
+        else
+            install -d -m 0700 "$_iid"
+        fi
+    done
+}
+# An installed root policy or either journal is an authority, not a shell-readable
+# idle flag. Unknown/completed/pending all require the root product's retirement
+# CAS. Ordinary reinstall therefore stages only, and uninstall refuses before any
+# host/file effect. The permanent journal lock serializes bootstrap publication;
+# it is never truncated, renamed or removed by cleanup.
+# origin: hot-update S9 plan §6.4 / T54 / M27
+infra_has_authority() {
+    for _iha_path in "$INFRA_ETC_DIR/policy.json" "$INFRA_DIR/policy.json" "$INFRA_DIR/journal.json" "$LIB_DIR/upgrade-state.json" \
+        "$INFRA_RUN_DIR/control.sock" "$INFRA_RUN_DIR/host.sock" "$RUN_DIR/admin.sock"; do
+        if [ -e "$_iha_path" ] || [ -L "$_iha_path" ]; then return 0; fi
+    done
+    if [ -L "$LIB_DIR/upgrade-control" ]; then return 0; fi
+    if [ -e "$LIB_DIR/upgrade-control" ]; then
+        [ -d "$LIB_DIR/upgrade-control" ] || return 0
+        # An unreadable registry is unknown authority, never an empty domain.
+        # origin: hot-update S9 plan §6.4 / T54 / M27
+        _iha_domains=$(find "$LIB_DIR/upgrade-control" -name '*.domain' -print 2>/dev/null) || return 0
+        [ -z "$_iha_domains" ] || return 0
+    fi
+    return 1
+}
+infra_install_admission() {
+    broker_paths
+    for _iia in "$BIN_DIR" "$LIBEXEC_DIR" "$INFRA_DIR" "$INFRA_ETC_DIR" "$SYSTEMD_DIR" "$INFRA_RUN_DIR"; do
+        infra_safe_path "$_iia"
+    done
+    if infra_has_authority || [ -e "$BIN_DIR/tether" ] || [ -e "$BIN_DIR/nats-server" ] || [ -e "$BIN_DIR/caddy" ] ||
+       [ -e "$LIBEXEC_DIR/tether-infra-helper" ] || [ -e "$LIBEXEC_DIR/tether-infra-launch" ] ||
+       [ -e "$SYSTEMD_DIR/nats-server.service" ] || [ -e "$SYSTEMD_DIR/caddy.service" ] || [ -e "$SYSTEMD_DIR/tether-broker.service" ] ||
+       [ -e "$ETC_DIR/broker.yaml" ] || [ -e "$ETC_DIR/Caddyfile" ] || [ -e "$ETC_DIR/nats.d/nats.conf" ]; then
+        INSTALL_STAGE_ONLY=1
+        if [ "$FORCE_CONFIG" -eq 1 ]; then
+            # Preserve the explicit manual cold override on a stopped host.
+            # Registered, running or unknown domains always require product CAS.
+            # origin: hot-update S9 plan §6.4 / T54
+            infra_has_authority && die "infra_busy: --force-config requires a retired upgrade domain"
+            infra_business_running && die "infra_busy: --force-config requires stopped business processes"
+            INSTALL_STAGE_ONLY=0
+            log "  + explicit --force-config: cold installation on an unregistered, stopped host"
+        else
+            log "  + existing installation: stage-only; active/previous selectors, units and runtime metadata are kept"
+        fi
+    fi
+}
+infra_lock_installation() {
+    [ "$DRY_RUN" -eq 0 ] || return 0
+    # Stage-only writes no active state and must work while the business domain
+    # is busy. Only an initial publication/retirement needs the journal barrier.
+    # origin: hot-update S9 plan §6.4 / T54 / M27
+    [ "$INSTALL_STAGE_ONLY" -eq 0 ] || return 0
+    infra_safe_path "$INFRA_DIR/journal.lock"
+    if [ -e "$INFRA_DIR/journal.lock" ]; then
+        [ -f "$INFRA_DIR/journal.lock" ] && [ "$(stat -c '%h:%a' "$INFRA_DIR/journal.lock")" = '1:600' ] || die "invalid permanent journal lock"
+    else
+        (umask 077; set -C; : > "$INFRA_DIR/journal.lock") || die "journal lock creation raced; retry installation"
+    fi
+    exec 9<> "$INFRA_DIR/journal.lock"
+    flock -n 9 || die "infra_busy: root journal is locked"
+    INFRA_INSTALL_LOCKED=1
+    # Recheck after acquisition: bootstrap may have committed after the preview.
+    if infra_has_authority; then
+        INSTALL_STAGE_ONLY=1
+        [ "$FORCE_CONFIG" -eq 0 ] || die "infra_busy: authority appeared before installation"
+    fi
+}
+# The support manifest is a bounded, closed release format, not caller argv.
+# Its source identity/protocol/previous-reader and all three file hashes are
+# mandatory. ELF headers are inspected as bytes; no candidate --version or
+# key generator is executed during installation, even with --skip-download.
+# origin: hot-update S9 plan §3.1 / §6.5 / T54
+validate_infra_support() {
+    _vis="$1"
+    infra_safe_path "$_vis"
+    for _vis_name in tether-infra-helper tether-infra-launch infra-catalog.json infra-support.manifest; do
+        _vis_file="$_vis/$_vis_name"
+        [ -f "$_vis_file" ] && [ ! -L "$_vis_file" ] && [ "$(stat -c '%h' "$_vis_file")" = 1 ] || die "missing or aliased support file: $_vis_name"
+    done
+    [ "$(wc -c < "$_vis/infra-support.manifest")" -le 4096 ] || die "support manifest is too large"
+    awk -v release="$VERSION" -v arch="$ARCH" '
+        function digest(s) { return length(s) == 64 && s !~ /[^0-9a-f]/ && s !~ /^0+$/ }
+        $1 == "format" && NF == 2 && $2 == "1" { seen[$1]++; next }
+        $1 == "release" && NF == 2 && $2 == release { seen[$1]++; next }
+        $1 == "goos" && NF == 2 && $2 == "linux" { seen[$1]++; next }
+        $1 == "goarch" && NF == 2 && $2 == arch { seen[$1]++; next }
+        $1 == "protocol" && NF == 2 && $2 == "1" { seen[$1]++; next }
+        $1 == "previous-reader" && NF == 2 && $2 == "1" { seen[$1]++; next }
+        $1 == "source-sha256" && NF == 2 && digest($2) { seen[$1]++; next }
+        $1 == "sha256" && NF == 3 && digest($2) && ($3 == "tether-infra-helper" || $3 == "tether-infra-launch" || $3 == "infra-catalog.json") { seen[$3]++; next }
+        { bad = 1 }
+        END {
+            split("format release goos goarch protocol previous-reader source-sha256 tether-infra-helper tether-infra-launch infra-catalog.json", required, " ")
+            for (i in required) if (seen[required[i]] != 1) bad = 1
+            exit bad
+        }
+    ' "$_vis/infra-support.manifest" || die "invalid release/platform/protocol support manifest"
+    for _vis_name in tether-infra-helper tether-infra-launch infra-catalog.json; do
+        _vis_hash=$(awk -v name="$_vis_name" '$1 == "sha256" && $3 == name {print $2}' "$_vis/infra-support.manifest")
+        verify_sha "$_vis/$_vis_name" "$_vis_hash"
+    done
+    for _vis_name in tether-infra-helper tether-infra-launch; do
+        [ -x "$_vis/$_vis_name" ] || die "support binary is not executable: $_vis_name"
+        validate_infra_elf "$_vis/$_vis_name"
+        case "$(stat -c '%a' "$_vis/$_vis_name")" in 755|555|500|700) ;; *) die "unsafe support binary permissions: $_vis_name" ;; esac
+    done
+}
+validate_infra_elf() {
+    _vie_header=$(od -An -v -tx1 -N20 "$1" | tr -d ' \n')
+    [ "${#_vie_header}" -eq 40 ] || die "binary has a truncated ELF header"
+    case "$_vie_header" in 7f454c46020101*) ;; *) die "binary is not little-endian ELF64" ;; esac
+    _vie_machine=$(printf '%s' "$_vie_header" | cut -c37-40)
+    case "$ARCH:$_vie_machine" in amd64:3e00|arm64:b700) ;; *) die "binary has the wrong ELF platform" ;; esac
+}
+# Offline supply has the same content checks as an archive install. The three
+# cold binaries are accompanied by an exact SHA256SUMS subset; support hashes
+# remain in the release-bound manifest. --bin replaces only the tether input.
+# origin: hot-update S9 plan §6.4 / T54
+validate_offline_broker_binaries() {
+    _iob_source="${INFRA_SUPPORT_DIR:-$BIN_DIR}"
+    validate_infra_support "$_iob_source"
+    _iob_sums="$_iob_source/broker-binaries.sha256"
+    [ -f "$_iob_sums" ] && [ ! -L "$_iob_sums" ] || die "--skip-download requires broker-binaries.sha256"
+    [ "$(wc -c < "$_iob_sums")" -le 1024 ] || die "offline checksum list is too large"
+    awk 'NF != 2 || length($1) != 64 || $1 ~ /[^0-9a-f]/ || ($2 != "tether" && $2 != "nats-server" && $2 != "caddy") {bad=1}
+         {seen[$2]++} END {exit bad || seen["tether"] != 1 || seen["nats-server"] != 1 || seen["caddy"] != 1}' "$_iob_sums" || die "invalid offline binary checksum list"
+    for _iob_name in tether nats-server caddy; do
+        _iob_file="$_iob_source/$_iob_name"
+        if [ "$_iob_name" = tether ] && [ -n "$LOCAL_BIN" ]; then _iob_file="$LOCAL_BIN"; fi
+        [ -f "$_iob_file" ] && [ ! -L "$_iob_file" ] && [ -x "$_iob_file" ] || die "missing offline broker binary: $_iob_name"
+        validate_infra_elf "$_iob_file"
+        _iob_hash=$(awk -v name="$_iob_name" '$2 == name {print $1}' "$_iob_sums")
+        verify_sha "$_iob_file" "$_iob_hash"
+    done
+}
+install_offline_broker_binaries() {
+    [ "$DRY_RUN" -eq 0 ] || return 0
+    validate_offline_broker_binaries
+    stage_infra_support "$_iob_source"
+    for _iob_name in tether nats-server caddy; do
+        _iob_file="$_iob_source/$_iob_name"
+        if [ "$_iob_name" = tether ] && [ -n "$LOCAL_BIN" ]; then _iob_file="$LOCAL_BIN"; fi
+        install -m 0755 "$_iob_file" "$DOWNLOAD_BIN_DIR/.$_iob_name.new"
+        _iob_hash=$(awk -v name="$_iob_name" '$2 == name {print $1}' "$_iob_sums")
+        verify_sha "$DOWNLOAD_BIN_DIR/.$_iob_name.new" "$_iob_hash"
+        mv -f "$DOWNLOAD_BIN_DIR/.$_iob_name.new" "$DOWNLOAD_BIN_DIR/$_iob_name"
+        record_owned_file "$DOWNLOAD_BIN_DIR/$_iob_name"
+    done
+}
+stage_broker_binaries() {
+    [ "$INSTALL_STAGE_ONLY" -eq 1 ] && [ "$DRY_RUN" -eq 0 ] || return 0
+    for _sbb_name in tether nats-server caddy; do
+        _sbb_hash=$(file_sha256 "$DOWNLOAD_BIN_DIR/$_sbb_name")
+        _sbb_slot="$INFRA_DIR/artifacts/$_sbb_hash"
+        infra_safe_path "$_sbb_slot"
+        if [ ! -d "$_sbb_slot" ]; then
+            _sbb_tmp=$(mktemp -d "$INFRA_DIR/artifacts/.stage.XXXXXX")
+            register_install_temp "$_sbb_tmp"
+            install -m 0555 "$DOWNLOAD_BIN_DIR/$_sbb_name" "$_sbb_tmp/$_sbb_name"
+            [ "$(file_sha256 "$_sbb_tmp/$_sbb_name")" = "$_sbb_hash" ] || die "binary changed during private staging"
+            chmod 0555 "$_sbb_tmp"
+            sync "$_sbb_tmp/$_sbb_name" "$_sbb_tmp"
+            mv -T "$_sbb_tmp" "$_sbb_slot"
+            sync "$INFRA_DIR/artifacts"
+        else
+            [ -f "$_sbb_slot/$_sbb_name" ] && [ ! -L "$_sbb_slot/$_sbb_name" ] &&
+                [ "$(file_sha256 "$_sbb_slot/$_sbb_name")" = "$_sbb_hash" ] || die "immutable binary slot changed"
+        fi
+        record_owned_file "$_sbb_slot/$_sbb_name"
+    done
+    # --bin is S8's explicit cold replacement, distinct from an ordinary
+    # reinstall. Preserve that operation only on an unregistered, stopped host;
+    # an enabled domain must use its product transaction, even when idle.
+    # origin: hot-update S8 plan §5.2 / P20; hot-update S9 plan §6.4 / T54
+    if [ -n "$LOCAL_BIN" ]; then
+        infra_has_authority && die "infra_busy: --bin requires a retired upgrade domain"
+        infra_business_running && die "infra_busy: --bin requires stopped business processes"
+        install -m 0755 "$DOWNLOAD_BIN_DIR/tether" "$BIN_DIR/.tether.new"
+        mv -f "$BIN_DIR/.tether.new" "$BIN_DIR/tether"
+        record_owned_file "$BIN_DIR/tether"
+    fi
+    rm -rf "$DOWNLOAD_BIN_DIR"
+}
+infra_business_running() {
+    for _ibr_process in /proc/[0-9]*/exe; do
+        _ibr_exe=$(readlink "$_ibr_process" 2>/dev/null) || continue
+        case "$_ibr_exe" in
+            "$BIN_DIR/tether"|"$BIN_DIR/tether (deleted)"|"$BIN_DIR/nats-server"|"$BIN_DIR/nats-server (deleted)"|"$BIN_DIR/caddy"|"$BIN_DIR/caddy (deleted)"|"$LIBEXEC_DIR/tether-infra-helper"|"$LIBEXEC_DIR/tether-infra-helper (deleted)"|"$LIBEXEC_DIR/tether-infra-launch"|"$LIBEXEC_DIR/tether-infra-launch (deleted)"|"$INFRA_DIR/artifacts/"*) return 0 ;;
+        esac
+    done
+    return 1
+}
+stage_infra_support() {
+    # Guard the staging owner itself: both archive and offline callers use it,
+    # and a preview must not validate nonexistent supply or publish copies.
+    # origin: hot-update S9 plan §6.4 / T54 / M27
+    if [ "$DRY_RUN" -eq 1 ]; then
+        log "  + (dry-run) stage infrastructure support from $1 into $INFRA_DIR/artifacts and $LIBEXEC_DIR"
+        return 0
+    fi
+    validate_infra_support "$1"
+    _sis_source="$1"
+    _sis_digest=$(file_sha256 "$_sis_source/infra-support.manifest")
+    _sis_slot="$INFRA_DIR/artifacts/$_sis_digest"
+    infra_safe_path "$_sis_slot"
+    if [ ! -d "$_sis_slot" ]; then
+        _sis_tmp=$(mktemp -d "$INFRA_DIR/artifacts/.stage.XXXXXX")
+        register_install_temp "$_sis_tmp"
+        for _sis_name in tether-infra-helper tether-infra-launch infra-catalog.json infra-support.manifest; do
+            install -m 0555 "$_sis_source/$_sis_name" "$_sis_tmp/$_sis_name"
+        done
+        chmod 0444 "$_sis_tmp/infra-catalog.json" "$_sis_tmp/infra-support.manifest"
+        # Hash the final private copies. Source FDs/paths can change after their
+        # first check; no executable is selected from that writable input inode.
+        validate_infra_support "$_sis_tmp"
+        [ "$(file_sha256 "$_sis_tmp/infra-support.manifest")" = "$_sis_digest" ] || die "support manifest changed during copy"
+        chmod 0555 "$_sis_tmp"
+        sync "$_sis_tmp/tether-infra-helper" "$_sis_tmp/tether-infra-launch" "$_sis_tmp/infra-catalog.json" "$_sis_tmp/infra-support.manifest" "$_sis_tmp"
+        mv -T "$_sis_tmp" "$_sis_slot"
+        sync "$INFRA_DIR/artifacts"
+    else
+        validate_infra_support "$_sis_slot"
+        [ "$(file_sha256 "$_sis_slot/infra-support.manifest")" = "$_sis_digest" ] || die "immutable support slot changed"
+    fi
+    # Legacy stage-only installs have no worker capable of activating support.
+    # Publish missing fixed entries under the permanent journal barrier, without
+    # replacing an existing generation or touching a business entry/unit.
+    # origin: S9 internal review rv-priv F4
+    (
+        if [ "${INFRA_INSTALL_LOCKED:-0}" -eq 0 ]; then
+            INSTALL_STAGE_ONLY=0
+            infra_lock_installation
+        fi
+        infra_safe_path "$LIBEXEC_DIR"
+        [ -d "$LIBEXEC_DIR" ] || install -d -m 0755 "$LIBEXEC_DIR"
+        for _sis_name in tether-infra-helper tether-infra-launch; do
+            if [ -e "$LIBEXEC_DIR/$_sis_name" ] || [ -L "$LIBEXEC_DIR/$_sis_name" ]; then
+                log "  + existing support entry kept; activate its staged candidate through product update-support: $_sis_name"
+            else
+                infra_has_authority && die "infra_busy: missing support entry requires authorized repair"
+                _sis_entry=$(mktemp "$LIBEXEC_DIR/.support.XXXXXX")
+                install -m 0755 "$_sis_slot/$_sis_name" "$_sis_entry"
+                [ "$(file_sha256 "$_sis_entry")" = "$(file_sha256 "$_sis_slot/$_sis_name")" ] || die "support entry changed during publication"
+                sync "$_sis_entry"
+                # link is an atomic create-if-absent, unlike a check then install.
+                if ! ln "$_sis_entry" "$LIBEXEC_DIR/$_sis_name"; then
+                    rm -f "$_sis_entry"
+                    die "support entry publication raced"
+                fi
+                rm -f "$_sis_entry"
+                sync "$LIBEXEC_DIR"
+                record_owned_file "$LIBEXEC_DIR/$_sis_name"
+            fi
+        done
+    )
+    for _sis_name in tether-infra-helper tether-infra-launch infra-catalog.json infra-support.manifest; do
+        record_owned_file "$_sis_slot/$_sis_name"
+    done
+    log "  + support artifacts staged: $_sis_digest (files_installed only)"
+}
+# These are preparation templates. P40/bootstrap installs the management plane;
+# the runtime persists FenceStart before loading the business drop-ins. Writing
+# a live drop-in here would let always/2s race the final ACME copy on retrofit.
+# Keep drop-in bytes identical to infrahost.ManagedUnitDropIn (T12).
+# origin: hot-update S9 plan §5.3 / §6.4 / T54
+write_infra_files() {
+    if [ "$DRY_RUN" -eq 1 ]; then
+        log "  + (dry-run) prepare $INFRA_ETC_DIR/templates/{tether-infra-helper.socket,tether-infra-helper@.service,nats-server.service.d/90-tether-infra.conf,caddy.service.d/90-tether-infra.conf}"
+        log "  + files_installed only; root bootstrap enables management explicitly"
+        return 0
+    fi
+    for _wif_dir in "$INFRA_ETC_DIR" "$INFRA_ETC_DIR/templates" "$INFRA_ETC_DIR/templates/nats-server.service.d" "$INFRA_ETC_DIR/templates/caddy.service.d"; do
+        infra_safe_path "$_wif_dir"
+        [ -d "$_wif_dir" ] || install -d -m 0755 "$_wif_dir"
+    done
+    config_dest "$INFRA_ETC_DIR/templates/tether-infra-helper.socket"
+    # UNQUOTED heredoc ON PURPOSE: only the redirected runtime socket path expands.
+    cat > "$CONFIG_DEST" <<EOF
+# tether-infra owned v1
+[Unit]
+Description=tether infrastructure management socket
+
+[Socket]
+ListenStream=$INFRA_RUN_DIR/control.sock
+Accept=yes
+SocketUser=root
+SocketGroup=tether
+SocketMode=0660
+DirectoryMode=0750
+MaxConnections=$INFRA_MAX_CONNECTIONS
+Service=tether-infra-helper@.service
+
+[Install]
+WantedBy=sockets.target
+EOF
+    publish_config 0644
+    config_dest "$INFRA_ETC_DIR/templates/tether-infra-helper@.service"
+    # UNQUOTED heredoc ON PURPOSE: only the redirected libexec entry expands.
+    cat > "$CONFIG_DEST" <<EOF
+# tether-infra owned v1
+[Unit]
+Description=tether infrastructure management worker
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=$LIBEXEC_DIR/tether-infra-helper worker
+StandardInput=socket
+StandardOutput=socket
+StandardError=journal
+Restart=no
+RuntimeMaxSec=${INFRA_WORKER_LIFETIME_S}s
+KillMode=control-group
+TimeoutStopSec=${INFRA_WORKER_STOP_S}s
+EOF
+    publish_config 0644
+    for _wif_component in nats caddy; do
+        if [ "$_wif_component" = nats ]; then _wif_unit=nats-server; _wif_caps=""; else _wif_unit=caddy; _wif_caps=CAP_NET_BIND_SERVICE; fi
+        config_dest "$INFRA_ETC_DIR/templates/$_wif_unit.service.d/90-tether-infra.conf"
+        # UNQUOTED heredoc ON PURPOSE: the component and sole bind capability expand.
+        cat > "$CONFIG_DEST" <<EOF
+# tether-infra owned v1
+[Service]
+User=tether
+Group=tether
+SupplementaryGroups=
+AmbientCapabilities=
+CapabilityBoundingSet=
+AmbientCapabilities=$_wif_caps
+CapabilityBoundingSet=$_wif_caps
+NoNewPrivileges=yes
+ExecStart=
+ExecStart=$LIBEXEC_DIR/tether-infra-launch --component=$_wif_component
+Restart=always
+RestartSec=2
+RuntimeMaxSec=infinity
+EOF
+        publish_config 0644
+    done
+    # Fresh management units stay inactive until explicit root bootstrap.
+    # Registered/stage-only installs preserve their effective units.
+    # origin: S9 internal review INFRA-SUITE-SUPPLIES F2 / S9 plan §6.4 / T54
+    if [ "$INSTALL_STAGE_ONLY" -eq 0 ] && ! infra_has_authority; then
+        for _wif_management in tether-infra-helper.socket tether-infra-helper@.service; do
+            config_target "$SYSTEMD_DIR/$_wif_management"
+            stage_config
+            cat "$INFRA_ETC_DIR/templates/$_wif_management" > "$CONFIG_DEST"
+            publish_config 0644
+        done
+    fi
+}
 install_broker() {
     [ -n "$DOMAIN" ]     || die "--domain required for --role broker"
     [ -n "$ACME_EMAIL" ] || die "--acme-email required for --role broker"
-
     detect_os_arch
     # broker is Linux-only: useradd, systemd units, and /etc layout below
     # all assume a Linux host (architecture A.3 / K). docs/broker-ops.md §2.3
     # also positions broker as the public-internet node.
     [ "$OS" = "darwin" ] && die "--role broker is not supported on macOS (only --role ctl is); broker requires a Linux host"
     log "tether install (role=broker, version=$VERSION, os=$OS, arch=$ARCH, domain=$DOMAIN)"
-
+    infra_install_admission
+    # Reject invalid offline supply before directory, lock or metadata effects.
+    # Staging revalidates the same inputs before publication under the lock.
+    # origin: S9 internal review INFRA-SUITE-SUPPLIES F3 / S9 plan §6.4 / T54
+    if [ "$SKIP_DOWNLOAD" -eq 1 ] && [ "$DRY_RUN" -eq 0 ]; then validate_offline_broker_binaries; fi
+    infra_install_directories
+    infra_lock_installation
+    DOWNLOAD_BIN_DIR="$BIN_DIR"
+    if [ "$INSTALL_STAGE_ONLY" -eq 1 ] && [ "$DRY_RUN" -eq 0 ]; then
+        DOWNLOAD_BIN_DIR=$(mktemp -d "$INFRA_DIR/artifacts/.incoming.XXXXXX")
+        register_install_temp "$DOWNLOAD_BIN_DIR"
+    fi
     # TETHER_INSTALL_ROOT is a TEST SEAM, and it is here because the alternative was
     # shipping the BLOCKER's own role with no coverage at all.
     #
@@ -885,13 +1490,6 @@ install_broker() {
         log "  ⚠ TETHER_INSTALL_ROOT=$TETHER_INSTALL_ROOT — system paths are being REDIRECTED under it."
         log "    This is a TEST SEAM. A broker installed this way is NOT installed on this host."
     fi
-    BIN_DIR="${PREFIX:-${TETHER_INSTALL_ROOT:-}/usr/local/bin}"
-    ETC_DIR="${TETHER_INSTALL_ROOT:-}/etc/tether"
-    LIB_DIR="${TETHER_INSTALL_ROOT:-}/var/lib/tether"
-    LOG_DIR="${TETHER_INSTALL_ROOT:-}/var/log/tether"
-    RUN_DIR="${TETHER_INSTALL_ROOT:-}/var/run/tether"
-    SYSTEMD_DIR="${TETHER_INSTALL_ROOT:-}/etc/systemd/system"
-
     # System user — installs.sh does not run it; we just create it.
     #
     # Skipped under the TEST SEAM: creating a system account is a mutation of the HOST,
@@ -900,59 +1498,63 @@ install_broker() {
     # kept, or written as .new — happens entirely below this point and is unaffected.
     if [ -n "${TETHER_INSTALL_ROOT:-}" ]; then
         log "  + (test seam) skip useradd tether — a redirected install must not touch the host's accounts"
-    elif [ "$DRY_RUN" -eq 0 ] && ! id -u tether >/dev/null 2>&1; then
+    elif [ "$INSTALL_STAGE_ONLY" -eq 0 ] && [ "$DRY_RUN" -eq 0 ] && ! id -u tether >/dev/null 2>&1; then
         run "useradd --system --home-dir '$LIB_DIR' --shell /usr/sbin/nologin tether"
     else
         log "  + (skip) useradd tether"
     fi
-
     run "mkdir -p '$BIN_DIR' '$ETC_DIR' '$SYSTEMD_DIR'"
     # Runtime dirs MUST be writable by the tether service user. The
     # systemd units run as User=tether; without these chowns the
     # daemon can't open SQLite, write JetStream files, or bind
     # admin.sock. install -d sets ownership + mode in one atomic
     # call (cleaner than mkdir + chmod + chown chain).
-    if [ -n "${TETHER_INSTALL_ROOT:-}" ]; then
+    if [ "$INSTALL_STAGE_ONLY" -eq 1 ]; then
+        log "  + stage-only: runtime directory ownership and modes kept"
+    elif [ -n "${TETHER_INSTALL_ROOT:-}" ]; then
         # Same reasoning as useradd above: there is no `tether` user to own these under
         # the seam. Create them with the same MODES so anything asserting on permissions
-        # still sees the real ones; only the ownership is the caller's.
-        install -d -m 0750 "$LIB_DIR" "$LOG_DIR"
-        install -d -m 0700 "$RUN_DIR"
-        install -d -m 0750 "$ETC_DIR/nats.d"
-    elif [ "$DRY_RUN" -eq 0 ]; then
-        install -d -o tether -g tether -m 0750 "$LIB_DIR" "$LOG_DIR"
-        install -d -o tether -g tether -m 0700 "$RUN_DIR"
+        # still sees the real ones; only the ownership is the caller's. Route this
+        # branch through run too: redirecting paths does not authorize dry-run writes.
+        # origin: hot-update S9 plan §6.4 / T54 / M27
+        run "install -d -m 0750 '$LIB_DIR' '$LOG_DIR'"
+        run "install -d -m 0700 '$RUN_DIR'"
+        run "install -d -m 0750 '$ETC_DIR/nats.d'"
+    else
+        run "install -d -o tether -g tether -m 0750 '$LIB_DIR' '$LOG_DIR'"
+        run "install -d -o tether -g tether -m 0700 '$RUN_DIR'"
         # G1 #22: the C3 topology reconciler runs User=tether and atomically rewrites its
         # nats.conf (os.CreateTemp + rename), which needs a tether-WRITABLE directory. We keep
         # $ETC_DIR itself root-owned (the root-run caddy.service loads $ETC_DIR/Caddyfile — a
         # tether-owned $ETC_DIR would be a tether->root local privesc) and hand the reconciler
         # ONLY this dedicated subdir. nats-server (User=tether) reads the conf from here too.
-        install -d -o tether -g tether -m 0750 "$ETC_DIR/nats.d"
-    else
-        log "  + (dry-run) install -d -o tether -g tether -m 0750 $LIB_DIR $LOG_DIR"
-        log "  + (dry-run) install -d -o tether -g tether -m 0700 $RUN_DIR"
-        log "  + (dry-run) install -d -o tether -g tether -m 0750 $ETC_DIR/nats.d  (#22 reconciler-writable nats.conf dir)"
+        run "install -d -o tether -g tether -m 0750 '$ETC_DIR/nats.d'"
     fi
-
     if [ "$SKIP_DOWNLOAD" -eq 0 ] && [ "$DRY_RUN" -eq 0 ]; then
         TARBALL=$(mktemp)
+        register_install_temp "$TARBALL"
         TARBALL_URL=$(source_tarball_url)
         SHA_URL=$(source_sha_url)
         fetch "$TARBALL_URL" "$TARBALL"
         SHA_FILE=$(mktemp)
+        register_install_temp "$SHA_FILE"
         fetch "$SHA_URL" "$SHA_FILE"
         EXPECT=$(grep "$(basename "$TARBALL_URL")" "$SHA_FILE" | awk '{print $1}')
         [ -n "$EXPECT" ] || die "no sha256 in SHA256SUMS"
         verify_sha "$TARBALL" "$EXPECT"
-        place_binary "$TARBALL" "$BIN_DIR"
+        place_binary "$TARBALL" "$DOWNLOAD_BIN_DIR"
         rm -f "$TARBALL" "$SHA_FILE"
     else
         log "  + (skip) binary install"
     fi
-
-    install_nats_server "$BIN_DIR"
-    install_caddy "$BIN_DIR"
-
+    if [ "$SKIP_DOWNLOAD" -eq 1 ]; then
+        install_offline_broker_binaries
+    else
+        install_nats_server "$BIN_DIR"
+        install_caddy "$BIN_DIR"
+    fi
+    stage_broker_binaries
+    write_infra_files
     # broker.yaml — architecture A.3 skeleton.
     if [ "$DRY_RUN" -eq 0 ]; then
         # UNQUOTED heredoc ON PURPOSE: expands $DOMAIN, $ACME_EMAIL, $RUN_DIR, $LIB_DIR and
@@ -1000,7 +1602,7 @@ broker:
   #   nats_conf_path: /etc/tether/nats.d/nats.conf   # C3 reconciler target (tether-owned dir, #22; empty opts out)
   #   nats_server_bin: nats-server      # C3 reconciler -t dry-run + --signal reload binary
 EOF
-        chmod 644 "$CONFIG_DEST"
+        publish_config 644
     else
         log "  + (dry-run) write $ETC_DIR/broker.yaml"
         dryrun_config_policy
@@ -1030,7 +1632,7 @@ $DOMAIN:443 {
     }
 }
 EOF
-        chmod 644 "$CONFIG_DEST"
+        publish_config 644
     else
         log "  + (dry-run) write $ETC_DIR/Caddyfile"
         dryrun_config_policy
@@ -1057,7 +1659,15 @@ EOF
     # the operator to just `start` and reboot-autostart would still be missing
     # — #76 resurrected on the environment-guard path. ENABLED_UNITS is set
     # only when enable actually ran.
-    if [ "$ENABLED_UNITS" -eq 1 ]; then
+    if [ "$INSTALL_STAGE_ONLY" -eq 1 ]; then
+        cat <<'EOF'
+
+Broker artifacts and templates staged (files_installed only).
+The running stack, active/previous selectors, effective units and enablement
+were preserved. Apply staged infrastructure through the authorized product
+transaction; a reinstall does not activate candidates.
+EOF
+    elif [ "$ENABLED_UNITS" -eq 1 ]; then
         cat <<'EOF'
 
 ✔ broker files installed.
@@ -1089,6 +1699,11 @@ takes the fleet offline (#76):
 EOF
     fi
     banner_kept_caveat
+    log "  + infrastructure state: files_installed; management socket is not activated by installation"
+    log "    Enable management explicitly as root: /usr/local/libexec/tether-infra-helper bootstrap"
+    if [ "$ARCH" != amd64 ]; then
+        log "  + unsupported: infrastructure hot cut requires linux/amd64; cold installation remains available"
+    fi
     if [ "${WROTE_JOURNALD_DROPIN:-0}" -eq 1 ]; then
         cat <<'EOF'
 
@@ -1116,7 +1731,7 @@ NATS_SERVER_VERSION="${TETHER_NATS_SERVER_VERSION:-v2.14.6}"
 CADDY_VERSION="${TETHER_CADDY_VERSION:-2.7.6}"
 
 install_nats_server() {
-    bin="$1"
+    bin="${DOWNLOAD_BIN_DIR:-$1}"
     if [ "$DRY_RUN" -eq 1 ] || [ "$SKIP_DOWNLOAD" -eq 1 ]; then
         log "  + (skip) nats-server install"
         return 0
@@ -1135,17 +1750,11 @@ install_nats_server() {
     # the inode it opened, so the new version takes effect at the operator's next
     # restart. Saying so is the point — a silent swap would leave `nats-server --version`
     # and the running process disagreeing with no explanation.
-    if [ -x "$bin/nats-server" ]; then
-        have="$("$bin/nats-server" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
-        want="${NATS_SERVER_VERSION#v}"
-        if [ "$have" = "$want" ]; then
-            log "  + nats-server already at ${NATS_SERVER_VERSION} (skip)"
-            return 0
-        fi
-        log "  ! nats-server at $bin/nats-server is ${have:-unknown}, this release pins ${NATS_SERVER_VERSION}"
-        log "    replacing it; RESTART nats-server afterwards for the new binary to take effect"
-        NATS_RETROFIT_FROM="${have:-unknown}"
-    fi
+    # Existing binaries are routed to immutable staging by admission. Do not
+    # execute even --version here: the never-start inventory includes every
+    # infrastructure executable, including short-lived version probes.
+    # origin: hot-update S9 plan §6.4 / T54 / M27
+    [ ! -e "$bin/nats-server" ] || [ "$FORCE_CONFIG" -eq 1 ] || die "existing nats-server entry requires stage-only installation"
     case "$ARCH" in amd64) na="amd64" ;; arm64) na="arm64" ;; *) die "nats arch $ARCH" ;; esac
     case "$OS"   in linux) no="linux" ;;  darwin) no="darwin" ;;  *) die "nats os $OS" ;; esac
     base="https://github.com/nats-io/nats-server/releases/download/${NATS_SERVER_VERSION}"
@@ -1153,7 +1762,8 @@ install_nats_server() {
     url="${base}/${name}.tar.gz"
     sums="${base}/SHA256SUMS"
     log "  + downloading $url"
-    tmp=$(mktemp -d); trap "rm -rf '$tmp'" EXIT
+    tmp=$(mktemp -d)
+    register_install_temp "$tmp"
     curl -fsSL --retry 3 "$url"  -o "$tmp/nats.tgz"  || die "fetch nats-server failed: $url"
     curl -fsSL --retry 3 "$sums" -o "$tmp/sums.txt" || die "fetch nats-server SHA256SUMS failed: $sums"
     expect=$(grep "${name}.tar.gz$" "$tmp/sums.txt" | awk '{print $1}')
@@ -1166,22 +1776,18 @@ install_nats_server() {
     install -m 0755 "$tmp/${name}/nats-server" "$bin/.nats-server.new" \
       || die "stage nats-server into $bin failed"
     mv -f "$bin/.nats-server.new" "$bin/nats-server" || die "install nats-server into $bin failed"
-    rm -rf "$tmp"; trap - EXIT
-    if [ -n "${NATS_RETROFIT_FROM:-}" ]; then
-        log "  ✔ replaced $bin/nats-server (${NATS_RETROFIT_FROM} -> ${NATS_SERVER_VERSION})"
-        log "    ACTION REQUIRED: sudo systemctl restart nats-server"
-    else
-        log "  ✔ installed $bin/nats-server (${NATS_SERVER_VERSION})"
-    fi
+    record_owned_file "$bin/nats-server"
+    rm -rf "$tmp"
+    log "  ✔ installed candidate nats-server bytes (${NATS_SERVER_VERSION}); no runtime change"
 }
 
 install_caddy() {
-    bin="$1"
+    bin="${DOWNLOAD_BIN_DIR:-$1}"
     if [ "$DRY_RUN" -eq 1 ] || [ "$SKIP_DOWNLOAD" -eq 1 ]; then
         log "  + (skip) caddy install"
         return 0
     fi
-    if [ -x "$bin/caddy" ]; then
+    if [ -x "$bin/caddy" ] && [ "$FORCE_CONFIG" -eq 0 ]; then
         log "  + caddy already present at $bin/caddy (skip)"
         return 0
     fi
@@ -1192,15 +1798,53 @@ install_caddy() {
     url="${base}/${name}.tar.gz"
     sums="${base}/caddy_${CADDY_VERSION}_checksums.txt"
     log "  + downloading $url"
-    tmp=$(mktemp -d); trap "rm -rf '$tmp'" EXIT
+    tmp=$(mktemp -d)
+    register_install_temp "$tmp"
     curl -fsSL --retry 3 "$url"  -o "$tmp/caddy.tgz" || die "fetch caddy failed: $url"
     curl -fsSL --retry 3 "$sums" -o "$tmp/sums.txt"  || die "fetch caddy checksums failed: $sums"
     expect=$(grep "${name}.tar.gz$" "$tmp/sums.txt" | awk '{print $1}')
     [ -n "$expect" ] || die "no sha256 for ${name}.tar.gz in Caddy checksums"
     verify_sha "$tmp/caddy.tgz" "$expect"
     tar -xzf "$tmp/caddy.tgz" -C "$tmp"
-    install -m 0755 "$tmp/caddy" "$bin/caddy"
-    rm -rf "$tmp"; trap - EXIT
+    # A failed copy must not truncate the canonical inode. Keep the verified old
+    # inode until an explicit later rollback/retirement decision; installation
+    # never runs a candidate to manufacture startup qualification.
+    # origin: S9 internal review rv-priv F9
+    infra_safe_path "$bin/caddy"
+    _ic_new=$(mktemp "$bin/.caddy.new.XXXXXX")
+    register_install_temp "$_ic_new"
+    install -m 0755 "$tmp/caddy" "$_ic_new" || die "stage caddy failed; canonical entry retained"
+    [ "$(file_sha256 "$_ic_new")" = "$(file_sha256 "$tmp/caddy")" ] || die "caddy changed during staging"
+    sync "$_ic_new" || die "sync caddy candidate failed; canonical entry retained"
+    _ic_previous=
+    if [ -e "$bin/caddy" ]; then
+        [ -f "$bin/caddy" ] && [ ! -L "$bin/caddy" ] || die "caddy entry must be regular"
+        _ic_hash=$(file_sha256 "$bin/caddy")
+        _ic_previous="$bin/.caddy.previous.$_ic_hash.$(stat -c '%d.%i' "$bin/caddy")"
+        if [ -e "$_ic_previous" ] || [ -L "$_ic_previous" ]; then
+            [ -f "$_ic_previous" ] && [ ! -L "$_ic_previous" ] && [ "$(file_sha256 "$_ic_previous")" = "$_ic_hash" ] || die "caddy rollback copy changed"
+        else
+            ln "$bin/caddy" "$_ic_previous" || die "cannot preserve caddy rollback inode"
+        fi
+        sync "$_ic_previous" "$bin" || die "sync caddy rollback failed; canonical entry retained"
+    fi
+    mv -Tf "$_ic_new" "$bin/caddy" || die "publish caddy failed; canonical entry retained"
+    if ! sync "$bin"; then
+        if [ -n "$_ic_previous" ]; then
+            _ic_restore=$(mktemp "$bin/.caddy.restore.XXXXXX")
+            register_install_temp "$_ic_restore"
+            rm -f "$_ic_restore"
+            ln "$_ic_previous" "$_ic_restore" && mv -Tf "$_ic_restore" "$bin/caddy" || die "caddy rollback failed; previous inode retained"
+            sync "$bin" || die "caddy rollback directory sync failed; old inode restored"
+        else
+            rm -f "$bin/caddy"
+            sync "$bin" || die "caddy first publication rollback sync failed"
+        fi
+        die "caddy publication directory sync failed; canonical entry restored"
+    fi
+    [ -z "$_ic_previous" ] || log "  + caddy rollback inode retained: $_ic_previous"
+    record_owned_file "$bin/caddy"
+    rm -rf "$tmp"
     log "  ✔ installed $bin/caddy (${CADDY_VERSION})"
 }
 
@@ -1210,6 +1854,20 @@ write_systemd_units() {
         log "  + (dry-run) write $sysd/{nats-server,tether-broker,caddy}.service + $etc/nats.d/nats.conf"
         dryrun_config_policy
         return 0
+    fi
+
+    # A legacy or partial installation can require stage-only while nats.d is
+    # absent. Atomic publication still needs a real destination for nats.conf.new;
+    # create only the missing directory and preserve every existing mode/owner.
+    # Keep this after the preview return so dry-run cannot create even that parent.
+    # origin: hot-update S9 plan §6.4 / S9 internal review FIX-INST F4
+    infra_safe_path "$etc/nats.d"
+    if [ ! -d "$etc/nats.d" ]; then
+        if [ -n "${TETHER_INSTALL_ROOT:-}" ]; then
+            install -d -m 0750 "$etc/nats.d"
+        else
+            install -d -o tether -g tether -m 0750 "$etc/nats.d"
+        fi
     fi
 
     # nats-server WebSocket can ONLY be configured via a conf file —
@@ -1247,7 +1905,7 @@ websocket {
   no_tls: true
 }
 EOF
-    chmod 644 "$CONFIG_DEST"
+    publish_config 644
 
     # UNQUOTED heredoc ON PURPOSE: ExecStart needs $bin and $etc. Because it is unquoted, the
     # comment prose below is shell-active too — P9: the backticks that once wrapped 'cluster add'
@@ -1275,8 +1933,40 @@ RestartSec=2
 [Install]
 WantedBy=multi-user.target
 EOF
-    chmod 644 "$CONFIG_DEST"
+    publish_config 644
 
+    write_broker_systemd_unit "$bin" "$etc" "$sysd" "$log_dir"
+
+    # UNQUOTED heredoc ON PURPOSE: expands $bin and $etc into ExecStart.
+    config_dest "$sysd/caddy.service"
+    cat > "$CONFIG_DEST" <<EOF
+[Unit]
+Description=Caddy (TLS termination for tether NATS WSS)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=$bin/caddy run --config $etc/Caddyfile --adapter caddyfile
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    publish_config 644
+}
+
+# Kept separate so hot-update retrofit never generates NATS/Caddy templates.
+# origin: hot-update S8 plan §5.2 / P20
+write_broker_systemd_unit() {
+    bin="$1"; etc="$2"; sysd="$3"; log_dir="$4"
+    # Normal installation and S8 retrofit share this writer. Keep its preview
+    # guard local so either caller can never create, chmod or receipt a unit.
+    # origin: hot-update S8 plan §5.2 / P20; hot-update S9 plan §6.4 / T54 / M27
+    if [ "$DRY_RUN" -eq 1 ]; then
+        log "  + (dry-run) write $sysd/tether-broker.service (canonical ExecStart=$bin/tether serve --config $etc/broker.yaml)"
+        return 0
+    fi
     # UNQUOTED heredoc ON PURPOSE: expands $bin, $etc and $log_dir. The G1 #23 prose below is
     # shell-active as well (see P9 on the unit above) — keep it free of backticks and $(…).
     config_dest "$sysd/tether-broker.service"
@@ -1296,6 +1986,8 @@ User=tether
 # tether user can't mkdir under /run) and Restart=on-failure just loops.
 RuntimeDirectory=tether
 RuntimeDirectoryMode=0700
+# The canonical S8 entry resolves this role/config/UID effective selector before
+# daemon initialization. Keep this path canonical across rollback and cold boot.
 ExecStart=$bin/tether serve --config $etc/broker.yaml
 # G1 #23: the broker clean-exits(0) on some nats-loss paths (serve.go maps a context.Canceled
 # Run() return to exit 0). Restart=on-failure would NOT revive a clean exit, stranding the
@@ -1318,132 +2010,260 @@ StandardError=journal
 [Install]
 WantedBy=multi-user.target
 EOF
-    chmod 644 "$CONFIG_DEST"
-
-    # UNQUOTED heredoc ON PURPOSE: expands $bin and $etc into ExecStart.
-    config_dest "$sysd/caddy.service"
-    cat > "$CONFIG_DEST" <<EOF
-[Unit]
-Description=Caddy (TLS termination for tether NATS WSS)
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-ExecStart=$bin/caddy run --config $etc/Caddyfile --adapter caddyfile
-Restart=on-failure
-
-[Install]
-WantedBy=multi-user.target
-EOF
-    chmod 644 "$CONFIG_DEST"
+    publish_config 644
 }
 
+# Retirement requires an absent root/S8 authority and an independently empty
+# process set. Shell code cannot interpret an unknown journal as idle or consume
+# a signed retirement CAS; an enabled host must retire through the root product.
+# origin: hot-update S9 plan §6.4 / T54 / M27
 uninstall_broker() {
-    # The SAME path resolution install_broker uses, including the TETHER_INSTALL_ROOT
-    # test seam — an uninstall that removed real system files while the matching install
-    # wrote into a redirected tree would be the worst possible asymmetry.
-    BIN_DIR="${PREFIX:-${TETHER_INSTALL_ROOT:-}/usr/local/bin}"
-    ETC_DIR="${TETHER_INSTALL_ROOT:-}/etc/tether"
-    LIB_DIR="${TETHER_INSTALL_ROOT:-}/var/lib/tether"
-    LOG_DIR="${TETHER_INSTALL_ROOT:-}/var/log/tether"
-    RUN_DIR="${TETHER_INSTALL_ROOT:-}/var/run/tether"
-    SYSTEMD_DIR="${TETHER_INSTALL_ROOT:-}/etc/systemd/system"
+    # The SAME path resolution install_broker uses, including TETHER_INSTALL_ROOT.
+    # origin: prerelease audit round 2, G2 / K-F10 / CC-5 / external review M-4.
+    # Prefixing files without prefixing service-manager effects was a live-host
+    # mutation; keep the symmetric host_systemd_is_the_target guard below.
+    broker_paths
     log "tether uninstall (role=broker)"
-    # #76 symmetry: disable BEFORE removing the unit files, so no dangling
-    # wants/ symlinks survive (this also cleans up after a manual
-    # `systemctl enable` on a pre-#76 install). review Mi7: the systemd probe
-    # is skipped in dry-run so the preview is host-INDEPENDENT and assertable
-    # (mirrors enable_broker_units' own principle). review Mi8: on a
-    # systemd-less host the disable is skipped, so explicitly rm the boot
-    # symlinks too or they dangle after the unit files go, and the closing
-    # log must not claim "disabled".
-    # external review M-4: the seam guard is checked FIRST and symmetrically with the
-    # install half. A redirected uninstall that ran `systemctl disable` would stop the
-    # HOST's real nats-server / tether-broker / caddy from starting at boot — the worst
-    # possible outcome for a flag documented as a test seam. The wants/ symlinks under
-    # $SYSTEMD_DIR are inside the root, so the hand-removal branch below is the correct
-    # (and sufficient) cleanup there.
-    _DISABLED=0
-    if ! host_systemd_is_the_target; then
-        log_would_run_systemctl "systemctl disable nats-server tether-broker caddy"
-        for u in nats-server tether-broker caddy; do
-            run "rm -f '$SYSTEMD_DIR/multi-user.target.wants/$u.service'"
-        done
-    elif [ "$DRY_RUN" -eq 1 ] || { command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; }; then
-        run "systemctl disable nats-server tether-broker caddy 2>/dev/null || true"
-        _DISABLED=1
-    else
-        # No systemd to run `disable`: drop the wants/ symlinks by hand so the
-        # unit removal below does not leave them dangling.
-        for u in nats-server tether-broker caddy; do
-            run "rm -f '$SYSTEMD_DIR/multi-user.target.wants/$u.service'"
-        done
-    fi
-    for u in nats-server tether-broker caddy; do
-        # ...and the `.new` sidecar a kept re-run may have written beside it. origin:
-        # prerelease audit round 2, K-F9: uninstall removed the unit and left its .new
-        # behind forever, so a host that had ever been re-installed kept three orphan
-        # files that no later run ever mentions again.
-        run "rm -f '$SYSTEMD_DIR/$u.service' '$SYSTEMD_DIR/$u.service.new'"
+    for _ub_path in "$BIN_DIR" "$ETC_DIR" "$SYSTEMD_DIR" "$LIBEXEC_DIR" "$INFRA_DIR"; do
+        infra_safe_path "$_ub_path"
     done
-    # #77 symmetry (review F3): remove the journald drop-in ONLY if it carries
-    # our ownership marker — a same-name operator/site-policy file that merely
-    # collided on the path must survive uninstall. Path is not proof; the
-    # first-line marker is.
+    infra_has_authority && die "infra_busy: product retirement CAS is required before uninstall"
+    if [ "$DRY_RUN" -eq 0 ]; then
+        # Keep both permanent lock inodes. In particular, never rm -rf the
+        # business directory: it contains SQLite, Raft and irreplaceable keys.
+        # origin: prerelease audit round 2, K-F13 / hot-update S9 §6.4.
+        infra_install_directories
+        infra_lock_installation
+        infra_has_authority && die "infra_busy: authority appeared before uninstall"
+        infra_business_running && die "infra_busy: installed executable is still running"
+    fi
+    _ub_units=""
+    for _ub_unit in nats-server tether-broker caddy; do
+        if [ "$DRY_RUN" -eq 1 ] || owned_file "$SYSTEMD_DIR/$_ub_unit.service"; then
+            _ub_units="$_ub_units $_ub_unit"
+            # #76 symmetry: disable before removing marked units; no --now.
+            # Mi8: on a systemd-less host, remove only our exact boot links.
+            _ub_link="$SYSTEMD_DIR/multi-user.target.wants/$_ub_unit.service"
+            if [ "$DRY_RUN" -eq 1 ]; then
+                log "  + (dry-run) remove $_ub_link (only if it points to the owned unit)"
+            elif [ -L "$_ub_link" ]; then
+                case "$(readlink "$_ub_link")" in
+                    "../$_ub_unit.service"|"$SYSTEMD_DIR/$_ub_unit.service") rm -f "$_ub_link" ;;
+                    *) log "  + kept operator boot link: $_ub_link" ;;
+                esac
+            fi
+        fi
+    done
+    if [ -n "$_ub_units" ]; then
+        if ! host_systemd_is_the_target; then
+            log_would_run_systemctl "systemctl disable$_ub_units"
+        elif [ "$DRY_RUN" -eq 1 ] || { command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; }; then
+            run "systemctl disable$_ub_units" || die "cannot disable owned units; files retained"
+        fi
+    fi
+    for _ub_unit in nats-server tether-broker caddy; do
+        remove_owned_file "$SYSTEMD_DIR/$_ub_unit.service"
+        remove_owned_file "$SYSTEMD_DIR/$_ub_unit.service.new"
+    done
+    for _ub_name in tether nats-server caddy; do remove_owned_file "$BIN_DIR/$_ub_name"; done
+    for _ub_name in tether-infra-helper tether-infra-launch; do remove_owned_file "$LIBEXEC_DIR/$_ub_name"; done
+    for _ub_target in "$ETC_DIR/broker.yaml" "$ETC_DIR/Caddyfile" "$ETC_DIR/nats.d/nats.conf" \
+        "$INFRA_ETC_DIR/templates/tether-infra-helper.socket" "$INFRA_ETC_DIR/templates/tether-infra-helper@.service" \
+        "$INFRA_ETC_DIR/templates/nats-server.service.d/90-tether-infra.conf" "$INFRA_ETC_DIR/templates/caddy.service.d/90-tether-infra.conf"; do
+        remove_owned_file "$_ub_target"
+        remove_owned_file "$_ub_target.new"
+    done
+    # #77 / review F3: a same-name operator journald drop-in is not ours.
     _u_dropin="${TETHER_JOURNALD_ROOT:-${TETHER_INSTALL_ROOT:-}/etc/systemd}/journald.conf.d/60-tether.conf"
-    _u_marker='# managed-by: tether-install.sh (#77 journald cap)'
     if [ "$DRY_RUN" -eq 1 ]; then
         log "  + (dry-run) remove $_u_dropin (only if it carries the tether ownership marker)"
-    elif [ ! -f "$_u_dropin" ]; then
-        : # nothing to remove
-    elif head -n1 "$_u_dropin" 2>/dev/null | grep -qF "$_u_marker"; then
-        run "rm -f '$_u_dropin'"
+    elif [ -f "$_u_dropin" ] && [ ! -L "$_u_dropin" ] &&
+         [ "$(head -n1 "$_u_dropin")" = '# managed-by: tether-install.sh (#77 journald cap)' ]; then
+        rm -f "$_u_dropin"
+    elif [ -e "$_u_dropin" ] || [ -L "$_u_dropin" ]; then
+        log "  ! $_u_dropin is NOT tether-owned; left in place"
+    fi
+    if [ "$DRY_RUN" -eq 0 ]; then
+        for _ub_slot in "$INFRA_DIR/artifacts/"*; do
+            [ -d "$_ub_slot" ] && [ ! -L "$_ub_slot" ] || continue
+            _ub_owned=1
+            _ub_nonempty=0
+            for _ub_file in "$_ub_slot/"* "$_ub_slot/".[!.]* "$_ub_slot/"..?*; do
+                [ -e "$_ub_file" ] || [ -L "$_ub_file" ] || continue
+                _ub_nonempty=1
+                owned_file "$_ub_file" || _ub_owned=0
+            done
+            [ "$_ub_owned:$_ub_nonempty" = 1:1 ] || continue
+            chmod 0700 "$_ub_slot"
+            for _ub_file in "$_ub_slot/"*; do remove_owned_file "$_ub_file"; done
+            rmdir "$_ub_slot"
+        done
+    fi
+    if [ -n "$_ub_units" ]; then
+        if ! host_systemd_is_the_target; then
+            log_would_run_systemctl "systemctl daemon-reload"
+        elif [ "$DRY_RUN" -eq 1 ] || { command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; }; then
+            run "systemctl daemon-reload" || die "owned files removed but service manager reload failed"
+        fi
+    fi
+    log "  + matching installer-owned files removed; operator files and business data retained"
+    log "  + permanent journal/store/domain locks and the tether system user retained"
+}
+
+# Render the complete operator-supplied declaration, never a guessed singleton
+# roster. The capable canonical entry derives and publishes the .domain record
+# on its first explicit cold start; K.0 forbids invoking tether in this script.
+# origin: S8 internal review remaining-orchestration F5 (R5) / S8 plan §5.1 / LQ1
+hot_update_registration() {
+    _hur_control=$1
+    _hur_uid=$2
+    _hur_gid=$3
+    if [ -z "$HOT_UPDATE_REGISTRATION" ]; then
+        log "  ! registration pending: supply --hot-update-registration FILE with every installation participant"
+        return 0
+    fi
+    [ -f "$HOT_UPDATE_REGISTRATION" ] && [ ! -L "$HOT_UPDATE_REGISTRATION" ] || die "hot-update registration must be a regular declaration file"
+    [ ! -L "$_hur_control/artifacts" ] && [ ! -L "$_hur_control/installation.json" ] || die "hot-update registration path must not be a symlink"
+    if [ "$DRY_RUN" -eq 1 ]; then
+        log "  + (dry-run) render $HOT_UPDATE_REGISTRATION as $_hur_control/installation.json; create $_hur_control/artifacts"
+        return 0
+    fi
+    install -d -o "$_hur_uid" -g "$_hur_gid" -m 0700 "$_hur_control/artifacts"
+    if [ -e "$_hur_control/installation.json" ]; then
+        cmp -s "$HOT_UPDATE_REGISTRATION" "$_hur_control/installation.json" || die "existing hot-update declaration differs; explicit deployment review required"
+        return 0
+    fi
+    _hur_temp=$(mktemp "$_hur_control/.installation.XXXXXX")
+    register_install_temp "$_hur_temp"
+    cat "$HOT_UPDATE_REGISTRATION" > "$_hur_temp"
+    chmod 0600 "$_hur_temp"
+    chown "$_hur_uid:$_hur_gid" "$_hur_temp"
+    sync "$_hur_temp"
+    # O_EXCL publication: another retrofit may have won; never replace its
+    # declaration or a pending daemon's registration under the same pathname.
+    ln "$_hur_temp" "$_hur_control/installation.json" || die "hot-update declaration publication raced another writer"
+    rm -f "$_hur_temp"
+    sync "$_hur_control"
+}
+
+# Retrofit prepares installation-owned paths only. The daemon remains the sole
+# journal writer; root publication belongs to the explicit upgrade stage command.
+# Put artifacts outside /var/lib/tether: that business directory is daemon-owned
+# and must not let an unprivileged sibling replace root-published executables.
+# origin: hot-update S8 plan §5.1 / §5.2 / LQ1 / P20
+hot_update_retrofit() {
+    [ "$UNINSTALL" -eq 0 ] || die "--hot-update-retrofit excludes --uninstall"
+    [ -z "$LOCAL_BIN" ] || die "--hot-update-retrofit excludes --bin; install a capable canonical entry explicitly"
+    [ "$FORCE_CONFIG" -eq 0 ] || die "--hot-update-retrofit excludes --force-config; review startup changes before applying"
+    case "$ROLE" in broker|agent) ;; *) die "--hot-update-retrofit requires --role broker or agent" ;; esac
+    detect_os_arch
+    [ "$OS" = linux ] || die "--hot-update-retrofit requires a Linux host"
+    log "tether hot-update retrofit (role=$ROLE); no binary replacement or service start"
+    if [ -n "${TETHER_INSTALL_ROOT:-}" ]; then
+        log "  + TETHER_INSTALL_ROOT=$TETHER_INSTALL_ROOT: system paths redirected; host service manager NOT touched"
+    elif [ "$DRY_RUN" -eq 0 ] && [ "$(id -u)" -ne 0 ]; then
+        die "--hot-update-retrofit requires root for installation-owned artifacts"
+    fi
+    if [ "$ROLE" = broker ]; then
+        broker_paths
+        for _hu_path in "$LIBEXEC_DIR" "$INFRA_DIR" "$INFRA_ETC_DIR" "$SYSTEMD_DIR" "$INFRA_RUN_DIR"; do
+            infra_safe_path "$_hu_path"
+        done
+    fi
+    if [ "$ROLE" = agent ]; then
+        case "$SESSION" in ''|.|..|*[!A-Za-z0-9_-]*) die "--session must be a safe nonempty session ID for agent retrofit" ;; esac
+        _hu_agent="$HOME/.tether/agents/$SESSION"
+        for _hu_path in "$HOME/.tether" "$HOME/.tether/agents" "$_hu_agent" "$_hu_agent/upgrades"; do
+            [ ! -L "$_hu_path" ] || die "agent upgrade directory must not be a symlink"
+        done
+    fi
+    _hu_base="${TETHER_INSTALL_ROOT:-}/var/lib/tether-upgrade"
+    # Reject aliases before chmod/chown; otherwise a root retrofit could change
+    # the permissions of an unrelated live directory through a symlink.
+    for _hu_path in "$_hu_base" "$_hu_base/artifacts" "$_hu_base/control"; do
+        [ ! -L "$_hu_path" ] || die "hot-update directory must not be a symlink: $_hu_path"
+    done
+    if [ "$DRY_RUN" -eq 1 ]; then
+        log "  + (dry-run) install -d -o root -g root -m 0755 $_hu_base $_hu_base/artifacts $_hu_base/control"
+    elif [ -n "${TETHER_INSTALL_ROOT:-}" ]; then
+        install -d -m 0755 "$_hu_base" "$_hu_base/artifacts" "$_hu_base/control"
     else
-        log "  ! $_u_dropin exists but is NOT tether-owned (no marker) — left in place"
+        install -d -o root -g root -m 0755 "$_hu_base" "$_hu_base/artifacts" "$_hu_base/control"
     fi
-    if ! host_systemd_is_the_target; then
-        # external review M-4: nothing the host's systemd knows about changed, so there is
-        # nothing for it to reload.
-        log_would_run_systemctl "systemctl daemon-reload"
-    elif [ "$DRY_RUN" -eq 1 ] || { command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; }; then
-        # Best-effort: a daemon-reload refreshes systemd's view after the unit
-        # files went; it is cleanup, not correctness. Tolerate failure (e.g. a
-        # non-root/no-polkit context) so uninstall's file removals still stand.
-        run "systemctl daemon-reload 2>/dev/null || true"
-    fi
-    run "rm -f '$BIN_DIR/tether'"
-    # THE SAME WARNING THE AGENT SIBLING GOT, for a larger deletion.
-    #
-    # origin: prerelease audit round 2, K-F13. B7's principle — never delete something
-    # irreplaceable without saying so — was applied to uninstall_agent in this very change
-    # and not here, where /var/lib/tether holds the SQLite state, the raft data dir and the
-    # secrets dir (the cluster CA and this node's tunnel key). Losing the secrets dir means
-    # this node can never rejoin its cluster under the same identity.
-    log ""
-    log "  ⚠ REMOVING $LIB_DIR — the SQLite state, the raft data dir and the secrets"
-    log "    dir (cluster CA + this node's tunnel key). The secrets cannot be regenerated:"
-    log "    without them this node cannot rejoin its cluster under the same identity."
-    log "    Take a backup first if this is not a decommission: tether cluster backup --offline"
-    log ""
-    # THE VARIABLES, NOT THE LITERALS. These were four hardcoded absolute paths, which
-    # was merely redundant until TETHER_INSTALL_ROOT existed (round 2, G2) and then
-    # became dangerous: a redirected uninstall would have rm -rf'd the REAL /etc/tether
-    # and /var/lib/tether — the SQLite state, the raft dir and the unregenerable secrets
-    # — on a host whose matching install had touched none of them.
-    run "rm -rf '$ETC_DIR' '$LIB_DIR' '$LOG_DIR' '$RUN_DIR'"
-    if [ "$_DISABLED" -eq 1 ]; then
-        log "  ✔ removed broker files (systemd units disabled+removed, journald drop-in, /etc/tether, /var/{lib,log,run}/tether)"
+    if [ "$ROLE" = broker ]; then
+        broker_paths
+        # Preparation never installs live NATS/Caddy drop-ins or touches their
+        # UID/storage. Root bootstrap owns their fence and effective-unit CAS.
+        # origin: hot-update S9 plan §5.3 / §6.4 / T54
+        infra_install_directories
+        write_infra_files
+        # Existing config/data ownership is not retroactively changed. Only the
+        # dedicated control directory is handed to the existing service identity.
+        [ ! -L "$LIB_DIR/upgrade-control" ] || die "broker upgrade-control must not be a symlink"
+        if [ "$DRY_RUN" -eq 1 ]; then
+            log "  + (dry-run) install -d -o tether -g tether -m 0700 $LIB_DIR/upgrade-control"
+        else
+            if [ -n "${TETHER_INSTALL_ROOT:-}" ]; then
+                install -d -m 0700 "$LIB_DIR/upgrade-control"
+            else
+                id -u tether >/dev/null 2>&1 || die "existing broker service user tether is required"
+                install -d -o tether -g tether -m 0700 "$LIB_DIR/upgrade-control"
+            fi
+        fi
+        run "mkdir -p '$SYSTEMD_DIR'"
+        write_broker_systemd_unit "$BIN_DIR" "$ETC_DIR" "$SYSTEMD_DIR" "${TETHER_INSTALL_ROOT:-}/var/log/tether"
     else
-        log "  ✔ removed broker files (unit files + boot symlinks removed [systemd not running], journald drop-in, /etc/tether, /var/{lib,log,run}/tether)"
+        if [ "$DRY_RUN" -eq 1 ]; then
+            log "  + (dry-run) install -d -m 0700 $_hu_agent/upgrades (owned by agent HOME owner)"
+        else
+            # Root is acting on behalf of the HOME owner, never turning the
+            # non-root agent's future journal directory into a root-only path.
+            _hu_uid=$(ls -nd "$HOME" | awk '{print $3}')
+            _hu_gid=$(ls -nd "$HOME" | awk '{print $4}')
+            install -d -o "$_hu_uid" -g "$_hu_gid" -m 0700 "$HOME/.tether" "$HOME/.tether/agents" "$_hu_agent" "$_hu_agent/upgrades"
+        fi
     fi
-    log "  ✔ note: did NOT remove the 'tether' system user; do that manually if intended"
+    if [ "$ROLE" = broker ]; then
+        if [ -n "${TETHER_INSTALL_ROOT:-}" ] || [ "$DRY_RUN" -eq 1 ]; then
+            _hu_uid=$(id -u)
+            _hu_gid=$(id -g)
+        else
+            _hu_uid=$(id -u tether)
+            _hu_gid=$(id -g tether)
+        fi
+        hot_update_registration "$LIB_DIR/upgrade-control" "$_hu_uid" "$_hu_gid"
+    else
+        _hu_uid=$(ls -nd "$HOME" | awk '{print $3}')
+        _hu_gid=$(ls -nd "$HOME" | awk '{print $4}')
+        hot_update_registration "$_hu_agent/upgrades" "$_hu_uid" "$_hu_gid"
+    fi
+    report_kept_configs
+    cat <<'EOF'
+
+Hot-update directories and canonical startup templates are prepared.
+Review any .new template before applying it. The canonical entry must already
+be S8-capable; first installation of that entry is an explicit non-hot operation.
+The daemon signs the grant and remains the only upgrade journal writer.
+
+Publish both authorized images explicitly as root:
+    tether upgrade stage --grant grant.json --source source-image --candidate candidate-image --receipt-out receipt.json
+Then the original actor starts the same transaction using its artifact receipt:
+    node upgrade NID --tx-id TXID --artifact-receipt receipt.json
+    broker upgrade reload --tx-id TXID --artifact-receipt receipt.json
+EOF
 }
 
 # -- dispatch --------------------------------------------------------------
 
 # Resolve VERSION once after argparse so every role's install path
 # sees the same value (no per-role drift if the redirect flaps).
+[ -z "$HOT_UPDATE_REGISTRATION" ] || [ "$HOT_UPDATE_RETROFIT" -eq 1 ] || die "--hot-update-registration requires --hot-update-retrofit"
+if [ "$HOT_UPDATE_RETROFIT" -eq 1 ]; then
+    hot_update_retrofit
+    exit 0
+fi
+[ -z "$LOCAL_BIN" ] || [ "$UNINSTALL" -eq 0 ] || die "--bin excludes --uninstall"
+[ -z "$LOCAL_BIN" ] || [ -f "$LOCAL_BIN" ] || die "--bin must name a regular local file"
 maybe_resolve_version
 
 case "$ROLE" in

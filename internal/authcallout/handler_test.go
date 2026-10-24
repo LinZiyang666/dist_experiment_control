@@ -540,6 +540,7 @@ func FuzzParseRole(f *testing.F) {
 		"tether-cli", "tether-cli:lab", "tether-cli:",
 		"tether-agent:lab:gpu1", "tether-agent:lab:", "tether-agent::gpu1", "tether-agent:lab",
 		"tether-agent:lab:gpu1:extra", "tether-agent:", "", "x", "tether-cli:lab:extra",
+		"transfer-settlement:lab:node", "transfer-settlement:lab:*", "session-removal:lab", "session-removal:",
 	} {
 		f.Add(s)
 	}
@@ -561,6 +562,17 @@ func FuzzParseRole(f *testing.F) {
 		case roleAgent:
 			if sid == "" || nid == "" || "tether-agent:"+sid+":"+nid != name {
 				t.Fatalf("roleAgent for %q does not rebuild: sid=%q nid=%q", name, sid, nid)
+			}
+		// Keep the role classifier's existing fuzz oracle complete after the
+		// transfer roles move to xferauth. Unknown roles must still fail below.
+		// origin: hot-update S7 plan §6.4 / T31
+		case roleTransferSettlement:
+			if sid == "" || nid == "" || "transfer-settlement:"+sid+":"+nid != name {
+				t.Fatalf("settlement role for %q does not rebuild: sid=%q nid=%q", name, sid, nid)
+			}
+		case roleSessionRemoval:
+			if sid == "" || nid != "" || "session-removal:"+sid != name {
+				t.Fatalf("removal role for %q does not rebuild: sid=%q nid=%q", name, sid, nid)
 			}
 		default:
 			t.Fatalf("parseRole(%q) returned an unknown role %d", name, r)

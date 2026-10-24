@@ -1,7 +1,8 @@
 # goreleaser config for tether v1 (architecture K.4).
 #
-# v1 ships ONE binary per (os, arch) plus a single install.sh and a
-# SHA256SUMS manifest. The install.sh entry covers all three roles
+# Each Linux archive ships tether and both infrastructure support executables;
+# Darwin archives keep tether. Both use one install.sh and SHA256SUMS manifest.
+# The install.sh entry covers all three roles
 # (agent / ctl / broker); architecture K.4 makes the case for "one
 # tarball per platform, one script" over six packages plus three
 # scripts.
@@ -40,13 +41,68 @@ builds:
       - -s -w -X github.com/LinZiyang666/tether/internal/proto.ReleaseVersion={{ .Version }}
     goos:
       - linux
-      - darwin
     goarch:
       - amd64
       - arm64
+  # origin: hot-update S9 plan §6.5 / T55. Separate archive groups keep
+  # Linux support out of Darwin without relaxing the binary-count check.
+  - id: tether-darwin
+    main: ./cmd/tether
+    binary: tether
+    env: [CGO_ENABLED=0]
+    flags: [-trimpath]
+    ldflags:
+      - -s -w -X github.com/LinZiyang666/tether/internal/proto.ReleaseVersion={{ .Version }}
+    goos: [darwin]
+    goarch: [amd64, arm64]
+  - id: tether-infra-helper
+    main: ./cmd/tether-infra-helper
+    binary: tether-infra-helper
+    env: [CGO_ENABLED=0]
+    flags: [-trimpath]
+    ldflags: ["-s -w"]
+    goos: [linux]
+    goarch: [amd64, arm64]
+    # origin: S9 internal review rv-priv F2. The last completed support build
+    # writes one manifest from both actual platform outputs.
+    hooks:
+      post:
+        - python3 -I -B build/infra-support.py --root . --release v{{ .Version }} --goos {{ .Os }} --goarch {{ .Arch }} --binary {{ .Path }}
+  - id: tether-infra-launch
+    main: ./cmd/tether-infra-launch
+    binary: tether-infra-launch
+    env: [CGO_ENABLED=0]
+    flags: [-trimpath]
+    ldflags: ["-s -w"]
+    goos: [linux]
+    goarch: [amd64, arm64]
+    # origin: S9 internal review rv-priv F2. The last completed support build
+    # writes one manifest from both actual platform outputs.
+    hooks:
+      post:
+        - python3 -I -B build/infra-support.py --root . --release v{{ .Version }} --goos {{ .Os }} --goarch {{ .Arch }} --binary {{ .Path }}
 
 archives:
-  - id: tether
+  - id: tether-linux
+    ids: [tether, tether-infra-helper, tether-infra-launch]
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+    formats: [tar.gz]
+    files:
+      - LICENSE
+      - README.md
+      - src: completions/_tether
+        dst: completions/_tether
+      - src: "dist/infra-support/{{ .Os }}_{{ .Arch }}/infra-catalog.json"
+        dst: infra-catalog.json
+        info:
+          mode: 0644
+      - src: "dist/infra-support/{{ .Os }}_{{ .Arch }}/infra-support.manifest"
+        dst: infra-support.manifest
+        info:
+          mode: 0644
+  - id: tether-darwin
+    ids: [tether-darwin]
     name_template: >-
       {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
     formats: [tar.gz]
