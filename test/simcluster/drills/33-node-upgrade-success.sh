@@ -44,6 +44,27 @@
 # image, marker pends forever. This drill deliberately does NOT stage such an artifact (it would wedge
 # agt1 for manual recovery); the gap is owned by #73 until a probe drill or a product defense lands.
 set -u
+# origin: hot-update S8 plan §9.4 / P29. The historical body remains V1;
+# V2 uses the shared P29 oracle in 31 and P26's original-resource custody.
+# arms: V1 V2
+# fixture: V1=install V2=install
+# grows: V1=0 V2=0
+# worst: V1=600 V2=900
+# forgoes: V1=- V2=-
+. "$HERE/lib/log.sh"
+. "$HERE/lib/assert.sh"
+. "$HERE/lib/supervisor.sh"
+if [ "${S8_REGRESSION_SUPERVISED:-0}" != 1 ]; then
+    [ -x "${SIM_UPGRADE_SUPERVISOR:-}" ] || {
+        drill_begin "33-node-upgrade-success"
+        setup_fail "shared process supervisor is required"
+    }
+    S8_REGRESSION_SUPERVISED=1
+    export S8_REGRESSION_SUPERVISED
+    exec "$SIM_UPGRADE_SUPERVISOR" -- /bin/sh "$0" "$@"
+fi
+
+regression_v1_setup() {
 . "$HERE/lib/log.sh"; . "$HERE/lib/docker.sh"; . "$HERE/lib/tether.sh"; . "$HERE/lib/assert.sh"
 . "$HERE/lib/secrets.sh"
 . "$HERE/drills/lib/agentyaml.sh"; . "$HERE/drills/lib/ident.sh"
@@ -172,6 +193,14 @@ _same_inode() {
         [ -n \"\$a\" ] && [ \"\$a\" = \"\$b\" ] && [ \"\$(stat -c %i \"\$a\")\" = \"\$(stat -c %i \"\$b\")\" ]"
 }
 
+}
+
+# Keep helpers above ARM and claims inside V1 for both static scanners.
+if [ "${1:-}" = --arm ]; then ARM=${2:-}; fi
+ARM=${ARM:-V2}
+case "${ARM:?}" in
+    V1)
+        regression_v1_setup
 drill_begin "33-node-upgrade-success (real re-exec success + watchdog rollback + upgrade domain)"
 "$SIM" nuke >/dev/null 2>&1 || true
 assert_ok "up 1 broker + 1 agent + 1 ctl"           "$SIM" up --brokers 1 --agents 1 --ctl 1
@@ -278,6 +307,26 @@ assert_ok "C2 domain released: sibling's own upgrade COMMITs (rc=0 ∧ COMMITTED
           _c2_committed
 
 not_covered "33 (gotcha #73, honest): a NON-tether artifact that fakes the frozen version line passes the smoke gate, then has NO boot shim — budget never ticks, the watchdog died with the old image, the marker pends forever, the node is stranded behind NAT" \
-    "DELIBERATELY not staged here: it would wedge agt1 into exactly that stranded state and require manual .prev recovery mid-drill. The scenario is registered as deploy-tier-gotchas #73 (OPEN); owner lands either as a dedicated probe drill (34) or as a product defense (artifact shim self-attestation) — whichever closes #73 flips this entry." gap
+    "DELIBERATELY not staged here: it would wedge agt1 into exactly that stranded state and require manual .prev recovery mid-drill. The scenario is registered as deploy-tier-gotchas #73 (OPEN); owner lands either as a dedicated probe drill (number not assigned; 34 owns the independent hot-update process baseline) or as a product defense (artifact shim self-attestation) — whichever closes #73 flips this entry." gap
 
+        ;;
+    V2)
+        drill_begin "33-node-upgrade-success v2"
+        /bin/sh "$HERE/drills/31-node-upgrade-fleet.sh" --regression-driver 33
+        _reg_rc=$?
+        # Preserve P26's native five-state verdict; CLI rc64/74/75 lives in
+        # the evidence and is never translated into the runner's rc.
+        case "$_reg_rc" in
+            0|1) assert_ok "v2 regression receipts (native rc $_reg_rc)" test "$_reg_rc" -eq 0 ;;
+            2) assert_setup "v2 regression adapters available" test "$_reg_rc" -eq 0 ;;
+            3) product_red "v2 regression product oracle failed; evidence retained" ;;
+            4) not_covered "v2 regression observation incomplete" "native interval/receipt missing" runtime-guard ;;
+            *) setup_fail "invalid regression driver rc $_reg_rc" ;;
+        esac
+        ;;
+    *)
+        drill_begin "33-node-upgrade-success"
+        setup_fail "unknown regression arm '$ARM'"
+        ;;
+esac
 drill_end

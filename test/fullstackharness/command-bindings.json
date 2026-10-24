@@ -1,0 +1,613 @@
+{
+  "version": 1,
+  "bindings": [
+    {
+      "id": "agent.stage",
+      "role": "agent",
+      "action": "stage",
+      "argv": [
+        "{binary}",
+        "upgrade",
+        "stage",
+        "--grant",
+        "{grant}",
+        "--source",
+        "{source}",
+        "--candidate",
+        "{candidate}",
+        "--receipt-out",
+        "{receipt}"
+      ],
+      "timeout_ns": 120000000000,
+      "help": {
+        "path": "NOT_RUN pending S8/P18",
+        "sha": "0000000000000000000000000000000000000000000000000000000000000000",
+        "bytes": 0,
+        "schema": "pending:S8/P18"
+      },
+      "raw_view_schema": "upgradeartifact.Receipt"
+    },
+    {
+      "id": "broker.stage",
+      "role": "broker",
+      "action": "stage",
+      "argv": [
+        "{binary}",
+        "upgrade",
+        "stage",
+        "--grant",
+        "{grant}",
+        "--source",
+        "{source}",
+        "--candidate",
+        "{candidate}",
+        "--receipt-out",
+        "{receipt}"
+      ],
+      "timeout_ns": 120000000000,
+      "help": {
+        "path": "NOT_RUN pending S8/P18",
+        "sha": "0000000000000000000000000000000000000000000000000000000000000000",
+        "bytes": 0,
+        "schema": "pending:S8/P18"
+      },
+      "raw_view_schema": "upgradeartifact.Receipt"
+    },
+    {
+      "id": "agent.prepare",
+      "role": "agent",
+      "action": "stage",
+      "argv": [
+        "{binary}",
+        "node",
+        "upgrade",
+        "--url",
+        "{url}",
+        "--sha256",
+        "{archive_sha256}",
+        "--prepare-only",
+        "--grant-out",
+        "{grant}",
+        "--home",
+        "{home}",
+        "--nats-url",
+        "{nats_url}",
+        "{nid}"
+      ],
+      "timeout_ns": 120000000000,
+      "help": {
+        "path": "NOT_RUN pending S8/P19",
+        "sha": "0000000000000000000000000000000000000000000000000000000000000000",
+        "bytes": 0,
+        "schema": "pending:S8/P19"
+      },
+      "raw_view_schema": "s8_view"
+    },
+    {
+      "id": "agent.apply",
+      "role": "agent",
+      "action": "apply",
+      "argv": [
+        "{binary}",
+        "node",
+        "upgrade",
+        "--tx-id",
+        "{tx_id}",
+        "--artifact-receipt",
+        "{receipt}",
+        "--home",
+        "{home}",
+        "--nats-url",
+        "{nats_url}",
+        "{nid}"
+      ],
+      "timeout_ns": 120000000000,
+      "help": {
+        "path": "NOT_RUN pending S8/P19",
+        "sha": "0000000000000000000000000000000000000000000000000000000000000000",
+        "bytes": 0,
+        "schema": "pending:S8/P19"
+      },
+      "raw_view_schema": "s8_view"
+    },
+    {
+      "id": "agent.query",
+      "role": "agent",
+      "action": "query",
+      "argv": [
+        "{binary}",
+        "node",
+        "upgrade-status",
+        "--tx-id",
+        "{tx_id}",
+        "--json",
+        "--home",
+        "{home}",
+        "--nats-url",
+        "{nats_url}",
+        "{nid}"
+      ],
+      "timeout_ns": 120000000000,
+      "help": {
+        "path": "NOT_RUN pending S8/P19",
+        "sha": "0000000000000000000000000000000000000000000000000000000000000000",
+        "bytes": 0,
+        "schema": "pending:S8/P19"
+      },
+      "raw_view_schema": "s8_view"
+    },
+    {
+      "id": "agent.rollback",
+      "role": "agent",
+      "action": "rollback",
+      "argv": [
+        "{binary}",
+        "node",
+        "upgrade-rollback",
+        "--tx-id",
+        "{tx_id}",
+        "--home",
+        "{home}",
+        "--nats-url",
+        "{nats_url}",
+        "{nid}"
+      ],
+      "timeout_ns": 120000000000,
+      "help": {
+        "path": "NOT_RUN pending S8/P19",
+        "sha": "0000000000000000000000000000000000000000000000000000000000000000",
+        "bytes": 0,
+        "schema": "pending:S8/P19"
+      },
+      "raw_view_schema": "s8_view"
+    },
+    {
+      "id": "broker.prepare",
+      "role": "broker",
+      "action": "stage",
+      "argv": [
+        "{binary}",
+        "broker",
+        "upgrade",
+        "reload",
+        "--socket",
+        "{socket}",
+        "--to-version",
+        "{version}",
+        "--expect-sha256",
+        "{binary_sha256}",
+        "--prepare-only",
+        "--grant-out",
+        "{grant}"
+      ],
+      "timeout_ns": 120000000000,
+      "help": {
+        "path": "NOT_RUN pending S8/P19",
+        "sha": "0000000000000000000000000000000000000000000000000000000000000000",
+        "bytes": 0,
+        "schema": "pending:S8/P19"
+      },
+      "raw_view_schema": "s8_view"
+    },
+    {
+      "id": "broker.apply",
+      "role": "broker",
+      "action": "apply",
+      "argv": [
+        "{binary}",
+        "broker",
+        "upgrade",
+        "reload",
+        "--socket",
+        "{socket}",
+        "--tx-id",
+        "{tx_id}",
+        "--artifact-receipt",
+        "{receipt}"
+      ],
+      "timeout_ns": 120000000000,
+      "help": {
+        "path": "NOT_RUN pending S8/P19",
+        "sha": "0000000000000000000000000000000000000000000000000000000000000000",
+        "bytes": 0,
+        "schema": "pending:S8/P19"
+      },
+      "raw_view_schema": "s8_view"
+    },
+    {
+      "id": "broker.query",
+      "role": "broker",
+      "action": "query",
+      "argv": [
+        "{binary}",
+        "broker",
+        "upgrade",
+        "status",
+        "--socket",
+        "{socket}",
+        "--tx-id",
+        "{tx_id}",
+        "--json"
+      ],
+      "timeout_ns": 120000000000,
+      "help": {
+        "path": "NOT_RUN pending S8/P19",
+        "sha": "0000000000000000000000000000000000000000000000000000000000000000",
+        "bytes": 0,
+        "schema": "pending:S8/P19"
+      },
+      "raw_view_schema": "s8_view"
+    },
+    {
+      "id": "broker.rollback",
+      "role": "broker",
+      "action": "rollback",
+      "argv": [
+        "{binary}",
+        "broker",
+        "upgrade",
+        "rollback",
+        "--socket",
+        "{socket}",
+        "--tx-id",
+        "{tx_id}"
+      ],
+      "timeout_ns": 120000000000,
+      "help": {
+        "path": "NOT_RUN pending S8/P19",
+        "sha": "0000000000000000000000000000000000000000000000000000000000000000",
+        "bytes": 0,
+        "schema": "pending:S8/P19"
+      },
+      "raw_view_schema": "s8_view"
+    },
+    {
+      "id": "broker.quorum.apply",
+      "role": "broker",
+      "action": "apply",
+      "argv": [
+        "{binary}",
+        "cluster",
+        "upgrade",
+        "--broker-only",
+        "--to-version",
+        "{version}",
+        "--expect-sha256",
+        "{binary_sha256}",
+        "--account-seed",
+        "{account_seed}",
+        "--backup-taken",
+        "--home",
+        "{home}",
+        "--nats-url",
+        "{nats_url}"
+      ],
+      "timeout_ns": 120000000000,
+      "help": {
+        "path": "NOT_RUN pending S8/P19",
+        "sha": "0000000000000000000000000000000000000000000000000000000000000000",
+        "bytes": 0,
+        "schema": "pending:S8/P19"
+      },
+      "raw_view_schema": "s8_view"
+    },
+    {
+      "id": "nats.single.apply",
+      "role": "nats",
+      "action": "apply",
+      "argv": [
+        "{binary}",
+        "admin",
+        "infra",
+        "upgrade",
+        "--component",
+        "nats",
+        "--to-version",
+        "{version}",
+        "--expect-sha256",
+        "{binary_sha256}",
+        "--socket",
+        "{socket}"
+      ],
+      "timeout_ns": 120000000000,
+      "help": {
+        "path": "NOT_RUN pending S9/P24",
+        "sha": "0000000000000000000000000000000000000000000000000000000000000000",
+        "bytes": 0,
+        "schema": "pending:S9/P24"
+      },
+      "raw_view_schema": "infracontract.Status"
+    },
+    {
+      "id": "nats.single.rollback",
+      "role": "nats",
+      "action": "rollback",
+      "argv": [
+        "{binary}",
+        "admin",
+        "infra",
+        "upgrade",
+        "--component",
+        "nats",
+        "--rollback",
+        "--socket",
+        "{socket}"
+      ],
+      "timeout_ns": 120000000000,
+      "help": {
+        "path": "NOT_RUN pending S9/P24",
+        "sha": "0000000000000000000000000000000000000000000000000000000000000000",
+        "bytes": 0,
+        "schema": "pending:S9/P24"
+      },
+      "raw_view_schema": "infracontract.Status"
+    },
+    {
+      "id": "nats.single.query",
+      "role": "nats",
+      "action": "query",
+      "argv": [
+        "{binary}",
+        "admin",
+        "infra",
+        "status",
+        "--tx",
+        "{tx_id}",
+        "--socket",
+        "{socket}"
+      ],
+      "timeout_ns": 120000000000,
+      "help": {
+        "path": "NOT_RUN pending S9/P24",
+        "sha": "0000000000000000000000000000000000000000000000000000000000000000",
+        "bytes": 0,
+        "schema": "pending:S9/P24"
+      },
+      "raw_view_schema": "infracontract.Status"
+    },
+    {
+      "id": "nats.quorum.apply",
+      "role": "nats",
+      "action": "apply",
+      "argv": [
+        "{binary}",
+        "cluster",
+        "upgrade",
+        "--component",
+        "nats",
+        "--to-version",
+        "{version}",
+        "--expect-sha256",
+        "{binary_sha256}",
+        "--account-seed",
+        "{account_seed}",
+        "--home",
+        "{home}",
+        "--nats-url",
+        "{nats_url}"
+      ],
+      "timeout_ns": 120000000000,
+      "help": {
+        "path": "NOT_RUN pending S9/P24",
+        "sha": "0000000000000000000000000000000000000000000000000000000000000000",
+        "bytes": 0,
+        "schema": "pending:S9/P24"
+      },
+      "raw_view_schema": "infracontract.Status"
+    },
+    {
+      "id": "nats.quorum.rollback",
+      "role": "nats",
+      "action": "rollback",
+      "argv": [
+        "{binary}",
+        "cluster",
+        "upgrade",
+        "--component",
+        "nats",
+        "--rollback",
+        "--account-seed",
+        "{account_seed}",
+        "--home",
+        "{home}",
+        "--nats-url",
+        "{nats_url}"
+      ],
+      "timeout_ns": 120000000000,
+      "help": {
+        "path": "NOT_RUN pending S9/P24",
+        "sha": "0000000000000000000000000000000000000000000000000000000000000000",
+        "bytes": 0,
+        "schema": "pending:S9/P24"
+      },
+      "raw_view_schema": "infracontract.Status"
+    },
+    {
+      "id": "nats.quorum.query",
+      "role": "nats",
+      "action": "query",
+      "argv": [
+        "{binary}",
+        "cluster",
+        "upgrade",
+        "--component",
+        "nats",
+        "--status",
+        "{tx_id}",
+        "--account-seed",
+        "{account_seed}",
+        "--home",
+        "{home}",
+        "--nats-url",
+        "{nats_url}"
+      ],
+      "timeout_ns": 120000000000,
+      "help": {
+        "path": "NOT_RUN pending S9/P24",
+        "sha": "0000000000000000000000000000000000000000000000000000000000000000",
+        "bytes": 0,
+        "schema": "pending:S9/P24"
+      },
+      "raw_view_schema": "infracontract.Status"
+    },
+    {
+      "id": "caddy.single.apply",
+      "role": "caddy",
+      "action": "apply",
+      "argv": [
+        "{binary}",
+        "admin",
+        "infra",
+        "upgrade",
+        "--component",
+        "caddy",
+        "--to-version",
+        "{version}",
+        "--expect-sha256",
+        "{binary_sha256}",
+        "--socket",
+        "{socket}"
+      ],
+      "timeout_ns": 120000000000,
+      "help": {
+        "path": "NOT_RUN pending S9/P24",
+        "sha": "0000000000000000000000000000000000000000000000000000000000000000",
+        "bytes": 0,
+        "schema": "pending:S9/P24"
+      },
+      "raw_view_schema": "infracontract.Status"
+    },
+    {
+      "id": "caddy.single.rollback",
+      "role": "caddy",
+      "action": "rollback",
+      "argv": [
+        "{binary}",
+        "admin",
+        "infra",
+        "upgrade",
+        "--component",
+        "caddy",
+        "--rollback",
+        "--socket",
+        "{socket}"
+      ],
+      "timeout_ns": 120000000000,
+      "help": {
+        "path": "NOT_RUN pending S9/P24",
+        "sha": "0000000000000000000000000000000000000000000000000000000000000000",
+        "bytes": 0,
+        "schema": "pending:S9/P24"
+      },
+      "raw_view_schema": "infracontract.Status"
+    },
+    {
+      "id": "caddy.single.query",
+      "role": "caddy",
+      "action": "query",
+      "argv": [
+        "{binary}",
+        "admin",
+        "infra",
+        "status",
+        "--tx",
+        "{tx_id}",
+        "--socket",
+        "{socket}"
+      ],
+      "timeout_ns": 120000000000,
+      "help": {
+        "path": "NOT_RUN pending S9/P24",
+        "sha": "0000000000000000000000000000000000000000000000000000000000000000",
+        "bytes": 0,
+        "schema": "pending:S9/P24"
+      },
+      "raw_view_schema": "infracontract.Status"
+    },
+    {
+      "id": "caddy.quorum.apply",
+      "role": "caddy",
+      "action": "apply",
+      "argv": [
+        "{binary}",
+        "cluster",
+        "upgrade",
+        "--component",
+        "caddy",
+        "--to-version",
+        "{version}",
+        "--expect-sha256",
+        "{binary_sha256}",
+        "--account-seed",
+        "{account_seed}",
+        "--home",
+        "{home}",
+        "--nats-url",
+        "{nats_url}"
+      ],
+      "timeout_ns": 120000000000,
+      "help": {
+        "path": "NOT_RUN pending S9/P24",
+        "sha": "0000000000000000000000000000000000000000000000000000000000000000",
+        "bytes": 0,
+        "schema": "pending:S9/P24"
+      },
+      "raw_view_schema": "infracontract.Status"
+    },
+    {
+      "id": "caddy.quorum.rollback",
+      "role": "caddy",
+      "action": "rollback",
+      "argv": [
+        "{binary}",
+        "cluster",
+        "upgrade",
+        "--component",
+        "caddy",
+        "--rollback",
+        "--account-seed",
+        "{account_seed}",
+        "--home",
+        "{home}",
+        "--nats-url",
+        "{nats_url}"
+      ],
+      "timeout_ns": 120000000000,
+      "help": {
+        "path": "NOT_RUN pending S9/P24",
+        "sha": "0000000000000000000000000000000000000000000000000000000000000000",
+        "bytes": 0,
+        "schema": "pending:S9/P24"
+      },
+      "raw_view_schema": "infracontract.Status"
+    },
+    {
+      "id": "caddy.quorum.query",
+      "role": "caddy",
+      "action": "query",
+      "argv": [
+        "{binary}",
+        "cluster",
+        "upgrade",
+        "--component",
+        "caddy",
+        "--status",
+        "{tx_id}",
+        "--account-seed",
+        "{account_seed}",
+        "--home",
+        "{home}",
+        "--nats-url",
+        "{nats_url}"
+      ],
+      "timeout_ns": 120000000000,
+      "help": {
+        "path": "NOT_RUN pending S9/P24",
+        "sha": "0000000000000000000000000000000000000000000000000000000000000000",
+        "bytes": 0,
+        "schema": "pending:S9/P24"
+      },
+      "raw_view_schema": "infracontract.Status"
+    }
+  ]
+}

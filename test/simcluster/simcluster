@@ -56,13 +56,25 @@ role_of() { d inspect -f '{{index .Config.Labels "sim.role"}}' "$(ctr_name "$1")
 
 cmd_build() {
     [ -x "$HERE/vendor/tether" ] || die "vendor/ not staged — run remote.sh --build (it rsyncs binaries)"
-    log "building image $IMAGE from $HERE"
-    run d build -t "$IMAGE" "$HERE"
+    # Verify the commit receipt before Docker can consume a partially published pair.
+    # The image repeats this check against its COPY results; serialize vendor staging/build.
+    python3 "$HERE/lib/caddy-artifact.py" verify "$HERE/vendor/caddy" \
+        "$HERE/vendor/caddy-source.json" "$HERE/vendor/install.sh" || die "invalid staged Caddy artifact"
+    _caddy_want=$(python3 "$HERE/lib/caddy-artifact.py" pin "$HERE/vendor/install.sh")
+    # origin: hot-update S9 plan §9.4 / T55/T56. Missing archives/support
+    # under skip-download fail before Docker; each COPY target is verified again.
+    python3 "$HERE/lib/infra-artifact.py" verify "$HERE/vendor" "$HERE/vendor/install.sh" || die "invalid staged infra supply"
+    python3 "$HERE/lib/infra-image-manifest.py" create "$HERE" "$HERE/vendor/infra-image-inputs.json" || die "incomplete image COPY inputs"
+    log "building image $IMAGE from $HERE (linux/amd64)"
+    run d build --platform linux/amd64 --build-arg "TETHER_CADDY_VERSION=$_caddy_want" -t "$IMAGE" "$HERE"
     # M10: verify the baked nats-server against install.sh's SSOT (rsync'd into vendor/), not a literal.
     _want="$(grep -oE 'NATS_SERVER_VERSION[^0-9]*[0-9]+\.[0-9]+\.[0-9]+' "$HERE/vendor/install.sh" 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
     _got="$(d run --rm "$IMAGE" /usr/local/bin/nats-server --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
     log "baked nats-server: ${_got:-unknown} (want ${_want:-?} == install.sh pin)"
     { [ -n "$_want" ] && [ "$_got" = "$_want" ]; } || die "nats-server pin mismatch: baked ${_got:-?} != install.sh ${_want:-?}"
+    _caddy_got=$(d run --rm "$IMAGE" /usr/local/bin/caddy version | awk '{print $1}')
+    [ "$_caddy_got" = "v$_caddy_want" ] || die "Caddy pin mismatch: baked $_caddy_got != v$_caddy_want"
+    check_image_or_die
     ok "image $IMAGE built"
 }
 
@@ -680,14 +692,26 @@ cmd_nuke() {
 }
 
 # drill <name> : run drills/<name>.sh on an isolated throwaway --instance; print RED/GREEN.
-# check_image_or_die: the baked image binary must match the staged vendor binary, else every drill runs
-# against a stale product and produces invalid evidence. Factored out of cmd_drill so run-drills.sh can
-# run it ONCE per sweep (V6) via the `check-image` subcommand.
+# check_image_or_die: every actual COPY input and final target must match, else
+# the drill's product/installer/catalog/support identity is stale. The image
+# computes its report from real files; the host reverse-scans today's Dockerfile.
+# run-drills.sh keeps its once-per-sweep early check; each drill also checks.
+# origin: hot-update S9 plan §9.4 / T56 / M28
 check_image_or_die() {
-    _vendor_sha=$(sha256sum "$HERE/vendor/tether" 2>/dev/null | awk '{print $1}')
-    _image_sha=$(d run --rm --entrypoint sha256sum "$IMAGE" /usr/local/bin/tether 2>/dev/null | awk '{print $1}')
-    [ -n "$_vendor_sha" ] && [ "$_image_sha" = "$_vendor_sha" ] || \
-        die "drill: stale image binary (image=${_image_sha:-missing}, vendor=${_vendor_sha:-missing}); run ./remote.sh --build build before testing code changes"
+    python3 "$HERE/lib/infra-artifact.py" verify "$HERE/vendor" "$HERE/vendor/install.sh" || die "drill: invalid infra supply; restage before testing"
+    # A private temporary report gives the Docker failure its own checked rc;
+    # a pipeline would let a successful consumer hide a failed image producer.
+    _image_report=$(mktemp) || die "drill: cannot allocate image report"
+    if ! d run --rm --entrypoint python3 "$IMAGE" /opt/sim/infra-image-manifest.py \
+        report /opt/sim/infra-image-inputs.json >"$_image_report"; then
+        rm -f "$_image_report"
+        die "drill: incomplete or stale image targets; rebuild before testing"
+    fi
+    if ! python3 "$HERE/lib/infra-image-manifest.py" check "$HERE" "$_image_report"; then
+        rm -f "$_image_report"
+        die "drill: stale image COPY inputs; restage and rebuild before testing"
+    fi
+    rm -f "$_image_report"
 }
 
 cmd_drill() {
@@ -855,7 +879,7 @@ case "$verb" in
     logs)          cmd_logs "$@";;
     nats-conf)     cmd_natsconf "$@";;
     drill)         cmd_drill "$@";;
-    check-image)   check_image_or_die; ok "image binary matches staged vendor/tether";;
+    check-image)   check_image_or_die; ok "all image COPY inputs and targets match staged supply";;
     down)          cmd_down "$@";;
     nuke)          cmd_nuke "$@";;
     doctor)        cmd_doctor "$@";;

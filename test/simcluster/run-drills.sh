@@ -30,7 +30,7 @@
 #   ./run-drills.sh -j 3                      # cap at 3 concurrent drills (smaller host)
 #   ./run-drills.sh --stagger 15             # 15s between launches (default 0 — not needed post-fix)
 #   ./run-drills.sh --no-retry               # do not auto-re-run infra flakes (raw parallel result)
-#   ./run-drills.sh --drill-timeout 900      # bound EACH drill at 900s (default 2700 = 45min)
+#   ./run-drills.sh --drill-timeout 900      # lower unit ceilings (legacy hard cap 2700s)
 #   ./run-drills.sh --skip-preflight         # do not check/raise the per-uid kernel counters
 #   ./run-drills.sh --no-lpt                 # launch in NAME order, not longest-first (forensics)
 #   ./run-drills.sh --no-attribute           # skip the post-report solo re-run of deviating drills
@@ -114,6 +114,7 @@ ALLOW_INCOMPLETE=0                  # fail closed unless an owner explicitly sup
 DRILL_TIMEOUT=2700                  # per-drill wall-clock ceiling, seconds. 45min is ~2x the slowest
                                     # observed drill (96/97 run 22/16min), so a trip means "wedged",
                                     # never "slow host". A tripped drill is INFRA-ABORT and NOT retried.
+DRILL_TIMEOUT_EXPLICIT=0            # 99 uses its exact manifest cap unless explicitly lowered
 # simcluster-speed E: the GROW LANE. Units whose content grows a cluster (lib/manifest.sh manifest_lane —
 # grow_to_3 / grow_to_2 / setup_forcesingle_n2 / `$SIM grow`) are throttled to GROW_CAP concurrent
 # grows, because ≥5 clusters forming at once starve raft VOTER promotion (README CAVEAT; gotcha #70)
@@ -163,8 +164,8 @@ while [ $# -gt 0 ]; do
         --no-attribute)     ATTRIBUTE=0; shift ;;
         --attr-budget)      ATTR_BUDGET="${2:?}"; shift 2 ;;
         --skip-preflight)   PREFLIGHT=0; shift ;;
-        --drill-timeout)    DRILL_TIMEOUT="${2:?}"; shift 2 ;;
-        --drill-timeout=*)  DRILL_TIMEOUT="${1#--drill-timeout=}"; shift ;;
+        --drill-timeout)    DRILL_TIMEOUT="${2:?}"; DRILL_TIMEOUT_EXPLICIT=1; shift 2 ;;
+        --drill-timeout=*)  DRILL_TIMEOUT="${1#--drill-timeout=}"; DRILL_TIMEOUT_EXPLICIT=1; shift ;;
         --allow-product-red) ALLOW_PRODUCT_RED=1; shift ;;
         --allow-incomplete)  ALLOW_INCOMPLETE=1; shift ;;
         --grow-cap)         GROW_CAP="${2:?}"; REGIME_EXPLICIT=1; shift 2 ;;
@@ -210,6 +211,10 @@ fi
 # unbounded hang this option exists to prevent. There is no supported way to disable the ceiling.
 case "$DRILL_TIMEOUT" in ''|*[!0-9]*) echo "run-drills: --drill-timeout must be a positive integer (seconds)" >&2; exit 2 ;; esac
 [ "$DRILL_TIMEOUT" -gt 0 ] || { echo "run-drills: --drill-timeout must be > 0 (0 would mean 'no limit')" >&2; exit 2 ; }
+# Only the exact 99 map can raise a ceiling. A global flag must never extend
+# existing units, including an unfiltered default/live-grow catalog sweep.
+# origin: hot-update S10 plan §9.1 / P32
+[ "$DRILL_TIMEOUT" -le 2700 ] || { echo "run-drills: --drill-timeout cannot exceed the legacy hard cap of 2700s" >&2; exit 2; }
 # MI3 + external review Medium 7/re-review Medium 5: the startup cleanup does `rm -f "$LOGDIR"/*.log …`
 # and `rm -rf "$LOGDIR"/evidence`. An empty logdir made that `rm -f /*.log`; a literal `/`, the repo root,
 # or $HOME deletes real files there. Worse, an ALIAS like `victim/new/..` slips past a cd-based canonicalize
@@ -253,6 +258,18 @@ fi
 # runner without lib/).
 . "$HERE/lib/manifest.sh" || { echo "run-drills: cannot source $HERE/lib/manifest.sh (the runner needs lib/ beside it)" >&2; exit 3; }
 declare -A UNIT_DRILL UNIT_ARM UNIT_LANE UNIT_WORST UNIT_GROWS
+declare -A UNIT_CEILING UNIT_MINIMUM
+# Validate the full union even when only one arm was selected; omissions in a
+# sibling arm must not hide behind a filter. P19 supplies this functional map.
+# origin: hot-update S10 plan §9.1–§9.2 / P32
+if [ -f "$HERE/drills/99-hot-update-fullstack.sh" ]; then
+    _fs_ceilings=$(manifest_fullstack_ceilings "$HERE/drills/lib/fullstack_manifest.json" \
+        "$HERE/drills/99-hot-update-fullstack.sh") || exit 2
+    while IFS=$'\t' read -r _fs_unit _fs_worst _fs_cap _fs_min; do
+        UNIT_CEILING["$_fs_unit"]="$_fs_cap"
+        UNIT_MINIMUM["$_fs_unit"]="$_fs_min"
+    done <<<"$_fs_ceilings"
+fi
 UNITS=()
 for d in "${DRILLS[@]}"; do
     base="${d%%.*}"; arm=""; [ "$base" != "$d" ] && arm="${d#*.}"
@@ -290,6 +307,21 @@ for d in "${DRILLS[@]}"; do
         fi
         UNITS+=("$u")
     done
+done
+# First-run acceptance cannot be replaced by an automatic retry or a solo
+# attribution run. Diagnostic runs belong in another directory (§9.1).
+# origin: hot-update S10 plan §9.1 / P32
+for u in "${UNITS[@]}"; do
+    case "${UNIT_DRILL[$u]}" in
+        99-hot-update-fullstack|100-hot-update-fullstack-controls)
+            if [ "$REPLAY" = 0 ] && { [ "$RETRY" != 0 ] || [ "$ATTRIBUTE" != 0 ]; }; then
+                echo "run-drills: fullstack acceptance requires --no-retry --no-attribute" >&2; exit 2
+            fi ;;
+    esac
+    if [ -n "${UNIT_CEILING[$u]:-}" ] && [ "$DRILL_TIMEOUT_EXPLICIT" = 1 ] &&
+       [ "$DRILL_TIMEOUT" -lt "${UNIT_MINIMUM[$u]}" ]; then
+        echo "run-drills: explicit ceiling is below the fullstack unit's actual transfer minimum" >&2; exit 2
+    fi
 done
 # LEGACY-UNIT (plan §5.5; round-2 R3-F11): a --replay of an archive that PREDATES a drill's arm split
 # holds `<drill>.log`, not `<drill>.<arm>.log`. Deriving the units from today's drills tree would look for
@@ -531,6 +563,13 @@ run_one() {
     # direction only — the hermetic fixture drills have no manifest and must keep working unchanged).
     drill="${UNIT_DRILL[$unit]:-$unit}"; arm="${UNIT_ARM[$unit]:-}"
     tmo="$DRILL_TIMEOUT"
+    # The long cap belongs to this exact unit, not to the whole suite. An
+    # explicit flag can lower it, never widen it or bypass its minimum.
+    # origin: hot-update S10 plan §9.1 / P32
+    if [ -n "${UNIT_CEILING[$unit]:-}" ]; then
+        tmo="${UNIT_CEILING[$unit]}"
+        if [ "$DRILL_TIMEOUT_EXPLICIT" = 1 ] && [ "$DRILL_TIMEOUT" -lt "$tmo" ]; then tmo="$DRILL_TIMEOUT"; fi
+    fi
     if [ -n "${UNIT_WORST[$unit]:-}" ] && [ "$(( 2 * UNIT_WORST[$unit] ))" -lt "$tmo" ]; then tmo=$(( 2 * UNIT_WORST[$unit] )); fi
     printf '%s\n' "$tmo" >"$LOGDIR/$out.tmo"
     # M1: the drill's flight recorder writes here. Exported (not passed) because it must reach
@@ -555,6 +594,14 @@ run_one() {
       _run_pg=$!
       printf '%s\n' "$_run_pg" >"$LOGDIR/$out.runpid"
       wait "$_run_pg"; _run_rc=$?
+      # timeout may return 124 as soon as its leader exits on TERM, leaving a
+      # TERM-ignoring child in the same supervised group. Retire that group
+      # before forgetting its identity. Escaped descendants require P05's
+      # shared subreaper adapter, whose final CLI binding is pending.
+      # origin: hot-update S10 plan §9.1 / P32
+      if [ "$_run_rc" = 124 ] || [ "$_run_rc" = 137 ]; then
+          kill -KILL -- "-$_run_pg" 2>/dev/null || true
+      fi
       rm -f "$LOGDIR/$out.runpid"
       echo "$_run_rc" >"$LOGDIR/$out.rc" )
     rc=$(cat "$LOGDIR/$out.rc" 2>/dev/null || echo '?')
@@ -701,9 +748,42 @@ _fail_context() {
         | grep -E '^\[(simcluster|warn)'
 }
 
+# An ASSERT-FAIL counter can outrank SETUP-RED even when no mutant was killed.
+# Recheck the archived source/build/runtime chain in this exact invocation's
+# directory before calling a transfer control "as expected".
+# origin: hot-update S6 plan §10.1 / T58; DRILL-ASSETS / drill 64 honest control verdicts.
+transfer_control_receipt_matches() {
+    local d="$1" arm="${1#64-hot-update-transfer-controls.}" directory
+    [ "$arm" != "$d" ] || return 1
+    directory=$(sed -n 's/^TRANSFER-EVIDENCE directory=//p' "$LOGDIR/$d.log")
+    [ -n "$directory" ] || return 1
+    python3 -I -B - "$HERE" "$LOGDIR/evidence" "$directory" "$arm" <<'PYCONTROL'
+import pathlib, sys
+sys.path.insert(0, str(pathlib.Path(sys.argv[1]) / 'drills/lib'))
+from transfer_mutations import check_kill, load
+try:
+    root = pathlib.Path(sys.argv[3]).resolve()
+    if not root.is_relative_to(pathlib.Path(sys.argv[2]).resolve()):
+        raise ValueError('foreign receipt directory')
+    receipt = load(root / 'control-receipt.json')
+    if receipt != check_kill(root, sys.argv[4], 1):
+        raise ValueError('control receipt changed')
+except (OSError, ValueError, KeyError, TypeError):
+    sys.exit(1)
+PYCONTROL
+}
+
 classify_match() {
     local d="$1" v="$2" ncg="$3" ffsig="$4" exp expncg bands b bv bid bsig re
     exp=$(_exp_field "$d" 2); [ -n "$exp" ] || { printf 'NO-EXPECTATION'; return; }
+    case "$d" in 64-hot-update-transfer-controls|64-hot-update-transfer-controls.*)
+        local setup
+        setup=$(sed -n 's/^DRILL-VERDICT .* setup_red=\([0-9]*\) .*/\1/p' "$LOGDIR/$d.log")
+        if [ "$setup" != 0 ] || ! transfer_control_receipt_matches "$d"; then
+            printf 'DEVIATION'; return
+        fi
+        ;;
+    esac
     expncg=$(_exp_field "$d" 3)
     if [ "$v" = "$exp" ]; then
         # An expectation pins the coverage debt too: a drill that lands INCOMPLETE with a DIFFERENT
@@ -807,7 +887,13 @@ if [ "$REPLAY" = 0 ]; then
     # pipe (a `out=$(run-drills …)` caller would otherwise block until the sampler died — this hung the
     # hermetic verdict-contract-test's synthetic sweeps).
     _runner_pid=$$
-    ( while :; do
+    ( _telemetry_stop=0; _telemetry_sleep=""
+      # Let a current probe finish so it closes/unlinks its canary, then join
+      # the timer child. Killing the sampler shell alone orphaned sleep(60)
+      # and allowed probe writes after the supposedly completed receipt.
+      # origin: hot-update S10 plan §10.2 P32 / subprocess supervision selftest
+      trap '_telemetry_stop=1; if [ -n "$_telemetry_sleep" ]; then kill "$_telemetry_sleep" 2>/dev/null; wait "$_telemetry_sleep" 2>/dev/null; fi' TERM HUP INT
+      while [ "$_telemetry_stop" = 0 ]; do
         # SELF-TERMINATE if the runner is gone, so a lost trap (e.g. an ssh SIGHUP the parent did not
         # forward) can never leak an immortal 60s loop on a shared sim host.
         kill -0 "$_runner_pid" 2>/dev/null || exit 0
@@ -824,7 +910,11 @@ if [ "$REPLAY" = 0 ]; then
         _rd=$(( _lc - _dc )); [ "$_rd" -lt 0 ] && _rd=0
         _cc=$(docker ps -q 2>/dev/null | wc -l); _fp=$(fsync_probe_pctl 40 | awk '{print $1}')
         printf '%s\t%s\t%s\t%s\t%s\n' "$_ts" "${_la:-?}" "$_rd" "${_fp:--}" "$_cc" >>"$HOST_TELEMETRY_TSV" 2>/dev/null || true
-        sleep 60
+        [ "$_telemetry_stop" = 0 ] || break
+        sleep 60 & _telemetry_sleep=$!
+        [ "$_telemetry_stop" = 0 ] || kill "$_telemetry_sleep" 2>/dev/null
+        wait "$_telemetry_sleep" 2>/dev/null
+        _telemetry_sleep=""
       done ) </dev/null >/dev/null 2>&1 &
     TELEMETRY_PID=$!
     # Ensure the sampler dies with the sweep however it exits (HUP included — an ssh drop is a SIGHUP).

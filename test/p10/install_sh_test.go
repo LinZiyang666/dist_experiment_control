@@ -12,6 +12,9 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/LinZiyang666/tether/internal/testharness"
+	"github.com/LinZiyang666/tether/test/hotupdate/testsupervisor"
 )
 
 // scriptPath returns the absolute path to scripts/install.sh in
@@ -50,9 +53,9 @@ func skipIfAgentOrBrokerUnsupported(t *testing.T) {
 // inspection; non-zero exit returns t.Fatal.
 func runInstall(t *testing.T, home string, extra ...string) string {
 	t.Helper()
-	cmd := exec.Command("bash", append([]string{scriptPath(t)}, extra...)...)
+	cmd := exec.CommandContext(t.Context(), "bash", append([]string{scriptPath(t)}, extra...)...)
 	cmd.Env = append(os.Environ(), "HOME="+home)
-	out, err := cmd.CombinedOutput()
+	out, err := testsupervisor.CombinedOutput(cmd)
 	if err != nil {
 		t.Fatalf("install.sh failed: %v\n%s", err, string(out))
 	}
@@ -63,9 +66,9 @@ func runInstall(t *testing.T, home string, extra ...string) string {
 // non-zero is expected.
 func runInstallExpectFail(t *testing.T, home string, extra ...string) string {
 	t.Helper()
-	cmd := exec.Command("bash", append([]string{scriptPath(t)}, extra...)...)
+	cmd := exec.CommandContext(t.Context(), "bash", append([]string{scriptPath(t)}, extra...)...)
 	cmd.Env = append(os.Environ(), "HOME="+home)
-	out, err := cmd.CombinedOutput()
+	out, err := testsupervisor.CombinedOutput(cmd)
 	if err == nil {
 		t.Fatalf("install.sh unexpectedly succeeded\n%s", string(out))
 	}
@@ -336,7 +339,7 @@ func TestInstallShJournaldDropin(t *testing.T) {
 	brokerDry := func(t *testing.T, jroot string) string {
 		t.Helper()
 		home := t.TempDir()
-		cmd := exec.Command("bash", scriptPath(t),
+		cmd := exec.CommandContext(t.Context(), "bash", scriptPath(t),
 			"--role", "broker",
 			"--domain", "tether.example.com",
 			"--acme-email", "admin@example.com",
@@ -344,7 +347,7 @@ func TestInstallShJournaldDropin(t *testing.T) {
 			"--skip-download",
 		)
 		cmd.Env = append(os.Environ(), "HOME="+home, "TETHER_JOURNALD_ROOT="+jroot)
-		out, err := cmd.CombinedOutput()
+		out, err := testsupervisor.CombinedOutput(cmd)
 		if err != nil {
 			t.Fatalf("install.sh failed: %v\n%s", err, out)
 		}
@@ -547,11 +550,11 @@ func TestInstallShJournaldStaleDropinRemoved(t *testing.T) {
 		t.Fatal(err)
 	}
 	home := t.TempDir()
-	cmd := exec.Command("bash", scriptPath(t),
+	cmd := exec.CommandContext(t.Context(), "bash", scriptPath(t),
 		"--role", "broker", "--domain", "brkx", "--acme-email", "x@x.test",
 		"--dry-run", "--skip-download")
 	cmd.Env = append(os.Environ(), "HOME="+home, "TETHER_JOURNALD_ROOT="+jroot)
-	out, err := cmd.CombinedOutput()
+	out, err := testsupervisor.CombinedOutput(cmd)
 	if err != nil {
 		t.Fatalf("install.sh failed: %v\n%s", err, out)
 	}
@@ -583,9 +586,11 @@ func TestInstallShJournaldForeignDropinSurvivesUninstall(t *testing.T) {
 		t.Fatal(err)
 	}
 	home := t.TempDir()
-	cmd := exec.Command("bash", scriptPath(t), "--role", "broker", "--uninstall")
-	cmd.Env = append(os.Environ(), "HOME="+home, "TETHER_JOURNALD_ROOT="+jroot)
-	out, err := cmd.CombinedOutput()
+	cmd := exec.CommandContext(t.Context(), "bash", scriptPath(t), "--role", "broker", "--uninstall")
+	// origin: hot-update S8 plan §5.2 / P20 — uninstall coverage must redirect
+	// system paths as well as journald; it must never target the live host.
+	cmd.Env = append(os.Environ(), "HOME="+home, "TETHER_JOURNALD_ROOT="+jroot, "TETHER_INSTALL_ROOT="+t.TempDir())
+	out, err := testsupervisor.CombinedOutput(cmd)
 	if err != nil {
 		t.Fatalf("uninstall failed: %v\n%s", err, out)
 	}
@@ -612,8 +617,10 @@ func TestInstallShUnknownRoleRejected(t *testing.T) {
 // tether process behind by counting children before/after. Even
 // without --dry-run, install.sh MUST not invoke `tether` itself
 // (architecture K.0 §2 + K.5 强制语义).
+// origin: hot-update S8 plan §5.2 / §11.2 P20 — publication is an explicit command.
 func TestInstallShDoesNotForkTether(t *testing.T) {
 	skipIfAgentOrBrokerUnsupported(t)
+	beforeG, beforeFD := runtime.NumGoroutine(), testharness.FDCount()
 	home := t.TempDir()
 	// Create a fake tether binary so install.sh's `tether version`
 	// path (if any future regression added one) would actually do
@@ -638,4 +645,9 @@ func TestInstallShDoesNotForkTether(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(home, "marker")); err == nil {
 		t.Errorf("install.sh invoked the tether binary; K.0 §2 forbids this")
 	}
+	for round := 0; round < 5; round++ {
+		exerciseRetrofitNeverStarts(t)
+	}
+	testharness.AssertNoGoroutineLeak(t, "installer shell supervision", beforeG)
+	testharness.AssertNoFDLeak(t, "installer shell supervision", beforeFD, 0)
 }

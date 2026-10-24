@@ -1,0 +1,24 @@
+# origin: hot-update S9 plan §9.3 / P36 / T87
+# Declared claims only; native evidence and measured marginal costs remain unset.
+candidate_sha	arm	claim	status	blocked_by	legacy_owner	marginal_seconds	reader_digest	receipt
+-	85-hot-update-nats	native-parent-join	NOT_RUN	P26,P32,P33,P36,P39	-	-	-	-
+-	85-hot-update-nats.A	single-original-cohort-current-store	NOT_RUN	P26,P32,P33,P36,P39	-	-	-	-
+-	85-hot-update-nats.A1	sole-voter-original-cohort-current-store	NOT_RUN	P26,P32,P33,P36,P39	-	-	-	-
+-	85-hot-update-nats.B	n3-original-cohort-nine-hop-cycle	NOT_RUN	P26,P32,P33,P36,P39	-	-	-	-
+-	85-hot-update-nats.D	n2-refusal-and-fresh-repair	NOT_RUN	P26,P32,P33,P36,P39	-	-	-	-
+-	85-hot-update-nats.Q	quorum-refusal-and-fresh-repair	NOT_RUN	P26,P32,P33,P36,P39	-	-	-	-
+-	85-hot-update-nats.L	lag-refusal-and-fresh-repair	NOT_RUN	P26,P32,P33,P36,P39	-	-	-	-
+-	85-hot-update-nats.S	store-double-open-refusal	NOT_RUN	P26,P32,P33,P36,P39	-	-	-	-
+-	85-hot-update-nats.J	exact-release-temporary-broker-join	NOT_RUN	P26,P32,P33,P36,P39	-	-	-	-
+-	85-hot-update-nats.F	post-ldm-halt-and-recover	NOT_RUN	P26,P32,P33,P36,P39	-	-	-	-
+-	86-hot-update-caddy	native-parent-join	NOT_RUN	P26,P32,P33,P36,P39	-	-	-	-
+-	86-hot-update-caddy.R	reload-original-business	NOT_RUN	P26,P32,P33,P36,P39	-	-	-	-
+-	86-hot-update-caddy.B	n3-adjacent-binary-cycle	NOT_RUN	P26,P32,P33,P36,P39	-	-	-	-
+-	86-hot-update-caddy.I	root-retrofit-current-acme	NOT_RUN	P26,P32,P33,P36,P39	-	-	-	-
+-	86-hot-update-caddy.H	healthy-n2-caddy-cycle	NOT_RUN	P26,P32,P33,P36,P39	-	-	-	-
+-	86-hot-update-caddy.C	bad-config-cert-before-effect	NOT_RUN	P26,P32,P33,P36,P39	-	-	-	-
+-	86-hot-update-caddy.K	privilege-late-upgrade-closure	NOT_RUN	P26,P32,P33,P36,P39	-	-	-	-
+-	86-hot-update-caddy.F	shadow-survives-controller-failure-recover	NOT_RUN	P26,P32,P33,P36,P39	-	-	-	-
+-	86-hot-update-caddy.U	support-warm-adjacent-cycle	NOT_RUN	P26,P32,P33,P36,P39	-	-	-	-
+-	39-hot-update-legacy-n1.NI	legacy-nats-capability-safe-refusal	NOT_RUN	P26,P32,P33,P36,P39	-	-	-	-
+-	39-hot-update-legacy-n1.CI	legacy-caddy-capability-safe-refusal	NOT_RUN	P26,P32,P33,P36,P39	-	-	-	-

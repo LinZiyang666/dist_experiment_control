@@ -10,15 +10,23 @@
 #        current broker's client port (silent DROP, the partition instrument), and assert the agent's
 #        heartbeat resumes via ANOTHER voter within the WRITTEN budget, classifying the recovery path.
 #   NOT: a pre-fix reproduction of #72 itself. The live incident rode a WSS half-dead handshake;
-#        simcluster fronts no wss:// listener today, so the ws write-path black-hole is NOT
-#        constructable here — that arm is the [GAP #72] below and the ledger's flip condition.
+#        this drill supplies no WSS fault fixture, so the ws write-path black-hole is NOT
+#        exercised here — that arm is the [GAP #72] below and the ledger's flip condition.
 #
 # RECOVERY-PATH CLASSIFICATION (MainPID three-way, per the #72 ledger's flip requirements): the assert
 # names WHICH allowed path recovered — same-PID in-process rebuild (the designed path), same-PID
 # self-exec (the escalate ladder's rebuild arm), or a supervisor restart (PID changed; allowed only
 # with systemd — its appearance under the designed budget is recorded, not banded away).
+# origin: hot-update S9 plan §9.4 / T81. Keep the native INCOMPLETE/#72 gap:
+# planned S9 raw-wedge movement does not exercise this unplanned WSS fault or
+# its longer recovery ladder. A supplied Caddy binary alone does not close it.
 set -u
 . "$HERE/lib/log.sh"; . "$HERE/lib/docker.sh"; . "$HERE/lib/tether.sh"; . "$HERE/lib/assert.sh"
+# origin: hot-update S9 plan §9.5 / L22. Supervise the complete drill shell.
+INFRA_LIBRARY_ONLY=1
+. "$HERE/drills/85-hot-update-nats.sh"
+unset INFRA_LIBRARY_ONLY
+infra_drill_supervise "$@"
 . "$HERE/lib/secrets.sh"
 . "$HERE/drills/lib/agentyaml.sh"; . "$HERE/drills/lib/ident.sh"
 . "$HERE/drills/lib/fault.sh"
@@ -308,6 +316,6 @@ assert_ok "steady state: agt1 stays ONLINE after heal (no flap loop)" \
           poll_until 60 5 "agt1 ONLINE post-heal" -- _online agt1
 
 not_covered "[GAP #72] the WSS write-path black-hole arm (the live incident's actual shape: half-dead wss:// handshake under nats.go's nc.mu)" \
-    "simcluster fronts no wss:// listener (no websocket block, no ws certs in the image) — the ws handshake write-path black-hole is NOT constructable on this stack today. This drill regresses the BOUNDED-TEARDOWN contract over nats:// only. Flip: give simcluster a wss:// front (listener + certs, an independent increment), add the ws black-hole arm, run it multiple rounds GREEN — the #72 ledger names this as the close condition." gap
+    "This drill does not supply a WSS half-dead handshake/write fault with same-defect negative controls; S9 Caddy supply and planned raw-wedge receipts do not cover that shape. This drill regresses the BOUNDED-TEARDOWN contract over nats:// only. Flip: give simcluster a wss:// front (listener + certs, an independent increment), add the ws black-hole arm, run it multiple rounds GREEN — the #72 ledger names this as the close condition." gap
 
 drill_end

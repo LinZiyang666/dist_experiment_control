@@ -23,7 +23,7 @@ func TestExposeRmRejectsNonCreatorMember(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer startBroker(t, url, db)()
-	defer startAgent(t, url, "lab", "lab-1", t.TempDir(), &recordingAdapter{})()
+	defer startAgent(t, db, url, "lab", "lab-1", t.TempDir(), &recordingAdapter{})()
 
 	nc, err := nats.Connect(url)
 	if err != nil {
@@ -64,7 +64,7 @@ func TestExposeResponseDoesNotLeakTunnelTokenToCtl(t *testing.T) {
 	seed(t, db, "lab", fp)
 	adapter := &recordingAdapter{}
 	defer startBroker(t, url, db)()
-	defer startAgent(t, url, "lab", "lab-1", t.TempDir(), adapter)()
+	defer startAgent(t, db, url, "lab", "lab-1", t.TempDir(), adapter)()
 
 	nc, err := nats.Connect(url)
 	if err != nil {

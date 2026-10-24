@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -90,15 +91,22 @@ func startAgent(t *testing.T, url, sid, nid string) func() {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- a.Run(ctx) }()
-	time.Sleep(300 * time.Millisecond)
-	return func() {
+	stop := sync.OnceFunc(func() {
 		cancel()
 		select {
 		case <-done:
 		case <-time.After(2 * time.Second):
 			t.Fatal("agent did not exit")
 		}
+	})
+	t.Cleanup(stop)
+	nc, err := nats.Connect(url)
+	if err != nil {
+		t.Fatal(err)
 	}
+	defer nc.Close()
+	stackharness.WaitAgentCommands(t, nc, sid, nid)
+	return stop
 }
 
 func runExec(t *testing.T, nc *nats.Conn, sid, actor, nid string, argv []string) {
@@ -134,6 +142,7 @@ func runExec(t *testing.T, nc *nats.Conn, sid, actor, nid string, argv []string)
 // in time order. We verify by reading the history-<sid> stream
 // directly via JetStream consumer (the same path tether history
 // uses).
+// origin: S7 internal review MAKETEST-TRANSFER F5
 func TestAuditEntriesLandInHistoryStream(t *testing.T) {
 	url := startJSNATS(t)
 	db := openDB(t)
@@ -325,6 +334,7 @@ func TestSessionRmDeletesStreamAndCascades(t *testing.T) {
 // TestDeletingSessionResumesOnBrokerRestart simulates a crash mid-rm:
 // SQLite is in DELETING but the JS stream was never deleted. A fresh
 // broker.Run on the same DB MUST finish phase ②③ on its own.
+// origin: S7 internal review MAKETEST-TRANSFER F2
 func TestDeletingSessionResumesOnBrokerRestart(t *testing.T) {
 	url := startJSNATS(t)
 	db := openDB(t)

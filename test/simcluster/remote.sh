@@ -37,7 +37,19 @@ fi
 do_build=0
 if [ "${1:-}" = "--build" ]; then do_build=1; shift; fi
 
-if [ "$do_build" = "1" ]; then sim_stage_binaries; fi
+if [ "$do_build" = "1" ]; then
+    # S8 staging refuses to run without the shared FIX-ORPHAN adapter (lib/supervisor.sh says why;
+    # it is Linux-only, as is the subreaper it wraps).
+    . "$here/lib/supervisor.sh"
+    _sup_dir=$(mktemp -d); trap 'rm -rf "$_sup_dir"' EXIT
+    sim_supervisor_provision "$_sup_dir"
+    sim_stage_binaries
+    # origin: hot-update S9 plan §9.4 / T55. Preserve the shared supervisor
+    # through staging, and refuse rsync of an incomplete adjacent/support set.
+    . "$here/lib/stage-infra.sh"
+    sim_verify_infra
+    rm -rf "$_sup_dir"; trap - EXIT
+fi
 [ -x "$vendor/tether" ] || { echo "[remote] no vendor/tether — run with --build first" >&2; exit 1; }
 
 # Every ssh here carries the same keepalive trio. WHY: a whole-suite `drill-all` holds one ssh open for
@@ -73,7 +85,9 @@ if [ "$#" -gt 0 ]; then
     # shell. `$*` flattens everything into one string — args with spaces/quotes/;/$()/nested `sh -c` payloads
     # (exactly what `exec <node> -- <cmd…>` / `ctl -- <tether…>` pass) would break apart or become remote
     # shell syntax (injection). This preserves exact argv and is injection-safe.
-    remote_cmd="cd $(printf '%q' "$REMOTE_DIR") && $entry"
+    # Keep an explicit Caddy release override identical on the staging and build hosts.
+    # printf %q retains argv boundaries; the shared verifier validates its numeric form.
+    remote_cmd="cd $(printf '%q' "$REMOTE_DIR") && env $(printf '%q' "TETHER_CADDY_VERSION=${TETHER_CADDY_VERSION:-}") $entry"
     for a in "$@"; do remote_cmd="$remote_cmd $(printf '%q' "$a")"; done
     # shellcheck disable=SC2086  # ditto — fixed literal, deliberate split; -t and $remote_cmd unchanged
     ssh $SSH_OPTS -t "$SERVER" "$remote_cmd"

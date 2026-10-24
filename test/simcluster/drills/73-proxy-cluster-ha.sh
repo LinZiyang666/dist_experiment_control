@@ -35,8 +35,16 @@
 #    killed (Q-xcheck), the killed broker is proven genuinely DOWN (Q-dead), and the SEPARATION claim is a COMPOUND
 #    gate on the black-hole ACTUALLY holding — a dead leg that keeps serving FAILS (RED), never a false "DEAD while
 #    200" conjunction (the solo2 accumulation bug). A non-black-holing leg is diagnosed (tunnel-survival vs teardown).
+# origin: hot-update S9 plan §9.4 / T81. Regression scope remains recovery:
+# fresh SS/curl connections and the Python TLS front do not prove continuity of
+# an original SS socket or stock Caddy. Drill 86 owns those separate receipts.
 set -u
 . "$HERE/lib/log.sh"; . "$HERE/lib/docker.sh"; . "$HERE/lib/tether.sh"; . "$HERE/lib/assert.sh"; . "$HERE/lib/secrets.sh"
+# origin: hot-update S9 plan §9.5 / L22. Supervise the complete drill shell.
+INFRA_LIBRARY_ONLY=1
+. "$HERE/drills/85-hot-update-nats.sh"
+unset INFRA_LIBRARY_ONLY
+infra_drill_supervise "$@"
 . "$HERE/drills/lib/agentyaml.sh"; . "$HERE/drills/lib/cluster.sh"; . "$HERE/drills/lib/ingress.sh"
 . "$HERE/drills/lib/proxy.sh"; . "$HERE/drills/lib/dataplane.sh"
 . "$HERE/drills/lib/logs.sh"   # broker slog reader for the #34 drift evidence dump (one mapping, never inlined)

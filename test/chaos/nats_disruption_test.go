@@ -93,6 +93,15 @@ func TestAgentReconnectsThroughNATSBounce(t *testing.T) {
 	t.Cleanup(stub.Close)
 
 	registerHits := make(chan struct{}, 8)
+	heartbeats := make(chan struct{}, 1)
+	if _, err := stub.Subscribe(proto.SubjNodeHeartbeat("lab", "n1"), func(*nats.Msg) {
+		select {
+		case heartbeats <- struct{}{}:
+		default:
+		}
+	}); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := stub.Subscribe(
 		proto.SubjectPrefix+".ctrl.s.*.node.*.register.req",
 		func(msg *nats.Msg) {
@@ -135,6 +144,17 @@ func TestAgentReconnectsThroughNATSBounce(t *testing.T) {
 	case <-registerHits:
 	case <-time.After(5 * time.Second):
 		t.Fatal("first register never observed")
+	}
+	// Receiving the request precedes delivery of its reply and the agent's
+	// subscription installation. A real heartbeat proves the declared mid-run
+	// fault window without racing the agent's initial startup.
+	// origin: S10 internal review E2E-PARALLEL-REAL-FAILS F7; S9 plan §4.4
+	select {
+	case <-heartbeats:
+	case err := <-agentDone:
+		t.Fatalf("agent exited before the first heartbeat: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("first agent heartbeat never observed")
 	}
 
 	// Bounce NATS. Agent's nats.Conn should fall into the reconnect

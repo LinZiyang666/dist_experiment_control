@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -96,6 +97,9 @@ func tunnelOnRandomPort(t *testing.T, lowPort, highPort int) (brokerOpts, string
 
 // D.20 — name reuse after rm is allowed and gets a NEW port.
 func TestExposeRmThenReuseSameNameNewPort(t *testing.T) {
+	// origin: hot-update S5 PROC-LEAK / final process census.
+	testharness.GuardProcessDirectory(t, filepath.Dir(t.TempDir()))
+
 	url := startNATS(t)
 	db := openDB(t)
 	pub, fp := freshUserPub(t)
@@ -134,6 +138,9 @@ func TestExposeRmThenReuseSameNameNewPort(t *testing.T) {
 
 // D.21 — duplicate name without rm → name_taken.
 func TestExposeDuplicateNameRejected(t *testing.T) {
+	// origin: hot-update S5 PROC-LEAK / final process census.
+	testharness.GuardProcessDirectory(t, filepath.Dir(t.TempDir()))
+
 	url := startNATS(t)
 	db := openDB(t)
 	pub, fp := freshUserPub(t)
@@ -158,6 +165,9 @@ func TestExposeDuplicateNameRejected(t *testing.T) {
 // The agent gets two AddProxy calls; the broker allocates two distinct
 // public ports; nothing in the schema or code blocks local-port reuse.
 func TestExposeSameLocalPortDifferentNames(t *testing.T) {
+	// origin: hot-update S5 PROC-LEAK / final process census.
+	testharness.GuardProcessDirectory(t, filepath.Dir(t.TempDir()))
+
 	url := startNATS(t)
 	db := openDB(t)
 	pub, fp := freshUserPub(t)
@@ -192,6 +202,9 @@ func TestExposeSameLocalPortDifferentNames(t *testing.T) {
 // 4th expose gets port_exhausted. Same pattern the prod 14000-14999
 // band would hit at 1000.
 func TestExposeBandExhaustionReturnsPortExhausted(t *testing.T) {
+	// origin: hot-update S5 PROC-LEAK / final process census.
+	testharness.GuardProcessDirectory(t, filepath.Dir(t.TempDir()))
+
 	url := startNATS(t)
 	db := openDB(t)
 	pub, fp := freshUserPub(t)
@@ -225,6 +238,9 @@ func TestExposeBandExhaustionReturnsPortExhausted(t *testing.T) {
 // `tether expose` through the broker tunnel server through the
 // agent tunnel client to the local socket.
 func TestExposeDataPlaneTCPEcho(t *testing.T) {
+	// origin: hot-update S5 PROC-LEAK / final process census.
+	testharness.GuardProcessDirectory(t, filepath.Dir(t.TempDir()))
+
 	// 1) Local "agent service": single-shot TCP echo on a kernel-assigned port.
 	echoLn, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -288,6 +304,9 @@ func TestExposeDataPlaneTCPEcho(t *testing.T) {
 // TestExposeDataPlaneTCPEchoInline is the working data-plane round-
 // trip test. Restructured to capture the tunnel addr inline.
 func TestExposeDataPlaneTCPEchoInline(t *testing.T) {
+	// origin: hot-update S5 PROC-LEAK / final process census.
+	testharness.GuardProcessDirectory(t, filepath.Dir(t.TempDir()))
+
 	// Local echo service.
 	echoLn, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -337,9 +356,9 @@ func TestExposeDataPlaneTCPEchoInline(t *testing.T) {
 	})()
 
 	adapter := agent.NewTunnelExposeAdapter(tunnelAddr, "lab", "lab-1", silentLog())
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	adapter.Start(ctx)
+	// Agent.New installs the flow owner before Run starts this adapter. Starting
+	// it here would make S5's constructor-only configuration correctly refuse.
+	// origin: hot-update S5 plan §7.1 / T38 — integration fixture seam.
 
 	defer startAgentExpose(t, url, "lab", "lab-1", t.TempDir(), adapter)()
 	testharness.WaitNodeOnline(t, db, "lab", "lab-1", 3*time.Second)
@@ -394,6 +413,9 @@ func TestExposeDataPlaneTCPEchoInline(t *testing.T) {
 // 1) expose, 2) snapshot state.json on disk, 3) bounce the agent,
 // 4) confirm the adapter saw a fresh AddProxy on replay.
 func TestExposeSurvivesAgentRestart(t *testing.T) {
+	// origin: hot-update S5 PROC-LEAK / final process census.
+	testharness.GuardProcessDirectory(t, filepath.Dir(t.TempDir()))
+
 	url := startNATS(t)
 	db := openDB(t)
 	pub, fp := freshUserPub(t)

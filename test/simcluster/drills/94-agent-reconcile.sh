@@ -186,9 +186,15 @@ assert_setup "the event subscription is really established (a missed event must 
 # side instead makes the sh -c wrapper exit 0 with the sleep orphaned OUTSIDE tether's view — recorded as
 # kind=exit rc=0, so there is nothing to reconcile (diagnosed live this session: argv was the wrapper,
 # exit_code was null not -1, and A2 failed for that reason, not a product one).
-assert_ok "A0a exec sleep 9481 on agt1 as a FOREGROUND process (ctl-side backgrounded — tether tracks it RUNNING)" _a0_start agt1 9481
-assert_ok "A0b exec sleep 9482 on agt1 (#2)" _a0_start agt1 9482
-assert_ok "A0c exec sleep 9483 on agt2 (THE CONTROL: it must survive agt1's reconciliation untouched)" _a0_start agt2 9483
+# origin: hot-update S4 DRILL-SUBSHELL audit. _a0_start records its background job in _A0_PIDS for
+# _cleanup; run as an assertion predicate it ran in the capture subshell and the PIDs were lost. Start
+# each job here, in the drill's shell, and keep the claim as a check of the start's own status.
+_a0_rc=0; _a0_start agt1 9481 || _a0_rc=$?
+assert_ok "A0a exec sleep 9481 on agt1 as a FOREGROUND process (ctl-side backgrounded — tether tracks it RUNNING)" test "$_a0_rc" = 0
+_a0_rc=0; _a0_start agt1 9482 || _a0_rc=$?
+assert_ok "A0b exec sleep 9482 on agt1 (#2)" test "$_a0_rc" = 0
+_a0_rc=0; _a0_start agt2 9483 || _a0_rc=$?
+assert_ok "A0c exec sleep 9483 on agt2 (THE CONTROL: it must survive agt1's reconciliation untouched)" test "$_a0_rc" = 0
 assert_ok "A0d the BROKER sees both agt1 procs RUNNING (tracked, not orphaned outside its view — this is what makes a missed-exit possible)" \
     poll_until 30 2 "agt1 has two RUNNING procs in ps" -- _a0_two_running
 assert_ok "A0e and agt2's child is RUNNING in the broker's view too" \

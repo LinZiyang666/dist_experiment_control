@@ -51,7 +51,9 @@ func seed(t *testing.T, db *sql.DB, sid, fp string) {
 
 func startBroker(t *testing.T, url string, db *sql.DB, opts ...func(*broker.Config)) func() {
 	t.Helper()
+	ready := make(chan struct{})
 	cfg := broker.Config{
+		ReadyCh:                 ready,
 		NATSURL:                 url,
 		DB:                      db,
 		Logger:                  silentLog(),
@@ -71,25 +73,28 @@ func startBroker(t *testing.T, url string, db *sql.DB, opts ...func(*broker.Conf
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
 	go func() { done <- b.Run(ctx) }()
-	for i := 0; i < 30; i++ {
-		if nc, err := nats.Connect(url); err == nil {
-			nc.Close()
-			break
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	time.Sleep(50 * time.Millisecond)
-	return func() {
+	stop := sync.OnceFunc(func() {
 		cancel()
 		select {
 		case <-done:
 		case <-time.After(2 * time.Second):
 			t.Fatal("broker did not exit")
 		}
+	})
+
+	// Subscribing is part of broker readiness; a live NATS socket proves only
+	// that the separate server has started. Join even when readiness fails.
+	// origin: hot-update S6 plan §8.1 / TESTFIX
+	t.Cleanup(stop)
+	select {
+	case <-ready:
+	case <-time.After(2 * time.Second):
+		t.Fatal("broker did not become ready")
 	}
+	return stop
 }
 
 // recordingAdapter implements agent.ExposeAdapter and records every
@@ -125,7 +130,7 @@ func (r *recordingAdapter) snapshot() ([]agent.PortToken, []string) {
 	return a, rm
 }
 
-func startAgent(t *testing.T, url, sid, nid, home string, adapter agent.ExposeAdapter) func() {
+func startAgent(t *testing.T, db *sql.DB, url, sid, nid, home string, adapter agent.ExposeAdapter) func() {
 	t.Helper()
 	a, err := agent.New(agent.Config{
 		NATSURL:           url,
@@ -140,18 +145,42 @@ func startAgent(t *testing.T, url, sid, nid, home string, adapter agent.ExposeAd
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
+	readyDeadline := time.Now().Add(2 * time.Second)
 	go func() { done <- a.Run(ctx) }()
-	time.Sleep(300 * time.Millisecond)
-	return func() {
+	stop := sync.OnceFunc(func() {
 		cancel()
 		select {
 		case <-done:
 		case <-time.After(2 * time.Second):
 			t.Fatal("agent did not exit")
 		}
+	})
+	// origin: hot-update S6 plan §8.1 / TESTFIX; wait for real registration.
+	t.Cleanup(stop)
+	testharness.WaitNodeOnline(t, db, sid, nid, time.Until(readyDeadline))
+	// The broker records ONLINE before the agent installs its forwarded intake.
+	// A real claim reply proves that intake is live; registration and intake
+	// share the original two-second fixture deadline.
+	readyCtx, readyCancel := context.WithDeadline(t.Context(), readyDeadline)
+	defer readyCancel()
+	nc, err := nats.Connect(url, nats.Timeout(time.Until(readyDeadline)))
+	if err != nil {
+		t.Fatal(err)
 	}
+	defer nc.Close()
+	if !testharness.WaitFor(t, time.Until(readyDeadline), time.Millisecond, func() bool {
+		msg, err := nc.RequestWithContext(readyCtx, proto.SubjCmdForwarded(sid, nid, proto.ClaimProbeVerb), nil)
+		if err != nil {
+			return false
+		}
+		var reply proto.ClaimProbeResp
+		return json.Unmarshal(msg.Data, &reply) == nil && reply.InstanceID != ""
+	}) {
+		t.Fatal("agent command intake did not become ready")
+	}
+	return stop
 }
 
 // runExpose mimics what `tether expose` does (without the CLI layer):
@@ -197,7 +226,7 @@ func TestExposeAllocatesAndPersistsToken(t *testing.T) {
 
 	home := t.TempDir()
 	adapter := &recordingAdapter{}
-	defer startAgent(t, url, "lab", "lab-1", home, adapter)()
+	defer startAgent(t, db, url, "lab", "lab-1", home, adapter)()
 
 	nc, _ := nats.Connect(url)
 	defer nc.Close()
@@ -247,7 +276,7 @@ func TestExposeRmFreesPortAndPortIsReusable(t *testing.T) {
 	pub, fp := freshUserPub(t)
 	seed(t, db, "lab", fp)
 	defer startBroker(t, url, db)()
-	defer startAgent(t, url, "lab", "lab-1", t.TempDir(), &recordingAdapter{})()
+	defer startAgent(t, db, url, "lab", "lab-1", t.TempDir(), &recordingAdapter{})()
 
 	nc, _ := nats.Connect(url)
 	defer nc.Close()
@@ -281,7 +310,7 @@ func TestExposeAdapterFailureRollsBackPortRow(t *testing.T) {
 	defer startBroker(t, url, db)()
 
 	adapter := &recordingAdapter{AddProxyErr: errFake("fake_frpc_failure")}
-	defer startAgent(t, url, "lab", "lab-1", t.TempDir(), adapter)()
+	defer startAgent(t, db, url, "lab", "lab-1", t.TempDir(), adapter)()
 
 	nc, _ := nats.Connect(url)
 	defer nc.Close()
@@ -305,7 +334,7 @@ func TestExposeRejectsDuplicateName(t *testing.T) {
 	pub, fp := freshUserPub(t)
 	seed(t, db, "lab", fp)
 	defer startBroker(t, url, db)()
-	defer startAgent(t, url, "lab", "lab-1", t.TempDir(), &recordingAdapter{})()
+	defer startAgent(t, db, url, "lab", "lab-1", t.TempDir(), &recordingAdapter{})()
 
 	nc, _ := nats.Connect(url)
 	defer nc.Close()
@@ -364,7 +393,7 @@ func TestReconcilerRevokesOfflineNodePorts(t *testing.T) {
 	seed(t, db, "lab", fp)
 	defer startBroker(t, url, db)()
 
-	stopAgent := startAgent(t, url, "lab", "lab-1", t.TempDir(), &recordingAdapter{})
+	stopAgent := startAgent(t, db, url, "lab", "lab-1", t.TempDir(), &recordingAdapter{})
 	// Belt-and-suspenders: stopAgent is called explicitly mid-test
 	// to drive the OFFLINE → REVOKED reconciler, but if the test
 	// fails earlier (Fatal'd setup, etc.) the agent goroutine would

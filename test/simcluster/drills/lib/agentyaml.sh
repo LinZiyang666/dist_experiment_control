@@ -20,8 +20,10 @@
 # /home/sim/.tether). This helper then OVERWRITES agent.yaml + the unit (flagless) + restarts + polls
 # ONLINE. Returns 0 iff the agent parsed the strict-KnownFields yaml and re-registered ONLINE.
 #
-# Usage: agent_provision_yaml <agt> <sid> <broker_url> <policy> [online_timeout_s]
+# Usage: agent_provision_yaml <agt> <sid> <broker_url> <policy> [online_timeout_s] [tunnel_addr]
 #   policy = open | disabled | narrow:<abs_root> | remotefs:<auto|off> | badkey (S1-02 guard self-test)
+#   tunnel_addr: DNS/IPv4:port or [IPv6[%scope]]:port, port 1..65535; no URL scheme.
+#   Requires host Python 3.9+ (standard library only); invalid addresses have no remote side effects.
 #   online_timeout_s: how long to wait for the NEW daemon to register ONLINE (default 45; a self-test
 #                     using `badkey` should pass a SHORT value since it is expected to never register).
 #
@@ -35,8 +37,59 @@ _apy_not_online() { ! "$SIM" ctl -- node ls 2>/dev/null | grep -qE "^$1[[:space:
 
 agent_provision_yaml() {
     _apy_agt=$1; _apy_sid=$2; _apy_url=$3; _apy_policy=$4
-    _apy_host=$(printf '%s' "$_apy_url" | sed -E 's#^nats://##; s#:[0-9]+$##')
-    _apy_tunnel="$_apy_host:7000"
+    # The control URL and TLS tunnel address are independent. Existing callers
+    # remain nats://; WSS profiles pass explicit host:port as the sixth argument.
+    _apy_tunnel=${6:-}
+    if [ -z "$_apy_tunnel" ]; then
+        case "$_apy_url" in
+            nats://*)
+                _apy_host=$(printf '%s' "$_apy_url" | sed -E 's#^nats://##; s#:[0-9]+$##')
+                _apy_tunnel="$_apy_host:7000"
+                ;;
+            *) warn "agent_provision_yaml: non-NATS URL requires explicit tunnel_addr argument"; return 2 ;;
+        esac
+    fi
+    # Validate before any remote directory/config/service operation. Python's
+    # standard library also emits JSON strings, which are valid YAML scalars.
+    _apy_header=$(python3 - "$_apy_url" "$_apy_sid" "$_apy_agt" "$_apy_tunnel" <<'APY_PY'
+import ipaddress
+import json
+import re
+import sys
+
+url, sid, nid, address = sys.argv[1:]
+try:
+    if not 1 <= len(address) <= 320 or any(ord(c) < 33 or ord(c) > 126 for c in address):
+        raise ValueError("tunnel_addr must be one ASCII host:port without whitespace")
+    if address.startswith("["):
+        match = re.fullmatch(r"\[([^\[\]]+)\]:([0-9]{1,5})", address)
+        if match is None:
+            raise ValueError("invalid bracketed IPv6 host:port")
+        host, port = match.groups()
+        literal, separator, zone = host.partition("%")
+        ipaddress.IPv6Address(literal)
+        if separator and re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", zone) is None:
+            raise ValueError("invalid IPv6 scope identifier")
+    else:
+        match = re.fullmatch(r"([^:]+):([0-9]{1,5})", address)
+        if match is None:
+            raise ValueError("tunnel_addr must be host:port; bracket IPv6 literals")
+        host, port = match.groups()
+        if re.fullmatch(r"[0-9.]+", host) and "." in host:
+            ipaddress.IPv4Address(host)
+        else:
+            name = host.removesuffix(".")
+            if len(name) > 253 or any(re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?", label) is None
+                                      for label in name.split(".")):
+                raise ValueError("invalid DNS host")
+    if not 1 <= int(port) <= 65535:
+        raise ValueError("tunnel_addr port must be in 1..65535")
+except ValueError as error:
+    raise SystemExit("agent_provision_yaml: " + str(error))
+for key, value in (("broker_url", url), ("session", sid), ("nid", nid), ("tunnel_addr", address)):
+    print(key + ": " + json.dumps(value))
+APY_PY
+    ) || { warn "agent_provision_yaml: invalid address or unavailable Python 3.9+"; return 2; }
     _apy_root=""
 
     # policy → the file_transfer / remote_fs block appended under the install.sh header.
@@ -83,10 +136,7 @@ agent_provision_yaml() {
     # sim:sim 0600 under the 0700 agent/<sid> tree (mirrors install.sh:315-317,346-360).
     _apy_tmp=$(mktemp) || return 1
     {
-        printf 'broker_url: %s\n' "$_apy_url"
-        printf 'session: %s\n'    "$_apy_sid"
-        printf 'nid: %s\n'        "$_apy_agt"
-        printf 'tunnel_addr: %s\n' "$_apy_tunnel"
+        printf '%s\n' "$_apy_header"
         [ -n "$_apy_block" ] && printf '%s\n' "$_apy_block"
     } > "$_apy_tmp"
     dexec -u sim "$_apy_agt" -- env HOME=/home/sim install -d -m 0700 "/home/sim/.tether/agent/$_apy_sid" \

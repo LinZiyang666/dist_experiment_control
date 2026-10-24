@@ -75,10 +75,10 @@ data_rows | while IFS= read -r line; do
     if [ "$expected" = GREEN ] && [ "$ncgap" != 0 ]; then
         printf 'GREEN-NCGAP\t%s\t%s\n' "$drill" "$ncgap"
     fi
-    # Conversely an INCOMPLETE row pinned at 0 gaps could never be met.
-    if [ "$expected" = INCOMPLETE ] && [ "$ncgap" = 0 ]; then
-        printf 'INCOMPLETE-ZERO\t%s\n' "$drill"
-    fi
+    # origin: S8 internal review s8-hermetic F7. INCOMPLETE is supported by
+    # either nc_gap or nc_guard. This column pins only coverage gaps, so zero
+    # is valid for a guarded non_hot observation such as LI-interrupting.
+    # Native counters/rc are still judged by assert.sh and the runner.
 
     if [ "$bands" != "-" ]; then
         # `printf '%s\n'`, NOT `printf '%s'`: without the trailing newline `read` consumes the final

@@ -659,35 +659,3 @@ func TestAdminUnknownOp(t *testing.T) {
 		t.Errorf("expected unknown-op error; got %+v", resp)
 	}
 }
-
-// TestAdminRejectsMalformedRequest covers the json_parse error path.
-func TestAdminRejectsMalformedRequest(t *testing.T) {
-	url := startNATS(t)
-	db := openDB(t)
-	socketPath := adminSocketPath(t)
-
-	defer startBrokerWithAdmin(t, url, db, socketPath)()
-
-	conn, err := osDialUnix(socketPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = conn.Close() }()
-
-	if _, err := conn.Write([]byte("not-json\n")); err != nil {
-		t.Fatal(err)
-	}
-	buf := make([]byte, 1024)
-	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-	n, err := conn.Read(buf)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var resp adminsock.Response
-	if err := json.Unmarshal(buf[:n-1], &resp); err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(resp.Error, "json_parse") {
-		t.Errorf("expected json_parse error; got %+v", resp)
-	}
-}

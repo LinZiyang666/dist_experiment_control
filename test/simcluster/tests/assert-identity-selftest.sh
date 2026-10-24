@@ -95,4 +95,63 @@ for shape in 'FOO=1 assert_ok "wrapped by an assignment" true' "eval 'assert_ok 
 done
 rm -f "$T/drills/cc-ctl.sh"
 
+
+# origin: S8 internal review s8-hermetic F10. Literal descriptions belong
+# to the caller's arm; the proven forwarding site contributes no phantom row.
+mkdir -p "$T/drills/lib"
+cp "$HERE/../drills/lib/hot_update_pty.sh" "$T/drills/lib/hot_update_pty.sh"
+cat > "$T/drills/dd-legacy.sh" <<'EOF'
+#!/bin/sh
+# arms: A B
+# fixture: A=N1 B=N1
+# grows: A=0 B=0
+# worst: A=60 B=60
+# forgoes: A=- B=-
+case "${ARM:?}" in
+    A)
+        upgrade_legacy_assert "$EV" agent "literal legacy A $NONCE" "$OWNER" "$PIN" observe
+        upgrade_legacy_assert "$EV" agent \
+            'literal legacy duplicate' "$OWNER" "$PIN" observe
+        upgrade_legacy_assert "$EV" agent 'literal legacy duplicate' "$OWNER" "$PIN" observe
+        ;;
+    B)
+        upgrade_legacy_assert "$EV" broker "literal legacy B" "$OWNER" "$PIN" observe
+        ;;
+    *) setup_fail x ;;
+esac
+EOF
+if DRILLS="$T/drills" sh "$GATE" > "$T/traced.tsv" 2> "$T/out" &&
+   [ "$(grep -c '^dd-legacy.A[[:space:]]assert_bug[[:space:]]' "$T/traced.tsv")" = 3 ] &&
+   [ "$(grep -c 'dd-legacy.A[[:space:]]assert_bug[[:space:]]literal legacy duplicate' "$T/traced.tsv")" = 2 ] &&
+   grep -q 'dd-legacy.B[[:space:]]assert_bug[[:space:]]literal legacy B' "$T/traced.tsv" &&
+   ! grep -q 'lib/hot_update_pty[[:space:]]assert_bug' "$T/traced.tsv"; then
+    ok "verified legacy caller descriptions retain their arm and multiplicity"
+else fail "literal legacy caller trace failed: $(cat "$T/out")"; fi
+if DRILLS="$T/drills" sh "$GATE" --check "$T/traced.tsv" > "$T/out" 2>&1; then
+    ok "literal caller baseline is stable"
+else fail "literal caller baseline is unstable: $(cat "$T/out")"; fi
+cp "$T/drills/dd-legacy.sh" "$T/dd.orig"
+sed 's/literal legacy B/reworded legacy B/' "$T/dd.orig" > "$T/drills/dd-legacy.sh"
+if DRILLS="$T/drills" sh "$GATE" --check "$T/traced.tsv" > "$T/out" 2>&1; then
+    fail "legacy caller reword escaped"
+else ok "legacy caller reword changes the identity multiset"; fi
+sed 's/"literal legacy B"/"$DESC"/' "$T/dd.orig" > "$T/drills/dd-legacy.sh"
+if DRILLS="$T/drills" sh "$GATE" > "$T/out" 2>&1; then
+    fail "parameterized legacy caller accepted"
+elif [ "$?" = 3 ] && grep -q 'dd-legacy.B:' "$T/out"; then
+    ok "parameterized legacy caller stays BLIND"
+else fail "parameterized caller rejected for wrong reason: $(cat "$T/out")"; fi
+cp "$T/dd.orig" "$T/drills/dd-legacy.sh"
+cp "$T/drills/lib/hot_update_pty.sh" "$T/legacy.orig"
+sed 's/_ula_desc=$3/_ula_desc=$2/' "$T/legacy.orig" > "$T/drills/lib/hot_update_pty.sh"
+if DRILLS="$T/drills" sh "$GATE" > "$T/out" 2>&1; then
+    fail "changed legacy forwarding ABI accepted"
+elif [ "$?" = 3 ] && grep -q 'BLIND\|INVISIBLE' "$T/out"; then
+    ok "changed forwarding argument stays BLIND"
+else fail "changed forwarding ABI rejected for wrong reason: $(cat "$T/out")"; fi
+cp "$T/legacy.orig" "$T/drills/lib/hot_update_pty.sh"
+if DRILLS="$T/drills" sh "$GATE" --check "$T/traced.tsv" > "$T/out" 2>&1; then
+    ok "restored caller trace is green"
+else fail "restored caller trace red: $(cat "$T/out")"; fi
+
 [ "$FAIL" = 0 ] && echo "assert-identity-selftest: PASS" || { echo "assert-identity-selftest: FAIL" >&2; exit 1; }

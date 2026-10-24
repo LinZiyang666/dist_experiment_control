@@ -2,6 +2,7 @@ package cli_e2e_test
 
 import (
 	"encoding/json"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -57,6 +58,9 @@ func callSessionRm(t *testing.T, nc *nats.Conn, actor, sid string) proto.Session
 
 // A.1 — full lifecycle: create → ls → rm → ls.
 func TestSessionFullLifecycle(t *testing.T) {
+	// origin: hot-update S5 PROC-LEAK / final process census.
+	testharness.GuardProcessDirectory(t, filepath.Dir(t.TempDir()))
+
 	url := startNATS(t)
 	db := openDB(t)
 	pub, fp := freshUserPub(t)
@@ -125,6 +129,9 @@ func TestSessionFullLifecycle(t *testing.T) {
 // silently allocating a fresh SID the call sites that use ReadCurrent
 // Session would silently target a stale sid.)
 func TestSessionCreateDuplicateNameFails(t *testing.T) {
+	// origin: hot-update S5 PROC-LEAK / final process census.
+	testharness.GuardProcessDirectory(t, filepath.Dir(t.TempDir()))
+
 	url := startNATS(t)
 	db := openDB(t)
 	pub, fp := freshUserPub(t)
@@ -151,6 +158,9 @@ func TestSessionCreateDuplicateNameFails(t *testing.T) {
 // A.3 — rm then create same SID with a NEW owner. After the broker's
 // finalize cleans the row out, a brand-new owner can claim that SID.
 func TestSessionRmThenRecreateSameSID(t *testing.T) {
+	// origin: hot-update S5 PROC-LEAK / final process census.
+	testharness.GuardProcessDirectory(t, filepath.Dir(t.TempDir()))
+
 	url := startNATS(t)
 	db := openDB(t)
 	ownerA, fpA := freshUserPub(t)
@@ -188,6 +198,9 @@ func TestSessionRmThenRecreateSameSID(t *testing.T) {
 // to rm it. Server-side check is session.IsOwner; the protocol code
 // is "not_owner".
 func TestSessionRmNonOwnerRejected(t *testing.T) {
+	// origin: hot-update S5 PROC-LEAK / final process census.
+	testharness.GuardProcessDirectory(t, filepath.Dir(t.TempDir()))
+
 	url := startNATS(t)
 	db := openDB(t)
 	owner, ownerFP := freshUserPub(t)
@@ -215,7 +228,11 @@ func TestSessionRmNonOwnerRejected(t *testing.T) {
 
 // A.5 — owner rm followed by member ps must return
 // session_not_found_or_deleting (same gate handleExecReq applies).
+// origin: S7 internal review MAKETEST-TRANSFER F2 / F5
 func TestPsAfterRmRejectsMember(t *testing.T) {
+	// origin: hot-update S5 PROC-LEAK / final process census.
+	testharness.GuardProcessDirectory(t, filepath.Dir(t.TempDir()))
+
 	url := startNATS(t)
 	db := openDB(t)
 	owner, ownerFP := freshUserPub(t)
@@ -255,6 +272,9 @@ func TestPsAfterRmRejectsMember(t *testing.T) {
 // state by direct Tombstone (handleSessionRm's finalize would
 // immediately drop the row).
 func TestSessionListIncludesDeletingState(t *testing.T) {
+	// origin: hot-update S5 PROC-LEAK / final process census.
+	testharness.GuardProcessDirectory(t, filepath.Dir(t.TempDir()))
+
 	url := startNATS(t)
 	db := openDB(t)
 	pub, fp := freshUserPub(t)

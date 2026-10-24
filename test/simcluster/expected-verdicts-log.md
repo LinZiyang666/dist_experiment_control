@@ -140,6 +140,10 @@ RECOVERY same-PID in-process rebuild. drill-costs row 98 re-seeded from this com
 
 ## 33-node-upgrade-success
 
+**Current final S5 serial acceptance**: native rc4/INCOMPLETE, 219 s. Image `sha256:9d8a232c3c02d0e1de59a6d7ad0354647dd19bbb39aec574d915e8f29682708c`; build source `09b96f95bfc66519320ab4f46e54eb8cd85e1b2429e7d510f9ef0804f206b336`; per-command source `09b96f95bfc66519320ab4f46e54eb8cd85e1b2429e7d510f9ef0804f206b336`. Exact command, measured oracles, host load and receipt: `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/run-274/runner/33-node-upgrade-success.log` and `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/FINAL-ACCEPTANCE-ARMS.json`.
+
+**Historical measurements and invariant rationale (previous image; current receipt above is authoritative):**
+
 - **batch**: `upgrade-safety follow-up`  _(expected/owner authoritative in expected-verdicts.tsv)_
 
 Born INCOMPLETE/1 by design: the drill's own not_covered names gotcha #73 (a NON-tether artifact that
@@ -171,6 +175,348 @@ because two of them are traps any future drill can fall into:
      sharper form is: the two streams are DISTINCT, and an oracle that reads the wrong one fails in
      the worst possible direction, reporting a healthy product as broken. drills/lib/logs.sh is the
      one place that knows the mapping.
+
+**S3 REGRESSION RUN 2026-10-02 — first run ASSERT-FAIL, a PRODUCT defect this drill alone caught.**
+On image `c346a962…` (S3 as reviewed) C2 failed: `agent_rejected:install_failed` "running image differs from
+the on-disk binary; restart the agent before upgrading" (pass=28, assert_fail=1, nc_gap=1). S3 plan §2.1 had
+added a pre-download gate `running image == dst` while §8 promised "33 A/C/C2 unchanged": after A commits,
+the shared-binary sibling agt1b has dst == the very candidate it is asked to install, yet runs the old image —
+refused on every retry, recoverable only by a restart. Fixed in the product (prev ∈ {running image, candidate},
+judged after extract; `internal/agent` `TestInstallPrevSlotAcceptsOnlyRollbackCapableImages` + three mutations).
+**Re-run on image `4fe3646b…` (tree `7094d4bb`): INCOMPLETE rc=4, pass=29, assert_fail=0, nc_gap=1 (#73),
+206 s — matches this row; B4's watchdog conjunction (`register deadline exceeded`, `.prev` consumed,
+exe==OLD, MainPID unchanged) holds with the S3 bundle path in place.** The drill script is unchanged.
+
+
+**Final S5 serial measured receipt (supersedes older NOT_RUN/status statements above):**
+
+Measured 2026-10-11: native rc4/INCOMPLETE, 216 s; one final serial image `sha256:049b3c3bc69a1f3b9e88b1dbc3998cf5b809c076f6eb9b0e9edfe0fe39b55086`, source patch `647e54d6f8457e651249f37f773842fa1f40ab39b2cdc87238f5d8af8305f63b`. Receipt: `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/run-257/runner/33-node-upgrade-success.log`.
+
+Full byte, nonce, Accept, calibration and host-load oracles: `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/FINAL-ACCEPTANCE-ARMS.json`.
+
+## 34-hot-update-process
+
+**Current final parent receipt:** A/G/U/N/P/W/F GREEN0 with original assertions. Parent native 1, wall 1921.302 s; exact command `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/run-274/regression-sweep/receipt.json`. One deadline-fixed product image/tree; all product and drill inputs unchanged through serial acceptance.
+
+
+**Declared legacy baseline: PRODUCT-RED, nc_gap=0; deploy-tier execution NOT_RUN.**
+Owner: `docs/reviews/hot-update-plan.md` H0 process continuity; implementation and real-drill receipts remain separate.
+One real success arm reuses 33's initial supply, trusted artifact and operator allowlists. Every fixture restart
+finishes before a long-running real `tether exec` producer begins. The oracle requires a nonempty no-upgrade
+source/output baseline, original PID/boot/startticks/nonce and parent, a committed same-agent-PID exec into the
+new running SHA, and independent source progress between two post-upgrade observations.
+
+Only the conjunction of both original pipes reporting EPIPE, original managed task reconciled EXITED(-1),
+missing output in both original ctl transcripts and missing exact exit code produces the known signature:
+`H0_LEGACY_EXEC_INTERRUPTED output=epipe management=exited_minus_one pid=<pid> nonce=<nonce>`.
+No broad failure band is registered. Empty, malformed, wrong-image or unrelated-death evidence cannot match it.
+`continuity` remains the positive oracle: exact source/transcript sequence equality, RUNNING ownership while
+alive, no pipe errors and exit code 23 through the original ctl. When fixed, `assert_bug` intentionally reports
+APPEARS FIXED / ASSERT-FAIL; promote that call to `assert_ok _continuity` and flip this expectation with real evidence.
+This is not a hot-update Pass: no PTY, SSH, transfer, rollback, NATS/Caddy replacement or N-1 claim.
+The four log streams use `drills/lib/logs.sh`; raw probe receipts are retained under SIM_EVIDENCE_DIR.
+Hermetic controls run through `tests/hot-update-process-probe-test.sh` and `tests/run-all.sh`; their success proves
+the sensor only. 34 is assigned here; the unrelated #73 non-tether artifact gap in 33 remains open and unnumbered.
+
+**S1 re-pin (2026-09-21, hot-update-reliable-exec-plan §5.3).** The paragraph above is the pre-S1 receipt and is
+kept verbatim. Two of the three halves of the known failure are unchanged — `node upgrade` is a `syscall.Exec`, so
+the child's pipe read ends close (`output=epipe`) and the new image's empty table reconciles the row EXITED(-1)
+(`management=exited_minus_one`). The CTL half changed: `tether exec` now takes the reliable path, the exec'd agent
+is a new runtime incarnation, its registry refuses the original lease (`procrequest.ErrInstance` →
+`process_instance_lost`), and the ctl exits **74** within seconds instead of idling to its `--timeout`. The
+signature is therefore
+`H0_LEGACY_EXEC_INTERRUPTED output=epipe management=exited_minus_one ctl=owner_lost_rc74 pid=<pid> nonce=<nonce>`;
+the pre-S1 `{"finished": false}` outcome and an rc 74 with a COMPLETE transcript are both hermetic negatives now.
+Expected verdict stays PRODUCT-RED, nc_gap=0. **Observed under the S1 signature on 2026-09-21** (55 s, image
+`sha256:ea43e478…`, pass=17 product_red=1 assert_fail=0): the ctl exited **74** promptly with `process request: lease was
+issued by another runtime instance; task continuity lost — the remote task was accepted and its result is unknown`, both
+pipes EPIPE, row EXITED(-1); the positive `_continuity` oracle still refused (`original live task lost management`), so
+this is the known defect reproduced, not a hot-update pass (docs/reviews/hot-update-evidence.md §12.2). The pre-S1 run
+(2026-09-20, old signature, ctl `{"finished":false}`) is in docs/reviews/hot-update-process-baseline.md. The positive `_continuity` oracle is untouched; S3
+promotes it to `assert_ok`.
+
+**S3 declaration (2026-10-02, plan §8; deployment NOT_RUN).** The historical S1 paragraph above
+is preserved verbatim. Drill 34 now declares seven GREEN arms; its parent is their DERIVED join, with
+zero coverage gaps. These are acceptance expectations, not observed deployment receipts. The lead
+must run them after merging CUT/BOOT/MIXEDPROBE. Same-description `_continuity` is now `assert_ok`
+in A. The S1 signature remains a hermetic negative of `hotupdate`; the real legacy exporter moves to 39.Y.
+Import-refusal redispatch is covered by the real-binary hermetic bootstrap tests, and W exercises the
+actual watchdog redispatch path. No injection switch or synthetic release is introduced into deployment.
+Freeze-window samples and mixed-request percentiles are calibration only; the sensor rate stays fixed. Activation and audit readers decode actual text/JSON slog records; shared golden records are pinned by the daemon logger test and consumed by the Python oracle. DR-3 remains a product dependency: W still requires generation 2 and two cut receipts.
+
+**Hermetic repair mutation receipts (2026-10-02; deployment still NOT_RUN).**
+The real logger golden and both Python judges were exercised with injected implementation defects.
+Each mutation below made its targeted control exit 1; every edited source was restored immediately.
+Logger mutations used Go overlays. These receipts do not claim a deployment or resolve DR-3.
+
+| Injected defect | Control result |
+|---|---|
+| activation parser ignores slog envelope | RED (exit 1) |
+| activation allows duplicate fields | RED (exit 1) |
+| activation allows duplicate generations | RED (exit 1) |
+| activation allows zero fields | RED (exit 1) |
+| activation accepts malformed numeric suffix | RED (exit 1) |
+| activation defaults a missing field | RED (exit 1) |
+| exec audit calls JSON true legacy | RED (exit 1) |
+| exec audit ignores omitted legacy flag | RED (exit 1) |
+| upgrade permits starvation | RED (exit 1) |
+| upgrade permits refusal side effects | RED (exit 1) |
+| upgrade permits unrequested effects | RED (exit 1) |
+| upgrade permits no successful read | RED (exit 1) |
+| upgrade permits no successful short | RED (exit 1) |
+| upgrade permits no successful write overlap | RED (exit 1) |
+| upgrade permits excessive refusals | RED (exit 1) |
+| outside-cut refusal not counted as failure | RED (exit 1) |
+| unrequested token reconciliation omitted | RED (exit 1) |
+| successful counts include refusals | RED (exit 1) |
+| write overlap counts any successful request | RED (exit 1) |
+| judge uses scheduled upgrade/end decoys | RED (exit 1) |
+| until-mark stops without activation | RED (exit 1) |
+| until-mark drops post-activation tail | RED (exit 1) |
+| mark uses another clock | RED (exit 1) |
+| F restores local-only boot order | RED (exit 1) |
+| F permits a non-probe spawn timeout | RED (exit 1) |
+| F omits retained probe census | RED (exit 1) |
+| P omits start handshake | RED (exit 1) |
+| P marks without log observation | RED (exit 1) |
+| P skips cut observation | RED (exit 1) |
+| P skips activation observation | RED (exit 1) |
+| P judges scheduled window | RED (exit 1) |
+| shell judge omits .rate>=(0.9*.configured_rate) | RED (exit 1) |
+| shell judge omits .effect_without_rc0==0 | RED (exit 1) |
+| shell judge omits .unrequested_effects==0 | RED (exit 1) |
+| shell judge omits .successful.read>0 | RED (exit 1) |
+| shell judge omits .successful.write>0 | RED (exit 1) |
+| shell judge omits .successful.short>0 | RED (exit 1) |
+| shell judge omits .writes_in_window>=1 | RED (exit 1) |
+| shell judge omits .agent_upgrading<=.starts_in_window | RED (exit 1) |
+| daemon handler changed | RED (exit 1) |
+| activation message layout changed | RED (exit 1) |
+| tail exceeds maximum accepted | RED (exit 1) |
+| scheduled activation allowed | RED (exit 1) |
+| start receipt ignored | RED (exit 1) |
+| path audit reader failure ignored | RED (exit 1) |
+| path audit parser failure ignored | RED (exit 1) |
+| upgrade shell rate floor omitted | RED (exit 1) |
+| activation body layout golden mismatch | RED (exit 1) |
+
+**REAL RUN 2026-10-02 (weilandserver, `./run-drills.sh -j4 --no-attribute 34-hot-update-process`): GREEN ×7,
+parent GREEN, NO DEVIATIONS.** The S3 declaration above is now measured. Final receipts are two clean
+sweeps on image `sha256:4fe3646b…` (tree `7094d4bb`, `vendor/tether` `81eb1d76…`, `tether-next` `73415cde…`,
+`tether-prev` `1cfd3ec6…`): 218 s and 220 s wall; per arm A 63 / G 77 / U 68 / N 72 / P 102 / W 217 / F 81 s.
+The very first sweep (image `c346a962…`, before the drill-33 fix below) was 6/7: **G ASSERT-FAIL
+`HOT_UPDATE_EVIDENCE_INVALID: empty activation import_ms`** — THIS DRILL'S ORACLE, not the product. `shim_ms`
+and `import_ms` are `Duration.Milliseconds()` truncations and are legitimately `0` when the step took under
+1 ms (the gen-2 hop imported in <1 ms). The judge now requires `>0` only for `generation`, `tasks` and
+`freeze_window_ms`; `0` is accepted for the two step timings, with a positive sub-ms selftest row and the
+`activation allows zero fields` mutation still RED for the three fields that can never be zero.
+Calibration samples (not budgets): `freeze_window_ms` 106–131 (budget 500), shim 92–107 ms (gen-2 hop 5 ms),
+import 0–6 ms.
+
+
+**Final S5 parent receipt:** All A/G/U/N/P/W/F nativeGREEN0 in257 on the final image; both-generation/watchdog/legacy/domain/calibration oracles retain their original assertions.
+
+## 34-hot-update-process.A
+
+**Current final S5 serial acceptance**: native rc0/GREEN, 67 s. Image `sha256:9d8a232c3c02d0e1de59a6d7ad0354647dd19bbb39aec574d915e8f29682708c`; build source `09b96f95bfc66519320ab4f46e54eb8cd85e1b2429e7d510f9ef0804f206b336`; per-command source `09b96f95bfc66519320ab4f46e54eb8cd85e1b2429e7d510f9ef0804f206b336`. Exact command, measured oracles, host load and receipt: `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/run-274/runner/34-hot-update-process.A.log` and `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/FINAL-ACCEPTANCE-ARMS.json`.
+
+**Historical measurements and invariant rationale (previous image; current receipt above is authoritative):**
+
+S3 acceptance expectation; **REAL RUN 2026-10-02: GREEN** (63 s; ×3 sweeps). One image hop: original child PID/boot/startticks/nonce/parent, complete stdout/stderr and original ctl rc23; final ps EXITED(23), generation 1 active/committed, exactly one execution and activation, stable service identity, replay/pipe/pidfd census and empty inherited-FD audit.
+
+
+**Final S5 serial measured receipt (supersedes older NOT_RUN/status statements above):**
+
+Measured 2026-10-11: native rc0/GREEN, 67 s; one final serial image `sha256:049b3c3bc69a1f3b9e88b1dbc3998cf5b809c076f6eb9b0e9edfe0fe39b55086`, source patch `647e54d6f8457e651249f37f773842fa1f40ab39b2cdc87238f5d8af8305f63b`. Receipt: `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/run-257/runner/34-hot-update-process.A.log`.
+
+Full byte, nonce, Accept, calibration and host-load oracles: `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/FINAL-ACCEPTANCE-ARMS.json`.
+
+## 34-hot-update-process.G
+
+**Current final S5 serial acceptance**: native rc0/GREEN, 78 s. Image `sha256:9d8a232c3c02d0e1de59a6d7ad0354647dd19bbb39aec574d915e8f29682708c`; build source `09b96f95bfc66519320ab4f46e54eb8cd85e1b2429e7d510f9ef0804f206b336`; per-command source `09b96f95bfc66519320ab4f46e54eb8cd85e1b2429e7d510f9ef0804f206b336`. Exact command, measured oracles, host load and receipt: `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/run-274/runner/34-hot-update-process.G.log` and `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/FINAL-ACCEPTANCE-ARMS.json`.
+
+**Historical measurements and invariant rationale (previous image; current receipt above is authoritative):**
+
+S3 acceptance expectation; **REAL RUN 2026-10-02: GREEN** (77 s; first sweep ASSERT-FAIL was the import_ms judge defect recorded in the parent section). One producer across tether → tether-next → tether, with artifact_add serving the second tarball from the same backend; generations 1 and 2, two activations, one execution, three FD/identity observations and progress before each hop.
+
+
+**Final S5 serial measured receipt (supersedes older NOT_RUN/status statements above):**
+
+Measured 2026-10-11: native rc0/GREEN, 79 s; one final serial image `sha256:049b3c3bc69a1f3b9e88b1dbc3998cf5b809c076f6eb9b0e9edfe0fe39b55086`, source patch `647e54d6f8457e651249f37f773842fa1f40ab39b2cdc87238f5d8af8305f63b`. Receipt: `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/run-257/runner/34-hot-update-process.G.log`.
+
+Full byte, nonce, Accept, calibration and host-load oracles: `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/FINAL-ACCEPTANCE-ARMS.json`.
+
+## 34-hot-update-process.U
+
+**Current final S5 serial acceptance**: native rc0/GREEN, 69 s. Image `sha256:9d8a232c3c02d0e1de59a6d7ad0354647dd19bbb39aec574d915e8f29682708c`; build source `09b96f95bfc66519320ab4f46e54eb8cd85e1b2429e7d510f9ef0804f206b336`; per-command source `09b96f95bfc66519320ab4f46e54eb8cd85e1b2429e7d510f9ef0804f206b336`. Exact command, measured oracles, host load and receipt: `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/run-274/runner/34-hot-update-process.U.log` and `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/FINAL-ACCEPTANCE-ARMS.json`.
+
+**Historical measurements and invariant rationale (previous image; current receipt above is authoritative):**
+
+S3 acceptance expectation; **REAL RUN 2026-10-02: GREEN** (68 s; ×3 sweeps). Product agentUserUnitBody rendered verbatim with User=sim as a SYSTEM unit. This proves body-equivalent launch behavior; it does not prove systemctl --user (82 U3 owns that gap).
+
+
+**Final S5 serial measured receipt (supersedes older NOT_RUN/status statements above):**
+
+Measured 2026-10-11: native rc0/GREEN, 67 s; one final serial image `sha256:049b3c3bc69a1f3b9e88b1dbc3998cf5b809c076f6eb9b0e9edfe0fe39b55086`, source patch `647e54d6f8457e651249f37f773842fa1f40ab39b2cdc87238f5d8af8305f63b`. Receipt: `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/run-257/runner/34-hot-update-process.U.log`.
+
+Full byte, nonce, Accept, calibration and host-load oracles: `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/FINAL-ACCEPTANCE-ARMS.json`.
+
+## 34-hot-update-process.N
+
+**Current final S5 serial acceptance**: native rc0/GREEN, 72 s. Image `sha256:9d8a232c3c02d0e1de59a6d7ad0354647dd19bbb39aec574d915e8f29682708c`; build source `09b96f95bfc66519320ab4f46e54eb8cd85e1b2429e7d510f9ef0804f206b336`; per-command source `09b96f95bfc66519320ab4f46e54eb8cd85e1b2429e7d510f9ef0804f206b336`. Exact command, measured oracles, host load and receipt: `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/run-274/runner/34-hot-update-process.N.log` and `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/FINAL-ACCEPTANCE-ARMS.json`.
+
+**Historical measurements and invariant rationale (previous image; current receipt above is authoritative):**
+
+S3 acceptance expectation; **REAL RUN 2026-10-02: GREEN** (72 s; ×3 sweeps). Unsupervised setsid/nohup under sim: nonce pidfile, one matching argv, vendor SHA, system unit MainPID zero; stable process startticks and fd2 inode, pidfd-pinned cleanup.
+
+
+**Final S5 serial measured receipt (supersedes older NOT_RUN/status statements above):**
+
+Measured 2026-10-11: native rc0/GREEN, 72 s; one final serial image `sha256:049b3c3bc69a1f3b9e88b1dbc3998cf5b809c076f6eb9b0e9edfe0fe39b55086`, source patch `647e54d6f8457e651249f37f773842fa1f40ab39b2cdc87238f5d8af8305f63b`. Receipt: `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/run-257/runner/34-hot-update-process.N.log`.
+
+Full byte, nonce, Accept, calibration and host-load oracles: `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/FINAL-ACCEPTANCE-ARMS.json`.
+
+## 34-hot-update-process.P
+
+**Current final S5 serial acceptance**: native rc0/GREEN, 103 s. Image `sha256:9d8a232c3c02d0e1de59a6d7ad0354647dd19bbb39aec574d915e8f29682708c`; build source `09b96f95bfc66519320ab4f46e54eb8cd85e1b2429e7d510f9ef0804f206b336`; per-command source `09b96f95bfc66519320ab4f46e54eb8cd85e1b2429e7d510f9ef0804f206b336`. Exact command, measured oracles, host load and receipt: `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/run-274/runner/34-hot-update-process.P.log` and `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/FINAL-ACCEPTANCE-ARMS.json`.
+
+**Historical measurements and invariant rationale (previous image; current receipt above is authoritative):**
+
+S3 acceptance expectation; **REAL RUN 2026-10-02: GREEN** (102 s; ×3 sweeps). P0: 30-second calibration, zero request/connect failures and rate ≥9, otherwise SETUP-RED. P1 starts the upgrade only after the probe start receipt. Agent slog cut/activation events after the cursor create marks in the probe monotonic clock; traffic continues through activation plus 10 seconds, with a 180-second maximum. Require ≥0.9×configured rate, successful read/write/short classes and a successful write overlapping cut..activated. Duplicate, missing, unrequested and refusal side effects fail; agent_upgrading is allowed only for requests starting inside the observed cut and is bounded by that count. Percentiles, over_5s and reliable/legacy exec counts remain calibration records. Observation timestamps include polling and transport delay; they are not nanosecond exec timestamps.
+
+
+**Final S5 serial measured receipt (supersedes older NOT_RUN/status statements above):**
+
+Measured 2026-10-11: native rc0/GREEN, 104 s; one final serial image `sha256:049b3c3bc69a1f3b9e88b1dbc3998cf5b809c076f6eb9b0e9edfe0fe39b55086`, source patch `647e54d6f8457e651249f37f773842fa1f40ab39b2cdc87238f5d8af8305f63b`. Receipt: `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/run-257/runner/34-hot-update-process.P.log`.
+
+Full byte, nonce, Accept, calibration and host-load oracles: `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/FINAL-ACCEPTANCE-ARMS.json`.
+
+## 34-hot-update-process.W
+
+**Current final S5 serial acceptance**: native rc0/GREEN, 218 s. Image `sha256:9d8a232c3c02d0e1de59a6d7ad0354647dd19bbb39aec574d915e8f29682708c`; build source `09b96f95bfc66519320ab4f46e54eb8cd85e1b2429e7d510f9ef0804f206b336`; per-command source `09b96f95bfc66519320ab4f46e54eb8cd85e1b2429e7d510f9ef0804f206b336`. Exact command, measured oracles, host load and receipt: `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/run-274/runner/34-hot-update-process.W.log` and `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/FINAL-ACCEPTANCE-ARMS.json`.
+
+**Historical measurements and invariant rationale (previous image; current receipt above is authoritative):**
+
+S3 acceptance expectation; **REAL RUN 2026-10-02: GREEN** (217 s; ×3 sweeps). Established producer, SYN-only NATS blackhole, new image imports/thaws but cannot register. The 120-second watchdog reexports current state to the previous image: rolled_back, register deadline exceeded, generation 2, redispatched, previous slot consumed, original SHA/PID/start. Heal then LOST→RUNNING, source progress and EXITED(23) from the previous courier. The original ctl outcome is recorded only.
+
+
+**Final S5 serial measured receipt (supersedes older NOT_RUN/status statements above):**
+
+Measured 2026-10-11: native rc0/GREEN, 215 s; one final serial image `sha256:049b3c3bc69a1f3b9e88b1dbc3998cf5b809c076f6eb9b0e9edfe0fe39b55086`, source patch `647e54d6f8457e651249f37f773842fa1f40ab39b2cdc87238f5d8af8305f63b`. Receipt: `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/run-257/runner/34-hot-update-process.W.log`.
+
+Full byte, nonce, Accept, calibration and host-load oracles: `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/FINAL-ACCEPTANCE-ARMS.json`.
+
+## 34-hot-update-process.F
+
+**Current final S5 serial acceptance**: native rc0/GREEN, 82 s. Image `sha256:9d8a232c3c02d0e1de59a6d7ad0354647dd19bbb39aec574d915e8f29682708c`; build source `09b96f95bfc66519320ab4f46e54eb8cd85e1b2429e7d510f9ef0804f206b336`; per-command source `09b96f95bfc66519320ab4f46e54eb8cd85e1b2429e7d510f9ef0804f206b336`. Exact command, measured oracles, host load and receipt: `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/run-274/runner/34-hot-update-process.F.log` and `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/FINAL-ACCEPTANCE-ARMS.json`.
+
+**Historical measurements and invariant rationale (previous image; current receipt above is authoritative):**
+
+S3 acceptance expectation; **REAL RUN 2026-10-02: GREEN** (81 s; ×3 sweeps). Healthy hangfs is mounted before the final setup restart and before the producer starts, matching drill 62 and the boot-time mount scan. The wedged cwd must refuse with remote_fs_unsafe_cwd; the upgrade refusal must carry remote_fs_probe_in_flight and a positive in-flight/retained probe census, corroborated by agent slog, before the healed upgrade. Unchanged binary/marker/PID and advancing source/ctl remain required. Heal then normal image continuity; thread census and freeze samples retained.
+
+
+**Final S5 serial measured receipt (supersedes older NOT_RUN/status statements above):**
+
+Measured 2026-10-11: native rc0/GREEN, 80 s; one final serial image `sha256:049b3c3bc69a1f3b9e88b1dbc3998cf5b809c076f6eb9b0e9edfe0fe39b55086`, source patch `647e54d6f8457e651249f37f773842fa1f40ab39b2cdc87238f5d8af8305f63b`. Receipt: `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/run-257/runner/34-hot-update-process.F.log`.
+
+Full byte, nonce, Accept, calibration and host-load oracles: `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/FINAL-ACCEPTANCE-ARMS.json`.
+
+## 35-hot-update-exec-carrier
+
+**Current final parent receipt:** A/B/C GREEN0; scoped registration fixture was frozen before this image build. Parent native 1, wall 1921.302 s; exact command `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/run-274/regression-sweep/receipt.json`. One deadline-fixed product image/tree; all product and drill inputs unchanged through serial acceptance.
+
+
+**GREEN on all three arms — observed 2026-09-21 (first real run; hot-update S1, docs/reviews/hot-update-reliable-exec-plan.md §5.2).**
+`./run-drills.sh 35-hot-update-exec-carrier` -j3 on image `sha256:ea43e478…`, vendor `tether` 6b180be0… / `tether-prev` v0.6.0 @ a3431a1
+(1cfd3ec6…): A GREEN 90 s pass=29, B GREEN 51 s pass=21, C GREEN 84 s pass=40, NO DEVIATIONS. Receipts (carrier.json per leg,
+legacy-outcome.json, calibration) in docs/reviews/hot-update-evidence.md §12.2. Highlights: A2 crossed redialAfter (`rebuild_lines=1`,
+source 167→626 through the 25 s outage); calibration post-A 10/10 rc 0 all reliable, max 246 ms; B-new (a new exec launched right after the
+broker restart) rc 0 reliable in 2.0 s; C1 the v0.6.0 ctl lost 450/522 records per stream from seq 55 (≥ the 54 it held at injection: attributable)
+while today's agent kept the child RUNNING and delivered EXITED(23); C2 `probe_reached_lines=4` (the old agent's `unknown forwarded verb`), legacy,
+complete. Parent row DERIVED (children's precedence join). The drill pins the S1 exit criterion that the hermetic
+real-binary suite (`test/cli_e2e`, `TestReliableExecMatrix`) cannot: a REAL nats-server / tether-broker under
+systemd on a real container host, replaced under a running `tether exec`. Fixture: N=1 (`up --brokers 1
+--agents 1 --ctl 1; init brk1; session lab; agent-join agt1`) plus the H0 producer/oracle copied in — no
+upgrade, no artifact server. Every log read goes through `drills/lib/logs.sh`.
+
+The oracle is `drills/lib/hot_update_process_probe.py carrier` (arms A/B, and C2 with `--path legacy`) and
+`legacy-carrier` (C1); both have positive AND negative synthetic controls in the probe's `selftest`, which
+`tests/run-all.sh` runs hermetically, and the drill's shell gates around them are proved two-sided in
+`tests/r9d-nonvacuity.sh`. Non-vacuity: `_stream_advancing` (two live samples strictly increasing) gates every
+injection, and each fault window must show >= 20 new source records — recorded in `carrier.json.faults[]` and
+judged.
+
+
+**Final S5 parent receipt:** All A/B/C nativeGREEN0; final NATS A/C in264 and corrected broker-only B in265. Initial stale-ONLINE35A1 and overly broad guard264B2 remain preserved as fixture defects. The final predicate changes no deadline/progress assertion. One product image and427 unchanged production/build inputs; exact per-attempt fixture digests disclosed.
+
+## 35-hot-update-exec-carrier.A
+
+**Current final S5 serial acceptance**: native rc0/GREEN, 89 s. Image `sha256:9d8a232c3c02d0e1de59a6d7ad0354647dd19bbb39aec574d915e8f29682708c`; build source `09b96f95bfc66519320ab4f46e54eb8cd85e1b2429e7d510f9ef0804f206b336`; per-command source `09b96f95bfc66519320ab4f46e54eb8cd85e1b2429e7d510f9ef0804f206b336`. Exact command, measured oracles, host load and receipt: `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/run-274/runner/35-hot-update-exec-carrier.A.log` and `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/FINAL-ACCEPTANCE-ARMS.json`.
+
+**Historical measurements and invariant rationale (previous image; current receipt above is authoritative):**
+
+A1 `systemctl restart nats-server` (seconds), then A2 `stop; sleep 25; start` — 25 s is deliberately past the
+agent's `redialAfter` (20 s), so the agent rebuilds its WHOLE NATS session (`agent: NATS stuck-disconnected;
+rebuilding session…` is asserted from the leg's slog cursor). GREEN = original child alive under the same PID
+triple/parent, agent MainPID + ExecMainStartTimestamp unchanged, both ctl transcripts byte-equal to the source,
+no pipe_error, ctl rc 23 on its own, exactly one `agent: exec … reliable=true` for the nonce, exactly one
+`ps -a` row EXITED(23). The 10 post-recovery `exec agt1 -- true` wall times and which path each took are
+CALIBRATION in `carrier.json.calibration` — recorded, never judged. Known deploy-tier risk: the 25 s outage may
+trip tether-broker's systemd StartLimit; that lands SETUP-RED here and a gotcha there, and the 25 s is not
+tuned down to buy green.
+
+
+**Final S5 serial measured receipt (supersedes older NOT_RUN/status statements above):**
+
+Measured 2026-10-11: native rc0/GREEN, 91 s; one final serial image `sha256:049b3c3bc69a1f3b9e88b1dbc3998cf5b809c076f6eb9b0e9edfe0fe39b55086`, source patch `34b246959068b299bac4d479118915795f1ce90b4de235997ef4545efc859212`. Receipt: `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/run-264/runner/35-hot-update-exec-carrier.A.log`.
+
+Full byte, nonce, Accept, calibration and host-load oracles: `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/FINAL-ACCEPTANCE-ARMS.json`.
+
+## 35-hot-update-exec-carrier.B
+
+**Current final S5 serial acceptance**: native rc0/GREEN, 51 s. Image `sha256:9d8a232c3c02d0e1de59a6d7ad0354647dd19bbb39aec574d915e8f29682708c`; build source `09b96f95bfc66519320ab4f46e54eb8cd85e1b2429e7d510f9ef0804f206b336`; per-command source `09b96f95bfc66519320ab4f46e54eb8cd85e1b2429e7d510f9ef0804f206b336`. Exact command, measured oracles, host load and receipt: `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/run-274/runner/35-hot-update-exec-carrier.B.log` and `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/FINAL-ACCEPTANCE-ARMS.json`.
+
+**Historical measurements and invariant rationale (previous image; current receipt above is authoritative):**
+
+`systemctl restart tether-broker` (nats-server stays up; the broker's subscriptions vanish and its auth_callout
+black window opens). Same GREEN conjunction as A. `B-new` launches a NEW exec immediately after the restart and
+records its rc / path / wall — plan §4 exit #5: new-request latency is not a criterion, and the connection-level
+retry through the callout black window is proven hermetically (`TestCtlConnectRetriesThroughCalloutBlackWindow`).
+
+
+**Final S5 serial measured receipt (supersedes older NOT_RUN/status statements above):**
+
+Measured 2026-10-11: native rc0/GREEN, 52 s; one final serial image `sha256:049b3c3bc69a1f3b9e88b1dbc3998cf5b809c076f6eb9b0e9edfe0fe39b55086`, source patch `2d15b0230013f12cedfab95aecdb9ecf23d9d897f51a866023cf462c4d780403`. Receipt: `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/run-265/runner/35-hot-update-exec-carrier.B.log`.
+
+Full byte, nonce, Accept, calibration and host-load oracles: `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/FINAL-ACCEPTANCE-ARMS.json`.
+
+## 35-hot-update-exec-carrier.C
+
+**Current final S5 serial acceptance**: native rc0/GREEN, 86 s. Image `sha256:9d8a232c3c02d0e1de59a6d7ad0354647dd19bbb39aec574d915e8f29682708c`; build source `09b96f95bfc66519320ab4f46e54eb8cd85e1b2429e7d510f9ef0804f206b336`; per-command source `09b96f95bfc66519320ab4f46e54eb8cd85e1b2429e7d510f9ef0804f206b336`. Exact command, measured oracles, host load and receipt: `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/run-274/runner/35-hot-update-exec-carrier.C.log` and `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/FINAL-ACCEPTANCE-ARMS.json`.
+
+**Historical measurements and invariant rationale (previous image; current receipt above is authoritative):**
+
+The N-1 window, both directions, against the REAL previous release (`vendor/tether-prev`, built by
+`lib/stage.sh sim_stage_prev` from the newest `v*` tag reachable from HEAD — today v0.6.0 — in a detached
+worktree with that tag's own Makefile/go.mod; `vendor/tether-prev-source.json` is the receipt and
+`sim_prev_source_ok` the die-gate; tether-next is NEVER accepted as "previous").
+**C1** — the v0.6.0 ctl against today's agent under the A2 fault. A previous-release ctl can only take the
+legacy exec path, and requirements §6.7 promises interoperability across the window, not carrier survival, so
+GREEN = `reliable_lines == 0 && exec_start_lines == 1` (legacy path, executed once), today's agent kept the
+child RUNNING and reported EXITED(23), and the discontinuity is RECORDED HONESTLY: transcript ≠ source (a clean
+prefix or an internal break) or exit undelivered. `legacy-outcome.json` is the receipt. A fully continuous old
+ctl would REFUSE the judge — the "N-1 is not continuous" claim must not be asserted on nothing. C1 is also the
+real old-binary NEGATIVE control of the A/B oracle. **C2** — today's ctl against the v0.6.0 AGENT (binary
+swapped under the same unit and home, `_agt1_at_prev` = ONLINE at the tag): the reliable probe reaches the old
+agent (`unknown forwarded verb … process-resume` ≥ 1 is the receipt), the ctl falls back to legacy after the
+2 s probe tax, and the run is complete (rc 23, transcript == source, one exec line, one EXITED(23) row).
+
+
+**Final S5 serial measured receipt (supersedes older NOT_RUN/status statements above):**
+
+Measured 2026-10-11: native rc0/GREEN, 87 s; one final serial image `sha256:049b3c3bc69a1f3b9e88b1dbc3998cf5b809c076f6eb9b0e9edfe0fe39b55086`, source patch `34b246959068b299bac4d479118915795f1ce90b4de235997ef4545efc859212`. Receipt: `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/run-264/runner/35-hot-update-exec-carrier.C.log`.
+
+Full byte, nonce, Accept, calibration and host-load oracles: `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/FINAL-ACCEPTANCE-ARMS.json`.
 
 ## 32-install-lifecycle
 
@@ -357,9 +703,20 @@ worded `refused ≥2 attempt(s)` (the retry actually ran), tooth PASS; CONTROL(a
 
 ## 70-expose-journey
 
+**Current final S5 serial acceptance**: native rc0/GREEN, 53 s. Image `sha256:9d8a232c3c02d0e1de59a6d7ad0354647dd19bbb39aec574d915e8f29682708c`; build source `09b96f95bfc66519320ab4f46e54eb8cd85e1b2429e7d510f9ef0804f206b336`; per-command source `09b96f95bfc66519320ab4f46e54eb8cd85e1b2429e7d510f9ef0804f206b336`. Exact command, measured oracles, host load and receipt: `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/run-275/runner/70-expose-journey.log` and `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/FINAL-ACCEPTANCE-ARMS.json`.
+
+**Historical measurements and invariant rationale (previous image; current receipt above is authoritative):**
+
 - **batch**: `-`  _(expected/owner are authoritative in expected-verdicts.tsv — not duplicated here, MI6)_
 
 stable across both runs
+
+
+**Final S5 serial measured receipt (supersedes older NOT_RUN/status statements above):**
+
+Measured 2026-10-11: native rc0/GREEN, 57 s; one final serial image `sha256:049b3c3bc69a1f3b9e88b1dbc3998cf5b809c076f6eb9b0e9edfe0fe39b55086`, source patch `2d15b0230013f12cedfab95aecdb9ecf23d9d897f51a866023cf462c4d780403`. Receipt: `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/run-258/runner/70-expose-journey.log`.
+
+Full byte, nonce, Accept, calibration and host-load oracles: `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/FINAL-ACCEPTANCE-ARMS.json`.
 
 ## 71-expose-rehome-failover
 
@@ -369,9 +726,20 @@ R15: R14: the four #29-family THIS-RUN guards (Arm E / B-silent / Arm B drain-mi
 
 ## 72-proxy-subscription
 
+**Current final S5 serial acceptance**: native rc0/GREEN, 90 s. Image `sha256:9d8a232c3c02d0e1de59a6d7ad0354647dd19bbb39aec574d915e8f29682708c`; build source `09b96f95bfc66519320ab4f46e54eb8cd85e1b2429e7d510f9ef0804f206b336`; per-command source `09b96f95bfc66519320ab4f46e54eb8cd85e1b2429e7d510f9ef0804f206b336`. Exact command, measured oracles, host load and receipt: `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/run-275/runner/72-proxy-subscription.log` and `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/FINAL-ACCEPTANCE-ARMS.json`.
+
+**Historical measurements and invariant rationale (previous image; current receipt above is authoritative):**
+
 - **batch**: `-`  _(expected/owner are authoritative in expected-verdicts.tsv — not duplicated here, MI6)_
 
 stable across both runs
+
+
+**Final S5 serial measured receipt (supersedes older NOT_RUN/status statements above):**
+
+Measured 2026-10-11: native rc0/GREEN, 100 s; one final serial image `sha256:049b3c3bc69a1f3b9e88b1dbc3998cf5b809c076f6eb9b0e9edfe0fe39b55086`, source patch `2d15b0230013f12cedfab95aecdb9ecf23d9d897f51a866023cf462c4d780403`. Receipt: `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/run-258/runner/72-proxy-subscription.log`.
+
+Full byte, nonce, Accept, calibration and host-load oracles: `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/FINAL-ACCEPTANCE-ARMS.json`.
 
 ## 73-proxy-cluster-ha
 
@@ -540,6 +908,10 @@ R15: R13 (item 4): the ONLY non-GREEN is the #42 BOUNDED observation gap (quorum
 
 ## 94-agent-reconcile
 
+**Current final S5 serial acceptance**: native rc0/GREEN, 128 s. Image `sha256:9d8a232c3c02d0e1de59a6d7ad0354647dd19bbb39aec574d915e8f29682708c`; build source `09b96f95bfc66519320ab4f46e54eb8cd85e1b2429e7d510f9ef0804f206b336`; per-command source `09b96f95bfc66519320ab4f46e54eb8cd85e1b2429e7d510f9ef0804f206b336`. Exact command, measured oracles, host load and receipt: `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/run-274/runner/94-agent-reconcile.log` and `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/FINAL-ACCEPTANCE-ARMS.json`.
+
+**Historical measurements and invariant rationale (previous image; current receipt above is authoritative):**
+
 - **batch**: `R13`  _(expected/owner are authoritative in expected-verdicts.tsv — not duplicated here, MI6)_
 
 R13-D6: `ps` LOST is now a REAL assertion (was an overclaim — the header/title named it but the drill only checked NODE status). A1d/e/f: agt1's exec children DERIVE LOST while agt1 is OFFLINE (storage-RUNNING row + OFFLINE owning node, exec.go:326-345) while agt2's stays RUNNING (the discriminator) — closing the RUNNING(A0d)→LOST(A1)→EXITED(A2) three-state chain. r13d GREEN pass=54. Was GREEN (stable both runs)
@@ -549,6 +921,13 @@ RUNNING/LOST snapshot as "history", so a node whose jobs had all exited never re
 `proc.NodeHasHistory`). B5 reworded, not re-judged: DOC-25 closed — `agent: re-registered after reconnect` now carries
 reconciled/drop_procs/revoke_ports, and B5 reads it instead of inferring the directive from the kill line. Receipt: 94c
 solo GREEN pass=54 (batch21, image #13).
+
+
+**Final S5 serial measured receipt (supersedes older NOT_RUN/status statements above):**
+
+Measured 2026-10-11: native rc0/GREEN, 128 s; one final serial image `sha256:049b3c3bc69a1f3b9e88b1dbc3998cf5b809c076f6eb9b0e9edfe0fe39b55086`, source patch `647e54d6f8457e651249f37f773842fa1f40ab39b2cdc87238f5d8af8305f63b`. Receipt: `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/run-257/runner/94-agent-reconcile.log`.
+
+Full byte, nonce, Accept, calibration and host-load oracles: `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/FINAL-ACCEPTANCE-ARMS.json`.
 
 ## 95-broker-selfheal
 
@@ -750,3 +1129,1608 @@ wall-clock 轮询超时，证据里 `fsync_4k_ms=15.3`。`96` 的声明式缺口
 读错了流或列（52 BOOT journal、60 KIND 列、81 agent BOOT 流 + cursor），产品文本没变，solo 全 GREEN；`94` 的 B3
 超时是产品缺陷 #87（已修）；`67` 的 CONTROL(after) 面是 #84（已修，三张脸）；`30` 是负载面（无变更）。「直到有人真的
 去分诊」——已分诊；「five remain stale」——不再成立。
+
+## 39-hot-update-legacy-n1
+
+**Current final parent receipt:** X0/Y3/P3/F3, frozen P pin unchanged; unpinned F272 native2 reconfirms exact reviewed reset, pinned F3. Parent native 0, wall 670.711 s; exact command `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/run-273/39-parent/receipt.json`. One deadline-fixed product image/tree; all product and drill inputs unchanged through serial acceptance.
+
+
+S3 N-1 boundary, **REAL RUN 2026-10-02: PRODUCT-RED (derived), NO DEVIATIONS, three sweeps.** Parent PRODUCT-RED is DERIVED from X GREEN and Y PRODUCT-RED.
+Owner: hot-update-plan H0 legacy exporter; S8 legacy-to-capable first migration. Both arms use the real
+`vendor/tether-prev` with source receipt, in-container SHA, v0.6.0 tag and absent image-ABI line verified.
+No arbitrary failure band is registered.
+
+
+**Final S5 parent receipt:** Final serial parent256 runner policy0 with --allow-product-red: X0/Y3/P3/F3. Exact frozen39P pin unchanged; actual reset F matched the existing reviewed pin. Owner: hot-update-plan H0 legacy exporter; S8 legacy-to-capable first migration; hot-update-plan H1 legacy PTY exporter; S8 legacy-to-capable first migration; hot-update-plan H2 legacy flow exporter; S8 legacy-to-capable first migration
+
+## 39-hot-update-legacy-n1.X
+
+**Current final S5 serial acceptance**: native rc0/GREEN, 63 s. Image `sha256:9d8a232c3c02d0e1de59a6d7ad0354647dd19bbb39aec574d915e8f29682708c`; build source `09b96f95bfc66519320ab4f46e54eb8cd85e1b2429e7d510f9ef0804f206b336`; per-command source `09b96f95bfc66519320ab4f46e54eb8cd85e1b2429e7d510f9ef0804f206b336`. Exact command, measured oracles, host load and receipt: `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/run-273/runner/39-hot-update-legacy-n1.X.log` and `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/FINAL-ACCEPTANCE-ARMS.json`.
+
+**Historical measurements and invariant rationale (previous image; current receipt above is authoritative):**
+
+GREEN acceptance expectation, **REAL RUN 2026-10-02: GREEN** (pass=20, 64 s, three sweeps). A live reliable task makes a legacy target inadmissible:
+`agent_rejected:image_abi_unsupported`, rc64, unchanged destination/exe SHA, no marker, original PID/start,
+continued producer output and original ctl rc23. This is a safe refusal, not a downgrade continuity claim.
+
+
+**Final S5 serial measured receipt (supersedes older NOT_RUN/status statements above):**
+
+Measured 2026-10-11: native rc0/GREEN, 63 s; one final serial image `sha256:049b3c3bc69a1f3b9e88b1dbc3998cf5b809c076f6eb9b0e9edfe0fe39b55086`, source patch `647e54d6f8457e651249f37f773842fa1f40ab39b2cdc87238f5d8af8305f63b`. Receipt: `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/run-256/runner/39-hot-update-legacy-n1.X.log`.
+
+Full byte, nonce, Accept, calibration and host-load oracles: `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/FINAL-ACCEPTANCE-ARMS.json`.
+
+## 39-hot-update-legacy-n1.Y
+
+**Current final S5 serial acceptance**: native rc3/PRODUCT-RED, 114 s. Image `sha256:9d8a232c3c02d0e1de59a6d7ad0354647dd19bbb39aec574d915e8f29682708c`; build source `09b96f95bfc66519320ab4f46e54eb8cd85e1b2429e7d510f9ef0804f206b336`; per-command source `09b96f95bfc66519320ab4f46e54eb8cd85e1b2429e7d510f9ef0804f206b336`. Exact command, measured oracles, host load and receipt: `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/run-273/runner/39-hot-update-legacy-n1.Y.log` and `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/FINAL-ACCEPTANCE-ARMS.json`.
+
+**Historical measurements and invariant rationale (previous image; current receipt above is authoritative):**
+
+PRODUCT-RED expected; **signature is a prediction to be re-pinned after the first real run**:
+`HOT_UPDATE_LEGACY_EXPORTER output=epipe management=exited_minus_one ctl=idle_timeout_rc70 pid=<pid> nonce=<nonce>`.
+The running exporter is v0.6.0; the dev ctl probes then falls back to legacy exec. Its legacy
+`NextMsgWithContext` deadline returns the unwrapped `exec: timed out after 1m0s waiting for chunk`
+error (`cmd/tether/exec.go`), so `exitcode.go` defaults to 70, unlike reliable-path owner-loss rc74.
+The judge requires both original EPIPEs, independent continued source, EXITED(-1), one legacy execution,
+a reached reliable probe, the exact timeout diagnostic and rc70. Complete continuity and S1 owner-loss
+receipts are negative controls. A different first-run shape must be investigated and re-pinned honestly.
+
+**REAL RUN 2026-10-02 (`./run-drills.sh -j2 --no-attribute --allow-product-red 39-hot-update-legacy-n1`,
+three sweeps on images `c346a962…` and `4fe3646b…`): PRODUCT-RED rc=3, pass=20, the predicted signature
+matched verbatim every time** (`/^HOT_UPDATE_LEGACY_EXPORTER output=epipe management=exited_minus_one
+ctl=idle_timeout_rc70 pid=[0-9]+ nonce=[0-9a-f]{32}$/`), 117 s. No re-pin was needed: the prediction is now a
+measurement. The waiver flag is the owner's (S8); the arm stays PRODUCT-RED until S8 migrates a legacy exporter.
+
+
+**Final S5 serial measured receipt (supersedes older NOT_RUN/status statements above):**
+
+Measured 2026-10-11: native rc3/PRODUCT-RED, 116 s; one final serial image `sha256:049b3c3bc69a1f3b9e88b1dbc3998cf5b809c076f6eb9b0e9edfe0fe39b55086`, source patch `647e54d6f8457e651249f37f773842fa1f40ab39b2cdc87238f5d8af8305f63b`. Receipt: `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/run-256/runner/39-hot-update-legacy-n1.Y.log`.
+
+Full byte, nonce, Accept, calibration and host-load oracles: `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/FINAL-ACCEPTANCE-ARMS.json`.
+
+## 36-hot-update-pty
+
+**Current final parent receipt:** A/W/C/L GREEN0; actual generation1→2 preserved. Parent native 1, wall 1921.302 s; exact command `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/run-274/regression-sweep/receipt.json`. One deadline-fixed product image/tree; all product and drill inputs unchanged through serial acceptance.
+
+
+Origin: hot-update S4 plan §9.2 / §9.3; internal review rv-drill DRILL-1..8 / V1.
+Hermetic predicates and real-binary tests do not supply deployment receipts.
+
+S4 plan §9.3 acceptance expectation: Parent GREEN, nc_gap=0, bands=-, owner=-,
+derived from A/W/C/L GREEN. Freeze windows are calibration; the five-second
+new-request and normal business-stall limits remain hard checks.
+
+**First complete real run 2026-10-03 (run 5, image 78f2c62d, -j10 with 34/35/33/39/94):
+A/W/C/L GREEN, parent GREEN (123 passes), every unit matched; costs recorded in
+drill-costs.tsv.** Runs 1–4 never completed 36 and each exposed real defects, all
+fixed before run 5 (evidence `~/tether-hot-update-handoff-20260920T2356Z/s4-evidence/drill-run{1..5}`):
+drill-side — state established inside `assert_*` capture subshells (`ART_SHA` unset;
+whole-suite guard `tests/assert-shell-state.py`, drill 94 fixed too), the probe's
+`census` crashing on pid 1 of a real `/proc`, `node ls` hiding offline nodes, a
+rollback-phase predicate, C1/C2 nonce join, fixture ordering for old brokers, W's
+unACKed-output precondition; PRODUCT — spawnsafe counted in-flight spawns as wedged
+(a busy node could never upgrade), the retained PTY terminal was lost after an image
+switch (ctl `workload: unknown process`, exit 74), the ctl printed NATS transport
+errors into the raw terminal during a carrier outage, and legacy-wire refusals of an
+upgrading agent used a code N-1 clients classify as 70 (now `try_again` +
+`agent_upgrading` detail ⇒ 75). See docs/reviews/hot-update-pty-terminal-review.md §4.
+
+
+**Final S5 parent receipt:** All A/W/C/L nativeGREEN0 in257 on the final image. A actual generation1→2, exact duplex bytes, resource ownership, control semantics and watchdog assertions retained.
+
+## 36-hot-update-pty.A
+
+**Current final S5 serial acceptance**: native rc0/GREEN, 107 s. Image `sha256:9d8a232c3c02d0e1de59a6d7ad0354647dd19bbb39aec574d915e8f29682708c`; build source `09b96f95bfc66519320ab4f46e54eb8cd85e1b2429e7d510f9ef0804f206b336`; per-command source `09b96f95bfc66519320ab4f46e54eb8cd85e1b2429e7d510f9ef0804f206b336`. Exact command, measured oracles, host load and receipt: `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/run-274/runner/36-hot-update-pty.A.log` and `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/FINAL-ACCEPTANCE-ARMS.json`.
+
+**Historical measurements and invariant rationale (previous image; current receipt above is authoritative):**
+
+GREEN, nc_gap=0, bands=-, owner=-; **real run 5 GREEN (104 s)**. Original raw duplex
+PTY, foreground and ctl must survive a distinct-image upgrade with exact bytes,
+zero HUP/early EOF, resize across the cut, rc23 and settled resources. Strict
+mixed requests must meet the five-second budget, after healthy strict calibration
+without synthetic fault markers. Full freeze maxima above 500 ms remain
+calibration under lead verdict L4; unexplained five-second stalls fail.
+Estimate 120 s; declared worst 300 s.
+
+
+**Final S5 serial measured receipt (supersedes older NOT_RUN/status statements above):**
+
+Measured 2026-10-11: native rc0/GREEN, 104 s; one final serial image `sha256:049b3c3bc69a1f3b9e88b1dbc3998cf5b809c076f6eb9b0e9edfe0fe39b55086`, source patch `647e54d6f8457e651249f37f773842fa1f40ab39b2cdc87238f5d8af8305f63b`. Receipt: `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/run-257/runner/36-hot-update-pty.A.log`.
+
+Full byte, nonce, Accept, calibration and host-load oracles: `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/FINAL-ACCEPTANCE-ARMS.json`.
+
+## 36-hot-update-pty.W
+
+**Current final S5 serial acceptance**: native rc0/GREEN, 218 s. Image `sha256:9d8a232c3c02d0e1de59a6d7ad0354647dd19bbb39aec574d915e8f29682708c`; build source `09b96f95bfc66519320ab4f46e54eb8cd85e1b2429e7d510f9ef0804f206b336`; per-command source `09b96f95bfc66519320ab4f46e54eb8cd85e1b2429e7d510f9ef0804f206b336`. Exact command, measured oracles, host load and receipt: `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/run-274/runner/36-hot-update-pty.W.log` and `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/FINAL-ACCEPTANCE-ARMS.json`.
+
+**Historical measurements and invariant rationale (previous image; current receipt above is authoritative):**
+
+GREEN, nc_gap=0, bands=-, owner=-; **real run 5 GREEN (216 s)**. Accepted pending input
+and unACKed output must advance in the disconnected candidate; the real 120 s
+register watchdog must restore the previous image from current state, preserving
+the original handle/master and absolute KA deadline. Actual resizes bracket
+the blackhole and recovery; activation alone cannot prove queued-byte progress.
+Estimate 240 s; declared worst 420 s.
+
+
+**Final S5 serial measured receipt (supersedes older NOT_RUN/status statements above):**
+
+Measured 2026-10-11: native rc0/GREEN, 216 s; one final serial image `sha256:049b3c3bc69a1f3b9e88b1dbc3998cf5b809c076f6eb9b0e9edfe0fe39b55086`, source patch `647e54d6f8457e651249f37f773842fa1f40ab39b2cdc87238f5d8af8305f63b`. Receipt: `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/run-257/runner/36-hot-update-pty.W.log`.
+
+Full byte, nonce, Accept, calibration and host-load oracles: `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/FINAL-ACCEPTANCE-ARMS.json`.
+
+## 36-hot-update-pty.C
+
+**Current final S5 serial acceptance**: native rc0/GREEN, 115 s. Image `sha256:9d8a232c3c02d0e1de59a6d7ad0354647dd19bbb39aec574d915e8f29682708c`; build source `09b96f95bfc66519320ab4f46e54eb8cd85e1b2429e7d510f9ef0804f206b336`; per-command source `09b96f95bfc66519320ab4f46e54eb8cd85e1b2429e7d510f9ef0804f206b336`. Exact command, measured oracles, host load and receipt: `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/run-274/runner/36-hot-update-pty.C.log` and `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/FINAL-ACCEPTANCE-ARMS.json`.
+
+**Historical measurements and invariant rationale (previous image; current receipt above is authoritative):**
+
+GREEN, nc_gap=0, bands=-, owner=-; **real run 5 GREEN (112 s)**. Both C1's 25 s carrier
+outage with observed session restoration and C2's draining leader, tail beyond
+200 ms, FIN, canonical/raw Ctrl-D/Ctrl-C and real terminal outcome must pass.
+C1's observed carrier outage must fit the original bounded recovery window
+with at most five seconds of unexplained silence at either edge. C2 permits
+only the original leader's identity-bound ReapHeld zombie during the measured
+live slave tail; unrelated, late, and settled zombies fail.
+Estimate 150 s; declared worst 360 s.
+
+
+**Final S5 serial measured receipt (supersedes older NOT_RUN/status statements above):**
+
+Measured 2026-10-11: native rc0/GREEN, 115 s; one final serial image `sha256:049b3c3bc69a1f3b9e88b1dbc3998cf5b809c076f6eb9b0e9edfe0fe39b55086`, source patch `647e54d6f8457e651249f37f773842fa1f40ab39b2cdc87238f5d8af8305f63b`. Receipt: `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/run-257/runner/36-hot-update-pty.C.log`.
+
+Full byte, nonce, Accept, calibration and host-load oracles: `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/FINAL-ACCEPTANCE-ARMS.json`.
+
+## 36-hot-update-pty.L
+
+**Current final S5 serial acceptance**: native rc0/GREEN, 201 s. Image `sha256:9d8a232c3c02d0e1de59a6d7ad0354647dd19bbb39aec574d915e8f29682708c`; build source `09b96f95bfc66519320ab4f46e54eb8cd85e1b2429e7d510f9ef0804f206b336`; per-command source `09b96f95bfc66519320ab4f46e54eb8cd85e1b2429e7d510f9ef0804f206b336`. Exact command, measured oracles, host load and receipt: `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/run-274/runner/36-hot-update-pty.L.log` and `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/FINAL-ACCEPTANCE-ARMS.json`.
+
+**Historical measurements and invariant rationale (previous image; current receipt above is authoritative):**
+
+GREEN, nc_gap=0, bands=-, owner=-; **real run 5 GREEN (193 s)**. Legacy admission before
+attach and while running must defer upgrade without disk mutation; original
+resize/dual-publish bytes and old-wire fallback quadrants remain usable. Pending
+admission reaches a registered candidate whose commit persistence is faulted
+and must return legacy75 — the refusal leads with `try_again` (a code the real
+v0.6.0 ctl already maps to 75; run 4 showed a bare `agent_upgrading` exits 70 on
+it) and carries the product reason `agent_upgrading` in its detail, zero
+Start/effect, and the same candidate still pending. Transport is healed before
+the admission request; no responders cannot prove the pending gate.
+Estimate 120 s; declared worst 300 s.
+
+
+**Final S5 serial measured receipt (supersedes older NOT_RUN/status statements above):**
+
+Measured 2026-10-11: native rc0/GREEN, 202 s; one final serial image `sha256:049b3c3bc69a1f3b9e88b1dbc3998cf5b809c076f6eb9b0e9edfe0fe39b55086`, source patch `647e54d6f8457e651249f37f773842fa1f40ab39b2cdc87238f5d8af8305f63b`. Receipt: `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/run-257/runner/36-hot-update-pty.L.log`.
+
+Full byte, nonce, Accept, calibration and host-load oracles: `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/FINAL-ACCEPTANCE-ARMS.json`.
+
+## 39-hot-update-legacy-n1.P
+
+**Current final S5 serial acceptance**: native rc3/PRODUCT-RED, 349 s. Image `sha256:9d8a232c3c02d0e1de59a6d7ad0354647dd19bbb39aec574d915e8f29682708c`; build source `09b96f95bfc66519320ab4f46e54eb8cd85e1b2429e7d510f9ef0804f206b336`; per-command source `09b96f95bfc66519320ab4f46e54eb8cd85e1b2429e7d510f9ef0804f206b336`. Exact command, measured oracles, host load and receipt: `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/run-273/runner/39-hot-update-legacy-n1.P.log` and `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/FINAL-ACCEPTANCE-ARMS.json`.
+
+**Historical measurements and invariant rationale (previous image; current receipt above is authoritative):**
+
+PRODUCT-RED, nc_gap=0, bands=-; **pinned; real run 5 PRODUCT-RED match (348 s)**.
+Owner: hot-update-plan H1 legacy PTY exporter; S8 legacy-to-capable first migration.
+The real previous exporter and old ctl use the same raw-byte continuity oracle
+and upgrade fault as 36.A. Missing legacy wait/management ownership is preserved as
+absence after proving
+old supply, original start, committed same-PID image replacement, readable fresh
+four-stream logs, and original ctl waitpid. No terminal audit is invented. If the
+original ctl misses its deadline, the collector labels the measured timeout and
+retains the actual waitpid signal status; it does not report an autonomous exit.
+The first unverified real failure is native ASSERT-FAIL, never PRODUCT-RED;
+the lead must retain and review the complete evidence, then pin its one exact
+observed signature. No rc70 or predicted failure shape is registered as a fact.
+A reviewed failure returns continuity_oracle_rc=1 and native PRODUCT-RED rc=3;
+invalid evidence, another shape or unexpected continuity are ASSERT-FAIL.
+Estimate 150 s; declared worst 300 s.
+
+**Pinned 2026-10-03 (lead review of the first real run).** Drill runs 1–3 never
+reached the classifier (drill-side defects, fixed); run 4 (image ab9568ac) did, as
+native ASSERT-FAIL with the UNPINNED notice, and retained its evidence under
+`~/tether-hot-update-handoff-20260920T2356Z/s4-evidence/drill-run4/` (39.P log,
+`evidence/hot-update-pty.P.*`). Observed signature, reproduced by a deterministic
+replay of the archived evidence:
+`HOT_UPDATE_LEGACY_PTY_EXPORTER output=interrupted hup=0 management_terminal=0 ctl=-9 pid=1397 nonce=c53008f2… reason=bytes_input,bytes_output,postprogress_input_received,postprogress_output_sent,postprogress_output_received,identity_window_leader,early_eof_foreground,identity_window_foreground,courier_terminal,resize_nonempty,resize_cut,ctl_reaped,ctl_exit,zombies,resources_stable,foreground_retained`.
+Reviewed meaning: the v0.6.0 exporter bare-execs and COMMITS, the original task is
+reconciled to `EXITED(-1)` with no terminal audit, the foreground reads early EOF,
+and the original ctl never ends on its own — the fixture kills it after its measured
+300.006 s timeout (`ctl=-9`). That is the H1 owner's defect, nothing else. The pin
+(`PTY_LEGACY_SIGNATURE` in the drill) fixes interrupted output, no management
+terminal, `ctl=-9`, and the presence of `bytes_output` then `courier_terminal` in the
+reason list; pid/nonce are per run and the HUP-vs-EOF order and zombie timing were
+seen to vary, so they are deliberately outside the pin. Negative checks: an
+autonomous ctl exit, exact output, or a delivered courier terminal all fail the pin.
+
+### S4 parent 39 declaration update — NOT_RUN
+
+The historical parent 39 and X/Y real-run receipts above are retained. With P
+added, the declared parent remains PRODUCT-RED, nc_gap=0, bands=-, derived from
+X GREEN and Y/P PRODUCT-RED. Its owner preserves the complete H0 owner and appends
+H1 with `; `: hot-update-plan H0 legacy exporter; S8 legacy-to-capable first migration; hot-update-plan H1 legacy PTY exporter; S8 legacy-to-capable first migration.
+This is a declared S4 update, not a new parent or P deployment receipt.
+
+
+**Final S5 serial measured receipt (supersedes older NOT_RUN/status statements above):**
+
+Measured 2026-10-11: native rc3/PRODUCT-RED, 349 s; one final serial image `sha256:049b3c3bc69a1f3b9e88b1dbc3998cf5b809c076f6eb9b0e9edfe0fe39b55086`, source patch `647e54d6f8457e651249f37f773842fa1f40ab39b2cdc87238f5d8af8305f63b`. Receipt: `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/run-256/runner/39-hot-update-legacy-n1.P.log`.
+
+Full byte, nonce, Accept, calibration and host-load oracles: `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/FINAL-ACCEPTANCE-ARMS.json`.
+
+## 75-hot-update-flows
+
+**Current final parent receipt:** All A/C/R/B/W/L GREEN0; C1 saturation, finite FIN/recovery and normal phase in one N3-live run. Parent native 0, wall 1286.019 s; exact command `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/run-271/75-parent/receipt.json`. One deadline-fixed product image/tree; all product and drill inputs unchanged through serial acceptance.
+
+
+GREEN, nc_gap=0, bands=-, owner=-; **final serial parent GREEN**.
+
+All six A/C/R/B/W/L arms completed on one image/tree in run254; parent runner native0,1307.368 s. The adopted C1 saturation/recovery and normal phases both passed. Frozen manifest headers, product budgets and deadlines are unchanged.
+
+Image `sha256:049b3c3bc69a1f3b9e88b1dbc3998cf5b809c076f6eb9b0e9edfe0fe39b55086`; product build patch `647e54d6f8457e651249f37f773842fa1f40ab39b2cdc87238f5d8af8305f63b`. The later35 fixture-only stale-ONLINE correction preserves all427 production inputs and every unrelated drill input (run263/UNAFFECTED-INPUT-PROOF.json). Parent command/receipt: `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/run-254/75-parent/receipt.json`.
+
+## 75-hot-update-flows.A
+
+**Current final S5 serial acceptance**: native rc0/GREEN, 166 s. Image `sha256:9d8a232c3c02d0e1de59a6d7ad0354647dd19bbb39aec574d915e8f29682708c`; build source `09b96f95bfc66519320ab4f46e54eb8cd85e1b2429e7d510f9ef0804f206b336`; per-command source `09b96f95bfc66519320ab4f46e54eb8cd85e1b2429e7d510f9ef0804f206b336`. Exact command, measured oracles, host load and receipt: `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/run-271/runner/75-hot-update-flows.A.log` and `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/FINAL-ACCEPTANCE-ARMS.json`.
+
+Normal per-capture max-stall p50/p95/max 0.153/1.603/3.013 s; original identities and target Accept=1 retained.
+
+435 requests at 10.0/s, terminal failures=0.
+
+**Historical measurements and invariant rationale (previous image; current receipt above is authoritative):**
+
+GREEN, nc_gap=0, bands=-, owner=-; **final serial acceptance GREEN**.
+
+The same original SSH/TCP/OPEN/half-close/SS cohort spans a real same-PID cut, silent-victim revocation and forced carrier replacement. No application reconnect is permitted.
+
+Measured 2026-10-11: native rc0/GREEN, 157 s; one final serial image `sha256:049b3c3bc69a1f3b9e88b1dbc3998cf5b809c076f6eb9b0e9edfe0fe39b55086`, source patch `647e54d6f8457e651249f37f773842fa1f40ab39b2cdc87238f5d8af8305f63b`. Receipt: `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/run-254/runner/75-hot-update-flows.A.log`.
+
+Normal per-capture maximum stalls p50/p95/max: 0.165/1.375/3.016 s. Original identities and target Accept=1 passed.
+
+451 requests at 10.0/s; terminal failures=0.
+
+Full byte, nonce, Accept, calibration and host-load oracles: `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/FINAL-ACCEPTANCE-ARMS.json`.
+
+## 75-hot-update-flows.C
+
+**Current final S5 serial acceptance**: native rc0/GREEN, 385 s. Image `sha256:9d8a232c3c02d0e1de59a6d7ad0354647dd19bbb39aec574d915e8f29682708c`; build source `09b96f95bfc66519320ab4f46e54eb8cd85e1b2429e7d510f9ef0804f206b336`; per-command source `09b96f95bfc66519320ab4f46e54eb8cd85e1b2429e7d510f9ef0804f206b336`. Exact command, measured oracles, host load and receipt: `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/run-271/runner/75-hot-update-flows.C.log` and `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/FINAL-ACCEPTANCE-ARMS.json`.
+
+Normal per-capture max-stall p50/p95/max 0.964/1.563/3.023 s; original identities and target Accept=1 retained.
+
+403 requests at 10.0/s, terminal failures=0.
+
+**Historical measurements and invariant rationale (previous image; current receipt above is authoritative):**
+
+GREEN, nc_gap=0, bands=-, owner=-; **final serial acceptance GREEN**.
+
+Lead C1: two phases in one arm, image and N3-live cluster. Saturation proves 32 active originals/full 256 MiB, one typed native flow refusal and two typed native exec refusals, 32 natural FINs / 64 complete direction ledgers, zero reservation and original-socket/new-exec recovery. Normal traffic reserves at most 224 MiB, preserves original identity/Accept=1 and exact post-cut samples, and passes the unchanged five-second and 10/s zero-failure checks.
+
+Measured 2026-10-11: native rc0/GREEN, 398 s; one final serial image `sha256:049b3c3bc69a1f3b9e88b1dbc3998cf5b809c076f6eb9b0e9edfe0fe39b55086`, source patch `647e54d6f8457e651249f37f773842fa1f40ab39b2cdc87238f5d8af8305f63b`. Receipt: `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/run-254/runner/75-hot-update-flows.C.log`.
+
+Normal per-capture maximum stalls p50/p95/max: 1.006/1.384/3.024 s. Original identities and target Accept=1 passed.
+
+437 requests at 10.0/s; terminal failures=0.
+
+Full byte, nonce, Accept, calibration and host-load oracles: `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/FINAL-ACCEPTANCE-ARMS.json`.
+
+## 75-hot-update-flows.R
+
+**Current final S5 serial acceptance**: native rc0/GREEN, 163 s. Image `sha256:9d8a232c3c02d0e1de59a6d7ad0354647dd19bbb39aec574d915e8f29682708c`; build source `09b96f95bfc66519320ab4f46e54eb8cd85e1b2429e7d510f9ef0804f206b336`; per-command source `09b96f95bfc66519320ab4f46e54eb8cd85e1b2429e7d510f9ef0804f206b336`. Exact command, measured oracles, host load and receipt: `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/run-271/runner/75-hot-update-flows.R.log` and `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/FINAL-ACCEPTANCE-ARMS.json`.
+
+Normal per-capture max-stall p50/p95/max 1.096/2.683/3.039 s; original identities and target Accept=1 retained.
+
+513 requests at 10.0/s, terminal failures=0.
+
+**Historical measurements and invariant rationale (previous image; current receipt above is authoritative):**
+
+GREEN, nc_gap=0, bands=-, owner=-; **final serial acceptance GREEN**.
+
+The actual PREPARE/final-cut/RESUME revocation windows close the original victims and release their FD/replay ownership while bob continues on his original socket.
+
+Measured 2026-10-11: native rc0/GREEN, 177 s; one final serial image `sha256:049b3c3bc69a1f3b9e88b1dbc3998cf5b809c076f6eb9b0e9edfe0fe39b55086`, source patch `647e54d6f8457e651249f37f773842fa1f40ab39b2cdc87238f5d8af8305f63b`. Receipt: `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/run-254/runner/75-hot-update-flows.R.log`.
+
+Normal per-capture maximum stalls p50/p95/max: 1.052/3.305/3.305 s. Original identities and target Accept=1 passed.
+
+584 requests at 10.0/s; terminal failures=0.
+
+Full byte, nonce, Accept, calibration and host-load oracles: `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/FINAL-ACCEPTANCE-ARMS.json`.
+
+## 75-hot-update-flows.B
+
+**Current final S5 serial acceptance**: native rc0/GREEN, 157 s. Image `sha256:9d8a232c3c02d0e1de59a6d7ad0354647dd19bbb39aec574d915e8f29682708c`; build source `09b96f95bfc66519320ab4f46e54eb8cd85e1b2429e7d510f9ef0804f206b336`; per-command source `09b96f95bfc66519320ab4f46e54eb8cd85e1b2429e7d510f9ef0804f206b336`. Exact command, measured oracles, host load and receipt: `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/run-271/runner/75-hot-update-flows.B.log` and `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/FINAL-ACCEPTANCE-ARMS.json`.
+
+Normal per-capture max-stall p50/p95/max 1.031/1.604/3.008 s; original identities and target Accept=1 retained.
+
+447 requests at 10.0/s, terminal failures=0.
+
+**Historical measurements and invariant rationale (previous image; current receipt above is authoritative):**
+
+GREEN, nc_gap=0, bands=-, owner=-; **final serial acceptance GREEN**.
+
+Two communicating flow/SS-capable artifacts perform A→B→A; offsets, replay Base, nonce and retirement state advance before the return cut. Both real upgrades commit.
+
+Measured 2026-10-11: native rc0/GREEN, 158 s; one final serial image `sha256:049b3c3bc69a1f3b9e88b1dbc3998cf5b809c076f6eb9b0e9edfe0fe39b55086`, source patch `647e54d6f8457e651249f37f773842fa1f40ab39b2cdc87238f5d8af8305f63b`. Receipt: `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/run-254/runner/75-hot-update-flows.B.log`.
+
+Normal per-capture maximum stalls p50/p95/max: 0.972/1.109/3.014 s. Original identities and target Accept=1 passed.
+
+425 requests at 10.0/s; terminal failures=0.
+
+Full byte, nonce, Accept, calibration and host-load oracles: `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/FINAL-ACCEPTANCE-ARMS.json`.
+
+## 75-hot-update-flows.W
+
+**Current final S5 serial acceptance**: native rc0/GREEN, 271 s. Image `sha256:9d8a232c3c02d0e1de59a6d7ad0354647dd19bbb39aec574d915e8f29682708c`; build source `09b96f95bfc66519320ab4f46e54eb8cd85e1b2429e7d510f9ef0804f206b336`; per-command source `09b96f95bfc66519320ab4f46e54eb8cd85e1b2429e7d510f9ef0804f206b336`. Exact command, measured oracles, host load and receipt: `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/run-271/runner/75-hot-update-flows.W.log` and `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/FINAL-ACCEPTANCE-ARMS.json`.
+
+Normal per-capture max-stall p50/p95/max 1.038/1.671/3.007 s; original identities and target Accept=1 retained.
+
+1584 requests at 10.0/s, terminal failures=0.
+
+**Historical measurements and invariant rationale (previous image; current receipt above is authoritative):**
+
+GREEN, nc_gap=0, bands=-, owner=-; **final serial acceptance GREEN**.
+
+The first real register commit fails after persisted boot count. The unchanged 120-second watchdog takes the second current-state cut automatically; original cohort continuity and rollback identity pass.
+
+Measured 2026-10-11: native rc0/GREEN, 277 s; one final serial image `sha256:049b3c3bc69a1f3b9e88b1dbc3998cf5b809c076f6eb9b0e9edfe0fe39b55086`, source patch `647e54d6f8457e651249f37f773842fa1f40ab39b2cdc87238f5d8af8305f63b`. Receipt: `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/run-254/runner/75-hot-update-flows.W.log`.
+
+Normal per-capture maximum stalls p50/p95/max: 0.260/1.052/3.020 s. Original identities and target Accept=1 passed.
+
+1617 requests at 10.0/s; terminal failures=0.
+
+Full byte, nonce, Accept, calibration and host-load oracles: `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/FINAL-ACCEPTANCE-ARMS.json`.
+
+## 75-hot-update-flows.L
+
+**Current final S5 serial acceptance**: native rc0/GREEN, 136 s. Image `sha256:9d8a232c3c02d0e1de59a6d7ad0354647dd19bbb39aec574d915e8f29682708c`; build source `09b96f95bfc66519320ab4f46e54eb8cd85e1b2429e7d510f9ef0804f206b336`; per-command source `09b96f95bfc66519320ab4f46e54eb8cd85e1b2429e7d510f9ef0804f206b336`. Exact command, measured oracles, host load and receipt: `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/run-271/runner/75-hot-update-flows.L.log` and `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/FINAL-ACCEPTANCE-ARMS.json`.
+
+Normal per-capture max-stall p50/p95/max 0.114/2.854/3.033 s; original identities and target Accept=1 retained.
+
+307 requests at 10.0/s, terminal failures=0.
+
+**Historical measurements and invariant rationale (previous image; current receipt above is authoritative):**
+
+GREEN, nc_gap=0, bands=-, owner=-; **final serial acceptance GREEN**.
+
+The fixed v0.6.0/a3431a1 broker runs before the first business operation. Empty ALPN/raw first bytes and actual running SHA prove supply; native75/legacy_session_busy safely refuses upgrade while original traffic remains usable.
+
+Measured 2026-10-11: native rc0/GREEN, 133 s; one final serial image `sha256:049b3c3bc69a1f3b9e88b1dbc3998cf5b809c076f6eb9b0e9edfe0fe39b55086`, source patch `647e54d6f8457e651249f37f773842fa1f40ab39b2cdc87238f5d8af8305f63b`. Receipt: `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/run-254/runner/75-hot-update-flows.L.log`.
+
+Normal per-capture maximum stalls p50/p95/max: 0.111/2.395/3.005 s. Original identities and target Accept=1 passed.
+
+297 requests at 10.0/s; terminal failures=0.
+
+Full byte, nonce, Accept, calibration and host-load oracles: `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/FINAL-ACCEPTANCE-ARMS.json`.
+
+## 39-hot-update-legacy-n1.F
+
+**Current final S5 serial acceptance**: native rc3/PRODUCT-RED, 141 s. Image `sha256:9d8a232c3c02d0e1de59a6d7ad0354647dd19bbb39aec574d915e8f29682708c`; build source `09b96f95bfc66519320ab4f46e54eb8cd85e1b2429e7d510f9ef0804f206b336`; per-command source `09b96f95bfc66519320ab4f46e54eb8cd85e1b2429e7d510f9ef0804f206b336`. Exact command, measured oracles, host load and receipt: `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/run-273/runner/39-hot-update-legacy-n1.F.log` and `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/FINAL-ACCEPTANCE-ARMS.json`.
+
+Normal per-capture max-stall p50/p95/max 5.767/50.800/55.489 s; original identities and target Accept=1 retained.
+
+603 requests at 10.0/s, terminal failures=9.
+
+**Historical measurements and invariant rationale (previous image; current receipt above is authoritative):**
+
+PRODUCT-RED, nc_gap=0, bands=-; **final native PRODUCT-RED**.
+
+Owner: hot-update-plan H2 legacy flow exporter; S8 legacy-to-capable first migration.
+
+The real fixed v0.6.0 exporter exchanges nonempty original traffic before bare exec. The unpinned run255 intentionally returned SETUP-RED2 with actual reset,67 pre-fault samples, original_socket=true and zero redials. The exact existing reviewed reset pin is confirmed by PIN-REVIEW.json; pinned F then returns native3. The common continuity oracle and fault-validity guards remain unchanged.
+
+Measured 2026-10-11: native rc3/PRODUCT-RED, 147 s; one final serial image `sha256:049b3c3bc69a1f3b9e88b1dbc3998cf5b809c076f6eb9b0e9edfe0fe39b55086`, source patch `647e54d6f8457e651249f37f773842fa1f40ab39b2cdc87238f5d8af8305f63b`. Receipt: `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/run-256/runner/39-hot-update-legacy-n1.F.log`.
+
+Normal per-capture maximum stalls p50/p95/max: 5.831/50.881/56.768 s. Original identities and target Accept=1 passed.
+
+613 requests at 10.0/s; terminal failures=10.
+
+Full byte, nonce, Accept, calibration and host-load oracles: `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/FINAL-ACCEPTANCE-ARMS.json`.
+
+
+### S5 final serial regression receipt — 2026-10-11
+
+Parent39 owner: hot-update-plan H0 legacy exporter; S8 legacy-to-capable first migration; hot-update-plan H1 legacy PTY exporter; S8 legacy-to-capable first migration; hot-update-plan H2 legacy flow exporter; S8 legacy-to-capable first migration.
+
+Parent75 is GREEN. Parent39 joins X GREEN with Y/P/F native PRODUCT-RED3; --allow-product-red gives runner native0. The frozen S4 P pin is unchanged. All36/34/35/94 and full70/72 pass. Native33 remains INCOMPLETE4 at its existing #73 NC_GAP, as required by frozen S5 §9.5; the original regression runner native2 (35.A assertion plus native33 INCOMPLETE) is retained, and corrected35 rerun native0 is joined explicitly; native33 stays4. Independent early-close and actual A+1 ACK negatives each return native ASSERT-FAIL1; restored original image A returns GREEN0. Complete receipts, defect classifications and measured oracles: `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/RECEIPTS.md`.
+
+
+### Deadline-fixed final S5 receipt
+
+All current acceptance arms use one final image `sha256:9d8a232c3c02d0e1de59a6d7ad0354647dd19bbb39aec574d915e8f29682708c`; previous049 serial successes remain historical because post-drill broker verification found a product deadline provenance defect. The root was regression/mutation verified, then a new image was rebuilt before the full serial acceptance. Parent75 native0; parent39 allow-product-red policy0; all36/34/35/94 and full70/72 native0. Regression274 policy1 preserves native33 INCOMPLETE4 at the frozen §9.5 #73 NC_GAP; no status is relabeled. Both native deploy negatives assert1/control0; restored original A0. Detailed receipt: `/home/weiland/tether-hot-update-handoff-20260920T2356Z/s5-evidence/drills/RECEIPTS.md`.
+## 37-hot-update-broker
+
+S6 declaration / NOT_RUN. Expected native GREEN (rc 0), nc_gap=0. All declared A/A1/B/T/R children must join without translating their native verdicts. Blocked claims remain in hot-update-broker-ledger.tsv until native evidence is archived.
+
+## 37-hot-update-broker.A
+
+S6 declaration / NOT_RUN. Expected native GREEN (rc 0), nc_gap=0. The frozen fixture, original cohort and same-candidate receipt are pending P29/P30/P35. Blocked claims remain in hot-update-broker-ledger.tsv until native evidence is archived.
+
+## 37-hot-update-broker.A1
+
+S6 declaration / NOT_RUN. Expected native GREEN (rc 0), nc_gap=0. The frozen fixture, original cohort and same-candidate receipt are pending P29/P30/P35. Blocked claims remain in hot-update-broker-ledger.tsv until native evidence is archived.
+
+## 37-hot-update-broker.B
+
+S6 declaration / NOT_RUN. Expected native GREEN (rc 0), nc_gap=0. The frozen fixture, original cohort and same-candidate receipt are pending P29/P30/P35. Blocked claims remain in hot-update-broker-ledger.tsv until native evidence is archived.
+
+## 37-hot-update-broker.T
+
+NOT_RUN pending S7 P29/P32/P33/P37. Target native GREEN0 requires two independent
+named lanes: N3 and default single. Each has four original capable transfers,
+both legs, real agent/broker A→B→A cuts before completion, original origin/ID/NUID/
+PID/OFD, postcut durable progress, default reaper and exact history. A capable
+transfer-busy refusal or terminal-only cut is INCOMPLETE, never this receipt.
+Separate retained legacy and unknown-census windows require actual reload native75,
+exact reason, unchanged running identity and zero cut effects. Business75 never
+becomes a drill4 by numeric mapping. Declared worst1200s, runner ceiling2400s;
+actual wall NOT_MEASURED. The old S6 defer key may remain NOT_RUN in the lead-owned
+ledger until migration; an old PASS cannot sign this S7 capable-cut claim.
+
+## 37-hot-update-broker.R
+
+S6 declaration / NOT_RUN. Expected native GREEN (rc 0), nc_gap=0. The frozen fixture, original cohort and same-candidate receipt are pending P29/P30/P35. Blocked claims remain in hot-update-broker-ledger.tsv until native evidence is archived.
+
+## 39-hot-update-legacy-n1.BR
+
+S6 declaration / NOT_RUN. Expected native PRODUCT-RED (rc 3), nc_gap=0. Owner: hot-update-plan S6 legacy broker Run unwind; S8 legacy-to-capable first migration. The genuine previous artifact must exercise N3 follower/home Run unwind; its exact historical signature is pending independent P35 pinning. An N1 leader refusal, loader failure or preflight refusal cannot satisfy this claim.
+
+## S7 transfer-continuation targets (NOT_RUN)
+
+These are frozen acceptance expectations, not observations. P37 records native
+child lines, candidate/source/artifact/running SHA, dirty digest, command, wall,
+reader digest and archived oracle inputs before making a claim. The runner's
+existing ARMS/missing-child join owns the parents. A missing child, early finish,
+empty data window or a prepared record offered as sender coverage cannot sign
+GREEN. A fixture/custody failure is SETUP-RED. Business75 is separate from drill4.
+
+63 contains positive arms only. 64 contains independently built production
+controls only: each expected native ASSERT-FAIL remains rc1 in the log and parent
+join. Compile/setup/incomplete red, a patch that never ran, or a lost nested
+GOFLAGS overlay cannot produce a control-receipt.json with killed=true. No waivers
+or signature bands are attached to controls. Genuine old N3 Run-unwind stays in
+39.BR with its existing PRODUCT-RED owner and reviewed signature.
+
+## 63-hot-update-transfer
+
+NOT_RUN pending P29/P32/P33/P34/P35/P37. Target native GREEN0 is the AND of all eleven required child receipts on one candidate. Controls never enter this parent.
+
+## 63-hot-update-transfer.A
+
+NOT_RUN. Target native GREEN0. Single, four cohorts, both legs: agent forward, broker forward, current-state rollback. Every cut is nonempty before, progresses after, and retains original ID/version/PID/OFD and exact history.
+
+## 63-hot-update-transfer.A1
+
+NOT_RUN. Target native GREEN0. Sole voter, four cohorts, both legs with actual same-PID cuts and default reaper. Every cut is nonempty before, progresses after, and retains original ID/version/PID/OFD and exact history.
+
+## 63-hot-update-transfer.B
+
+NOT_RUN. Target native GREEN0. N3, each leg covers source follower, transferred original leader and third voter; broker-only roll. Every cut is nonempty before, progresses after, and retains original ID/version/PID/OFD and exact history.
+
+## 63-hot-update-transfer.C1
+
+NOT_RUN. Target native GREEN0. Actual S5 TLS/yamux/WSS carrier replacement, four cohorts both legs. Every cut is nonempty before, progresses after, and retains original ID/version/PID/OFD and exact history.
+
+## 63-hot-update-transfer.C2
+
+NOT_RUN. Target native GREEN0. Actual transfer NATS data attachment reconstruction, four cohorts both legs. Every cut is nonempty before, progresses after, and retains original ID/version/PID/OFD and exact history.
+
+## 63-hot-update-transfer.C3
+
+NOT_RUN. Target native GREEN0. Same NATS binary and store_dir server restart, four cohorts both legs. Every cut is nonempty before, progresses after, and retains original ID/version/PID/OFD and exact history.
+
+## 63-hot-update-transfer.R1
+
+NOT_RUN. Target native GREEN0. Pristine import failures, agent/broker-store/broker-control, each tier and direction. Every cut is nonempty before, progresses after, and retains original ID/version/PID/OFD and exact history.
+
+## 63-hot-update-transfer.R2
+
+NOT_RUN. Target native GREEN0. ACTIVE failures after new progress, current-owner rollback, each tier and direction. Every cut is nonempty before, progresses after, and retains original ID/version/PID/OFD and exact history.
+
+## 63-hot-update-transfer.X
+
+NOT_RUN. Target native GREEN0. Independent Ctrl-C and session-rm victims, four successful survivors keep their own buckets. Every cut is nonempty before, progresses after, and retains original ID/version/PID/OFD and exact history.
+
+## 63-hot-update-transfer.W1
+
+NOT_RUN. Target native GREEN0. One actual120s data+REGISTER outage per call, leg1 pull sender, original deadline. Every cut is nonempty before, progresses after, and retains original ID/version/PID/OFD and exact history.
+
+## 63-hot-update-transfer.W2
+
+NOT_RUN. Target native GREEN0. One actual120s data+REGISTER outage per call, leg2 push receiver, original deadline. Every cut is nonempty before, progresses after, and retains original ID/version/PID/OFD and exact history.
+
+## 64-hot-update-transfer-controls
+
+NOT_RUN. Target native ASSERT-FAIL1 is the original join of all23 independent control children. A killed mutation is an expected/actual receipt relation; it does not turn native1 into0.
+
+## 64-hot-update-transfer-controls.M01
+
+NOT_RUN pending owner production patch and P29 runtime/oracle witnesses. Target native ASSERT-FAIL1: SDK Put or new NUID after sent-unknown. Source patch/hash, nested build selector, artifact and actual running SHA, exercised predicate and original judge inputs are required.
+
+## 64-hot-update-transfer-controls.M02
+
+NOT_RUN pending owner production patch and P29 runtime/oracle witnesses. Target native ASSERT-FAIL1: remove chunk CAS receipt guard. Source patch/hash, nested build selector, artifact and actual running SHA, exercised predicate and original judge inputs are required.
+
+## 64-hot-update-transfer-controls.M03
+
+NOT_RUN pending owner production patch and P29 runtime/oracle witnesses. Target native ASSERT-FAIL1: publish metadata before final receipt. Source patch/hash, nested build selector, artifact and actual running SHA, exercised predicate and original judge inputs are required.
+
+## 64-hot-update-transfer-controls.M04
+
+NOT_RUN pending owner production patch and P29 runtime/oracle witnesses. Target native ASSERT-FAIL1: skip reader rebuild after healthy drop. Source patch/hash, nested build selector, artifact and actual running SHA, exercised predicate and original judge inputs are required.
+
+## 64-hot-update-transfer-controls.M05
+
+NOT_RUN pending owner production patch and P29 runtime/oracle witnesses. Target native ASSERT-FAIL1: forget dirty barrier on last close. Source patch/hash, nested build selector, artifact and actual running SHA, exercised predicate and original judge inputs are required.
+
+## 64-hot-update-transfer-controls.M06
+
+NOT_RUN pending owner production patch and P29 runtime/oracle witnesses. Target native ASSERT-FAIL1: watchdog fails an outstanding Grant. Source patch/hash, nested build selector, artifact and actual running SHA, exercised predicate and original judge inputs are required.
+
+## 64-hot-update-transfer-controls.M07
+
+NOT_RUN pending owner production patch and P29 runtime/oracle witnesses. Target native ASSERT-FAIL1: create with expired or foreign-home permit. Source patch/hash, nested build selector, artifact and actual running SHA, exercised predicate and original judge inputs are required.
+
+## 64-hot-update-transfer-controls.M08A
+
+NOT_RUN pending owner production patch and P29 runtime/oracle witnesses. Target native ASSERT-FAIL1: drop synced checkpoint. Source patch/hash, nested build selector, artifact and actual running SHA, exercised predicate and original judge inputs are required.
+
+## 64-hot-update-transfer-controls.M08B
+
+NOT_RUN pending owner production patch and P29 runtime/oracle witnesses. Target native ASSERT-FAIL1: restore wrong offset or hash ahead. Source patch/hash, nested build selector, artifact and actual running SHA, exercised predicate and original judge inputs are required.
+
+## 64-hot-update-transfer-controls.M08C
+
+NOT_RUN pending owner production patch and P29 runtime/oracle witnesses. Target native ASSERT-FAIL1: ConfirmSynced before successful Sync. Source patch/hash, nested build selector, artifact and actual running SHA, exercised predicate and original judge inputs are required.
+
+## 64-hot-update-transfer-controls.M09
+
+NOT_RUN pending owner production patch and P29 runtime/oracle witnesses. Target native ASSERT-FAIL1: reopen original OFD by path. Source patch/hash, nested build selector, artifact and actual running SHA, exercised predicate and original judge inputs are required.
+
+## 64-hot-update-transfer-controls.M10A
+
+NOT_RUN pending owner production patch and P29 runtime/oracle witnesses. Target native ASSERT-FAIL1: repeat successful commit primitive. Source patch/hash, nested build selector, artifact and actual running SHA, exercised predicate and original judge inputs are required.
+
+## 64-hot-update-transfer-controls.M10B
+
+NOT_RUN pending owner production patch and P29 runtime/oracle witnesses. Target native ASSERT-FAIL1: write partial destination in place then restore. Source patch/hash, nested build selector, artifact and actual running SHA, exercised predicate and original judge inputs are required.
+
+## 64-hot-update-transfer-controls.M11A
+
+NOT_RUN pending owner production patch and P29 runtime/oracle witnesses. Target native ASSERT-FAIL1: skip tracker import. Source patch/hash, nested build selector, artifact and actual running SHA, exercised predicate and original judge inputs are required.
+
+## 64-hot-update-transfer-controls.M11B
+
+NOT_RUN pending owner production patch and P29 runtime/oracle witnesses. Target native ASSERT-FAIL1: late source seal overwrites terminal. Source patch/hash, nested build selector, artifact and actual running SHA, exercised predicate and original judge inputs are required.
+
+## 64-hot-update-transfer-controls.M11C
+
+NOT_RUN pending owner production patch and P29 runtime/oracle witnesses. Target native ASSERT-FAIL1: reset original deadline on import. Source patch/hash, nested build selector, artifact and actual running SHA, exercised predicate and original judge inputs are required.
+
+## 64-hot-update-transfer-controls.M12A
+
+NOT_RUN pending owner production patch and P29 runtime/oracle witnesses. Target native ASSERT-FAIL1: any terminal is an exact ACK. Source patch/hash, nested build selector, artifact and actual running SHA, exercised predicate and original judge inputs are required.
+
+## 64-hot-update-transfer-controls.M12B
+
+NOT_RUN pending owner production patch and P29 runtime/oracle witnesses. Target native ASSERT-FAIL1: remove history subject CAS. Source patch/hash, nested build selector, artifact and actual running SHA, exercised predicate and original judge inputs are required.
+
+## 64-hot-update-transfer-controls.M12C
+
+NOT_RUN pending owner production patch and P29 runtime/oracle witnesses. Target native ASSERT-FAIL1: replace failed outcome with complete. Source patch/hash, nested build selector, artifact and actual running SHA, exercised predicate and original judge inputs are required.
+
+## 64-hot-update-transfer-controls.M13A
+
+NOT_RUN pending owner production patch and P29 runtime/oracle witnesses. Target native ASSERT-FAIL1: bypass live owner GC protection. Source patch/hash, nested build selector, artifact and actual running SHA, exercised predicate and original judge inputs are required.
+
+## 64-hot-update-transfer-controls.M13B
+
+NOT_RUN pending owner production patch and P29 runtime/oracle witnesses. Target native ASSERT-FAIL1: discard cleanup responsibility. Source patch/hash, nested build selector, artifact and actual running SHA, exercised predicate and original judge inputs are required.
+
+## 64-hot-update-transfer-controls.M13C
+
+NOT_RUN pending owner production patch and P29 runtime/oracle witnesses. Target native ASSERT-FAIL1: stop reaper to fake live protection. Source patch/hash, nested build selector, artifact and actual running SHA, exercised predicate and original judge inputs are required.
+
+## 64-hot-update-transfer-controls.M14
+
+NOT_RUN pending owner production patch and P29 runtime/oracle witnesses. Target native ASSERT-FAIL1: full ObjectStoreConfig loses Duplicates or TTL. Source patch/hash, nested build selector, artifact and actual running SHA, exercised predicate and original judge inputs are required.
+
+## 38-hot-update-rollback-compat
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/drill38-mutation-receipts-02dy1kmf/expected-verdicts-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S8 receipt spelling `ASSERT-RED` denotes the same native rc1 as the shell and expectation table spelling `ASSERT-FAIL`; neither is success. Positive and mutation arms keep separate native rows.
+
+## 38-hot-update-rollback-compat.A-single
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/drill38-mutation-receipts-02dy1kmf/expected-verdicts-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S8 receipt spelling `ASSERT-RED` denotes the same native rc1 as the shell and expectation table spelling `ASSERT-FAIL`; neither is success. Positive and mutation arms keep separate native rows.
+
+## 38-hot-update-rollback-compat.A-sole
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/drill38-mutation-receipts-02dy1kmf/expected-verdicts-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S8 receipt spelling `ASSERT-RED` denotes the same native rc1 as the shell and expectation table spelling `ASSERT-FAIL`; neither is success. Positive and mutation arms keep separate native rows.
+
+## 38-hot-update-rollback-compat.A-n3
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/drill38-mutation-receipts-02dy1kmf/expected-verdicts-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S8 receipt spelling `ASSERT-RED` denotes the same native rc1 as the shell and expectation table spelling `ASSERT-FAIL`; neither is success. Positive and mutation arms keep separate native rows.
+
+## 38-hot-update-rollback-compat.R0
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/drill38-mutation-receipts-02dy1kmf/expected-verdicts-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S8 receipt spelling `ASSERT-RED` denotes the same native rc1 as the shell and expectation table spelling `ASSERT-FAIL`; neither is success. Positive and mutation arms keep separate native rows.
+
+## 38-hot-update-rollback-compat.R1
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/drill38-mutation-receipts-02dy1kmf/expected-verdicts-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S8 receipt spelling `ASSERT-RED` denotes the same native rc1 as the shell and expectation table spelling `ASSERT-FAIL`; neither is success. Positive and mutation arms keep separate native rows.
+
+## 38-hot-update-rollback-compat.R2
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/drill38-mutation-receipts-02dy1kmf/expected-verdicts-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S8 receipt spelling `ASSERT-RED` denotes the same native rc1 as the shell and expectation table spelling `ASSERT-FAIL`; neither is success. Positive and mutation arms keep separate native rows.
+
+## 38-hot-update-rollback-compat.H-root
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/drill38-mutation-receipts-02dy1kmf/expected-verdicts-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S8 receipt spelling `ASSERT-RED` denotes the same native rc1 as the shell and expectation table spelling `ASSERT-FAIL`; neither is success. Positive and mutation arms keep separate native rows.
+
+## 38-hot-update-rollback-compat.H-user
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/drill38-mutation-receipts-02dy1kmf/expected-verdicts-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S8 receipt spelling `ASSERT-RED` denotes the same native rc1 as the shell and expectation table spelling `ASSERT-FAIL`; neither is success. Positive and mutation arms keep separate native rows.
+
+## 38-hot-update-rollback-compat.H-no-systemd
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/drill38-mutation-receipts-02dy1kmf/expected-verdicts-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S8 receipt spelling `ASSERT-RED` denotes the same native rc1 as the shell and expectation table spelling `ASSERT-FAIL`; neither is success. Positive and mutation arms keep separate native rows.
+
+## 38-hot-update-rollback-compat.H-colocated
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/drill38-mutation-receipts-02dy1kmf/expected-verdicts-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S8 receipt spelling `ASSERT-RED` denotes the same native rc1 as the shell and expectation table spelling `ASSERT-FAIL`; neither is success. Positive and mutation arms keep separate native rows.
+
+## 38-hot-update-rollback-compat.H-sibling
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/drill38-mutation-receipts-02dy1kmf/expected-verdicts-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S8 receipt spelling `ASSERT-RED` denotes the same native rc1 as the shell and expectation table spelling `ASSERT-FAIL`; neither is success. Positive and mutation arms keep separate native rows.
+
+## 38-hot-update-rollback-compat.H-readonly
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/drill38-mutation-receipts-02dy1kmf/expected-verdicts-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S8 receipt spelling `ASSERT-RED` denotes the same native rc1 as the shell and expectation table spelling `ASSERT-FAIL`; neither is success. Positive and mutation arms keep separate native rows.
+
+## 38-hot-update-rollback-compat.G-two
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/drill38-mutation-receipts-02dy1kmf/expected-verdicts-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S8 receipt spelling `ASSERT-RED` denotes the same native rc1 as the shell and expectation table spelling `ASSERT-FAIL`; neither is success. Positive and mutation arms keep separate native rows.
+
+## 38-hot-update-rollback-compat.G-third
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/drill38-mutation-receipts-02dy1kmf/expected-verdicts-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S8 receipt spelling `ASSERT-RED` denotes the same native rc1 as the shell and expectation table spelling `ASSERT-FAIL`; neither is success. Positive and mutation arms keep separate native rows.
+
+## 38-hot-update-rollback-compat.G-concurrent
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/drill38-mutation-receipts-02dy1kmf/expected-verdicts-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S8 receipt spelling `ASSERT-RED` denotes the same native rc1 as the shell and expectation table spelling `ASSERT-FAIL`; neither is success. Positive and mutation arms keep separate native rows.
+
+## 38-hot-update-rollback-compat.C-driver
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/drill38-mutation-receipts-02dy1kmf/expected-verdicts-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S8 receipt spelling `ASSERT-RED` denotes the same native rc1 as the shell and expectation table spelling `ASSERT-FAIL`; neither is success. Positive and mutation arms keep separate native rows.
+
+## 38-hot-update-rollback-compat.C-reopen
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/drill38-mutation-receipts-02dy1kmf/expected-verdicts-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S8 receipt spelling `ASSERT-RED` denotes the same native rc1 as the shell and expectation table spelling `ASSERT-FAIL`; neither is success. Positive and mutation arms keep separate native rows.
+
+## 38-hot-update-rollback-compat.C-gc
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/drill38-mutation-receipts-02dy1kmf/expected-verdicts-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S8 receipt spelling `ASSERT-RED` denotes the same native rc1 as the shell and expectation table spelling `ASSERT-FAIL`; neither is success. Positive and mutation arms keep separate native rows.
+
+## 38-hot-update-rollback-compat.C-late-writer
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/drill38-mutation-receipts-02dy1kmf/expected-verdicts-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S8 receipt spelling `ASSERT-RED` denotes the same native rc1 as the shell and expectation table spelling `ASSERT-FAIL`; neither is success. Positive and mutation arms keep separate native rows.
+
+## 38-hot-update-rollback-compat.C-history-rollback
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/drill38-mutation-receipts-02dy1kmf/expected-verdicts-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S8 receipt spelling `ASSERT-RED` denotes the same native rc1 as the shell and expectation table spelling `ASSERT-FAIL`; neither is success. Positive and mutation arms keep separate native rows.
+
+## 38-hot-update-rollback-compat.C-owner-dead
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/drill38-mutation-receipts-02dy1kmf/expected-verdicts-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S8 receipt spelling `ASSERT-RED` denotes the same native rc1 as the shell and expectation table spelling `ASSERT-FAIL`; neither is success. Positive and mutation arms keep separate native rows.
+
+## 38-hot-update-rollback-compat.W00-F0-agent-L-known-none
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/drill38-mutation-receipts-02dy1kmf/expected-verdicts-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S8 receipt spelling `ASSERT-RED` denotes the same native rc1 as the shell and expectation table spelling `ASSERT-FAIL`; neither is success. Positive and mutation arms keep separate native rows.
+
+## 38-hot-update-rollback-compat.W01-F1-single-L-known-none
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/drill38-mutation-receipts-02dy1kmf/expected-verdicts-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S8 receipt spelling `ASSERT-RED` denotes the same native rc1 as the shell and expectation table spelling `ASSERT-FAIL`; neither is success. Positive and mutation arms keep separate native rows.
+
+## 38-hot-update-rollback-compat.W02-F2-sole-voter-L-known-none
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/drill38-mutation-receipts-02dy1kmf/expected-verdicts-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S8 receipt spelling `ASSERT-RED` denotes the same native rc1 as the shell and expectation table spelling `ASSERT-FAIL`; neither is success. Positive and mutation arms keep separate native rows.
+
+## 38-hot-update-rollback-compat.W03-F3-N3-L-known-none
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/drill38-mutation-receipts-02dy1kmf/expected-verdicts-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S8 receipt spelling `ASSERT-RED` denotes the same native rc1 as the shell and expectation table spelling `ASSERT-FAIL`; neither is success. Positive and mutation arms keep separate native rows.
+
+## 38-hot-update-rollback-compat.W04-F4-agent-L-known-none
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/drill38-mutation-receipts-02dy1kmf/expected-verdicts-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S8 receipt spelling `ASSERT-RED` denotes the same native rc1 as the shell and expectation table spelling `ASSERT-FAIL`; neither is success. Positive and mutation arms keep separate native rows.
+
+## 38-hot-update-rollback-compat.W05-F5-single-L-known-inside
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/drill38-mutation-receipts-02dy1kmf/expected-verdicts-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S8 receipt spelling `ASSERT-RED` denotes the same native rc1 as the shell and expectation table spelling `ASSERT-FAIL`; neither is success. Positive and mutation arms keep separate native rows.
+
+## 38-hot-update-rollback-compat.W06-F6-sole-voter-L-known-none
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/drill38-mutation-receipts-02dy1kmf/expected-verdicts-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S8 receipt spelling `ASSERT-RED` denotes the same native rc1 as the shell and expectation table spelling `ASSERT-FAIL`; neither is success. Positive and mutation arms keep separate native rows.
+
+## 38-hot-update-rollback-compat.W07-F7-N3-L-known-inside
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/drill38-mutation-receipts-02dy1kmf/expected-verdicts-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S8 receipt spelling `ASSERT-RED` denotes the same native rc1 as the shell and expectation table spelling `ASSERT-FAIL`; neither is success. Positive and mutation arms keep separate native rows.
+
+## 38-hot-update-rollback-compat.W08-F0-agent-D-known-none
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/drill38-mutation-receipts-02dy1kmf/expected-verdicts-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S8 receipt spelling `ASSERT-RED` denotes the same native rc1 as the shell and expectation table spelling `ASSERT-FAIL`; neither is success. Positive and mutation arms keep separate native rows.
+
+## 38-hot-update-rollback-compat.W09-F1-single-D-known-none
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/drill38-mutation-receipts-02dy1kmf/expected-verdicts-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S8 receipt spelling `ASSERT-RED` denotes the same native rc1 as the shell and expectation table spelling `ASSERT-FAIL`; neither is success. Positive and mutation arms keep separate native rows.
+
+## 38-hot-update-rollback-compat.W10-F2-sole-voter-D-known-none
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/drill38-mutation-receipts-02dy1kmf/expected-verdicts-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S8 receipt spelling `ASSERT-RED` denotes the same native rc1 as the shell and expectation table spelling `ASSERT-FAIL`; neither is success. Positive and mutation arms keep separate native rows.
+
+## 38-hot-update-rollback-compat.W11-F8-N3-D-known-none
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/drill38-mutation-receipts-02dy1kmf/expected-verdicts-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S8 receipt spelling `ASSERT-RED` denotes the same native rc1 as the shell and expectation table spelling `ASSERT-FAIL`; neither is success. Positive and mutation arms keep separate native rows.
+
+## 38-hot-update-rollback-compat.W12-F9-N3-D-known-none
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/drill38-mutation-receipts-02dy1kmf/expected-verdicts-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S8 receipt spelling `ASSERT-RED` denotes the same native rc1 as the shell and expectation table spelling `ASSERT-FAIL`; neither is success. Positive and mutation arms keep separate native rows.
+
+## 38-hot-update-rollback-compat.W05-F5-single-L-known-outside
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/drill38-mutation-receipts-02dy1kmf/expected-verdicts-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S8 receipt spelling `ASSERT-RED` denotes the same native rc1 as the shell and expectation table spelling `ASSERT-FAIL`; neither is success. Positive and mutation arms keep separate native rows.
+
+## 38-hot-update-rollback-compat.W07-F7-N3-L-known-outside
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/drill38-mutation-receipts-02dy1kmf/expected-verdicts-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S8 receipt spelling `ASSERT-RED` denotes the same native rc1 as the shell and expectation table spelling `ASSERT-FAIL`; neither is success. Positive and mutation arms keep separate native rows.
+
+## 38-hot-update-rollback-compat.W09-F5-agent-D-known-inside
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/drill38-mutation-receipts-02dy1kmf/expected-verdicts-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S8 receipt spelling `ASSERT-RED` denotes the same native rc1 as the shell and expectation table spelling `ASSERT-FAIL`; neither is success. Positive and mutation arms keep separate native rows.
+
+## 38-hot-update-rollback-compat.W09-F5-agent-D-known-outside
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/drill38-mutation-receipts-02dy1kmf/expected-verdicts-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S8 receipt spelling `ASSERT-RED` denotes the same native rc1 as the shell and expectation table spelling `ASSERT-FAIL`; neither is success. Positive and mutation arms keep separate native rows.
+
+## 38-hot-update-rollback-compat.W09-F7-N3-D-known-inside
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/drill38-mutation-receipts-02dy1kmf/expected-verdicts-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S8 receipt spelling `ASSERT-RED` denotes the same native rc1 as the shell and expectation table spelling `ASSERT-FAIL`; neither is success. Positive and mutation arms keep separate native rows.
+
+## 38-hot-update-rollback-compat.W09-F7-N3-D-known-outside
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/drill38-mutation-receipts-02dy1kmf/expected-verdicts-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S8 receipt spelling `ASSERT-RED` denotes the same native rc1 as the shell and expectation table spelling `ASSERT-FAIL`; neither is success. Positive and mutation arms keep separate native rows.
+
+## 38-hot-update-rollback-compat.W08-F0-single-D-unknown-none
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/drill38-mutation-receipts-02dy1kmf/expected-verdicts-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S8 receipt spelling `ASSERT-RED` denotes the same native rc1 as the shell and expectation table spelling `ASSERT-FAIL`; neither is success. Positive and mutation arms keep separate native rows.
+
+## 38-hot-update-rollback-compat.W09-F1-agent-D-unknown-none
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/drill38-mutation-receipts-02dy1kmf/expected-verdicts-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S8 receipt spelling `ASSERT-RED` denotes the same native rc1 as the shell and expectation table spelling `ASSERT-FAIL`; neither is success. Positive and mutation arms keep separate native rows.
+
+## 38-hot-update-rollback-compat.W12-F9-N3-D-unknown-none
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/drill38-mutation-receipts-02dy1kmf/expected-verdicts-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S8 receipt spelling `ASSERT-RED` denotes the same native rc1 as the shell and expectation table spelling `ASSERT-FAIL`; neither is success. Positive and mutation arms keep separate native rows.
+
+## 38-hot-update-rollback-compat.W08-F3-single-D-known-none
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/drill38-mutation-receipts-02dy1kmf/expected-verdicts-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S8 receipt spelling `ASSERT-RED` denotes the same native rc1 as the shell and expectation table spelling `ASSERT-FAIL`; neither is success. Positive and mutation arms keep separate native rows.
+
+## 38-hot-update-rollback-compat.W09-F4-sole-voter-D-known-none
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/drill38-mutation-receipts-02dy1kmf/expected-verdicts-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S8 receipt spelling `ASSERT-RED` denotes the same native rc1 as the shell and expectation table spelling `ASSERT-FAIL`; neither is success. Positive and mutation arms keep separate native rows.
+
+## 38-hot-update-rollback-compat.W09-F6-agent-D-known-none
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/drill38-mutation-receipts-02dy1kmf/expected-verdicts-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S8 receipt spelling `ASSERT-RED` denotes the same native rc1 as the shell and expectation table spelling `ASSERT-FAIL`; neither is success. Positive and mutation arms keep separate native rows.
+
+## 38-hot-update-rollback-compat.I-late-revoke-current-rollback
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/drill38-mutation-receipts-02dy1kmf/expected-verdicts-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S8 receipt spelling `ASSERT-RED` denotes the same native rc1 as the shell and expectation table spelling `ASSERT-FAIL`; neither is success. Positive and mutation arms keep separate native rows.
+
+## 38-hot-update-rollback-compat.I-nats-cut-leader-move
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/drill38-mutation-receipts-02dy1kmf/expected-verdicts-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S8 receipt spelling `ASSERT-RED` denotes the same native rc1 as the shell and expectation table spelling `ASSERT-FAIL`; neither is success. Positive and mutation arms keep separate native rows.
+
+## 38-hot-update-rollback-compat.I-begin-archive-gc
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/drill38-mutation-receipts-02dy1kmf/expected-verdicts-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S8 receipt spelling `ASSERT-RED` denotes the same native rc1 as the shell and expectation table spelling `ASSERT-FAIL`; neither is success. Positive and mutation arms keep separate native rows.
+
+## 38-hot-update-rollback-compat.I-driver-death-host-reservation
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/drill38-mutation-receipts-02dy1kmf/expected-verdicts-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S8 receipt spelling `ASSERT-RED` denotes the same native rc1 as the shell and expectation table spelling `ASSERT-FAIL`; neither is success. Positive and mutation arms keep separate native rows.
+
+## 38-hot-update-rollback-compat.M01
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/drill38-mutation-receipts-02dy1kmf/expected-verdicts-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S8 receipt spelling `ASSERT-RED` denotes the same native rc1 as the shell and expectation table spelling `ASSERT-FAIL`; neither is success. Positive and mutation arms keep separate native rows.
+
+## 38-hot-update-rollback-compat.M02
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/drill38-mutation-receipts-02dy1kmf/expected-verdicts-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S8 receipt spelling `ASSERT-RED` denotes the same native rc1 as the shell and expectation table spelling `ASSERT-FAIL`; neither is success. Positive and mutation arms keep separate native rows.
+
+## 38-hot-update-rollback-compat.M03
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/drill38-mutation-receipts-02dy1kmf/expected-verdicts-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S8 receipt spelling `ASSERT-RED` denotes the same native rc1 as the shell and expectation table spelling `ASSERT-FAIL`; neither is success. Positive and mutation arms keep separate native rows.
+
+## 38-hot-update-rollback-compat.M04
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/drill38-mutation-receipts-02dy1kmf/expected-verdicts-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S8 receipt spelling `ASSERT-RED` denotes the same native rc1 as the shell and expectation table spelling `ASSERT-FAIL`; neither is success. Positive and mutation arms keep separate native rows.
+
+## 38-hot-update-rollback-compat.M05
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/drill38-mutation-receipts-02dy1kmf/expected-verdicts-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S8 receipt spelling `ASSERT-RED` denotes the same native rc1 as the shell and expectation table spelling `ASSERT-FAIL`; neither is success. Positive and mutation arms keep separate native rows.
+
+## 38-hot-update-rollback-compat.M06
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/drill38-mutation-receipts-02dy1kmf/expected-verdicts-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S8 receipt spelling `ASSERT-RED` denotes the same native rc1 as the shell and expectation table spelling `ASSERT-FAIL`; neither is success. Positive and mutation arms keep separate native rows.
+
+## 38-hot-update-rollback-compat.M07
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/drill38-mutation-receipts-02dy1kmf/expected-verdicts-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S8 receipt spelling `ASSERT-RED` denotes the same native rc1 as the shell and expectation table spelling `ASSERT-FAIL`; neither is success. Positive and mutation arms keep separate native rows.
+
+## 38-hot-update-rollback-compat.M08
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/drill38-mutation-receipts-02dy1kmf/expected-verdicts-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S8 receipt spelling `ASSERT-RED` denotes the same native rc1 as the shell and expectation table spelling `ASSERT-FAIL`; neither is success. Positive and mutation arms keep separate native rows.
+
+## 38-hot-update-rollback-compat.M09
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/drill38-mutation-receipts-02dy1kmf/expected-verdicts-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S8 receipt spelling `ASSERT-RED` denotes the same native rc1 as the shell and expectation table spelling `ASSERT-FAIL`; neither is success. Positive and mutation arms keep separate native rows.
+
+## 38-hot-update-rollback-compat.M10
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/drill38-mutation-receipts-02dy1kmf/expected-verdicts-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S8 receipt spelling `ASSERT-RED` denotes the same native rc1 as the shell and expectation table spelling `ASSERT-FAIL`; neither is success. Positive and mutation arms keep separate native rows.
+
+## 38-hot-update-rollback-compat.M11
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/drill38-mutation-receipts-02dy1kmf/expected-verdicts-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S8 receipt spelling `ASSERT-RED` denotes the same native rc1 as the shell and expectation table spelling `ASSERT-FAIL`; neither is success. Positive and mutation arms keep separate native rows.
+
+## 38-hot-update-rollback-compat.M12
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/drill38-mutation-receipts-02dy1kmf/expected-verdicts-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S8 receipt spelling `ASSERT-RED` denotes the same native rc1 as the shell and expectation table spelling `ASSERT-FAIL`; neither is success. Positive and mutation arms keep separate native rows.
+
+## 38-hot-update-rollback-compat.M13
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/drill38-mutation-receipts-02dy1kmf/expected-verdicts-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S8 receipt spelling `ASSERT-RED` denotes the same native rc1 as the shell and expectation table spelling `ASSERT-FAIL`; neither is success. Positive and mutation arms keep separate native rows.
+
+## 38-hot-update-rollback-compat.M14
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/drill38-mutation-receipts-02dy1kmf/expected-verdicts-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S8 receipt spelling `ASSERT-RED` denotes the same native rc1 as the shell and expectation table spelling `ASSERT-FAIL`; neither is success. Positive and mutation arms keep separate native rows.
+
+## 38-hot-update-rollback-compat.M15
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/drill38-mutation-receipts-02dy1kmf/expected-verdicts-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S8 receipt spelling `ASSERT-RED` denotes the same native rc1 as the shell and expectation table spelling `ASSERT-FAIL`; neither is success. Positive and mutation arms keep separate native rows.
+
+## 38-hot-update-rollback-compat.M16
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/drill38-mutation-receipts-02dy1kmf/expected-verdicts-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S8 receipt spelling `ASSERT-RED` denotes the same native rc1 as the shell and expectation table spelling `ASSERT-FAIL`; neither is success. Positive and mutation arms keep separate native rows.
+
+## 38-hot-update-rollback-compat.M17
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/drill38-mutation-receipts-02dy1kmf/expected-verdicts-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S8 receipt spelling `ASSERT-RED` denotes the same native rc1 as the shell and expectation table spelling `ASSERT-FAIL`; neither is success. Positive and mutation arms keep separate native rows.
+
+## 38-hot-update-rollback-compat.M18
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/drill38-mutation-receipts-02dy1kmf/expected-verdicts-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S8 receipt spelling `ASSERT-RED` denotes the same native rc1 as the shell and expectation table spelling `ASSERT-FAIL`; neither is success. Positive and mutation arms keep separate native rows.
+
+## 38-hot-update-rollback-compat.M19
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/drill38-mutation-receipts-02dy1kmf/expected-verdicts-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S8 receipt spelling `ASSERT-RED` denotes the same native rc1 as the shell and expectation table spelling `ASSERT-FAIL`; neither is success. Positive and mutation arms keep separate native rows.
+
+## 38-hot-update-rollback-compat.M20
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/drill38-mutation-receipts-02dy1kmf/expected-verdicts-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S8 receipt spelling `ASSERT-RED` denotes the same native rc1 as the shell and expectation table spelling `ASSERT-FAIL`; neither is success. Positive and mutation arms keep separate native rows.
+
+## 38-hot-update-rollback-compat.M21
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/drill38-mutation-receipts-02dy1kmf/expected-verdicts-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S8 receipt spelling `ASSERT-RED` denotes the same native rc1 as the shell and expectation table spelling `ASSERT-FAIL`; neither is success. Positive and mutation arms keep separate native rows.
+
+## 39-hot-update-legacy-n1.Q00B0-exec
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/s8-p28/s8-p28-expected-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+
+## 39-hot-update-legacy-n1.Q00B0-run
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/s8-p28/s8-p28-expected-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+
+## 39-hot-update-legacy-n1.Q00B0-kill
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/s8-p28/s8-p28-expected-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+
+## 39-hot-update-legacy-n1.Q00B0-expose
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/s8-p28/s8-p28-expected-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+
+## 39-hot-update-legacy-n1.Q00B0-transfer
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/s8-p28/s8-p28-expected-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+
+## 39-hot-update-legacy-n1.Q01B0-exec
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/s8-p28/s8-p28-expected-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+
+## 39-hot-update-legacy-n1.Q01B0-run
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/s8-p28/s8-p28-expected-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+
+## 39-hot-update-legacy-n1.Q01B0-kill
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/s8-p28/s8-p28-expected-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+
+## 39-hot-update-legacy-n1.Q01B0-expose
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/s8-p28/s8-p28-expected-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+
+## 39-hot-update-legacy-n1.Q01B0-transfer
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/s8-p28/s8-p28-expected-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+
+## 39-hot-update-legacy-n1.Q10B0-exec
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/s8-p28/s8-p28-expected-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+
+## 39-hot-update-legacy-n1.Q10B0-run
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/s8-p28/s8-p28-expected-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+
+## 39-hot-update-legacy-n1.Q10B0-kill
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/s8-p28/s8-p28-expected-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+
+## 39-hot-update-legacy-n1.Q10B0-expose
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/s8-p28/s8-p28-expected-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+
+## 39-hot-update-legacy-n1.Q10B0-transfer
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/s8-p28/s8-p28-expected-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+
+## 39-hot-update-legacy-n1.Q11B0-exec
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/s8-p28/s8-p28-expected-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+
+## 39-hot-update-legacy-n1.Q11B0-run
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/s8-p28/s8-p28-expected-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+
+## 39-hot-update-legacy-n1.Q11B0-kill
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/s8-p28/s8-p28-expected-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+
+## 39-hot-update-legacy-n1.Q11B0-expose
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/s8-p28/s8-p28-expected-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+
+## 39-hot-update-legacy-n1.Q11B0-transfer
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/s8-p28/s8-p28-expected-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+
+## 39-hot-update-legacy-n1.Q00B1-exec
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/s8-p28/s8-p28-expected-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+
+## 39-hot-update-legacy-n1.Q00B1-run
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/s8-p28/s8-p28-expected-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+
+## 39-hot-update-legacy-n1.Q00B1-kill
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/s8-p28/s8-p28-expected-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+
+## 39-hot-update-legacy-n1.Q00B1-expose
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/s8-p28/s8-p28-expected-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+
+## 39-hot-update-legacy-n1.Q00B1-transfer
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/s8-p28/s8-p28-expected-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+
+## 39-hot-update-legacy-n1.Q01B1-exec
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/s8-p28/s8-p28-expected-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+
+## 39-hot-update-legacy-n1.Q01B1-run
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/s8-p28/s8-p28-expected-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+
+## 39-hot-update-legacy-n1.Q01B1-kill
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/s8-p28/s8-p28-expected-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+
+## 39-hot-update-legacy-n1.Q01B1-expose
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/s8-p28/s8-p28-expected-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+
+## 39-hot-update-legacy-n1.Q01B1-transfer
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/s8-p28/s8-p28-expected-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+
+## 39-hot-update-legacy-n1.Q10B1-exec
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/s8-p28/s8-p28-expected-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+
+## 39-hot-update-legacy-n1.Q10B1-run
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/s8-p28/s8-p28-expected-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+
+## 39-hot-update-legacy-n1.Q10B1-kill
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/s8-p28/s8-p28-expected-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+
+## 39-hot-update-legacy-n1.Q10B1-expose
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/s8-p28/s8-p28-expected-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+
+## 39-hot-update-legacy-n1.Q10B1-transfer
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/s8-p28/s8-p28-expected-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+
+## 39-hot-update-legacy-n1.Q11B1-exec
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/s8-p28/s8-p28-expected-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+
+## 39-hot-update-legacy-n1.Q11B1-run
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/s8-p28/s8-p28-expected-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+
+## 39-hot-update-legacy-n1.Q11B1-kill
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/s8-p28/s8-p28-expected-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+
+## 39-hot-update-legacy-n1.Q11B1-expose
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/s8-p28/s8-p28-expected-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+
+## 39-hot-update-legacy-n1.Q11B1-transfer
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/s8-p28/s8-p28-expected-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+
+## 39-hot-update-legacy-n1.LB-new
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/s8-p28/s8-p28-expected-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+
+## 39-hot-update-legacy-n1.LB-old
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/s8-p28/s8-p28-expected-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+
+## 39-hot-update-legacy-n1.LI-defer
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/s8-p28/s8-p28-expected-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+
+## 39-hot-update-legacy-n1.LI-interrupting
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/s8-p28/s8-p28-expected-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+
+## 39-hot-update-legacy-n1.M-route
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/s8-p28/s8-p28-expected-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+
+## 39-hot-update-legacy-n1.CC-idle
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/s8-p28/s8-p28-expected-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+
+## 39-hot-update-legacy-n1.CC-late-create
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/s8-p28/s8-p28-expected-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+
+## 39-hot-update-legacy-n1.CL-reject
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/s8-p28/s8-p28-expected-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+
+## 39-hot-update-legacy-n1.ABI-adjacent
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/s8-p28/s8-p28-expected-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+
+## 39-hot-update-legacy-n1.ABI-too-far
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/s8-p28/s8-p28-expected-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+
+## 39-hot-update-legacy-n1.ABI-unknown
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/s8-p28/s8-p28-expected-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+
+## 39-hot-update-legacy-n1.GO-hash
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/s8-p28/s8-p28-expected-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+
+## 39-hot-update-legacy-n1.CFG-nats-old
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/s8-p28/s8-p28-expected-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+
+## 39-hot-update-legacy-n1.CFG-nats-new
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/s8-p28/s8-p28-expected-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+
+## 39-hot-update-legacy-n1.CFG-caddy-old
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/s8-p28/s8-p28-expected-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+
+## 39-hot-update-legacy-n1.CFG-caddy-new
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s8wt/receipts/s8-p28/s8-p28-expected-rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+
+## 85-hot-update-nats
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s9wt/receipts/s9-p37-receipts.xUDKSg/requested-expected-verdicts.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+
+## 85-hot-update-nats.A
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s9wt/receipts/s9-p37-receipts.xUDKSg/requested-expected-verdicts.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+
+## 85-hot-update-nats.A1
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s9wt/receipts/s9-p37-receipts.xUDKSg/requested-expected-verdicts.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+
+## 85-hot-update-nats.B
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s9wt/receipts/s9-p37-receipts.xUDKSg/requested-expected-verdicts.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+
+## 85-hot-update-nats.D
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s9wt/receipts/s9-p37-receipts.xUDKSg/requested-expected-verdicts.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+
+## 85-hot-update-nats.Q
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s9wt/receipts/s9-p37-receipts.xUDKSg/requested-expected-verdicts.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+
+## 85-hot-update-nats.L
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s9wt/receipts/s9-p37-receipts.xUDKSg/requested-expected-verdicts.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+
+## 85-hot-update-nats.S
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s9wt/receipts/s9-p37-receipts.xUDKSg/requested-expected-verdicts.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+
+## 85-hot-update-nats.J
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s9wt/receipts/s9-p37-receipts.xUDKSg/requested-expected-verdicts.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+
+## 85-hot-update-nats.F
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s9wt/receipts/s9-p37-receipts.xUDKSg/requested-expected-verdicts.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+
+## 86-hot-update-caddy
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s9wt/receipts/s9-p37-receipts.xUDKSg/requested-expected-verdicts.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+
+## 86-hot-update-caddy.R
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s9wt/receipts/s9-p37-receipts.xUDKSg/requested-expected-verdicts.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+
+## 86-hot-update-caddy.B
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s9wt/receipts/s9-p37-receipts.xUDKSg/requested-expected-verdicts.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+
+## 86-hot-update-caddy.I
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s9wt/receipts/s9-p37-receipts.xUDKSg/requested-expected-verdicts.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+
+## 86-hot-update-caddy.H
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s9wt/receipts/s9-p37-receipts.xUDKSg/requested-expected-verdicts.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+
+## 86-hot-update-caddy.C
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s9wt/receipts/s9-p37-receipts.xUDKSg/requested-expected-verdicts.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+
+## 86-hot-update-caddy.K
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s9wt/receipts/s9-p37-receipts.xUDKSg/requested-expected-verdicts.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+
+## 86-hot-update-caddy.F
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s9wt/receipts/s9-p37-receipts.xUDKSg/requested-expected-verdicts.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+
+## 86-hot-update-caddy.U
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s9wt/receipts/s9-p37-receipts.xUDKSg/requested-expected-verdicts.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+
+## 39-hot-update-legacy-n1.NI
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s9wt/receipts/s9-p37-receipts.xUDKSg/requested-expected-verdicts.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+
+## 39-hot-update-legacy-n1.CI
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s9wt/receipts/s9-p37-receipts.xUDKSg/requested-expected-verdicts.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+
+## 99-hot-update-fullstack
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s10wt/receipts/s10-p19-verify-g2iu2ttv/expected-verdicts.rows`. No live native result, source/artifact/running identity or measured cost is claimed.
+S10 calibration C1/C3, full rollout A/B, prefix S1/S3/F1/F3 and soak K retain separate cells and original cohorts. Quiet/default/live-grow regimes need the same candidate; no retry or attribution may certify these declarations.
+
+## 99-hot-update-fullstack.C1
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s10wt/receipts/s10-p19-verify-g2iu2ttv/expected-verdicts.rows`. No live native result, source/artifact/running identity or measured cost is claimed.
+S10 calibration C1/C3, full rollout A/B, prefix S1/S3/F1/F3 and soak K retain separate cells and original cohorts. Quiet/default/live-grow regimes need the same candidate; no retry or attribution may certify these declarations.
+
+## 99-hot-update-fullstack.C3
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s10wt/receipts/s10-p19-verify-g2iu2ttv/expected-verdicts.rows`. No live native result, source/artifact/running identity or measured cost is claimed.
+S10 calibration C1/C3, full rollout A/B, prefix S1/S3/F1/F3 and soak K retain separate cells and original cohorts. Quiet/default/live-grow regimes need the same candidate; no retry or attribution may certify these declarations.
+
+## 99-hot-update-fullstack.A
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s10wt/receipts/s10-p19-verify-g2iu2ttv/expected-verdicts.rows`. No live native result, source/artifact/running identity or measured cost is claimed.
+S10 calibration C1/C3, full rollout A/B, prefix S1/S3/F1/F3 and soak K retain separate cells and original cohorts. Quiet/default/live-grow regimes need the same candidate; no retry or attribution may certify these declarations.
+
+## 99-hot-update-fullstack.B
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s10wt/receipts/s10-p19-verify-g2iu2ttv/expected-verdicts.rows`. No live native result, source/artifact/running identity or measured cost is claimed.
+S10 calibration C1/C3, full rollout A/B, prefix S1/S3/F1/F3 and soak K retain separate cells and original cohorts. Quiet/default/live-grow regimes need the same candidate; no retry or attribution may certify these declarations.
+
+## 99-hot-update-fullstack.S1
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s10wt/receipts/s10-p19-verify-g2iu2ttv/expected-verdicts.rows`. No live native result, source/artifact/running identity or measured cost is claimed.
+S10 calibration C1/C3, full rollout A/B, prefix S1/S3/F1/F3 and soak K retain separate cells and original cohorts. Quiet/default/live-grow regimes need the same candidate; no retry or attribution may certify these declarations.
+
+## 99-hot-update-fullstack.S3
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s10wt/receipts/s10-p19-verify-g2iu2ttv/expected-verdicts.rows`. No live native result, source/artifact/running identity or measured cost is claimed.
+S10 calibration C1/C3, full rollout A/B, prefix S1/S3/F1/F3 and soak K retain separate cells and original cohorts. Quiet/default/live-grow regimes need the same candidate; no retry or attribution may certify these declarations.
+
+## 99-hot-update-fullstack.F1
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s10wt/receipts/s10-p19-verify-g2iu2ttv/expected-verdicts.rows`. No live native result, source/artifact/running identity or measured cost is claimed.
+S10 calibration C1/C3, full rollout A/B, prefix S1/S3/F1/F3 and soak K retain separate cells and original cohorts. Quiet/default/live-grow regimes need the same candidate; no retry or attribution may certify these declarations.
+
+## 99-hot-update-fullstack.F3
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s10wt/receipts/s10-p19-verify-g2iu2ttv/expected-verdicts.rows`. No live native result, source/artifact/running identity or measured cost is claimed.
+S10 calibration C1/C3, full rollout A/B, prefix S1/S3/F1/F3 and soak K retain separate cells and original cohorts. Quiet/default/live-grow regimes need the same candidate; no retry or attribution may certify these declarations.
+
+## 99-hot-update-fullstack.K
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s10wt/receipts/s10-p19-verify-g2iu2ttv/expected-verdicts.rows`. No live native result, source/artifact/running identity or measured cost is claimed.
+S10 calibration C1/C3, full rollout A/B, prefix S1/S3/F1/F3 and soak K retain separate cells and original cohorts. Quiet/default/live-grow regimes need the same candidate; no retry or attribution may certify these declarations.
+
+## 100-hot-update-fullstack-controls
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s10wt/receipts/s10-p20/expected-verdicts.rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S10 P20 requires an independent baseline0 / mutant1 / restore0 archive for every applicable topology cell, exact nonempty hit window and original supervised waiter Join. This control is excluded from the positive 99 parent.
+
+## 100-hot-update-fullstack-controls.M01A
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s10wt/receipts/s10-p20/expected-verdicts.rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S10 P20 requires an independent baseline0 / mutant1 / restore0 archive for every applicable topology cell, exact nonempty hit window and original supervised waiter Join. This control is excluded from the positive 99 parent.
+
+## 100-hot-update-fullstack-controls.M01B
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s10wt/receipts/s10-p20/expected-verdicts.rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S10 P20 requires an independent baseline0 / mutant1 / restore0 archive for every applicable topology cell, exact nonempty hit window and original supervised waiter Join. This control is excluded from the positive 99 parent.
+
+## 100-hot-update-fullstack-controls.M02E
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s10wt/receipts/s10-p20/expected-verdicts.rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S10 P20 requires an independent baseline0 / mutant1 / restore0 archive for every applicable topology cell, exact nonempty hit window and original supervised waiter Join. This control is excluded from the positive 99 parent.
+
+## 100-hot-update-fullstack-controls.M02P
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s10wt/receipts/s10-p20/expected-verdicts.rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S10 P20 requires an independent baseline0 / mutant1 / restore0 archive for every applicable topology cell, exact nonempty hit window and original supervised waiter Join. This control is excluded from the positive 99 parent.
+
+## 100-hot-update-fullstack-controls.M02F
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s10wt/receipts/s10-p20/expected-verdicts.rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S10 P20 requires an independent baseline0 / mutant1 / restore0 archive for every applicable topology cell, exact nonempty hit window and original supervised waiter Join. This control is excluded from the positive 99 parent.
+
+## 100-hot-update-fullstack-controls.M02X
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s10wt/receipts/s10-p20/expected-verdicts.rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S10 P20 requires an independent baseline0 / mutant1 / restore0 archive for every applicable topology cell, exact nonempty hit window and original supervised waiter Join. This control is excluded from the positive 99 parent.
+
+## 100-hot-update-fullstack-controls.M03E
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s10wt/receipts/s10-p20/expected-verdicts.rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S10 P20 requires an independent baseline0 / mutant1 / restore0 archive for every applicable topology cell, exact nonempty hit window and original supervised waiter Join. This control is excluded from the positive 99 parent.
+
+## 100-hot-update-fullstack-controls.M03P
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s10wt/receipts/s10-p20/expected-verdicts.rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S10 P20 requires an independent baseline0 / mutant1 / restore0 archive for every applicable topology cell, exact nonempty hit window and original supervised waiter Join. This control is excluded from the positive 99 parent.
+
+## 100-hot-update-fullstack-controls.M03F
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s10wt/receipts/s10-p20/expected-verdicts.rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S10 P20 requires an independent baseline0 / mutant1 / restore0 archive for every applicable topology cell, exact nonempty hit window and original supervised waiter Join. This control is excluded from the positive 99 parent.
+
+## 100-hot-update-fullstack-controls.M03X
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s10wt/receipts/s10-p20/expected-verdicts.rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S10 P20 requires an independent baseline0 / mutant1 / restore0 archive for every applicable topology cell, exact nonempty hit window and original supervised waiter Join. This control is excluded from the positive 99 parent.
+
+## 100-hot-update-fullstack-controls.M04A
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s10wt/receipts/s10-p20/expected-verdicts.rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S10 P20 requires an independent baseline0 / mutant1 / restore0 archive for every applicable topology cell, exact nonempty hit window and original supervised waiter Join. This control is excluded from the positive 99 parent.
+
+## 100-hot-update-fullstack-controls.M04B
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s10wt/receipts/s10-p20/expected-verdicts.rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S10 P20 requires an independent baseline0 / mutant1 / restore0 archive for every applicable topology cell, exact nonempty hit window and original supervised waiter Join. This control is excluded from the positive 99 parent.
+
+## 100-hot-update-fullstack-controls.M04P
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s10wt/receipts/s10-p20/expected-verdicts.rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S10 P20 requires an independent baseline0 / mutant1 / restore0 archive for every applicable topology cell, exact nonempty hit window and original supervised waiter Join. This control is excluded from the positive 99 parent.
+
+## 100-hot-update-fullstack-controls.M05E
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s10wt/receipts/s10-p20/expected-verdicts.rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S10 P20 requires an independent baseline0 / mutant1 / restore0 archive for every applicable topology cell, exact nonempty hit window and original supervised waiter Join. This control is excluded from the positive 99 parent.
+
+## 100-hot-update-fullstack-controls.M05P
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s10wt/receipts/s10-p20/expected-verdicts.rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S10 P20 requires an independent baseline0 / mutant1 / restore0 archive for every applicable topology cell, exact nonempty hit window and original supervised waiter Join. This control is excluded from the positive 99 parent.
+
+## 100-hot-update-fullstack-controls.M05X
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s10wt/receipts/s10-p20/expected-verdicts.rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S10 P20 requires an independent baseline0 / mutant1 / restore0 archive for every applicable topology cell, exact nonempty hit window and original supervised waiter Join. This control is excluded from the positive 99 parent.
+
+## 100-hot-update-fullstack-controls.M05R
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s10wt/receipts/s10-p20/expected-verdicts.rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S10 P20 requires an independent baseline0 / mutant1 / restore0 archive for every applicable topology cell, exact nonempty hit window and original supervised waiter Join. This control is excluded from the positive 99 parent.
+
+## 100-hot-update-fullstack-controls.M06A
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s10wt/receipts/s10-p20/expected-verdicts.rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S10 P20 requires an independent baseline0 / mutant1 / restore0 archive for every applicable topology cell, exact nonempty hit window and original supervised waiter Join. This control is excluded from the positive 99 parent.
+
+## 100-hot-update-fullstack-controls.M06B
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s10wt/receipts/s10-p20/expected-verdicts.rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S10 P20 requires an independent baseline0 / mutant1 / restore0 archive for every applicable topology cell, exact nonempty hit window and original supervised waiter Join. This control is excluded from the positive 99 parent.
+
+## 100-hot-update-fullstack-controls.M06R
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s10wt/receipts/s10-p20/expected-verdicts.rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S10 P20 requires an independent baseline0 / mutant1 / restore0 archive for every applicable topology cell, exact nonempty hit window and original supervised waiter Join. This control is excluded from the positive 99 parent.
+
+## 100-hot-update-fullstack-controls.M06F
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s10wt/receipts/s10-p20/expected-verdicts.rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S10 P20 requires an independent baseline0 / mutant1 / restore0 archive for every applicable topology cell, exact nonempty hit window and original supervised waiter Join. This control is excluded from the positive 99 parent.
+
+## 100-hot-update-fullstack-controls.M07A
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s10wt/receipts/s10-p20/expected-verdicts.rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S10 P20 requires an independent baseline0 / mutant1 / restore0 archive for every applicable topology cell, exact nonempty hit window and original supervised waiter Join. This control is excluded from the positive 99 parent.
+
+## 100-hot-update-fullstack-controls.M07B
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s10wt/receipts/s10-p20/expected-verdicts.rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S10 P20 requires an independent baseline0 / mutant1 / restore0 archive for every applicable topology cell, exact nonempty hit window and original supervised waiter Join. This control is excluded from the positive 99 parent.
+
+## 100-hot-update-fullstack-controls.M07N
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s10wt/receipts/s10-p20/expected-verdicts.rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S10 P20 requires an independent baseline0 / mutant1 / restore0 archive for every applicable topology cell, exact nonempty hit window and original supervised waiter Join. This control is excluded from the positive 99 parent.
+
+## 100-hot-update-fullstack-controls.M07C
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s10wt/receipts/s10-p20/expected-verdicts.rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S10 P20 requires an independent baseline0 / mutant1 / restore0 archive for every applicable topology cell, exact nonempty hit window and original supervised waiter Join. This control is excluded from the positive 99 parent.
+
+## 100-hot-update-fullstack-controls.M08E
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s10wt/receipts/s10-p20/expected-verdicts.rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S10 P20 requires an independent baseline0 / mutant1 / restore0 archive for every applicable topology cell, exact nonempty hit window and original supervised waiter Join. This control is excluded from the positive 99 parent.
+
+## 100-hot-update-fullstack-controls.M08P
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s10wt/receipts/s10-p20/expected-verdicts.rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S10 P20 requires an independent baseline0 / mutant1 / restore0 archive for every applicable topology cell, exact nonempty hit window and original supervised waiter Join. This control is excluded from the positive 99 parent.
+
+## 100-hot-update-fullstack-controls.M08A
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s10wt/receipts/s10-p20/expected-verdicts.rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S10 P20 requires an independent baseline0 / mutant1 / restore0 archive for every applicable topology cell, exact nonempty hit window and original supervised waiter Join. This control is excluded from the positive 99 parent.
+
+## 100-hot-update-fullstack-controls.M08B
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s10wt/receipts/s10-p20/expected-verdicts.rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S10 P20 requires an independent baseline0 / mutant1 / restore0 archive for every applicable topology cell, exact nonempty hit window and original supervised waiter Join. This control is excluded from the positive 99 parent.
+
+## 100-hot-update-fullstack-controls.M08D
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s10wt/receipts/s10-p20/expected-verdicts.rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S10 P20 requires an independent baseline0 / mutant1 / restore0 archive for every applicable topology cell, exact nonempty hit window and original supervised waiter Join. This control is excluded from the positive 99 parent.
+
+## 100-hot-update-fullstack-controls.M08X
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s10wt/receipts/s10-p20/expected-verdicts.rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S10 P20 requires an independent baseline0 / mutant1 / restore0 archive for every applicable topology cell, exact nonempty hit window and original supervised waiter Join. This control is excluded from the positive 99 parent.
+
+## 100-hot-update-fullstack-controls.M08C
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s10wt/receipts/s10-p20/expected-verdicts.rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S10 P20 requires an independent baseline0 / mutant1 / restore0 archive for every applicable topology cell, exact nonempty hit window and original supervised waiter Join. This control is excluded from the positive 99 parent.
+
+## 100-hot-update-fullstack-controls.M08O
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s10wt/receipts/s10-p20/expected-verdicts.rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S10 P20 requires an independent baseline0 / mutant1 / restore0 archive for every applicable topology cell, exact nonempty hit window and original supervised waiter Join. This control is excluded from the positive 99 parent.
+
+## 100-hot-update-fullstack-controls.M09A
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s10wt/receipts/s10-p20/expected-verdicts.rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S10 P20 requires an independent baseline0 / mutant1 / restore0 archive for every applicable topology cell, exact nonempty hit window and original supervised waiter Join. This control is excluded from the positive 99 parent.
+
+## 100-hot-update-fullstack-controls.M09B
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s10wt/receipts/s10-p20/expected-verdicts.rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S10 P20 requires an independent baseline0 / mutant1 / restore0 archive for every applicable topology cell, exact nonempty hit window and original supervised waiter Join. This control is excluded from the positive 99 parent.
+
+## 100-hot-update-fullstack-controls.M10S
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s10wt/receipts/s10-p20/expected-verdicts.rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S10 P20 requires an independent baseline0 / mutant1 / restore0 archive for every applicable topology cell, exact nonempty hit window and original supervised waiter Join. This control is excluded from the positive 99 parent.
+
+## 100-hot-update-fullstack-controls.M10C
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s10wt/receipts/s10-p20/expected-verdicts.rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S10 P20 requires an independent baseline0 / mutant1 / restore0 archive for every applicable topology cell, exact nonempty hit window and original supervised waiter Join. This control is excluded from the positive 99 parent.
+
+## 100-hot-update-fullstack-controls.M11W
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s10wt/receipts/s10-p20/expected-verdicts.rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S10 P20 requires an independent baseline0 / mutant1 / restore0 archive for every applicable topology cell, exact nonempty hit window and original supervised waiter Join. This control is excluded from the positive 99 parent.
+
+## 100-hot-update-fullstack-controls.M11I
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s10wt/receipts/s10-p20/expected-verdicts.rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S10 P20 requires an independent baseline0 / mutant1 / restore0 archive for every applicable topology cell, exact nonempty hit window and original supervised waiter Join. This control is excluded from the positive 99 parent.
+
+## 100-hot-update-fullstack-controls.M11O
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s10wt/receipts/s10-p20/expected-verdicts.rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S10 P20 requires an independent baseline0 / mutant1 / restore0 archive for every applicable topology cell, exact nonempty hit window and original supervised waiter Join. This control is excluded from the positive 99 parent.
+
+## 100-hot-update-fullstack-controls.M11P
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s10wt/receipts/s10-p20/expected-verdicts.rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S10 P20 requires an independent baseline0 / mutant1 / restore0 archive for every applicable topology cell, exact nonempty hit window and original supervised waiter Join. This control is excluded from the positive 99 parent.
+
+## 100-hot-update-fullstack-controls.M11Q
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s10wt/receipts/s10-p20/expected-verdicts.rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S10 P20 requires an independent baseline0 / mutant1 / restore0 archive for every applicable topology cell, exact nonempty hit window and original supervised waiter Join. This control is excluded from the positive 99 parent.
+
+## 100-hot-update-fullstack-controls.M11F
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s10wt/receipts/s10-p20/expected-verdicts.rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S10 P20 requires an independent baseline0 / mutant1 / restore0 archive for every applicable topology cell, exact nonempty hit window and original supervised waiter Join. This control is excluded from the positive 99 parent.
+
+## 100-hot-update-fullstack-controls.M11S
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s10wt/receipts/s10-p20/expected-verdicts.rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S10 P20 requires an independent baseline0 / mutant1 / restore0 archive for every applicable topology cell, exact nonempty hit window and original supervised waiter Join. This control is excluded from the positive 99 parent.
+
+## 100-hot-update-fullstack-controls.M11X
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s10wt/receipts/s10-p20/expected-verdicts.rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S10 P20 requires an independent baseline0 / mutant1 / restore0 archive for every applicable topology cell, exact nonempty hit window and original supervised waiter Join. This control is excluded from the positive 99 parent.
+
+## 100-hot-update-fullstack-controls.M11D
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s10wt/receipts/s10-p20/expected-verdicts.rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S10 P20 requires an independent baseline0 / mutant1 / restore0 archive for every applicable topology cell, exact nonempty hit window and original supervised waiter Join. This control is excluded from the positive 99 parent.
+
+## 100-hot-update-fullstack-controls.M11C
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s10wt/receipts/s10-p20/expected-verdicts.rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S10 P20 requires an independent baseline0 / mutant1 / restore0 archive for every applicable topology cell, exact nonempty hit window and original supervised waiter Join. This control is excluded from the positive 99 parent.
+
+## 100-hot-update-fullstack-controls.M11L
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s10wt/receipts/s10-p20/expected-verdicts.rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S10 P20 requires an independent baseline0 / mutant1 / restore0 archive for every applicable topology cell, exact nonempty hit window and original supervised waiter Join. This control is excluded from the positive 99 parent.
+
+## 100-hot-update-fullstack-controls.M11U
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s10wt/receipts/s10-p20/expected-verdicts.rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S10 P20 requires an independent baseline0 / mutant1 / restore0 archive for every applicable topology cell, exact nonempty hit window and original supervised waiter Join. This control is excluded from the positive 99 parent.
+
+## 100-hot-update-fullstack-controls.M11K
+
+Declared expectation / **NOT_RUN**. Source: `/home/weiland/s10wt/receipts/s10-p20/expected-verdicts.rows.tsv`. No live native result, source/artifact/running identity or measured cost is claimed.
+S10 P20 requires an independent baseline0 / mutant1 / restore0 archive for every applicable topology cell, exact nonempty hit window and original supervised waiter Join. This control is excluded from the positive 99 parent.
+
+## 31-node-upgrade-fleet.V1
+
+Declared expectation / **NOT_RUN**. Source: `S8 P29: exact historical parent copied to V1`. No live native result, source/artifact/running identity or measured cost is claimed.
+
+## 31-node-upgrade-fleet.V2
+
+Declared expectation / **NOT_RUN**. Source: `S8 P29: declared v2 regression expectation`. No live native result, source/artifact/running identity or measured cost is claimed.
+
+## 33-node-upgrade-success.V1
+
+Declared expectation / **NOT_RUN**. Source: `S8 P29: exact historical parent copied to V1`. No live native result, source/artifact/running identity or measured cost is claimed.
+
+## 33-node-upgrade-success.V2
+
+Declared expectation / **NOT_RUN**. Source: `S8 P29: declared v2 regression expectation`. No live native result, source/artifact/running identity or measured cost is claimed.
+
+### S10 P31 declaration reconciliation
+
+The 99/100 expectations above remain declarations / NOT_RUN pending
+S10/P19/P20/P26/P27/P32/P35 and upstream manifest owners. No expectation or
+historical 39.P/F/BR PRODUCT-RED3 was changed. The P31 crosscheck joins the actual
+shell and JSON child sets to expected native values, histories, launch costs,
+claim identities and the full-directory declaration catalog. Its mutation
+controls are hermetic gate evidence only. Live source/artifact/running identities,
+native chains and measured resources remain absent until their exact owner
+supplies original same-candidate raw evidence. Cost input changes require a new
+candidate seal; they are never receipt-only updates.

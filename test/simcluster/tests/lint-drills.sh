@@ -9,6 +9,7 @@
 #      fire-and-forget setup/cleanup, which legitimately end `…; true`]
 #   4. a manual counter poke `_AS_FAIL=…` / `_AS_NC=…` in a drill → must use the public API
 #   5. every drill must open with drill_begin and close with drill_end (else no verdict line is emitted)
+#   6. captured predicates must not export globals/jobs or change caller shell state
 #
 # SCOPE. The drills in BATCH below are CONTRACT-ENFORCED: any violation is a HARD failure (exit 1).
 # Every new contract-era batch MUST append its drills to BATCH — a drill absent from this list is exempt
@@ -72,7 +73,8 @@ scan_file() {
     # "not found", `!` inverts the failure, and the assertion becomes PERMANENTLY TRUE: a false green no
     # amount of running can catch. (Caught three times while writing the G-C drills; s7-s9-plan §1.4
     # R-NOSHC. The same shape as the round-5 sigpipe rule above: a structural guard, not vigilance.)
-    # assert_* runs "$@" in the CURRENT shell, so the fix is always "define a predicate function".
+    # assert_* sees sourced functions in its capture subshell. A predicate must
+    # be self-contained: state the caller needs is established before asserting.
     printf '%s\n' "$_C" | grep -qE "sh -c [\"'][^\"']*(dexec|dexec_it|poll_until|node_running|node_exists|node_kill|node_start|node_stop|rm_node|ctr_name|net_name|vol_etc|vol_lib|tcp_refused|list_nodes|sim_leader|a_non_leader_voter|grow_to_[23]|dp_curl_ok_body|dp_curl_refused|dp_curl_blackholed|expose_serve_sentinel|vault_[a-z]+|fault_[a-z_]+|leak_[a-z_]+|ev_[a-z_]+|secrets_[a-z_]+|agent_provision_yaml)[[:space:]]" \
         && echo "noshc: a HARNESS FUNCTION inside 'sh -c' — a new shell does not inherit sourced functions, so the command dies as 'not found' (and under '!' becomes permanently TRUE = false green). Define a predicate function and pass it to assert_* instead (s7-s9-plan §1.4 R-NOSHC)"
     # G-C: `timeout N <harness-fn>` — same trap as noshc but via coreutils `timeout`, which execvp's its
@@ -122,6 +124,13 @@ scan_file() {
 is_batch() { case " $BATCH " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
 
 HARD=0; LEGACY=0
+# origin: hot-update S4 plan §9.1–§9.3 / DRILL-SUBSHELL. This follows literal
+# helper calls across drills/lib, including predicates behind poll wrappers.
+# Source failures are hard errors; a missing parser cannot silently waive it.
+# Enforced over the WHOLE suite: the first audit found drill 94's _A0_PIDS
+# capture as well as the S4 PTY programs, and both are fixed.
+if python3 -I -B "$HERE/assert-shell-state.py" "$DRILLS_DIR"/*.sh; then :
+else HARD=$((HARD+1)); fi
 echo "── contract-enforced batch (S6-S8 + G-C) ──────────────────────────────────────"
 for name in $BATCH; do
     f="$DRILLS_DIR/$name.sh"

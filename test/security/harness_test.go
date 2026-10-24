@@ -15,15 +15,11 @@ import (
 	"context"
 	"database/sql"
 	"log/slog"
-	"net/http"
-	"net/http/httptest"
-	"os"
 	"path/filepath"
 	"runtime"
 	"testing"
 	"time"
 
-	"github.com/LinZiyang666/tether/internal/agent"
 	"github.com/LinZiyang666/tether/internal/auth"
 	"github.com/LinZiyang666/tether/internal/broker"
 	"github.com/LinZiyang666/tether/internal/session"
@@ -157,52 +153,18 @@ func connectAnon(t *testing.T, url string) *nats.Conn {
 	return nc
 }
 
+// Retired legacy fixture rationale: current candidate verification is exercised
+// through upgradecli in upgrade_candidate_fixture_test.go.
 // newTestServer returns an httptest.Server that always serves body
 // (with a 200 status) for any path. The caller must Close() it.
-func newTestServer(t *testing.T, body []byte) *httptest.Server {
-	t.Helper()
-	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write(body)
-	}))
-}
 
 // startAgentForUpgrade boots an in-process agent wired to a sandboxed
 // upgrade-target executable so a successful upgrade doesn't trample
 // the go-test binary. Returns a teardown func.
-func startAgentForUpgrade(t *testing.T, url, sid, nid string, allow []string) func() {
-	t.Helper()
-	exePath := filepath.Join(t.TempDir(), "tether-target")
-	if err := os.WriteFile(exePath, []byte("OLD"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	a, err := agent.New(agent.Config{
-		NATSURL:               url,
-		SID:                   sid,
-		NID:                   nid,
-		Logger:                silentLog(),
-		HeartbeatInterval:     100 * time.Millisecond,
-		RegisterTimeout:       2 * time.Second,
-		UpgradeURLAllowlist:   allow,
-		UpgradeNoExit:         true,
-		UpgradeExecutablePath: exePath,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() { done <- a.Run(ctx) }()
-	// Brief wait for register; matches test/p10 pattern.
-	time.Sleep(300 * time.Millisecond)
-	return func() {
-		cancel()
-		select {
-		case <-done:
-		case <-time.After(2 * time.Second):
-			t.Fatal("agent did not exit")
-		}
-	}
-}
+// hot-update S3: an install now refuses unless the running image IS the
+// on-disk binary (a re-dispatch must never hand a bundle to bytes that
+// are not the exporter); the sandbox binary stands for the running one.
+// Brief wait for register; matches test/p10 pattern.
 
 // scriptPath returns the absolute path to scripts/install.sh.
 // Computed off this test file's location (matches test/p10).

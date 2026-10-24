@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -138,6 +139,9 @@ func runRunResize(
 // C.14 — `run echo "hello"` round-trip. Under PTY, every \n becomes
 // \r\n; we just need the literal token in the byte stream.
 func TestRunEchoHelloOverPTY(t *testing.T) {
+	// origin: hot-update S5 PROC-LEAK / final process census.
+	testharness.GuardProcessDirectory(t, filepath.Dir(t.TempDir()))
+
 	url := startNATS(t)
 	db := openDB(t)
 	pub, fp := freshUserPub(t)
@@ -164,6 +168,9 @@ func TestRunEchoHelloOverPTY(t *testing.T) {
 
 // C.15 — non-zero exit propagation under PTY.
 func TestRunExitCodePropagates(t *testing.T) {
+	// origin: hot-update S5 PROC-LEAK / final process census.
+	testharness.GuardProcessDirectory(t, filepath.Dir(t.TempDir()))
+
 	url := startNATS(t)
 	db := openDB(t)
 	pub, fp := freshUserPub(t)
@@ -193,6 +200,9 @@ func TestRunExitCodePropagates(t *testing.T) {
 // `stty size` prints "<rows> <cols>" (newline-terminated). We grep
 // for "60 200" in the output stream.
 func TestRunResizePropagatesViaSIGWINCH(t *testing.T) {
+	// origin: hot-update S5 PROC-LEAK / final process census.
+	testharness.GuardProcessDirectory(t, filepath.Dir(t.TempDir()))
+
 	url := startNATS(t)
 	db := openDB(t)
 	pub, fp := freshUserPub(t)
@@ -228,6 +238,9 @@ func TestRunResizePropagatesViaSIGWINCH(t *testing.T) {
 // C.17 — fast-exit run (< 1s child). Pin that the attach handshake
 // race never surfaces as attach_timeout when ctl attaches promptly.
 func TestRunFastExitNoAttachTimeout(t *testing.T) {
+	// origin: hot-update S5 PROC-LEAK / final process census.
+	testharness.GuardProcessDirectory(t, filepath.Dir(t.TempDir()))
+
 	url := startNATS(t)
 	db := openDB(t)
 	pub, fp := freshUserPub(t)
@@ -261,6 +274,9 @@ func TestRunFastExitNoAttachTimeout(t *testing.T) {
 // before any byte hits the master. The agent treats this as
 // exec_failed (handle_run.go after pty.Start).
 func TestRunNonexistentCommandFails(t *testing.T) {
+	// origin: hot-update S5 PROC-LEAK / final process census.
+	testharness.GuardProcessDirectory(t, filepath.Dir(t.TempDir()))
+
 	url := startNATS(t)
 	db := openDB(t)
 	pub, fp := freshUserPub(t)

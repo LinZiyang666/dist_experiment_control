@@ -32,7 +32,28 @@ DRILLS="${DRILLS:-$SIM_ROOT/drills}"
 # manifest_line_arms) and empty when no map is given.
 sites() {
     _st_map="${2:-/dev/null}"
-    awk -v mapfile="$_st_map" '
+    _st_start=0; _st_end=0
+    if [ "$1" = "$DRILLS/lib/hot_update_pty.sh" ]; then
+        _st_start=$_identity_legacy_start; _st_end=$_identity_legacy_end
+    fi
+    awk -v mapfile="$_st_map" -v legacy="$_identity_legacy_start" -v legacy_start="$_st_start" -v legacy_end="$_st_end" '
+        # origin: S8 internal review s8-hermetic F10. Skip two shell words
+        # (evidence root and role) without expanding any caller variables.
+        function drop_words(s, count,    n,p,c,q,escaped,started) {
+            n=length(s); q=""; escaped=0; started=0
+            for (p=1; p<=n; p++) {
+                c=substr(s,p,1)
+                if (escaped) { escaped=0; continue }
+                if (c=="\\" && q!="\047") { escaped=1; started=1; continue }
+                if (q!="") { if (c==q) q=""; continue }
+                if (c=="\"" || c=="\047") { q=c; started=1; continue }
+                if (c ~ /[ \t]/) {
+                    if (started && --count==0) return substr(s,p+1)
+                    started=0
+                } else started=1
+            }
+            return ""
+        }
         BEGIN {
             split("assert_ok assert_refuses assert_setup assert_bug product_red not_covered", a, " ")
             for (i in a) K[a[i]] = 1
@@ -42,7 +63,15 @@ sites() {
         FILENAME == mapfile { owner[$1] = $2; next }
         /^[ \t]*#/ { next }
         {
+            site_line = FNR
             line = $0
+            # Forwarding calls can continue their arguments on later lines.
+            # Attribute the claim to the original call line, not its tail.
+            while (line ~ /\\$/) {
+                sub(/\\$/, "", line)
+                if ((getline) <= 0) break
+                line = line $0
+            }
             # Split on separators that sit OUTSIDE quotes by walking the line once, keeping BOTH the original
             # fragment (the description is read back out of it) and a quote-masked twin (quoted spans → Q),
             # which is what the blind-shape check below looks at so that prose mentioning a primitive inside
@@ -69,6 +98,20 @@ sites() {
                 while (w ~ /^(then|else|do|if|elif|while|until|!)[ \t]+/) { sub(/^[a-z!]+[ \t]+/, "", w); sub(/^[a-z!]+[ \t]+/, "", mw) }
                 if (!match(w, /^[A-Za-z_][A-Za-z0-9_]*/)) continue
                 kw = substr(w, 1, RLENGTH)
+                forwarding = (kw == "upgrade_legacy_assert")
+                if (forwarding && i == 1 && line ~ /^[ \t]*upgrade_legacy_assert[ \t]*\(\)[ \t]*\{/) continue
+                if (forwarding && legacy == 0) {
+                    printf "%s\tBLIND\t%s\n", (site_line in owner ? owner[site_line] : ""), w; continue
+                }
+                if (forwarding) {
+                    caller_desc = drop_words(substr(w, RLENGTH + 1), 2)
+                    if (caller_desc !~ /^[ \t]*["\047]/) {
+                        printf "%s\tBLIND\t%s\n", (site_line in owner ? owner[site_line] : ""), w; continue
+                    }
+                    w = "assert_bug " caller_desc
+                    kw = "assert_bug"
+                    match(w, /^[A-Za-z_][A-Za-z0-9_]*/)
+                }
                 if (!(kw in K)) {
                     # BLIND SHAPES (internal review round 1 R3-8): a primitive reached through a wrapper —
                     # `FOO=x assert_ok …`, `eval "assert_ok …"`, `command assert_ok …`, `sh -c "assert_ok …"`,
@@ -79,12 +122,12 @@ sites() {
                     # are recognised by their first word and checked on the ORIGINAL text.
                     blind = 0
                     if (mw ~ /^[A-Za-z_][A-Za-z0-9_]*=[^ \t]*[ \t]+/ || kw == "command" || kw == "env" || kw == "exec" || kw == "time" || kw == "nohup" || kw == "timeout" || kw == "xargs") {
-                        if (mw ~ /(^|[ \t])(assert_ok|assert_refuses|assert_setup|assert_bug|product_red|not_covered)([ \t]|$)/) blind = 1
+                        if (mw ~ /(^|[ \t])(assert_ok|assert_refuses|assert_setup|assert_bug|product_red|not_covered|upgrade_legacy_assert)([ \t]|$)/) blind = 1
                     }
                     if (kw == "eval" || kw == "sh" || kw == "bash") {
-                        if (w ~ /(^|[ \t"\047])(assert_ok|assert_refuses|assert_setup|assert_bug|product_red|not_covered)([ \t"\047]|$)/) blind = 1
+                        if (w ~ /(^|[ \t"\047])(assert_ok|assert_refuses|assert_setup|assert_bug|product_red|not_covered|upgrade_legacy_assert)([ \t"\047]|$)/) blind = 1
                     }
-                    if (blind) printf "%s\tBLIND\t%s\n", (FNR in owner ? owner[FNR] : ""), w
+                    if (blind) printf "%s\tBLIND\t%s\n", (site_line in owner ? owner[site_line] : ""), w
                     continue
                 }
                 rest = substr(w, RLENGTH + 1)
@@ -113,20 +156,27 @@ sites() {
                     # SEE IT AND FAIL: the text of a claim must be literal at the call site. A bare word
                     # that is not a variable is recorded so it is never silently invisible.
                     match(rest, /^[^ \t]*/); first = substr(rest, 1, RLENGTH)
-                    if (first ~ /^\$/) { printf "%s\tBLIND\t%s\n", (FNR in owner ? owner[FNR] : ""), w; continue }
+                    if (first ~ /^\$/) { printf "%s\tBLIND\t%s\n", (site_line in owner ? owner[site_line] : ""), w; continue }
                     desc = "<" first ">"
                 }
                 # A quoted description that is NOTHING BUT one variable (`"$1"`, `"$desc"`, `"${d}"`) is the
                 # wrapper shape in its quoted form — same refusal. A literal text that merely CONTAINS a
                 # variable (`"session $SID + ctl login"`) is a real, stable identity and passes.
-                if (desc ~ /^\$\{?[A-Za-z_0-9@*#?]+\}?$/) { printf "%s\tBLIND\t%s\n", (FNR in owner ? owner[FNR] : ""), w; continue }
-                printf "%s\t%s\t%s\n", (FNR in owner ? owner[FNR] : ""), kw, desc
+                # Only the verified forwarding site is replaced by caller
+                # claims. All other parameterized primitives remain BLIND.
+                if (kw == "assert_bug" && desc == "$_ula_desc" && legacy_start > 0 && site_line > legacy_start && site_line < legacy_end) continue
+                if (desc ~ /^\$\{?[A-Za-z_0-9@*#?]+\}?$/) { printf "%s\tBLIND\t%s\n", (site_line in owner ? owner[site_line] : ""), w; continue }
+                printf "%s\t%s\t%s\n", (site_line in owner ? owner[site_line] : ""), kw, desc
             }
         }
     ' "$_st_map" "$1"
 }
 
 report_raw() {
+    _identity_contract=$(python3 -I -B "$HERE/assert-identity-callers.py" "$DRILLS/lib/hot_update_pty.sh") || return 3
+    read -r _identity_legacy_start _identity_legacy_end <<EOF
+$_identity_contract
+EOF
     _rr_map="${TMPDIR:-/tmp}/assert-identity.map.$$"
     for f in "$DRILLS"/*.sh; do
         d=$(basename "$f" .sh)
@@ -154,7 +204,11 @@ report_raw() {
 # a blind site can neither be baselined nor pass the check.
 report() {
     _rows="${TMPDIR:-/tmp}/assert-identity.rows.$$"
-    report_raw > "$_rows"
+    if ! report_raw > "$_rows"; then
+        printf 'assert-identity: caller contract inspection failed\n' >&2
+        rm -f "$_rows"
+        exit 3
+    fi
     if grep -q "$(printf '\tBLIND\t')" "$_rows"; then
         printf 'assert-identity: claim site(s) reached through a wrapper are INVISIBLE to the identity and kept-sites gates — rewrite each as a line-leading call:\n' >&2
         grep "$(printf '\tBLIND\t')" "$_rows" | awk -F'\t' '{ printf "  %s: %s\n", $1, $3 }' >&2

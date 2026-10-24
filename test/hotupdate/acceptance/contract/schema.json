@@ -1,0 +1,532 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:tether:fullstack-acceptance:v1",
+  "$comment": "origin: hot-update S10 plan \u00a75.1 / P00. Duplicate object members are rejected before schema evaluation. x-go-name/type define the explicit Go codec. Validation never establishes product success.",
+  "oneOf": [{"$ref":"#/$defs/evidence"},{"$ref":"#/$defs/result"},{"$ref":"#/$defs/profile"},{"$ref":"#/$defs/workload"},{"$ref":"#/$defs/transfer"},{"$ref":"#/$defs/abi"},{"$ref":"#/$defs/command_bindings"},{"$ref":"#/$defs/log_roster"},{"$ref":"#/$defs/log_cursor"},{"$ref":"#/$defs/log_end"}],
+  "$defs": {
+    "text": {"type":"string"},
+    "id": {"type":"string","minLength":1},
+    "digest": {"type":"string","pattern":"^[0-9a-f]{64}$"},
+    "uint64": {"type":"integer","minimum":0,"maximum":18446744073709551615},
+    "uint32": {"type":"integer","minimum":0,"maximum":4294967295},
+    "int64": {"type":"integer","minimum":-9223372036854775808,"maximum":9223372036854775807},
+    "nonnegative": {"type":"integer","minimum":0,"maximum":9223372036854775807},
+    "positive": {"type":"integer","minimum":1,"maximum":9223372036854775807},
+    "role": {"enum":["agent","broker","nats","caddy","ctl","fixture","support"]},
+    "topology": {"enum":["single","quorum"]},
+    "regime": {"enum":["calibration","quiet","default","live-grow","control"]},
+    "tier": {"enum":["hermetic","deploy","source_gate"]},
+    "verdict": {"enum":["GREEN","ASSERT-FAIL","SETUP-RED","PRODUCT-RED","INCOMPLETE"]},
+    "direction": {"enum":["forward","reverse"]},
+    "receipt_kind": {"enum":["control_ready","resources_migrated","old_generation_released"]},
+    "step_action": {"enum":["upgrade","rollback","reload","recover"]},
+    "slot_class": {"enum":["read","write","short-exec"]},
+    "leg": {"enum":["leg1","leg2"]},
+    "interval_event": {"enum":["activate","retire","read","write","wait","accept","primitive"]},
+    "s8_phase": {"enum":["prepared","staged","ready","freezing","activating","serving_new","migrating","completed","deferred","rejected","rollback_pending","rollback_blocked","rolled_back","recovery_required","cancelled","abandoned"]},
+    "s8_outcome": {"enum":["pending","success","deferred","rejected","rolled_back","legacy_interrupting","unknown","cancelled"]},
+    "s8_direction": {"enum":["forward","reverse"]},
+    "s8_cut_stage": {"enum":["none","pristine","partial_active","active","retiring","released"]},
+    "s8_component": {"enum":["agent","broker","nats","caddy"]},
+    "s8_domain": {"enum":["control","exec","pty","flow","ss","transfer_worker","transfer_tracker","broker_store","broker_runtime","authority","upgrade"]},
+    "s8_receipt_kind": {"enum":["control_ready","resources_migrated","old_generation_released"]},
+    "s8_mode": {"enum":["hot","legacy_interrupting"]},
+    "s8_action_state": {"enum":["intent","observed","durable"]},
+    "s8_window_state": {"enum":["open","closing","closed"]},
+    "s8_action_kind": {"enum":["publish","select","freeze","dispatch","activate","control","migrate","retire","reverse","release"]},
+    "s7_status_state": {"enum":["unknown","live","terminal"]},
+    "s7_phase": {"enum":["open","prepared","sending","receiving","commit_reserved","decided","terminal_pending","history_confirmed","cleanup_pending","settled"]},
+    "s7_primitive_outcome": {"enum":["not_entered","inflight","landed"]},
+    "s7_commit_primitive": {"enum":["rename","link"]},
+    "agentboot_phase": {"enum":["","held","refused","imported","active","ready","lost"]},
+    "s9_phase": {"enum":[1,2,3,4,5,6,7,8,9,10,11]},
+    "s9_action": {"enum":[1,2,3,4]},
+    "s9_observation_kind": {"enum":["artifact_verified","asset_sealed","successor_installed","attachment_changed","auth_usable","business_ready","signal_applied","old_exit","storage_finalized","startup_released","return_verified","owner_retired","completed","halted"]},
+    "s8_key": {"type": "object", "additionalProperties": false, "required": ["domain_id","component"], "properties": {
+      "domain_id": {"$ref":"#/$defs/text"},
+      "component": {"$ref":"#/$defs/s8_component"},
+      "sid": {"$ref":"#/$defs/text"},
+      "configured_nid": {"$ref":"#/$defs/text"},
+      "config_path": {"$ref":"#/$defs/text"},
+      "uid": {"$ref":"#/$defs/uint32"}
+    }},
+    "s8_handle": {"type": "object", "additionalProperties": false, "required": ["key","tx_id","cut_id","generation","revision"], "properties": {
+      "key": {"$ref":"#/$defs/s8_key"},
+      "tx_id": {"$ref":"#/$defs/text"},
+      "cut_id": {"$ref":"#/$defs/text"},
+      "generation": {"$ref":"#/$defs/uint64"},
+      "revision": {"$ref":"#/$defs/uint64"}
+    }},
+    "s8_owner": {"type": "object", "additionalProperties": false, "required": ["boot_id","pid","start_ticks","instance_id"], "properties": {
+      "boot_id": {"$ref":"#/$defs/text"},
+      "pid": {"$ref":"#/$defs/int64"},
+      "start_ticks": {"$ref":"#/$defs/uint64"},
+      "instance_id": {"$ref":"#/$defs/text"}
+    }},
+    "s8_grant": {"type": "object", "additionalProperties": false, "required": ["handle","client_nonce","issuer","actor_fp","mode","source_release","target_release","source_sha","target_sha","scope_digest","capability_digest","expires_at"], "properties": {
+      "handle": {"$ref":"#/$defs/s8_handle"},
+      "parent_tx_id": {"$ref":"#/$defs/text"},
+      "parent_slot": {"$ref":"#/$defs/text"},
+      "client_nonce": {"$ref":"#/$defs/text"},
+      "issuer": {"$ref":"#/$defs/s8_owner"},
+      "actor_fp": {"$ref":"#/$defs/text"},
+      "mode": {"$ref":"#/$defs/s8_mode"},
+      "source_release": {"$ref":"#/$defs/text"},
+      "target_release": {"$ref":"#/$defs/text"},
+      "source_sha": {"$ref":"#/$defs/text"},
+      "target_sha": {"$ref":"#/$defs/text"},
+      "scope_digest": {"$ref":"#/$defs/text"},
+      "capability_digest": {"$ref":"#/$defs/text"},
+      "expires_at": {"$ref":"#/$defs/int64"}
+    }},
+    "s8_resource": {"type": "object", "additionalProperties": false, "required": ["domain","id","origin","owner","generation","state","custody"], "properties": {
+      "domain": {"$ref":"#/$defs/s8_domain"},
+      "id": {"$ref":"#/$defs/text"},
+      "origin": {"$ref":"#/$defs/text"},
+      "owner": {"$ref":"#/$defs/s8_owner"},
+      "generation": {"$ref":"#/$defs/uint64"},
+      "state": {"$ref":"#/$defs/text"},
+      "custody": {"$ref":"#/$defs/text"}
+    }},
+    "s8_scope": {"type": "object", "additionalProperties": false, "required": ["id","participants","domains","expected"], "properties": {
+      "id": {"$ref":"#/$defs/text"},
+      "participants": {"oneOf":[{"type":"array","items":{"$ref":"#/$defs/s8_key"}},{"type":"null"}]},
+      "domains": {"oneOf":[{"type":"array","items":{"$ref":"#/$defs/s8_domain"}},{"type":"null"}]},
+      "expected": {"oneOf":[{"type":"array","items":{"$ref":"#/$defs/s8_resource"}},{"type":"null"}]}
+    }},
+    "s8_stamp": {"type": "object", "additionalProperties": false, "required": ["attempt","producer","nonce","sequence","at","scope_digest"], "properties": {
+      "attempt": {"$ref":"#/$defs/s8_handle"},
+      "producer": {"$ref":"#/$defs/s8_owner"},
+      "nonce": {"$ref":"#/$defs/text"},
+      "sequence": {"$ref":"#/$defs/uint64"},
+      "at": {"$ref":"#/$defs/int64"},
+      "scope_digest": {"$ref":"#/$defs/text"}
+    }},
+    "s8_census": {"type": "object", "additionalProperties": false, "required": ["stamp","known","complete","resources","expected_digest","admitting","old_owners"], "properties": {
+      "stamp": {"$ref":"#/$defs/s8_stamp"},
+      "known": {"type":"boolean"},
+      "complete": {"type":"boolean"},
+      "resources": {"oneOf":[{"type":"array","items":{"$ref":"#/$defs/s8_resource"}},{"type":"null"}]},
+      "expected_digest": {"$ref":"#/$defs/text"},
+      "admitting": {"$ref":"#/$defs/uint64"},
+      "old_owners": {"oneOf":[{"type":"array","items":{"$ref":"#/$defs/s8_owner"}},{"type":"null"}]}
+    }},
+    "s8_action": {"type": "object", "additionalProperties": false, "required": ["id","handle","kind","intent_digest","result_digest","state","nonce"], "properties": {
+      "id": {"$ref":"#/$defs/text"},
+      "handle": {"$ref":"#/$defs/s8_handle"},
+      "kind": {"$ref":"#/$defs/s8_action_kind"},
+      "intent_digest": {"$ref":"#/$defs/text"},
+      "result_digest": {"$ref":"#/$defs/text"},
+      "state": {"$ref":"#/$defs/s8_action_state"},
+      "nonce": {"$ref":"#/$defs/text"}
+    }},
+    "s8_cancellationproof": {"type": "object", "additionalProperties": false, "required": ["thawed","observation"], "properties": {
+      "thawed": {"type":"boolean"},
+      "observation": {"$ref":"#/$defs/s8_observation"}
+    }},
+    "s8_record": {"type": "object", "additionalProperties": false, "required": ["version","key","revision","grant","forward","reverse","actions","reason","effective_sha","recorded_previous_sha"], "properties": {
+      "cancellation": {"oneOf":[{"$ref":"#/$defs/s8_cancellationproof"},{"type":"null"}]},
+      "version": {"$ref":"#/$defs/uint32"},
+      "key": {"$ref":"#/$defs/s8_key"},
+      "revision": {"$ref":"#/$defs/uint64"},
+      "grant": {"$ref":"#/$defs/s8_grant"},
+      "forward": {"$ref":"#/$defs/s8_attempt"},
+      "reverse": {"$ref":"#/$defs/s8_attempt"},
+      "actions": {"oneOf":[{"type":"array","items":{"$ref":"#/$defs/s8_action"}},{"type":"null"}]},
+      "reason": {"$ref":"#/$defs/text"},
+      "effective_sha": {"$ref":"#/$defs/text"},
+      "recorded_previous_sha": {"$ref":"#/$defs/text"}
+    }},
+    "s8_metadata": {"type": "object", "additionalProperties": false, "required": ["tx_id","reported_revision","window","pins","archived_at"], "properties": {
+      "tx_id": {"$ref":"#/$defs/text"},
+      "reported_revision": {"$ref":"#/$defs/uint64"},
+      "window": {"$ref":"#/$defs/s8_window_state"},
+      "pins": {"oneOf":[{"type":"array","items":{"$ref":"#/$defs/text"}},{"type":"null"}]},
+      "archived_at": {"$ref":"#/$defs/int64"}
+    }},
+    "s8_observation": {"type": "object", "additionalProperties": false, "required": ["nonce","at","current","census","owner_known","running_sha","effective_sha"], "properties": {
+      "nonce": {"$ref":"#/$defs/text"},
+      "at": {"$ref":"#/$defs/int64"},
+      "current": {"$ref":"#/$defs/s8_attempt"},
+      "census": {"$ref":"#/$defs/s8_census"},
+      "owner_known": {"type":"boolean"},
+      "running_sha": {"$ref":"#/$defs/text"},
+      "effective_sha": {"$ref":"#/$defs/text"}
+    }},
+    "s8_view": {"type": "object", "additionalProperties": false, "required": ["historical","metadata","observation"], "properties": {
+      "historical": {"$ref":"#/$defs/s8_record"},
+      "metadata": {"$ref":"#/$defs/s8_metadata"},
+      "observation": {"$ref":"#/$defs/s8_observation"},
+      "code": {"$ref":"#/$defs/text"},
+      "detail": {"$ref":"#/$defs/text"}
+    }},
+    "s8_history": {"type": "object", "additionalProperties": false, "required": ["record","metadata"], "properties": {
+      "record": {"$ref":"#/$defs/s8_record"},
+      "metadata": {"$ref":"#/$defs/s8_metadata"}
+    }},
+    "key": {"type": "object", "additionalProperties": false, "required": ["role","host","unit","sid","nid","domain","uid"], "x-go-type": "Key", "properties": {
+      "role": {"$ref":"#/$defs/role","x-go-name":"Role"},
+      "host": {"$ref":"#/$defs/id","x-go-name":"Host"},
+      "unit": {"$ref":"#/$defs/id","x-go-name":"Unit"},
+      "sid": {"$ref":"#/$defs/text","x-go-name":"SID"},
+      "nid": {"$ref":"#/$defs/text","x-go-name":"NID"},
+      "domain": {"$ref":"#/$defs/id","x-go-name":"Domain"},
+      "uid": {"$ref":"#/$defs/uint32","x-go-name":"UID"}
+    }},
+    "process": {"type": "object", "additionalProperties": false, "required": ["key","boot_id","pidns","instance_id","pid","start_ticks"], "x-go-type": "Process", "properties": {
+      "key": {"$ref":"#/$defs/key","x-go-name":"Key"},
+      "boot_id": {"$ref":"#/$defs/id","x-go-name":"BootID"},
+      "pidns": {"$ref":"#/$defs/id","x-go-name":"PIDNS"},
+      "instance_id": {"$ref":"#/$defs/id","x-go-name":"InstanceID"},
+      "pid": {"$ref":"#/$defs/positive","x-go-name":"PID"},
+      "start_ticks": {"$ref":"#/$defs/positive_uint64","x-go-name":"StartTicks"}
+    }},
+    "stamp": {"type": "object", "additionalProperties": false, "required": ["process","tx_id","cut_id","direction","query_nonce","scope_digest","generation","revision","sequence","at_boot_ns"], "x-go-type": "Stamp", "properties": {
+      "process": {"$ref":"#/$defs/process","x-go-name":"Process"},
+      "tx_id": {"$ref":"#/$defs/text","x-go-name":"TxID"},
+      "cut_id": {"$ref":"#/$defs/text","x-go-name":"CutID"},
+      "direction": {"$ref":"#/$defs/direction","x-go-name":"Direction"},
+      "query_nonce": {"$ref":"#/$defs/text","x-go-name":"QueryNonce"},
+      "scope_digest": {"$ref":"#/$defs/text","x-go-name":"ScopeDigest"},
+      "generation": {"$ref":"#/$defs/uint64","x-go-name":"Generation"},
+      "revision": {"$ref":"#/$defs/uint64","x-go-name":"Revision"},
+      "sequence": {"$ref":"#/$defs/uint64","x-go-name":"Sequence"},
+      "at_boot_ns": {"$ref":"#/$defs/nonnegative","x-go-name":"AtBootNS"}
+    }},
+    "artifact": {"type": "object", "additionalProperties": false, "required": ["id","role","release","source_commit","toolchain","image_id","tree","dirty","flags","archive","binary","vendor","copy_manifest","epoch","read_epochs","domains"], "x-go-type": "Artifact", "properties": {
+      "id": {"$ref":"#/$defs/id","x-go-name":"ID"},
+      "role": {"$ref":"#/$defs/role","x-go-name":"Role"},
+      "release": {"$ref":"#/$defs/text","x-go-name":"Release"},
+      "source_commit": {"$ref":"#/$defs/text","x-go-name":"SourceCommit"},
+      "toolchain": {"$ref":"#/$defs/text","x-go-name":"Toolchain"},
+      "image_id": {"$ref":"#/$defs/text","x-go-name":"ImageID"},
+      "tree": {"$ref":"#/$defs/digest","x-go-name":"Tree"},
+      "dirty": {"$ref":"#/$defs/digest","x-go-name":"Dirty"},
+      "flags": {"$ref":"#/$defs/digest","x-go-name":"Flags"},
+      "archive": {"$ref":"#/$defs/digest","x-go-name":"Archive"},
+      "binary": {"$ref":"#/$defs/digest","x-go-name":"Binary"},
+      "vendor": {"$ref":"#/$defs/digest","x-go-name":"Vendor"},
+      "copy_manifest": {"$ref":"#/$defs/digest","x-go-name":"CopyManifest"},
+      "epoch": {"$ref":"#/$defs/uint64","x-go-name":"Epoch"},
+      "read_epochs": {"type":"array","items":{"$ref":"#/$defs/uint64"},"minItems":1,"uniqueItems":true,"x-go-name":"ReadEpochs"},
+      "domains": {"type":"array","items":{"$ref":"#/$defs/id"},"minItems":1,"uniqueItems":true,"x-go-name":"Domains"}
+    }},
+    "step": {"type": "object", "additionalProperties": false, "required": ["id","parent_id","action","direction","cohort","leg","target","from","to","depends_on","deadline_ns"], "x-go-type": "Step", "properties": {
+      "id": {"$ref":"#/$defs/id","x-go-name":"ID"},
+      "parent_id": {"$ref":"#/$defs/text","x-go-name":"ParentID"},
+      "action": {"$ref":"#/$defs/step_action","x-go-name":"Action"},
+      "direction": {"$ref":"#/$defs/direction","x-go-name":"Direction"},
+      "cohort": {"$ref":"#/$defs/text","x-go-name":"Cohort"},
+      "leg": {"$ref":"#/$defs/text","x-go-name":"Leg"},
+      "target": {"$ref":"#/$defs/key","x-go-name":"Target"},
+      "from": {"$ref":"#/$defs/text","x-go-name":"From"},
+      "to": {"$ref":"#/$defs/text","x-go-name":"To"},
+      "depends_on": {"type":"array","items":{"$ref":"#/$defs/text"},"minItems":0,"x-go-name":"DependsOn"},
+      "deadline_ns": {"$ref":"#/$defs/positive","x-go-name":"DeadlineNS"}
+    }},
+    "profile": {"type": "object", "additionalProperties": false, "required": ["id","topology","regime","tier","evidence_root","command_bindings","probe_rate","start_ns","end_ns","budget_digest","workload_digest","required","steps","artifacts"], "x-go-type": "Profile", "properties": {
+      "id": {"$ref":"#/$defs/id","x-go-name":"ID"},
+      "topology": {"$ref":"#/$defs/topology","x-go-name":"Topology"},
+      "regime": {"$ref":"#/$defs/regime","x-go-name":"Regime"},
+      "tier": {"$ref":"#/$defs/tier","x-go-name":"Tier"},
+      "evidence_root": {"$ref":"#/$defs/id","x-go-name":"EvidenceRoot"},
+      "command_bindings": {"$ref":"#/$defs/raw_ref","x-go-name":"CommandBindings"},
+      "probe_rate": {"$ref":"#/$defs/positive","x-go-name":"ProbeRate"},
+      "start_ns": {"$ref":"#/$defs/nonnegative","x-go-name":"StartNS"},
+      "end_ns": {"$ref":"#/$defs/nonnegative","x-go-name":"EndNS"},
+      "budget_digest": {"$ref":"#/$defs/digest","x-go-name":"BudgetDigest"},
+      "workload_digest": {"$ref":"#/$defs/digest","x-go-name":"WorkloadDigest"},
+      "required": {"type":"array","items":{"$ref":"#/$defs/key"},"minItems":1,"uniqueItems":true,"x-go-name":"Required"},
+      "steps": {"type":"array","items":{"$ref":"#/$defs/step"},"minItems":0,"x-go-name":"Steps"},
+      "artifacts": {"type":"array","items":{"$ref":"#/$defs/artifact"},"minItems":1,"uniqueItems":true,"x-go-name":"Artifacts"}
+    }},
+    "raw_ref": {"type": "object", "additionalProperties": false, "required": ["path","sha","bytes","schema"], "x-go-type": "RawRef", "properties": {
+      "path": {"$ref":"#/$defs/id","x-go-name":"Path"},
+      "sha": {"$ref":"#/$defs/digest","x-go-name":"SHA"},
+      "bytes": {"$ref":"#/$defs/nonnegative","x-go-name":"Bytes"},
+      "schema": {"$ref":"#/$defs/id","x-go-name":"Schema"}
+    }},
+    "receipt": {"type": "object", "additionalProperties": false, "required": ["kind","stamp","known","complete","running_sha","resource_i_ds","evidence"], "x-go-type": "Receipt", "properties": {
+      "kind": {"$ref":"#/$defs/receipt_kind","x-go-name":"Kind"},
+      "stamp": {"$ref":"#/$defs/stamp","x-go-name":"Stamp"},
+      "known": {"type":"boolean","x-go-name":"Known"},
+      "complete": {"type":"boolean","x-go-name":"Complete"},
+      "running_sha": {"$ref":"#/$defs/digest","x-go-name":"RunningSHA"},
+      "resource_i_ds": {"type":"array","items":{"$ref":"#/$defs/text"},"minItems":0,"x-go-name":"ResourceIDs"},
+      "evidence": {"$ref":"#/$defs/raw_ref","x-go-name":"Evidence"}
+    }},
+    "view": {"type": "object", "additionalProperties": false, "required": ["stamp","historical","current","phase","outcome","code","detail","deferred","control","resources","released","raw"], "x-go-type": "View", "properties": {
+      "stamp": {"$ref":"#/$defs/stamp","x-go-name":"Stamp"},
+      "historical": {"$ref":"#/$defs/s8_history","x-go-name":"Historical"},
+      "current": {"$ref":"#/$defs/s8_observation","x-go-name":"Current"},
+      "phase": {"$ref":"#/$defs/s8_phase","x-go-name":"Phase"},
+      "outcome": {"$ref":"#/$defs/s8_outcome","x-go-name":"Outcome"},
+      "code": {"$ref":"#/$defs/text","x-go-name":"Code"},
+      "detail": {"$ref":"#/$defs/text","x-go-name":"Detail"},
+      "deferred": {"type":"array","items":{"$ref":"#/$defs/text"},"minItems":0,"x-go-name":"Deferred"},
+      "control": {"$ref":"#/$defs/receipt","x-go-name":"Control"},
+      "resources": {"$ref":"#/$defs/receipt","x-go-name":"Resources"},
+      "released": {"$ref":"#/$defs/receipt","x-go-name":"Released"},
+      "raw": {"$ref":"#/$defs/raw_ref","x-go-name":"Raw"}
+    }},
+    "resource": {"type": "object", "additionalProperties": false, "required": ["id","kind","domain","ofd","state","owner","fd","flags","bytes","release_after_ns"], "x-go-type": "Resource", "properties": {
+      "id": {"$ref":"#/$defs/text","x-go-name":"ID"},
+      "kind": {"$ref":"#/$defs/text","x-go-name":"Kind"},
+      "domain": {"$ref":"#/$defs/text","x-go-name":"Domain"},
+      "ofd": {"$ref":"#/$defs/text","x-go-name":"OFD"},
+      "state": {"$ref":"#/$defs/text","x-go-name":"State"},
+      "owner": {"$ref":"#/$defs/stamp","x-go-name":"Owner"},
+      "fd": {"$ref":"#/$defs/int64","x-go-name":"FD"},
+      "flags": {"$ref":"#/$defs/uint64","x-go-name":"Flags"},
+      "bytes": {"$ref":"#/$defs/nonnegative","x-go-name":"Bytes"},
+      "release_after_ns": {"$ref":"#/$defs/nonnegative","x-go-name":"ReleaseAfterNS"}
+    }},
+    "sample": {"type": "object", "additionalProperties": false, "required": ["stamp","exe_sha","goroutines","fds","resources","consumers","temps","locks","old_images","complete","raw"], "x-go-type": "Sample", "properties": {
+      "stamp": {"$ref":"#/$defs/stamp","x-go-name":"Stamp"},
+      "exe_sha": {"$ref":"#/$defs/digest","x-go-name":"ExeSHA"},
+      "goroutines": {"$ref":"#/$defs/nonnegative","x-go-name":"Goroutines"},
+      "fds": {"$ref":"#/$defs/nonnegative","x-go-name":"FDs"},
+      "resources": {"type":"array","items":{"$ref":"#/$defs/resource"},"minItems":0,"x-go-name":"Resources"},
+      "consumers": {"type":"array","items":{"$ref":"#/$defs/text"},"minItems":0,"x-go-name":"Consumers"},
+      "temps": {"type":"array","items":{"$ref":"#/$defs/text"},"minItems":0,"x-go-name":"Temps"},
+      "locks": {"type":"array","items":{"$ref":"#/$defs/text"},"minItems":0,"x-go-name":"Locks"},
+      "old_images": {"type":"array","items":{"$ref":"#/$defs/text"},"minItems":0,"x-go-name":"OldImages"},
+      "complete": {"type":"boolean","x-go-name":"Complete"},
+      "raw": {"$ref":"#/$defs/raw_ref","x-go-name":"Raw"}
+    }},
+    "slot": {"type": "object", "additionalProperties": false, "required": ["id","class","target","scheduled_ns","deadline_ns"], "x-go-type": "Slot", "properties": {
+      "id": {"$ref":"#/$defs/id","x-go-name":"ID"},
+      "class": {"$ref":"#/$defs/slot_class","x-go-name":"Class"},
+      "target": {"$ref":"#/$defs/key","x-go-name":"Target"},
+      "scheduled_ns": {"$ref":"#/$defs/nonnegative","x-go-name":"ScheduledNS"},
+      "deadline_ns": {"$ref":"#/$defs/positive","x-go-name":"DeadlineNS"}
+    }},
+    "attempt": {"type": "object", "additionalProperties": false, "required": ["slot_id","call_id","phase","index","started_ns","finished_ns","sent","completed","rc","code","raw"], "x-go-type": "Attempt", "properties": {
+      "slot_id": {"$ref":"#/$defs/text","x-go-name":"SlotID"},
+      "call_id": {"$ref":"#/$defs/text","x-go-name":"CallID"},
+      "phase": {"$ref":"#/$defs/s6_attempt_phase","x-go-name":"Phase"},
+      "index": {"$ref":"#/$defs/uint64","x-go-name":"Index"},
+      "started_ns": {"$ref":"#/$defs/nonnegative","x-go-name":"StartedNS"},
+      "finished_ns": {"$ref":"#/$defs/nonnegative","x-go-name":"FinishedNS"},
+      "sent": {"type":"boolean","x-go-name":"Sent"},
+      "completed": {"type":"boolean","x-go-name":"Completed"},
+      "rc": {"$ref":"#/$defs/int64","x-go-name":"RC"},
+      "code": {"$ref":"#/$defs/text","x-go-name":"Code"},
+      "raw": {"$ref":"#/$defs/raw_ref","x-go-name":"Raw"}
+    }},
+    "interval": {"type": "object", "additionalProperties": false, "required": ["stamp","resource_id","event","at_ns","raw"], "x-go-type": "Interval", "properties": {
+      "stamp": {"$ref":"#/$defs/stamp","x-go-name":"Stamp"},
+      "resource_id": {"$ref":"#/$defs/text","x-go-name":"ResourceID"},
+      "event": {"$ref":"#/$defs/interval_event","x-go-name":"Event"},
+      "at_ns": {"$ref":"#/$defs/nonnegative","x-go-name":"AtNS"},
+      "raw": {"$ref":"#/$defs/raw_ref","x-go-name":"Raw"}
+    }},
+    "result": {"type": "object", "additionalProperties": false, "required": ["verdict","rc","failures","missing","inputs"], "x-go-type": "Result", "allOf": [{"oneOf":[{"properties":{"verdict":{"const":"GREEN"},"rc":{"const":0}}},{"properties":{"verdict":{"const":"ASSERT-FAIL"},"rc":{"const":1}}},{"properties":{"verdict":{"const":"SETUP-RED"},"rc":{"const":2}}},{"properties":{"verdict":{"const":"PRODUCT-RED"},"rc":{"const":3}}},{"properties":{"verdict":{"const":"INCOMPLETE"},"rc":{"const":4}}}]}], "properties": {
+      "verdict": {"$ref":"#/$defs/verdict","x-go-name":"Verdict"},
+      "rc": {"$ref":"#/$defs/int64","x-go-name":"RC"},
+      "failures": {"type":"array","items":{"$ref":"#/$defs/text"},"minItems":0,"x-go-name":"Failures"},
+      "missing": {"type":"array","items":{"$ref":"#/$defs/text"},"minItems":0,"x-go-name":"Missing"},
+      "inputs": {"type":"array","items":{"$ref":"#/$defs/raw_ref"},"minItems":0,"x-go-name":"Inputs"}
+    }},
+    "distribution": {"type": "object", "additionalProperties": false, "required": ["count","failed","censored","missing","min_ns","p50_ns","p95_ns","p99_ns","max_ns"], "x-go-type": "Distribution", "properties": {
+      "count": {"$ref":"#/$defs/uint64","x-go-name":"Count"},
+      "failed": {"$ref":"#/$defs/uint64","x-go-name":"Failed"},
+      "censored": {"$ref":"#/$defs/uint64","x-go-name":"Censored"},
+      "missing": {"$ref":"#/$defs/uint64","x-go-name":"Missing"},
+      "min_ns": {"$ref":"#/$defs/int64","x-go-name":"MinNS"},
+      "p50_ns": {"$ref":"#/$defs/int64","x-go-name":"P50NS"},
+      "p95_ns": {"$ref":"#/$defs/int64","x-go-name":"P95NS"},
+      "p99_ns": {"$ref":"#/$defs/int64","x-go-name":"P99NS"},
+      "max_ns": {"$ref":"#/$defs/int64","x-go-name":"MaxNS"}
+    }},
+    "evidence": {"type": "object", "additionalProperties": false, "required": ["profile","views","samples","slots","attempts","intervals","raw"], "x-go-type": "Evidence", "properties": {
+      "profile": {"$ref":"#/$defs/profile","x-go-name":"Profile"},
+      "views": {"type":"array","items":{"$ref":"#/$defs/view"},"minItems":0,"x-go-name":"Views"},
+      "samples": {"type":"array","items":{"$ref":"#/$defs/sample"},"minItems":0,"x-go-name":"Samples"},
+      "slots": {"type":"array","items":{"$ref":"#/$defs/slot"},"minItems":0,"x-go-name":"Slots"},
+      "attempts": {"type":"array","items":{"$ref":"#/$defs/attempt"},"minItems":0,"x-go-name":"Attempts"},
+      "intervals": {"type":"array","items":{"$ref":"#/$defs/interval"},"minItems":0,"x-go-name":"Intervals"},
+      "raw": {"type":"array","items":{"$ref":"#/$defs/raw_ref"},"minItems":0,"x-go-name":"Raw"}
+    }},
+    "deploy_evidence": {"allOf":[{"$ref":"#/$defs/evidence"},{"properties":{"profile":{"properties":{"tier":{"const":"deploy"}}}}}]},
+    "workload": {"type": "object", "additionalProperties": false, "required": ["version","id","profile","required","flows","tasks","transfers","raw"], "properties": {
+      "version": {"const":1},
+      "id": {"$ref":"#/$defs/id"},
+      "profile": {"$ref":"#/$defs/id"},
+      "required": {"type":"array","items":{"$ref":"#/$defs/key"},"minItems":1,"uniqueItems":true},
+      "flows": {"type":"array","items":{"$ref":"#/$defs/workload_item"},"minItems":1},
+      "tasks": {"type":"array","items":{"$ref":"#/$defs/workload_item"},"minItems":1},
+      "transfers": {"type":"array","items":{"$ref":"#/$defs/transfer"},"minItems":1},
+      "raw": {"$ref":"#/$defs/raw_ref"}
+    }},
+    "workload_item": {"type": "object", "additionalProperties": false, "required": ["id","kind","target","process","resource_ids","nonce","records","bytes","raw"], "properties": {
+      "id": {"$ref":"#/$defs/id"},
+      "kind": {"enum":["tcp","ssh","exec","pty","ss","remote-fs"]},
+      "target": {"$ref":"#/$defs/key"},
+      "process": {"$ref":"#/$defs/process"},
+      "resource_ids": {"type":"array","items":{"$ref":"#/$defs/id"},"minItems":1,"uniqueItems":true},
+      "nonce": {"$ref":"#/$defs/id"},
+      "records": {"$ref":"#/$defs/positive"},
+      "bytes": {"$ref":"#/$defs/positive"},
+      "raw": {"$ref":"#/$defs/raw_ref"}
+    }},
+    "transfer_identity": {"type": "object", "additionalProperties": false, "required": ["sid","nid","actor_fp","agent_instance","transfer_id","entry_nonce","intent_digest","object_version"], "properties": {
+      "sid": {"$ref":"#/$defs/id"},
+      "nid": {"$ref":"#/$defs/id"},
+      "actor_fp": {"$ref":"#/$defs/id"},
+      "agent_instance": {"$ref":"#/$defs/id"},
+      "transfer_id": {"$ref":"#/$defs/id"},
+      "entry_nonce": {"$ref":"#/$defs/id"},
+      "intent_digest": {"$ref":"#/$defs/id"},
+      "object_version": {"$ref":"#/$defs/id"}
+    }},
+    "transfer_origin": {"type": "object", "additionalProperties": false, "required": ["broker_id","instance_id","boot_id","generation"], "properties": {
+      "broker_id": {"$ref":"#/$defs/id"},
+      "instance_id": {"$ref":"#/$defs/id"},
+      "boot_id": {"$ref":"#/$defs/id"},
+      "generation": {"$ref":"#/$defs/uint64"}
+    }},
+    "transfer_budget": {"type": "object", "additionalProperties": false, "required": ["started_at","size","rate_limit_bps","effective_budget_ns","remaining_ns","source_sealed"], "properties": {
+      "started_at": {"$ref":"#/$defs/id"},
+      "size": {"$ref":"#/$defs/positive"},
+      "rate_limit_bps": {"$ref":"#/$defs/positive"},
+      "effective_budget_ns": {"$ref":"#/$defs/positive"},
+      "remaining_ns": {"$ref":"#/$defs/nonnegative"},
+      "source_sealed": {"type":"boolean"}
+    }},
+    "transfer": {"type": "object", "additionalProperties": false, "required": ["identity","origin","budget_seal","cohort","leg","direction","tier","nuid","status","phase","primitive_outcome","raw"], "properties": {
+      "identity": {"$ref":"#/$defs/transfer_identity"},
+      "origin": {"$ref":"#/$defs/transfer_origin"},
+      "budget_seal": {"$ref":"#/$defs/transfer_budget"},
+      "cohort": {"$ref":"#/$defs/id"},
+      "leg": {"$ref":"#/$defs/leg"},
+      "direction": {"enum":["push","pull"]},
+      "tier": {"enum":["A","B"]},
+      "nuid": {"$ref":"#/$defs/id"},
+      "status": {"$ref":"#/$defs/s7_status_state"},
+      "phase": {"$ref":"#/$defs/s7_phase"},
+      "primitive_outcome": {"$ref":"#/$defs/s7_primitive_outcome"},
+      "raw": {"$ref":"#/$defs/raw_ref"}
+    }},
+    "abi": {"type": "object", "additionalProperties": false, "required": ["version","role","reader","gate","artifact","export_epoch","required_domains","decoded_domains","raw"], "properties": {
+      "version": {"const":1},
+      "role": {"$ref":"#/$defs/role"},
+      "reader": {"enum":["running","candidate","recorded-prev"]},
+      "gate": {"enum":["disk-select","freeze","finalPrepare"]},
+      "artifact": {"$ref":"#/$defs/artifact"},
+      "export_epoch": {"$ref":"#/$defs/uint64"},
+      "required_domains": {"type":"array","items":{"$ref":"#/$defs/id"},"minItems":1,"uniqueItems":true},
+      "decoded_domains": {"type":"array","items":{"$ref":"#/$defs/id"},"minItems":1,"uniqueItems":true},
+      "raw": {"$ref":"#/$defs/raw_ref"}
+    }},
+    "command_bindings": {"type": "object", "additionalProperties": false, "required": ["version","bindings"], "properties": {
+      "version": {"const":1},
+      "bindings": {"type":"array","items":{"$ref":"#/$defs/command_binding"},"minItems":1,"uniqueItems":true}
+    }},
+    "command_binding": {"type": "object", "additionalProperties": false, "required": ["id","role","action","argv","timeout_ns","help","raw_view_schema"], "properties": {
+      "id": {"$ref":"#/$defs/id"},
+      "role": {"$ref":"#/$defs/role"},
+      "action": {"enum":["stage","apply","query","rollback"]},
+      "argv": {"type":"array","items":{"$ref":"#/$defs/id"},"minItems":1},
+      "timeout_ns": {"$ref":"#/$defs/positive"},
+      "help": {"$ref":"#/$defs/raw_ref"},
+      "raw_view_schema": {"$ref":"#/$defs/id"}
+    }},
+    "log_stream": {"type": "object", "additionalProperties": false, "required": ["id","host","unit","sid","home","boot_id","invocation_id","source_kind"], "properties": {
+      "id": {"$ref":"#/$defs/id"},
+      "host": {"$ref":"#/$defs/id"},
+      "unit": {"$ref":"#/$defs/id"},
+      "sid": {"$ref":"#/$defs/text"},
+      "home": {"$ref":"#/$defs/id"},
+      "boot_id": {"$ref":"#/$defs/id"},
+      "invocation_id": {"$ref":"#/$defs/id"},
+      "source_kind": {"enum":["broker-slog","broker-journal","agent-slog","agent-boot-err","prelogger-journal"]}
+    }},
+    "log_roster": {"type": "object", "additionalProperties": false, "required": ["version","digest","streams"], "properties": {
+      "version": {"const":1},
+      "digest": {"$ref":"#/$defs/digest"},
+      "streams": {"type":"array","items":{"$ref":"#/$defs/log_stream"},"minItems":1,"uniqueItems":true}
+    }},
+    "log_position": {"type": "object", "additionalProperties": false, "required": ["stream","cursor","device","inode","offset","sequence","raw"], "properties": {
+      "stream": {"$ref":"#/$defs/log_stream"},
+      "cursor": {"$ref":"#/$defs/text"},
+      "device": {"$ref":"#/$defs/uint64"},
+      "inode": {"$ref":"#/$defs/uint64"},
+      "offset": {"$ref":"#/$defs/nonnegative"},
+      "sequence": {"$ref":"#/$defs/uint64"},
+      "raw": {"$ref":"#/$defs/raw_ref"}
+    }},
+    "log_cursor": {"type": "object", "additionalProperties": false, "required": ["version","digest","roster_digest","positions"], "properties": {
+      "version": {"const":1},
+      "digest": {"$ref":"#/$defs/digest"},
+      "roster_digest": {"$ref":"#/$defs/digest"},
+      "positions": {"type":"array","items":{"$ref":"#/$defs/log_position"},"minItems":1,"uniqueItems":true}
+    }},
+    "log_end": {"type": "object", "additionalProperties": false, "required": ["version","digest","cursor_digest","positions","complete"], "properties": {
+      "version": {"const":1},
+      "digest": {"$ref":"#/$defs/digest"},
+      "cursor_digest": {"$ref":"#/$defs/digest"},
+      "positions": {"type":"array","items":{"$ref":"#/$defs/log_position"},"minItems":1,"uniqueItems":true},
+      "complete": {"type":"boolean"}
+    }},
+    "positive_uint64": {"type":"integer","minimum":1,"maximum":18446744073709551615},
+    "s6_attempt_phase": {"enum":["dns","proxy","tls","ws","connect","inbox_probe","inbox_fallback","discovery","banner","probe","create","request","backoff","cancel","result","freeze","exec","import","auth","ready","maintenance"]},
+    "runtime_binding": {"type": "object", "additionalProperties": false, "required": ["domain","instance_id","generation"], "properties": {
+      "domain": {"$ref":"#/$defs/id"},
+      "instance_id": {"$ref":"#/$defs/id"},
+      "generation": {"$ref":"#/$defs/uint64"}
+    }},
+    "runtime_counters": {"type": "object", "additionalProperties": false, "required": ["binding","pid","start_ticks","goroutines","fds","replay_reserved","active_exec","active_pty","retained_records","courier_pending","consumers","temps","upgrade_locks","old_owners","sequence","at_boot_ns","exe_sha","nonce","boot_id","pidns","cut_id","scope_digest","unknown"], "properties": {
+      "binding": {"$ref":"#/$defs/runtime_binding"},
+      "pid": {"$ref":"#/$defs/uint64"},
+      "start_ticks": {"$ref":"#/$defs/uint64"},
+      "goroutines": {"$ref":"#/$defs/uint64"},
+      "fds": {"$ref":"#/$defs/uint64"},
+      "replay_reserved": {"$ref":"#/$defs/uint64"},
+      "active_exec": {"$ref":"#/$defs/uint64"},
+      "active_pty": {"$ref":"#/$defs/uint64"},
+      "retained_records": {"$ref":"#/$defs/uint64"},
+      "courier_pending": {"$ref":"#/$defs/uint64"},
+      "consumers": {"$ref":"#/$defs/uint64"},
+      "temps": {"$ref":"#/$defs/uint64"},
+      "upgrade_locks": {"$ref":"#/$defs/uint64"},
+      "old_owners": {"$ref":"#/$defs/uint64"},
+      "sequence": {"$ref":"#/$defs/uint64"},
+      "at_boot_ns": {"$ref":"#/$defs/uint64"},
+      "exe_sha": {"$ref":"#/$defs/digest"},
+      "nonce": {"type":"string","pattern":"^[0-9a-f]{24}$"},
+      "boot_id": {"$ref":"#/$defs/id"},
+      "pidns": {"$ref":"#/$defs/id"},
+      "cut_id": {"$ref":"#/$defs/id"},
+      "scope_digest": {"$ref":"#/$defs/id"},
+      "unknown": {"type":"integer","minimum":0,"maximum":65535}
+    }},
+    "s8_receipt_present": {"type": "object", "additionalProperties": false, "required": ["kind","stamp","known","complete","running_sha","census","evidence_digest"], "properties": {
+      "kind": {"$ref":"#/$defs/s8_receipt_kind"},
+      "stamp": {"$ref":"#/$defs/s8_stamp"},
+      "known": {"type":"boolean"},
+      "complete": {"type":"boolean"},
+      "running_sha": {"$ref":"#/$defs/text"},
+      "census": {"$ref":"#/$defs/s8_census"},
+      "evidence_digest": {"$ref":"#/$defs/text"}
+    }},
+    "s8_receipt_empty": {"const":{"kind":"","stamp":{"attempt":{"key":{"domain_id":"","component":""},"tx_id":"","cut_id":"","generation":0,"revision":0},"producer":{"boot_id":"","pid":0,"start_ticks":0,"instance_id":""},"nonce":"","sequence":0,"at":0,"scope_digest":""},"known":false,"complete":false,"running_sha":"","census":{"stamp":{"attempt":{"key":{"domain_id":"","component":""},"tx_id":"","cut_id":"","generation":0,"revision":0},"producer":{"boot_id":"","pid":0,"start_ticks":0,"instance_id":""},"nonce":"","sequence":0,"at":0,"scope_digest":""},"known":false,"complete":false,"resources":null,"expected_digest":"","admitting":0,"old_owners":null},"evidence_digest":""}},
+    "s8_receipt": {"oneOf":[{"$ref":"#/$defs/s8_receipt_present"},{"$ref":"#/$defs/s8_receipt_empty"}]},
+    "s8_attempt_present": {"type": "object", "additionalProperties": false, "required": ["handle","direction","source_sha","target_sha","source_generation","phase","cut_stage","outcome","scope","control","resources","released"], "properties": {
+      "handle": {"$ref":"#/$defs/s8_handle"},
+      "direction": {"$ref":"#/$defs/s8_direction"},
+      "source_sha": {"$ref":"#/$defs/text"},
+      "target_sha": {"$ref":"#/$defs/text"},
+      "source_generation": {"$ref":"#/$defs/uint64"},
+      "phase": {"$ref":"#/$defs/s8_phase"},
+      "cut_stage": {"$ref":"#/$defs/s8_cut_stage"},
+      "outcome": {"$ref":"#/$defs/s8_outcome"},
+      "scope": {"$ref":"#/$defs/s8_scope"},
+      "control": {"$ref":"#/$defs/s8_receipt"},
+      "resources": {"$ref":"#/$defs/s8_receipt"},
+      "released": {"$ref":"#/$defs/s8_receipt"}
+    }},
+    "s8_attempt_empty": {"const":{"handle":{"key":{"domain_id":"","component":""},"tx_id":"","cut_id":"","generation":0,"revision":0},"direction":"","source_sha":"","target_sha":"","source_generation":0,"phase":"","cut_stage":"","outcome":"","scope":{"id":"","participants":null,"domains":null,"expected":null},"control":{"kind":"","stamp":{"attempt":{"key":{"domain_id":"","component":""},"tx_id":"","cut_id":"","generation":0,"revision":0},"producer":{"boot_id":"","pid":0,"start_ticks":0,"instance_id":""},"nonce":"","sequence":0,"at":0,"scope_digest":""},"known":false,"complete":false,"running_sha":"","census":{"stamp":{"attempt":{"key":{"domain_id":"","component":""},"tx_id":"","cut_id":"","generation":0,"revision":0},"producer":{"boot_id":"","pid":0,"start_ticks":0,"instance_id":""},"nonce":"","sequence":0,"at":0,"scope_digest":""},"known":false,"complete":false,"resources":null,"expected_digest":"","admitting":0,"old_owners":null},"evidence_digest":""},"resources":{"kind":"","stamp":{"attempt":{"key":{"domain_id":"","component":""},"tx_id":"","cut_id":"","generation":0,"revision":0},"producer":{"boot_id":"","pid":0,"start_ticks":0,"instance_id":""},"nonce":"","sequence":0,"at":0,"scope_digest":""},"known":false,"complete":false,"running_sha":"","census":{"stamp":{"attempt":{"key":{"domain_id":"","component":""},"tx_id":"","cut_id":"","generation":0,"revision":0},"producer":{"boot_id":"","pid":0,"start_ticks":0,"instance_id":""},"nonce":"","sequence":0,"at":0,"scope_digest":""},"known":false,"complete":false,"resources":null,"expected_digest":"","admitting":0,"old_owners":null},"evidence_digest":""},"released":{"kind":"","stamp":{"attempt":{"key":{"domain_id":"","component":""},"tx_id":"","cut_id":"","generation":0,"revision":0},"producer":{"boot_id":"","pid":0,"start_ticks":0,"instance_id":""},"nonce":"","sequence":0,"at":0,"scope_digest":""},"known":false,"complete":false,"running_sha":"","census":{"stamp":{"attempt":{"key":{"domain_id":"","component":""},"tx_id":"","cut_id":"","generation":0,"revision":0},"producer":{"boot_id":"","pid":0,"start_ticks":0,"instance_id":""},"nonce":"","sequence":0,"at":0,"scope_digest":""},"known":false,"complete":false,"resources":null,"expected_digest":"","admitting":0,"old_owners":null},"evidence_digest":""}}},
+    "s8_attempt": {"oneOf":[{"$ref":"#/$defs/s8_attempt_present"},{"$ref":"#/$defs/s8_attempt_empty"}]}
+  }
+}

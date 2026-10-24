@@ -15,7 +15,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         systemd systemd-sysv dbus \
         openssh-server \
         python3 \
-        jq openssl iproute2 iptables curl ca-certificates procps iputils-ping less vim-tiny \
+        jq openssl iproute2 iptables nftables conntrack libcap2-bin util-linux \
+        curl ca-certificates procps iputils-ping less vim-tiny \
         fuse3 libfuse2t64 python3-fusepy \
         shadowsocks-libev python3-yaml sqlite3 \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
@@ -56,10 +57,38 @@ RUN mkdir -p /run/sshd \
 # Running what the fleet runs is this tool's entire justification.
 COPY vendor/tether       /usr/local/bin/tether
 COPY vendor/nats-server  /usr/local/bin/nats-server
+COPY vendor/caddy        /usr/local/bin/caddy
+COPY vendor/caddy-source.json /opt/sim/caddy-source.json
 COPY vendor/nats         /usr/local/bin/nats
 COPY vendor/nk           /usr/local/bin/nk
 COPY vendor/install.sh   /opt/sim/install.sh
-RUN chmod +x /usr/local/bin/tether /usr/local/bin/nats-server /usr/local/bin/nats /usr/local/bin/nk /opt/sim/install.sh
+COPY lib/caddy-artifact.py /opt/sim/caddy-artifact.py
+COPY vendor/nats-server-prev /opt/sim/nats-server-prev
+COPY vendor/nats-server-next /opt/sim/nats-server-next
+COPY vendor/caddy-prev /opt/sim/caddy-prev
+COPY vendor/caddy-next /opt/sim/caddy-next
+COPY vendor/tether-next /opt/sim/tether-next
+COPY vendor/tether-prev /opt/sim/tether-prev
+COPY vendor/tether-dynamic-prev /opt/sim/tether-dynamic-prev
+COPY vendor/tether-flow-legacy /opt/sim/tether-flow-legacy
+COPY vendor/tether-source.json /opt/sim/tether-source.json
+COPY vendor/tether-prev-source.json /opt/sim/tether-prev-source.json
+COPY vendor/tether-dynamic-prev-source.json /opt/sim/tether-dynamic-prev-source.json
+COPY vendor/tether-flow-legacy-source.json /opt/sim/tether-flow-legacy-source.json
+# origin: hot-update S9 plan §6.5 / §9.4 / T55/T56. These are files only:
+# the product's explicit bootstrap activates management on a live stock host.
+COPY vendor/tether-infra-helper /usr/local/libexec/tether-infra-helper
+COPY vendor/tether-infra-launch /usr/local/libexec/tether-infra-launch
+COPY vendor/infra/ /opt/sim/infra/
+COPY lib/infra-artifact.py /opt/sim/infra-artifact.py
+COPY lib/infra-image-manifest.py /opt/sim/infra-image-manifest.py
+COPY Dockerfile /opt/sim/Dockerfile
+COPY vendor/infra-image-inputs.json /opt/sim/infra-image-inputs.json
+ARG TETHER_CADDY_VERSION
+# Bind the image's exact COPY results, including the installer pin, before success.
+RUN python3 /opt/sim/caddy-artifact.py verify /usr/local/bin/caddy /opt/sim/caddy-source.json /opt/sim/install.sh
+RUN python3 /opt/sim/infra-artifact.py verify /opt/sim /opt/sim/install.sh \
+        --binary-root /usr/local/bin --support-root /usr/local/libexec
 
 # Provisioning + typed-confirm/interactive-pty helpers (run inside the container via docker exec).
 COPY image/provision-node.sh          /opt/sim/provision-node.sh
@@ -68,7 +97,9 @@ COPY image/pty-run.py                 /opt/sim/pty-run.py
 COPY image/hangfs.py                  /opt/sim/hangfs.py
 COPY image/ingress-proxy.py           /opt/sim/ingress-proxy.py
 COPY image/units/tether-agent.service /opt/sim/tether-agent.service
-RUN chmod +x /opt/sim/provision-node.sh /opt/sim/pty-confirm.py /opt/sim/pty-run.py /opt/sim/hangfs.py /opt/sim/ingress-proxy.py
+# Do not rewrite COPY modes after recording them. The complete source/target
+# manifest verifies actual content and metadata; its own bytes are excluded.
+RUN python3 /opt/sim/infra-image-manifest.py targets /opt/sim/infra-image-inputs.json
 
 # STOPSIGNAL SIGRTMIN+3 is mandatory: default SIGTERM 10s-kills PID1 mid-write and corrupts
 # SQLite/BoltDB, masking real bugs as sim artifacts. Pair with --stop-signal at run time.

@@ -1,0 +1,341 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:tether:upgrade-tx-fixture:1",
+  "title": "S8 public observation; private SS material stays in sealed custody",
+  "description": "origin: hot-update S8 plan \u00a72 / \u00a79.0 / \u00a710; zero and unknown never imply completion",
+  "type": "object",
+  "properties": {
+    "version": {"const": 1},
+    "source_commit": {"type": "string", "pattern": "^[0-9a-f]{40,64}$"},
+    "artifact_sha": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "run_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+    "arm": {"type": "string", "pattern": "^[a-zA-Z0-9_.-]{1,128}$"},
+    "role": {"enum": ["agent", "single", "sole-voter", "n3", "N3"]},
+    "topology": {"enum": ["single", "sole-voter", "n3", "N3"]},
+    "original_set_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "owner_boot_id": {"type": "string", "minLength": 1, "maxLength": 256},
+    "pid": {"type": "integer", "minimum": 1, "maximum": 18446744073709551615},
+    "start_ticks": {"type": "integer", "minimum": 1, "maximum": 18446744073709551615},
+    "tx_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+    "cut_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+    "generation": {"type": "integer", "minimum": 1, "maximum": 18446744073709551615},
+    "direction": {"enum": ["forward", "reverse"]},
+    "source_sha": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "target_sha": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "running_sha": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "effective_sha": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "scope_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "sequence": {"type": "integer", "minimum": 1, "maximum": 18446744073709551615},
+    "domains": {"type": "array", "items": {"enum": ["control", "exec", "pty", "flow", "ss", "transfer_worker", "transfer_tracker", "broker_store", "broker_runtime", "authority", "upgrade"]}, "maxItems": 11, "minItems": 1},
+    "resources": {"type": "array", "items": {"$ref": "#/$defs/resource"}, "maxItems": 16384, "minItems": 1},
+    "control_receipt": {"$ref": "#/$defs/receipt"},
+    "resources_receipt": {"$ref": "#/$defs/receipt"},
+    "released_receipt": {"$ref": "#/$defs/receipt"},
+    "hit_begin_ns": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+    "hit_end_ns": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+    "syscall": {"type": "string", "minLength": 1, "maxLength": 256},
+    "errno": {"type": "integer", "minimum": 0, "maximum": 4095},
+    "native_rc": {"type": "integer", "minimum": 0, "maximum": 255},
+    "nonce": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+    "known": {"type": "boolean"},
+    "complete": {"type": "boolean"},
+    "observed_begin_ns": {"type": "integer", "minimum": 1, "maximum": 18446744073709551615},
+    "observed_end_ns": {"type": "integer", "minimum": 1, "maximum": 18446744073709551615},
+    "clock": {"const": "host_boottime"},
+    "phase": {"type": "string", "minLength": 1, "maxLength": 256},
+    "outcome": {"type": "string", "minLength": 1, "maxLength": 256},
+    "admissions": {"type": "array", "items": {"$ref": "#/$defs/contract_resource"}, "maxItems": 16384, "minItems": 0},
+    "admission_complete": {"type": "boolean"},
+    "metrics": {"$ref": "#/$defs/metrics"},
+    "hit": {"$ref": "#/$defs/hit"},
+    "safety_receipt": {"$ref": "#/$defs/safety_receipt"},
+    "archive_receipt": {"$ref": "#/$defs/archive_receipt"},
+    "observed_begin_unix_ns": {"type": "integer", "minimum": 1, "maximum": 18446744073709551615},
+    "observed_end_unix_ns": {"type": "integer", "minimum": 1, "maximum": 18446744073709551615}
+  },
+  "required": ["version", "source_commit", "artifact_sha", "run_id", "arm", "role", "topology", "original_set_digest", "owner_boot_id", "pid", "start_ticks", "tx_id", "cut_id", "generation", "direction", "source_sha", "target_sha", "running_sha", "effective_sha", "scope_digest", "sequence", "domains", "resources", "control_receipt", "resources_receipt", "released_receipt", "hit_begin_ns", "hit_end_ns", "syscall", "errno", "native_rc", "nonce", "known", "complete", "observed_begin_ns", "observed_end_ns", "clock", "phase", "outcome", "admissions", "admission_complete", "metrics", "hit", "safety_receipt", "observed_begin_unix_ns", "observed_end_unix_ns"],
+  "additionalProperties": false,
+  "$defs": {
+    "companion_input": {"type":"object","properties":{"version":{"const":1},"run_id":{"type":"string","pattern":"^[0-9a-f]{32}$"},"arm":{"type":"string","pattern":"^[a-zA-Z0-9_.-]{1,128}$"},"original_set_digest":{"type":"string","pattern":"^[0-9a-f]{64}$"},"evidence_run_id":{"type":"string","minLength":1,"maxLength":512},"files":{"type":"array","items":{"$ref":"#/$defs/evidence_file"},"minItems":1,"maxItems":2}},"required":["version","run_id","arm","original_set_digest","evidence_run_id","files"],"additionalProperties":false},
+    "mutation_execution": {"type":"object","properties":{"version":{"const":1},"run_id":{"type":"string","pattern":"^[0-9a-f]{32}$"},"arm":{"type":"string","pattern":"^[a-zA-Z0-9_.-]{1,128}$"},"owner":{"$ref":"#/$defs/process_owner"},"source_digest":{"type":"string","pattern":"^[0-9a-f]{64}$"},"binary_sha":{"type":"string","pattern":"^[0-9a-f]{64}$"},"patch_digest":{"type":"string","pattern":"^[0-9a-f]{64}$"},"executable_sha":{"type":"string","pattern":"^[0-9a-f]{64}$"},"argv":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":256},"begin_ns":{"type":"integer","minimum":1,"maximum":18446744073709551615},"end_ns":{"type":"integer","minimum":1,"maximum":18446744073709551615},"executed_path":{"type":"string","minLength":1,"maxLength":4096}},"required":["version","run_id","arm","owner","source_digest","binary_sha","patch_digest","executable_sha","argv","begin_ns","end_ns","executed_path"],"additionalProperties":false},
+
+    "owner": {
+      "type": "object",
+      "properties": {
+        "boot_id": {"type": "string", "minLength": 1, "maxLength": 256},
+        "pid": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+        "start_ticks": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+        "instance_id": {"type": "string", "minLength": 1, "maxLength": 256}
+      },
+      "required": ["boot_id", "pid", "start_ticks", "instance_id"],
+      "additionalProperties": false
+    },
+    "key": {
+      "type": "object",
+      "properties": {
+        "domain_id": {"type": "string", "minLength": 1, "maxLength": 256},
+        "component": {"enum": ["agent", "broker", "nats", "caddy"]},
+        "sid": {"type": "string", "minLength": 1, "maxLength": 256},
+        "configured_nid": {"type": "string", "minLength": 1, "maxLength": 256},
+        "config_path": {"type": "string", "minLength": 1, "maxLength": 256},
+        "uid": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615}
+      },
+      "required": ["domain_id", "component"],
+      "additionalProperties": false
+    },
+    "handle": {
+      "type": "object",
+      "properties": {
+        "key": {"$ref": "#/$defs/key"},
+        "tx_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+        "cut_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+        "generation": {"type": "integer", "minimum": 1, "maximum": 18446744073709551615},
+        "revision": {"type": "integer", "minimum": 1, "maximum": 18446744073709551615}
+      },
+      "required": ["key", "tx_id", "cut_id", "generation", "revision"],
+      "additionalProperties": false
+    },
+    "stamp": {
+      "type": "object",
+      "properties": {
+        "attempt": {"$ref": "#/$defs/handle"},
+        "producer": {"$ref": "#/$defs/owner"},
+        "nonce": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+        "sequence": {"type": "integer", "minimum": 1, "maximum": 18446744073709551615},
+        "at": {"type": "integer", "minimum": 1, "maximum": 18446744073709551615},
+        "scope_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      },
+      "required": ["attempt", "producer", "nonce", "sequence", "at", "scope_digest"],
+      "additionalProperties": false
+    },
+    "contract_resource": {
+      "type": "object",
+      "properties": {
+        "domain": {"enum": ["control", "exec", "pty", "flow", "ss", "transfer_worker", "transfer_tracker", "broker_store", "broker_runtime", "authority", "upgrade"]},
+        "id": {"type": "string", "pattern": "^[a-zA-Z0-9_.-]{1,128}$"},
+        "origin": {"type": "string", "minLength": 1, "maxLength": 256},
+        "owner": {"$ref": "#/$defs/owner"},
+        "generation": {"type": "integer", "minimum": 1, "maximum": 18446744073709551615},
+        "state": {"type": "string", "minLength": 1, "maxLength": 256},
+        "custody": {"type": "string", "minLength": 1, "maxLength": 256}
+      },
+      "required": ["domain", "id", "origin", "owner", "generation", "state", "custody"],
+      "additionalProperties": false
+    },
+    "census": {
+      "type": "object",
+      "properties": {
+        "stamp": {"$ref": "#/$defs/stamp"},
+        "known": {"type": "boolean"},
+        "complete": {"type": "boolean"},
+        "resources": {"type": "array", "items": {"$ref": "#/$defs/contract_resource"}, "maxItems": 16384, "minItems": 0},
+        "expected_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "admitting": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+        "old_owners": {"type": "array", "items": {"$ref": "#/$defs/owner"}, "maxItems": 16384, "minItems": 0}
+      },
+      "required": ["stamp", "known", "complete", "resources", "expected_digest", "admitting", "old_owners"],
+      "additionalProperties": false
+    },
+    "receipt": {
+      "type": "object",
+      "properties": {
+        "kind": {"enum": ["control_ready", "resources_migrated", "old_generation_released"]},
+        "stamp": {"$ref": "#/$defs/stamp"},
+        "known": {"type": "boolean"},
+        "complete": {"type": "boolean"},
+        "running_sha": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "census": {"$ref": "#/$defs/census"},
+        "evidence_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      },
+      "required": ["kind", "stamp", "known", "complete", "running_sha", "census", "evidence_digest"],
+      "additionalProperties": false
+    },
+    "ofd": {
+      "type": "object",
+      "properties": {
+        "known": {"type": "boolean"},
+        "method": {"enum": ["kcmp", "kernel_cookie", "verified_native", "not_applicable"]},
+        "identity": {"type": "string", "minLength": 1, "maxLength": 256},
+        "original_identity": {"type": "string", "minLength": 1, "maxLength": 256},
+        "same": {"type": "boolean"},
+        "observed_ns": {"type": "integer", "minimum": 1, "maximum": 18446744073709551615}
+      },
+      "required": ["known", "method", "identity", "original_identity", "same", "observed_ns"],
+      "additionalProperties": false
+    },
+    "resource": {
+      "type": "object",
+      "properties": {
+        "id": {"type": "string", "pattern": "^[a-zA-Z0-9_.-]{1,128}$"},
+        "domain": {"enum": ["control", "exec", "pty", "flow", "ss", "transfer_worker", "transfer_tracker", "broker_store", "broker_runtime", "authority", "upgrade"]},
+        "family": {"enum": ["ssh", "tcp", "pty", "exec", "transfer", "ss", "remote_fs", "control", "tracker", "store", "runtime", "authority", "upgrade"]},
+        "origin_owner": {"$ref": "#/$defs/owner"},
+        "current_owner": {"$ref": "#/$defs/owner"},
+        "generation": {"type": "integer", "minimum": 1, "maximum": 18446744073709551615},
+        "known": {"type": "boolean"},
+        "ofd": {"$ref": "#/$defs/ofd"},
+        "sequence": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+        "content_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "fin": {"type": "boolean"},
+        "terminal": {"type": "string", "minLength": 1, "maxLength": 256},
+        "result": {"type": "string", "minLength": 1, "maxLength": 256},
+        "gc_permit": {"type": "string", "minLength": 1, "maxLength": 256},
+        "reconnects": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+        "admission_sequence": {"type": "integer", "minimum": 1, "maximum": 18446744073709551615},
+        "state": {"type": "string", "minLength": 1, "maxLength": 256},
+        "custody": {"type": "string", "minLength": 1, "maxLength": 256},
+        "files": {"type": "array", "items": {"$ref": "#/$defs/file_ofd"}, "minItems": 0, "maxItems": 3},
+        "transfer": {"$ref": "#/$defs/transfer"},
+        "mount_identity": {"type": "string", "minLength": 1, "maxLength": 256}
+      },
+      "required": ["id", "domain", "family", "origin_owner", "current_owner", "generation", "known", "ofd", "sequence", "content_hash", "fin", "terminal", "result", "gc_permit", "reconnects", "admission_sequence", "state", "custody", "files", "transfer", "mount_identity"],
+      "additionalProperties": false
+    },
+    "freeze": {
+      "type": "object",
+      "properties": {
+        "cut_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+        "earliest_fence_ns": {"type": "integer", "minimum": 1, "maximum": 18446744073709551615},
+        "last_pump_ready_ns": {"type": "integer", "minimum": 1, "maximum": 18446744073709551615},
+        "domains": {"type": "array", "items": {"enum": ["control", "exec", "pty", "flow", "ss", "transfer_worker", "transfer_tracker", "broker_store", "broker_runtime", "authority", "upgrade"]}, "maxItems": 11, "minItems": 1},
+        "tx_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+        "generation": {"type": "integer", "minimum": 1, "maximum": 18446744073709551615},
+        "owner": {"$ref": "#/$defs/owner"},
+        "source_sha": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "target_sha": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      },
+      "required": ["cut_id", "earliest_fence_ns", "last_pump_ready_ns", "domains", "tx_id", "generation", "owner", "source_sha", "target_sha"],
+      "additionalProperties": false
+    },
+    "request": {
+      "type": "object",
+      "properties": {
+        "slot": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+        "kind": {"enum": ["read", "write", "shortcmd"]},
+        "call_id": {"type": "string", "pattern": "^[a-zA-Z0-9_.-]{1,128}$"},
+        "scheduled_ns": {"type": "integer", "minimum": 1, "maximum": 18446744073709551615},
+        "run_e_ns": {"type": "integer", "minimum": 1, "maximum": 18446744073709551615},
+        "result_ns": {"type": "integer", "minimum": 1, "maximum": 18446744073709551615},
+        "native_rc": {"type": "integer", "minimum": 0, "maximum": 255},
+        "durable_effects": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+        "attempts": {"type": "integer", "minimum": 1, "maximum": 18446744073709551615}
+      },
+      "required": ["slot", "kind", "call_id", "scheduled_ns", "run_e_ns", "result_ns", "native_rc", "durable_effects", "attempts"],
+      "additionalProperties": false
+    },
+    "progress": {
+      "type": "object",
+      "properties": {
+        "resource_id": {"type": "string", "pattern": "^[a-zA-Z0-9_.-]{1,128}$"},
+        "at_ns": {"type": "integer", "minimum": 1, "maximum": 18446744073709551615},
+        "sequence": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+        "durable_bytes": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615}
+      },
+      "required": ["resource_id", "at_ns", "sequence", "durable_bytes"],
+      "additionalProperties": false
+    },
+    "calibration": {
+      "type": "object",
+      "properties": {
+        "round": {"enum": [1, 2]},
+        "start_ns": {"type": "integer", "minimum": 1, "maximum": 18446744073709551615},
+        "end_ns": {"type": "integer", "minimum": 1, "maximum": 18446744073709551615},
+        "load": {"enum": ["idle", "full"]},
+        "cpu_millis": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+        "rss_bytes": {"type": "integer", "minimum": 1, "maximum": 18446744073709551615},
+        "fd_count": {"type": "integer", "minimum": 1, "maximum": 18446744073709551615},
+        "disk_bytes": {"type": "integer", "minimum": 1, "maximum": 18446744073709551615},
+        "toolchain": {"type": "string", "minLength": 1, "maxLength": 256},
+        "network": {"type": "string", "minLength": 1, "maxLength": 256}
+      },
+      "required": ["round", "start_ns", "end_ns", "load", "cpu_millis", "rss_bytes", "fd_count", "disk_bytes", "toolchain", "network"],
+      "additionalProperties": false
+    },
+    "metrics": {
+      "type": "object",
+      "properties": {
+        "schedule_start_ns": {"type": "integer", "minimum": 1, "maximum": 18446744073709551615},
+        "schedule_end_ns": {"type": "integer", "minimum": 1, "maximum": 18446744073709551615},
+        "expected_slots": {"type": "integer", "minimum": 1, "maximum": 18446744073709551615},
+        "requests": {"type": "array", "items": {"$ref": "#/$defs/request"}, "maxItems": 144000, "minItems": 0},
+        "freezes": {"type": "array", "items": {"$ref": "#/$defs/freeze"}, "maxItems": 64, "minItems": 0},
+        "flow_progress": {"type": "array", "items": {"$ref": "#/$defs/progress"}, "maxItems": 144000, "minItems": 0},
+        "transfer_progress": {"type": "array", "items": {"$ref": "#/$defs/progress"}, "maxItems": 144000, "minItems": 0},
+        "calibrations": {"type": "array", "items": {"$ref": "#/$defs/calibration"}, "maxItems": 4, "minItems": 0},
+        "node_replay_bytes": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615}
+      },
+      "required": ["schedule_start_ns", "schedule_end_ns", "expected_slots", "requests", "freezes", "flow_progress", "transfer_progress", "calibrations", "node_replay_bytes"],
+      "additionalProperties": false
+    },
+    "hit": {
+      "type": "object",
+      "properties": {
+        "known": {"type": "boolean"},
+        "begin_ns": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+        "end_ns": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+        "syscall": {"type": "string", "minLength": 1, "maxLength": 256},
+        "errno": {"type": "integer", "minimum": 0, "maximum": 4095},
+        "owner": {"$ref": "#/$defs/owner"},
+        "cut_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+        "resource_id": {"type": "string", "pattern": "^[a-zA-Z0-9_.-]{1,128}$"},
+        "mechanism": {"type": "string", "minLength": 1, "maxLength": 256},
+        "kernel_evidence_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "window_begin_ns": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+        "window_end_ns": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615}
+      },
+      "required": ["known", "begin_ns", "end_ns", "syscall", "errno", "owner", "cut_id", "resource_id", "mechanism", "kernel_evidence_digest", "window_begin_ns", "window_end_ns"],
+      "additionalProperties": false
+    },
+    "file_ofd": {"type": "object", "properties": {"role": {"enum": ["source", "tmp", "parent"]}, "proof": {"$ref": "#/$defs/ofd"}}, "required": ["role", "proof"], "additionalProperties": false},
+    "transfer": {
+      "type": "object",
+      "properties": {
+        "applicable": {"type": "boolean"},
+        "known": {"type": "boolean"},
+        "tier": {"enum": ["B", "none"]},
+        "direction": {"enum": ["push", "pull", "none"]},
+        "business_id": {"type": "string", "minLength": 1, "maxLength": 256},
+        "object_nuid_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "size_bytes": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+        "rate_bytes_s": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+        "original_start_ns": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+        "budget_deadline_ns": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+        "durable_bytes": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615}
+      },
+      "required": ["applicable", "known", "tier", "direction", "business_id", "object_nuid_hash", "size_bytes", "rate_bytes_s", "original_start_ns", "budget_deadline_ns", "durable_bytes"],
+      "additionalProperties": false
+    },
+    "safety_receipt": {
+      "type": "object",
+      "properties": {
+        "known": {"type": "boolean"},
+        "complete": {"type": "boolean"},
+        "nonce": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+        "tx_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+        "cut_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+        "generation": {"type": "integer", "minimum": 1, "maximum": 18446744073709551615},
+        "owner": {"$ref": "#/$defs/owner"},
+        "scope_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "original_owner_dead": {"type": "boolean"},
+        "current_owner_known": {"type": "boolean"},
+        "reverse_execs": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+        "begin_ns": {"type": "integer", "minimum": 1, "maximum": 18446744073709551615},
+        "end_ns": {"type": "integer", "minimum": 1, "maximum": 18446744073709551615},
+        "evidence_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      },
+      "required": ["known", "complete", "nonce", "tx_id", "cut_id", "generation", "owner", "scope_digest", "original_owner_dead", "current_owner_known", "reverse_execs", "begin_ns", "end_ns", "evidence_digest"],
+      "additionalProperties": false
+    },
+    "scenario": {"type": "object", "properties": {"version": {"const": 1}, "run_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"}, "arm": {"type": "string", "pattern": "^[a-zA-Z0-9_.-]{1,128}$"}, "source_commit": {"type": "string", "pattern": "^[0-9a-f]{40,64}$"}, "original_set_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"}, "proofs": {"type": "array", "items": {"type": "string", "minLength": 1, "maxLength": 256}, "minItems": 1, "maxItems": 16384}, "rc": {"type": "integer", "minimum": 0, "maximum": 4}}, "required": ["version", "run_id", "arm", "source_commit", "original_set_digest", "proofs", "rc"], "additionalProperties": false},
+    "judgment": {"type": "object", "properties": {"observation_rc": {"type": "integer", "minimum": 0, "maximum": 4}, "rc": {"type": "integer", "minimum": 0, "maximum": 4}, "verdict": {"enum": ["GREEN", "ASSERT-RED", "SETUP-RED", "PRODUCT-RED", "INCOMPLETE"]}, "non_hot": {"type": "boolean"}, "run_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"}, "original_set_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"}, "samples": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615}, "reason": {"type": "string", "minLength": 1, "maxLength": 256}, "scenario": {"$ref": "#/$defs/scenario"}}, "required": ["rc", "verdict", "non_hot", "run_id", "original_set_digest", "scenario"], "additionalProperties": false},
+    "evidence_file": {"type": "object", "properties": {"path": {"type": "string", "minLength": 1, "maxLength": 4096}, "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}, "required": ["path", "sha256"], "additionalProperties": false},
+    "scenario_companion": {"type": "object", "properties": {"version": {"const": 1}, "run_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"}, "arm": {"type": "string", "pattern": "^[a-zA-Z0-9_.-]{1,128}$"}, "source_commit": {"type": "string", "pattern": "^[0-9a-f]{40,64}$"}, "original_set_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"}, "artifact_sha": {"type": "string", "pattern": "^[0-9a-f]{64}$"}, "evidence_run_id": {"type": "string", "minLength": 1, "maxLength": 256}, "test": {"type": "string", "minLength": 1, "maxLength": 256}, "files": {"type": "array", "items": {"$ref": "#/$defs/evidence_file"}, "minItems": 1, "maxItems": 16384}, "proofs": {"type": "array", "items": {"type": "string", "minLength": 1, "maxLength": 256}, "minItems": 1, "maxItems": 16384}, "rc": {"type": "integer", "minimum": 0, "maximum": 4}, "validation": {"$ref": "#/$defs/evidence_file"}}, "required": ["version", "run_id", "arm", "source_commit", "original_set_digest", "artifact_sha", "evidence_run_id", "test", "files", "proofs", "rc", "validation"], "additionalProperties": false},
+    "companion_validation": {"type": "object", "properties": {"process": {"$ref": "#/$defs/verifier_process"}, "proofs": {"type": "array", "items": {"type": "string", "minLength": 1, "maxLength": 256}, "minItems": 1, "maxItems": 128}, "version": {"const": 1}, "run_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"}, "arm": {"type": "string", "pattern": "^[a-zA-Z0-9_.-]{1,128}$"}, "source_commit": {"type": "string", "pattern": "^[0-9a-f]{40,64}$"}, "original_set_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"}, "artifact_sha": {"type": "string", "pattern": "^[0-9a-f]{64}$"}, "evidence_run_id": {"type": "string", "minLength": 1, "maxLength": 256}, "test": {"type": "string", "minLength": 1, "maxLength": 256}, "files": {"type": "array", "items": {"$ref": "#/$defs/evidence_file"}, "minItems": 1, "maxItems": 16384}, "native_rc": {"type": "integer", "minimum": 0, "maximum": 255}, "begin_ns": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615}, "end_ns": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615}, "events": {"type": "array", "items": {"$ref": "#/$defs/validation_event"}, "minItems": 1, "maxItems": 16384}, "invocation": {"$ref": "#/$defs/evidence_file"}}, "required": ["process", "proofs", "version", "run_id", "arm", "source_commit", "original_set_digest", "artifact_sha", "evidence_run_id", "test", "files", "native_rc", "begin_ns", "end_ns", "events", "invocation"], "additionalProperties": false},
+    "validation_event": {"type": "object", "properties": {"Action": {"enum": ["run", "pass", "fail", "skip", "output"]}, "Test": {"type": "string", "minLength": 1, "maxLength": 256}}, "required": ["Action", "Test"], "additionalProperties": false},
+    "archive_receipt": {"type": "object", "properties": {"known": {"type": "boolean"}, "complete": {"type": "boolean"}, "nonce": {"type": "string", "pattern": "^[0-9a-f]{32}$"}, "tx_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"}, "cut_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"}, "generation": {"type": "integer", "minimum": 1, "maximum": 18446744073709551615}, "scope_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"}, "owner": {"$ref": "#/$defs/owner"}, "evidence_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"}, "at_ns": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615}, "current_released": {"type": "boolean"}, "remaining": {"type": "array", "items": {"$ref": "#/$defs/owner"}, "minItems": 0, "maxItems": 16384}, "phase": {"type": "string", "minLength": 1, "maxLength": 256}, "outcome": {"type": "string", "minLength": 1, "maxLength": 256}, "resource_ids": {"type": "array", "items": {"type": "string", "minLength": 1, "maxLength": 256}, "minItems": 1, "maxItems": 16384}}, "required": ["known", "complete", "nonce", "tx_id", "cut_id", "generation", "scope_digest", "owner", "evidence_digest", "at_ns", "current_released", "remaining", "phase", "outcome", "resource_ids"], "additionalProperties": false},
+    "cold_boundary": {"type": "object", "properties": {"version": {"const": 1}, "run_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"}, "arm": {"type": "string", "pattern": "^[a-zA-Z0-9_.-]{1,128}$"}, "source_commit": {"type": "string", "pattern": "^[0-9a-f]{40,64}$"}, "original_set_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"}, "artifact_sha": {"type": "string", "pattern": "^[0-9a-f]{64}$"}, "begin_ns": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615}, "end_ns": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615}, "before_nonce": {"type": "string", "pattern": "^[0-9a-f]{32}$"}, "owner_before": {"$ref": "#/$defs/owner"}, "owner_after": {"$ref": "#/$defs/owner"}, "canonical_path": {"type": "string", "pattern": "^/[^\\x00]+$", "maxLength": 4096}, "selected_sha": {"type": "string", "pattern": "^[0-9a-f]{64}$"}, "retired_ids": {"type": "array", "items": {"type": "string", "minLength": 1, "maxLength": 256}, "minItems": 1, "maxItems": 16384}, "drains": {"type": "array", "items": {"$ref": "#/$defs/evidence_file"}, "minItems": 2, "maxItems": 16384}}, "required": ["version", "run_id", "arm", "source_commit", "original_set_digest", "artifact_sha", "begin_ns", "end_ns", "before_nonce", "owner_before", "owner_after", "canonical_path", "selected_sha", "retired_ids", "drains"], "additionalProperties": false},
+    "verifier_process": {"type": "object", "properties": {"native_rc": {"type": "integer", "minimum": 0, "maximum": 255}, "stdout": {"type": "string", "maxLength": 16777216}, "owner": {"$ref": "#/$defs/process_owner"}, "executable_sha": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}, "required": ["native_rc", "stdout", "owner", "executable_sha"], "additionalProperties": false},
+    "go_test_event": {"type": "object", "properties": {"Action": {"enum": ["start", "run", "pause", "cont", "pass", "fail", "skip", "output"]}, "Test": {"type": "string", "maxLength": 4096}, "Time": {"type": "string", "maxLength": 4096}, "Package": {"type": "string", "maxLength": 4096}, "Elapsed": {"type": "number"}, "Output": {"type": "string", "maxLength": 16777216}, "FailedBuild": {"type": "string", "maxLength": 4096}}, "required": ["Action"], "additionalProperties": false},
+    "process_owner": {"type": "object", "properties": {"boot_id": {"type": "string", "minLength": 1, "maxLength": 256}, "pid": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615}, "start_ticks": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615}}, "required": ["boot_id", "pid", "start_ticks"], "additionalProperties": false}
+  }
+}

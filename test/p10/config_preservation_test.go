@@ -1,11 +1,16 @@
 package p10_test
 
 import (
+	"crypto/sha256"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/LinZiyang666/tether/test/hotupdate/testsupervisor"
 )
 
 // config_preservation_test.go — a re-run of install.sh must not silently revert local edits.
@@ -252,20 +257,89 @@ func TestTheSuccessBannerDoesNotClaimAKeptFileWasWritten(t *testing.T) {
 // B4 names left the entire suite green.
 func runBrokerInstall(t *testing.T, root string, extra ...string) string {
 	t.Helper()
+	out, err := runBrokerInstallResult(t, root, extra...)
+	if err != nil {
+		t.Fatalf("broker install.sh failed: %v\n%s", err, out)
+	}
+	return out
+}
+
+func runBrokerInstallResult(t *testing.T, root string, extra ...string) (string, error) {
+	t.Helper()
+	// origin: hot-update S9 plan §6.4 / S9 internal review FIX-INST F1
+	// Skip-download now validates the complete offline release. Supplying it
+	// keeps these tests on the real config writer instead of bypassing admission.
+	supply := brokerOfflineSupply(t, nil)
+	t.Cleanup(func() {
+		// Immutable slots remain read-only during the test, then become removable.
+		_ = filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+			if err == nil && entry.IsDir() {
+				return os.Chmod(path, 0o700)
+			}
+			return err
+		})
+	})
 	args := append([]string{
 		"--role", "broker",
 		"--domain", "b.example.com",
 		"--acme-email", "ops@example.com",
 		"--skip-download",
 		"--no-enable",
+		"--version", "v0.0.0-installer-fixture",
 	}, extra...)
-	cmd := exec.Command("bash", append([]string{scriptPath(t)}, args...)...)
-	cmd.Env = append(os.Environ(), "HOME="+t.TempDir(), "TETHER_INSTALL_ROOT="+root)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("broker install.sh failed: %v\n%s", err, string(out))
+	cmd := exec.CommandContext(t.Context(), "bash", append([]string{scriptPath(t)}, args...)...)
+	for _, env := range os.Environ() {
+		if !strings.HasPrefix(env, "HOME=") && !strings.HasPrefix(env, "TETHER_") {
+			cmd.Env = append(cmd.Env, env)
+		}
 	}
-	return string(out)
+	cmd.Env = append(cmd.Env, "HOME="+t.TempDir(), "TETHER_INSTALL_ROOT="+root, "TETHER_INFRA_SUPPORT_DIR="+supply)
+	out, err := testsupervisor.CombinedOutput(cmd)
+	return string(out), err
+}
+
+// brokerOfflineSupply provides byte-parser fixtures, never runtime acceptance.
+// A real executable supplied by the offline test also makes candidate execution
+// observable. Each name has different bytes so immutable content slots are distinct.
+// origin: hot-update S9 plan §6.4 / §6.5 / S9 internal review FIX-INST F1–F4
+func brokerOfflineSupply(t *testing.T, candidate []byte) string {
+	t.Helper()
+	dir := t.TempDir()
+	if candidate == nil {
+		candidate = make([]byte, 64)
+		copy(candidate, []byte{0x7f, 'E', 'L', 'F', 2, 1, 1})
+		switch runtime.GOARCH {
+		case "amd64":
+			candidate[18] = 0x3e
+		case "arm64":
+			candidate[18] = 0xb7
+		default:
+			t.Fatalf("unsupported offline fixture architecture: %s", runtime.GOARCH)
+		}
+	}
+	manifest := "format 1\nrelease v0.0.0-installer-fixture\ngoos linux\ngoarch " + runtime.GOARCH +
+		"\nprotocol 1\nprevious-reader 1\nsource-sha256 " + strings.Repeat("1", 64) + "\n"
+	sums := ""
+	for _, name := range []string{"tether", "nats-server", "caddy", "tether-infra-helper", "tether-infra-launch", "infra-catalog.json"} {
+		data := append(append([]byte{}, candidate...), []byte("\n"+name)...)
+		switch name {
+		case "tether":
+			data = candidate // --bin must match this exact checksum.
+		case "infra-catalog.json":
+			data = []byte("{\"fixture\":true}\n")
+		}
+		if err := os.WriteFile(filepath.Join(dir, name), data, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if name == "tether" || name == "nats-server" || name == "caddy" {
+			sums += fmt.Sprintf("%x %s\n", sha256.Sum256(data), name)
+		} else {
+			manifest += fmt.Sprintf("sha256 %x %s\n", sha256.Sum256(data), name)
+		}
+	}
+	writeInstallFixture(t, filepath.Join(dir, "infra-support.manifest"), manifest, 0o644)
+	writeInstallFixture(t, filepath.Join(dir, "broker-binaries.sha256"), sums, 0o644)
+	return dir
 }
 
 // origin: external review 2026-09-03, redirected-install host-systemd finding.
@@ -319,6 +393,8 @@ func brokerConfigs(root string) map[string]string {
 		"Caddyfile":   filepath.Join(root, "etc", "tether", "Caddyfile"),
 		"nats.conf":   filepath.Join(root, "etc", "tether", "nats.d", "nats.conf"),
 		"unit":        filepath.Join(root, "etc", "systemd", "system", "tether-broker.service"),
+		"nats-unit":   filepath.Join(root, "etc", "systemd", "system", "nats-server.service"),
+		"caddy-unit":  filepath.Join(root, "etc", "systemd", "system", "caddy.service"),
 	}
 }
 
@@ -329,6 +405,7 @@ func brokerConfigs(root string) map[string]string {
 // this is worth its own test rather than trusting the shared helper is that
 // `config_dest` has to be reached at FOUR separate write sites on this path, and a
 // site that simply does not call it is invisible to any test of the helper itself.
+// origin: S9 internal review FIX-INST F1
 func TestARerunKeepsEveryEditedBrokerFile(t *testing.T) {
 	skipIfAgentOrBrokerUnsupported(t)
 	root := t.TempDir()
@@ -382,11 +459,18 @@ func TestARerunKeepsEveryEditedBrokerFile(t *testing.T) {
 // it has to actually override — a preservation that cannot be switched off is the
 // opposite mistake, since a release that must correct a unit file (G1 #23 shipped
 // `Restart=always` that way) reaches existing machines only through the rewrite.
+// origin: S9 internal review FIX-INST F2
 func TestForceConfigOverwritesEveryBrokerFile(t *testing.T) {
 	skipIfAgentOrBrokerUnsupported(t)
 	root := t.TempDir()
 	runBrokerInstall(t, root)
+	generated := map[string]string{}
 	for name, path := range brokerConfigs(root) {
+		body, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		generated[name] = string(body)
 		if err := os.WriteFile(path, []byte("# local "+name+"\n"), 0o600); err != nil {
 			t.Fatal(err)
 		}
@@ -404,6 +488,22 @@ func TestForceConfigOverwritesEveryBrokerFile(t *testing.T) {
 				"Preservation that cannot be switched off means a release which has to CORRECT a "+
 				"config or unit file can never reach an existing machine.", name)
 		}
+		if string(body) != generated[name] {
+			t.Errorf("--force-config did not publish the generated %s content", name)
+		}
+	}
+	// origin: hot-update S9 plan §6.4 / S9 internal review FIX-INST F2
+	// The cold override still works, but an unknown registered authority is
+	// never permission to overwrite the active host's files.
+	policy := filepath.Join(root, "var/lib/tether-infra/policy.json")
+	writeInstallFixture(t, policy, "unknown authority\n", 0o600)
+	out, err := runBrokerInstallResult(t, root, "--force-config")
+	if err == nil || !strings.Contains(out, "infra_busy") {
+		t.Fatalf("--force-config bypassed installed authority: %v\n%s", err, out)
+	}
+	assertInstallContents(t, policy, "unknown authority\n")
+	for name, path := range brokerConfigs(root) {
+		assertInstallContents(t, path, generated[name])
 	}
 }
 
@@ -422,6 +522,8 @@ func TestForceConfigOverwritesEveryBrokerFile(t *testing.T) {
 //     and the next run keeps nothing so it reports nothing.
 //   - --uninstall removes the config; a sidecar for a file that is gone is an orphan
 //     no later run will ever mention.
+//
+// origin: S9 internal review FIX-INST F3
 func TestSupersededAndOrphanedNewFilesAreCleanedUp(t *testing.T) {
 	skipIfAgentOrBrokerUnsupported(t)
 	root := t.TempDir()
@@ -458,10 +560,25 @@ func TestSupersededAndOrphanedNewFilesAreCleanedUp(t *testing.T) {
 		}
 	}
 	runBrokerInstall(t, root)
+	lock := filepath.Join(root, "var/lib/tether-infra/journal.lock")
+	beforeLock, err := os.Stat(lock)
+	if err != nil {
+		t.Fatal(err)
+	}
 	runBrokerInstall(t, root, "--uninstall")
+	// origin: hot-update S9 plan §6.4 / S9 internal review FIX-INST F3
+	// Uninstall now requires content ownership: edited configs survive while
+	// generated sidecars are retired. The old orphan check still covers every .new.
+	for _, path := range brokerConfigs(root) {
+		assertInstallContents(t, path, "# local again\n")
+	}
+	afterLock, err := os.Stat(lock)
+	if err != nil || !os.SameFile(beforeLock, afterLock) {
+		t.Fatalf("uninstall replaced or removed the permanent journal lock: %v", err)
+	}
 
 	var leftovers []string
-	err := filepath.WalkDir(root, func(p string, d os.DirEntry, werr error) error {
+	err = filepath.WalkDir(root, func(p string, d os.DirEntry, werr error) error {
 		if werr != nil {
 			return werr
 		}

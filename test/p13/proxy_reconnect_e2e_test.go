@@ -6,11 +6,14 @@
 package p13_test
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
+	"runtime"
 	"strconv"
 	"sync"
 	"testing"
@@ -71,8 +74,11 @@ func (r *severableRelay) pipe(c net.Conn) {
 	r.mu.Lock()
 	r.conns = append(r.conns, c, d)
 	r.mu.Unlock()
-	go func() { _, _ = io.Copy(d, c); _ = d.Close() }()
-	_, _ = io.Copy(c, d)
+	// Avoid net.TCPConn's process-wide splice-pipe cache: the relay's FD
+	// census owns only its sockets, and must settle before the next round.
+	// origin: hot-update S6 plan §9.3 / T56 / TESTFIX-2
+	go func() { _, _ = io.Copy(struct{ io.Writer }{d}, struct{ io.Reader }{c}); _ = d.Close() }()
+	_, _ = io.Copy(struct{ io.Writer }{c}, struct{ io.Reader }{d})
 	_ = c.Close()
 }
 
@@ -157,40 +163,98 @@ type fullStackProxy struct {
 	pubAddr  string
 }
 
-func startFullStackProxy(t *testing.T) *fullStackProxy {
+// Failed startup must retain both sides of the real tunnel handshake. Discarding
+// those records makes a missed directive indistinguishable from a TLS refusal.
+// origin: S10 internal review POLISH-B F4 / plan §11.1
+type proxyFixtureLog struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (l *proxyFixtureLog) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.Write(p)
+}
+
+func (l *proxyFixtureLog) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.String()
+}
+
+func startFullStackProxy(t *testing.T, heartbeatIntervals ...time.Duration) *fullStackProxy {
 	t.Helper()
+	heartbeatInterval := 100 * time.Millisecond
+	if len(heartbeatIntervals) != 0 {
+		heartbeatInterval = heartbeatIntervals[0]
+	}
 	url := testharness.StartNATS(t)
 	db := testharness.OpenDB(t)
 	ownerPub, ownerFP := testharness.FreshUserPub(t)
 	if _, err := session.Create(db, "lab", "lab", ownerFP, "pin-hash", time.Now().UTC()); err != nil {
 		t.Fatal(err)
 	}
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	logs := &proxyFixtureLog{}
+	t.Cleanup(func() {
+		if t.Failed() {
+			t.Logf("proxy fixture log:\n%s", logs.String())
+		}
+	})
+	logger := slog.New(slog.NewTextHandler(logs, nil))
 	btun := freePort(t)
+	// The no-resurrection oracle must own a private allocation. A fixed 14000
+	// band lets another matrix worker bind the just-disabled port and makes a
+	// correct synchronous revoke look like a resurrected tunnel.
+	// Hold the candidate through startup and release only before proxy ON.
+	// origin: hot-update S6 plan §6.3 / T28 / TESTFIX-2
+	reservation, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = reservation.Close() })
+	publicPort := reservation.Addr().(*net.TCPAddr).Port
+	// This fixture faults the data tunnel while NATS stays healthy. Keep the
+	// broker's product liveness defaults: a 300ms test-only stale threshold
+	// expired between REGISTER and the first heartbeat during cold transfer
+	// binding, revoked the allocation, and made the initial tunnel REGISTER
+	// fail with session_closed before the intended fault was injected.
+	// origin: S10 internal review POLISH-B F4 / plan §11.1
 	b, err := broker.New(broker.Config{
 		NATSURL: url, DB: db, Logger: logger,
-		ReconcileInterval: 50 * time.Millisecond, StaleAfter: 300 * time.Millisecond, OfflineAfter: 2 * time.Second,
-		PublicHost: "broker.test", PortBandLow: 14000, PortBandHigh: 14010,
+		ReconcileInterval: 50 * time.Millisecond,
+		PublicHost:        "broker.test", PortBandLow: publicPort, PortBandHigh: publicPort,
 		SubHTTPAddr: freePort(t), TunnelControlAddr: btun, TunnelPublicHost: "127.0.0.1",
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	bctx, bcancel := context.WithCancel(context.Background())
-	t.Cleanup(bcancel)
-	go func() { _ = b.Run(bctx) }()
+	bdone := make(chan error, 1)
+	go func() { bdone <- b.Run(bctx) }()
+	t.Cleanup(func() {
+		bcancel()
+		select {
+		case err := <-bdone:
+			if err != nil && err != context.Canceled {
+				t.Errorf("broker did not exit cleanly: %v", err)
+			}
+		case <-time.After(3 * time.Second):
+			t.Error("broker did not exit")
+		}
+	})
 	testharness.WaitConnect(t, url, 3*time.Second)
 	time.Sleep(100 * time.Millisecond)
 
 	relay := newSeverableRelay(t, btun)
-	logger2 := slog.New(slog.NewTextHandler(io.Discard, nil))
+	logger2 := logger.With("role", "agent")
 	adapter := agent.NewTunnelExposeAdapter(relay.addr(), "lab", "lab-1", logger2)
 	actx, acancel := context.WithCancel(context.Background())
 	adapter.Start(actx)
 	ag, err := agent.New(agent.Config{
 		NATSURL: url, SID: "lab", NID: "lab-1", Home: t.TempDir(),
 		ExposeAdapter: adapter, Logger: logger2,
-		HeartbeatInterval: 100 * time.Millisecond, RegisterTimeout: 2 * time.Second,
+		HeartbeatInterval: heartbeatInterval, RegisterTimeout: 2 * time.Second,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -213,6 +277,9 @@ func startFullStackProxy(t *testing.T) *fullStackProxy {
 	}
 	t.Cleanup(nc.Close)
 
+	if err := reservation.Close(); err != nil {
+		t.Fatal(err)
+	}
 	var setR proto.ProxySetResp
 	proxyReq(t, nc, proto.SubjCtrlProxySet(ownerPub, "lab"), proto.ProxySetReq{Enabled: true}, &setR)
 	if !setR.OK {
@@ -294,7 +361,24 @@ func TestProxyFalseOnlineRecoversAfterTunnelDrop(t *testing.T) {
 // reconnect must NOT resurrect the exit — the public port stays refused and the
 // node stays unready, forever (no rebind).
 func TestProxyDisableDuringTunnelDropStaysDown(t *testing.T) {
+	g, fd := runtime.NumGoroutine(), testharness.FDCount()
+	for round := 0; round < 5; round++ {
+		t.Run(fmt.Sprintf("round-%d", round), func(t *testing.T) { exerciseProxyDisableDuringTunnelDrop(t) })
+	}
+	testharness.AssertNoGoroutineLeak(t, "proxy disable during drop", g)
+	testharness.AssertNoFDLeak(t, "proxy disable during drop", fd, 0)
+}
+
+// A second real stack stays alive through the refusal window. Shared fixed
+// allocation bands collide before this point; private ports preserve both the
+// hard no-resurrection assertion and the independent proxy's availability.
+// origin: hot-update S6 plan §6.3 / T28 / TESTFIX-2
+func exerciseProxyDisableDuringTunnelDrop(t *testing.T) {
 	f := startFullStackProxy(t)
+	other := startFullStackProxy(t)
+	if f.pubAddr == other.pubAddr {
+		t.Fatal("independent fixtures share a public allocation")
+	}
 
 	// Durable data-plane outage: close the relay so the agent's reconnect dial is
 	// refused (it cannot self-heal). This makes the disable-vs-reconnect outcome
@@ -321,4 +405,41 @@ func TestProxyDisableDuringTunnelDropStaysDown(t *testing.T) {
 	// No resurrection: the port stays refused across a sustained window that
 	// comfortably exceeds the agent's reconnect backoff.
 	assertTCPStays(t, f.pubAddr, false, 3*time.Second)
+	waitTCP(t, other.pubAddr, true, 5*time.Second)
+	if !proxyReady(other.db, "lab", "lab-1") {
+		t.Fatal("disabling one fixture interrupted the independent proxy")
+	}
+}
+
+// A one-second heartbeat remains well inside the broker's product liveness
+// window. The old 300ms fixture override declared this healthy control plane
+// stale, revoked its allocation and turned a tunnel-only test into a node-loss
+// test. Real TCP availability witnesses that ordering without polling config.
+// origin: S10 internal review POLISH-B F4 / plan §11.1
+func TestProxyStartupKeepsProductLivenessWindow(t *testing.T) {
+	g, fd := runtime.NumGoroutine(), testharness.FDCount()
+	for round := 0; round < 5; round++ {
+		t.Run(fmt.Sprintf("round-%d", round), func(t *testing.T) { exerciseProxyProductLiveness(t) })
+	}
+	testharness.AssertNoGoroutineLeak(t, "proxy product liveness window", g)
+	testharness.AssertNoFDLeak(t, "proxy product liveness window", fd, 0)
+}
+
+func exerciseProxyProductLiveness(t *testing.T) {
+	t.Helper()
+	f := startFullStackProxy(t, time.Second)
+	// Sampling only after the second heartbeat hides a stale/online flap.
+	// Observe the whole interval between heartbeats as well as the live port.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if state := nodeStatus(f.db, "lab", "lab-1"); state != "ONLINE" {
+			t.Fatalf("healthy NATS control plane became %s during proxy startup", state)
+		}
+		conn, err := net.DialTimeout("tcp", f.pubAddr, 150*time.Millisecond)
+		if err != nil {
+			t.Fatalf("healthy proxy became unavailable during startup: %v", err)
+		}
+		_ = conn.Close()
+		time.Sleep(50 * time.Millisecond)
+	}
 }

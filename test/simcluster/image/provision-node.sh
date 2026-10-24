@@ -19,6 +19,18 @@ if [ -f "$SENTINEL" ]; then
     exit 0
 fi
 
+# origin: hot-update S9 plan §6.4 / §9.4 / T55/T56. Supplying tools and
+# verified files is provisioning; activating helper/socket/nft is product work.
+# --skip-download does not waive existence, archive, platform or metadata checks.
+python3 /opt/sim/infra-artifact.py verify /opt/sim /opt/sim/install.sh \
+    --binary-root /usr/local/bin --support-root /usr/local/libexec
+[ -r /proc/sys/net/ipv6/conf/all/disable_ipv6 ] \
+    && [ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6)" = 0 ] \
+    || { echo "provision: IPv6 is required for the infra profile" >&2; exit 2; }
+for tool in /usr/sbin/nft /usr/sbin/conntrack /usr/sbin/ip; do
+    [ -x "$tool" ] || { echo "provision: missing infra kernel observation tool" >&2; exit 2; }
+done
+
 case "$ROLE" in
 broker)
     # REUSE the production installer headlessly: --skip-download early-returns the nats-server/caddy
@@ -30,9 +42,12 @@ broker)
     # curl-able cross-container (the real reverse-tunnel data plane, verified live). This is the FAITHFUL
     # operator choice (an operator sets public_host to their resolvable domain; the sim's resolvable name IS
     # the container hostname) — NOT a mask (no /etc/hosts spoofing). install.sh has no FQDN/dot check
-    # (install.sh:460 is just `[ -n ]`). Caddy never runs in the sim, so the `<node>:443` Caddyfile is inert;
-    # route/tunnel cert SANs are minted on <node> independently (secrets.sh), so route mTLS is unaffected.
-    sh /opt/sim/install.sh --role broker --skip-download --prefix /usr/local/bin \
+    # (install.sh:460 is just `[ -n ]`). Fresh nodes select their service profile explicitly via the
+    # installer's public --no-enable option: cmd_start_broker enables NATS/broker, and caddy_start
+    # enables Caddy only for the real TLS/WSS profile. Thus rebooting a Python-ingress drill does not
+    # introduce a second front on port 443. Existing provisioned nodes are not modified by this choice.
+    # Route/tunnel cert SANs are minted on <node> independently (secrets.sh), so route mTLS is unaffected.
+    sh /opt/sim/install.sh --role broker --skip-download --no-enable --prefix /usr/local/bin \
         --domain "${NODE}" --acme-email dev@sim.tether.test
 
     # --- thin overlay (§2), the ONLY sim-specific deltas over the real tree ---

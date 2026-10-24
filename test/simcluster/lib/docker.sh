@@ -22,8 +22,20 @@ vol_shared_home() { printf 'sim-%s-sharedhome' "$INSTANCE"; }
 
 ensure_net() {
     assert_host_dns_says_no
-    d network inspect "$(net_name)" >/dev/null 2>&1 && return 0
-    run d network create --driver bridge "$(net_name)" >/dev/null
+    # origin: hot-update S9 plan §9.4 / T56. Existing IPv4-only networks
+    # must fail setup instead of silently omitting the IPv6 canonical ingress.
+    if d network inspect "$(net_name)" >/dev/null 2>&1; then
+        [ "$(d network inspect -f '{{.EnableIPv6}}' "$(net_name)")" = true ] || {
+            printf 'sim network is IPv4-only; recreate the isolated instance network\n' >&2
+            return 2
+        }
+        return 0
+    fi
+    _net_digest=$(printf '%s' "$INSTANCE" | sha256sum | cut -c1-8)
+    _net_first=$(printf '%s' "$_net_digest" | cut -c1-4)
+    _net_second=$(printf '%s' "$_net_digest" | cut -c5-8)
+    run d network create --driver bridge --ipv6 \
+        --subnet "${SIM_IPV6_SUBNET:-fd53:9:$_net_first:$_net_second::/64}" "$(net_name)" >/dev/null
 }
 
 # assert_host_dns_says_no — refuse to run when the host resolver fabricates an address for names that
@@ -118,10 +130,12 @@ run_node() {
         --name "$(ctr_name "$_rn_node")" --hostname "$_rn_node" \
         --network "$(net_name)" --network-alias "$_rn_node" \
         --privileged --cgroupns=host -v /sys/fs/cgroup:/sys/fs/cgroup:rw \
+        --sysctl net.ipv6.conf.all.disable_ipv6=0 --sysctl net.ipv6.conf.default.disable_ipv6=0 \
         --tmpfs /run --tmpfs /run/lock --stop-signal SIGRTMIN+3 \
         --restart no \
         --label sim.instance="$INSTANCE" --label sim.role="$_rn_role" --label sim.nodeid="$_rn_node" \
         -v "$(vol_etc "$_rn_node"):/etc/tether" \
+        -v "sim-$INSTANCE-drill-custody:/run/tether-drill-custody" \
         "$@" \
         "$IMAGE" >/dev/null
 }

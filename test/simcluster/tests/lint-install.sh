@@ -25,116 +25,311 @@
 #   * a body that expands nothing      -> quote the heredoc:  <<'EOF'
 #
 # Run:  sh tests/lint-install.sh
-set -u
+set -eu
 HERE="$(cd "$(dirname "$0")" && pwd)"
 # tests/ -> simcluster/ -> test/ -> repo root. Keep this resolved rather than relying on cwd, since
 # the drill runner invokes the lints from several different directories.
-TARGET="$(cd "$HERE/../../.." && pwd)/scripts/install.sh"
+# origin: hot-update S8 plan §5.2 / P20 — explicit file input permits hermetic
+# positive/negative controls without executing the root installer being scanned.
+[ "$#" -le 1 ] || { echo "usage: lint-install.sh [install-script]" >&2; exit 2; }
+TARGET="${1:-$(cd "$HERE/../../.." && pwd)/scripts/install.sh}"
 
-[ -f "$TARGET" ] || { echo "lint-install: cannot find $TARGET"; exit 1; }
-
-echo "── install.sh heredoc scan ─────────────────────────────────────────────────────"
-
-# The quote characters are passed IN rather than written into the awk program: a program that has to
-# recognise both ' and " cannot embed either literal without a layer of shell-escaping that is far
-# more error-prone than the rule it implements.
-SQ=$(printf '\047')
-DQ=$(printf '\042')
-
-# One state-machine pass. Tracking heredoc state (rather than grepping for backticks globally) is
-# what makes the rule precise: a backtick in ordinary script comments outside a heredoc is harmless,
-# and a `<<` appearing INSIDE a body must not be mistaken for a new opener.
-#
-# KNOWN LIMITATION (N-7, record-only — accepted, NOT fixed): the opener detector is not quote-aware. A
-# `<<` inside a QUOTED string or a left-shift expression can be misread as a heredoc opener, and the
-# opener's own quote (`<<'EOF'` — semantic) cannot be told apart from an ENCLOSING quote without
-# position-aware quote tracking. Both drift directions are LOUD, not silent, so a fix is disproportionate
-# for one vendored file: a spurious opener either hits the never-terminated VIOLATION at EOF, or marks a
-# real body "quoted ⇒ inert, not scanned" and prints a visible `skip` row (never a false GREEN that hides
-# a command substitution). If install.sh ever grows a `<<`-bearing string this must be revisited.
-OUT=$(awk -v sq="$SQ" -v dq="$DQ" '
-    # --- inside a heredoc: look for the terminator, and scan the body if it is shell-active ---
-    in_hd {
-        if ($0 ~ "^[[:space:]]*" delim "[[:space:]]*$") {
-            if (quoted)
-                printf "  %-6s line %-4d quoted <<%s%s%s — body inert, not scanned\n", "skip", start, sq, delim, sq
-            else if (hd_bad)
-                printf "  %-6s line %-4d unquoted <<%s — %d violation(s) above\n", "FAIL", start, delim, hd_bad
-            else
-                printf "  %-6s line %-4d unquoted <<%s — body clean (no backtick, no $-paren)\n", "ok", start, delim
-            in_hd = 0; hd_bad = 0
-            next
-        }
-        if (!quoted) {
-            # A backtick is command substitution regardless of position; \` is an escaped literal
-            # and is therefore allowed. Checked before the generic backtick test so the escaped
-            # form does not trip the rule.
-            line = $0
-            gsub(/\\`/, "", line)
-            if (line ~ /`/) {
-                printf "  VIOLATION line %d (heredoc opened at %d): backtick = COMMAND SUBSTITUTION, runs as root\n", NR, start
-                printf "            | %s\n", $0
-                bad++; hd_bad++
-            }
-            if (line ~ /\$\(/) {
-                printf "  VIOLATION line %d (heredoc opened at %d): $( = COMMAND SUBSTITUTION, runs as root\n", NR, start
-                printf "            | %s\n", $0
-                bad++; hd_bad++
-            }
-        }
-        next
-    }
-
-    # --- outside a heredoc: detect an opener ---
-    # Covers <<EOF, <<-EOF and both quoted spellings. Whether a quote character immediately follows
-    # << (or <<-) is the ONLY thing that decides if the body is shell-active, so that single
-    # character is what the state machine has to read correctly.
-    /<</ {
-        s = $0
-        # greedy: keeps whatever follows the last <<, and (external review M-4) ALSO strips any
-        # blanks between << and the delimiter word. `cat << EOF` with a space is POSIX-legal; without
-        # eating the blanks c would be " " (not a quote), the delim match would fail on " EOF", and the
-        # whole shell-active body would be skipped un-linted — a lint blind spot a rename could exploit.
-        sub(/^.*<<-?[ \t]*/, "", s)
-        c = substr(s, 1, 1)
-        quoted = (c == sq || c == dq) ? 1 : 0
-        if (quoted) s = substr(s, 2)
-        # No valid delimiter word means this was not a heredoc opener at all; stay out of the body
-        # state rather than swallowing the rest of the file.
-        if (match(s, /^[A-Za-z_][A-Za-z_0-9]*/)) {
-            delim = substr(s, 1, RLENGTH)
-            in_hd = 1; start = NR; total++
-        }
-        next
-    }
-
-    END {
-        if (in_hd) {
-            printf "  VIOLATION heredoc opened at line %d never terminated (delimiter %s)\n", start, delim
-            bad++
-        }
-        printf "SUMMARY %d %d\n", total, bad
-    }
-' "$TARGET" 2>&1)
-
-# Kept in a variable rather than a /tmp scratch file: a predictable path under a world-writable
-# directory is a symlink target, and a lint that guards a root-run installer should not itself
-# introduce one.
-printf '%s\n' "$OUT" | grep -v '^SUMMARY '
-TOTAL=$(printf '%s\n' "$OUT" | awk '/^SUMMARY /{print $2+0}')
-BAD=$(printf '%s\n' "$OUT" | awk '/^SUMMARY /{print $3+0}')
-
-echo "────────────────────────────────────────────────────────────────────────────────"
-# A scan that found no heredoc at all would report "0 violations" and pass forever — the same
-# permanently-true-oracle failure mode lint-drills.sh guards against with its empty-needle rule.
-# Assert the parser actually saw the heredocs it is supposed to be policing.
-if [ "${TOTAL:-0}" -lt 10 ]; then
-    echo "lint-install: only ${TOTAL:-0} heredoc(s) parsed — the scanner is broken, not install.sh"
-    exit 1
+[ -f "$TARGET" ] || { echo "lint-install: cannot find $TARGET" >&2; exit 1; }
+# Standalone invocations use the same adapter as run-all. The private directory
+# owns only the launcher build, never an installer output or a production path.
+# origin: hot-update S9 plan §9.5 / P37 / T88
+LINT_SUPERVISOR_DIR=
+trap '[ -z "$LINT_SUPERVISOR_DIR" ] || rm -rf "$LINT_SUPERVISOR_DIR"' EXIT
+if [ -z "${SIM_UPGRADE_SUPERVISOR:-}" ]; then
+    . "$HERE/../lib/supervisor.sh"
+    LINT_SUPERVISOR_DIR=$(mktemp -d)
+    SIM_UPGRADE_SUPERVISOR=$(sim_supervisor_build "$(cd "$HERE/../../.." && pwd)" "$LINT_SUPERVISOR_DIR")
+    export SIM_UPGRADE_SUPERVISOR
 fi
-if [ "$BAD" = 0 ]; then
-    echo "lint-install: OK ($TOTAL heredocs, 0 command substitutions in unquoted bodies)"
-    exit 0
-fi
-echo "lint-install: $BAD command-substitution violation(s) in unquoted heredoc bodies"
-exit 1
+[ -x "$SIM_UPGRADE_SUPERVISOR" ] || { echo "lint-install: shared supervisor is required" >&2; exit 2; }
+# Syntax checking is read-only: never source or execute the root installer.
+"$SIM_UPGRADE_SUPERVISOR" -- sh -n "$TARGET"
+"$SIM_UPGRADE_SUPERVISOR" -- python3 -I -B - "$TARGET" <<'PYINSTALL'
+from collections import Counter
+from pathlib import Path
+import re
+import sys
+
+
+# Exact source identities, including the two outputs of the shared drop-in
+# writer. Counts alone let removal of a helper template hide behind a banner.
+# origin: hot-update S9 plan §1 / §6.4 / P37 / T88
+EXPECTED_TARGETS = {
+    ('install_agent', '$SESSION_DIR/agent.yaml'),
+    ('write_journald_dropin', '$_dropin'),
+    ('write_infra_files', '$INFRA_ETC_DIR/templates/tether-infra-helper.socket'),
+    ('write_infra_files', '$INFRA_ETC_DIR/templates/tether-infra-helper@.service'),
+    ('write_infra_files', '$INFRA_ETC_DIR/templates/nats-server.service.d/90-tether-infra.conf'),
+    ('write_infra_files', '$INFRA_ETC_DIR/templates/caddy.service.d/90-tether-infra.conf'),
+    ('install_broker', '$ETC_DIR/broker.yaml'),
+    ('install_broker', '$ETC_DIR/Caddyfile'),
+    ('write_systemd_units', '$etc/nats.d/nats.conf'),
+    ('write_systemd_units', '$sysd/nats-server.service'),
+    ('write_systemd_units', '$sysd/caddy.service'),
+    ('write_broker_systemd_unit', '$sysd/tether-broker.service'),
+}
+EXPECTED_STDOUT = Counter({
+    'usage': 1, 'install_agent': 1, 'install_ctl': 2,
+    'install_broker': 5, 'hot_update_retrofit': 1,
+})
+
+
+def backtick(source, offset):
+    offset += 1
+    while offset < len(source) and source[offset] != '`':
+        if source.startswith('<<', offset):
+            raise ValueError('nested heredoc backtick is unsupported')
+        offset += 2 if source[offset] == '\\' else 1
+    if offset >= len(source):
+        raise ValueError('unfinished backtick expansion')
+    return offset + 1
+
+
+def expansion(source, offset):
+    depth = 1
+    arithmetic = source.startswith('$((', offset)
+    offset += 2
+    while offset < len(source) and depth:
+        # Arithmetic shifts are harmless, but a nested command substitution
+        # re-enters shell syntax and must not conceal another heredoc.
+        # origin: hot-update S9 plan §12 P37 / T88 / M34
+        if source.startswith('$(', offset):
+            offset = expansion(source, offset)
+            continue
+        if not arithmetic and source.startswith('<<', offset):
+            raise ValueError('nested heredoc expansion is unsupported')
+        char = source[offset]
+        if char in "'\"`":
+            _, _, offset = word(source, offset)
+            continue
+        if char == '\\':
+            offset += 2
+            continue
+        depth += (char == '(') - (char == ')')
+        offset += 1
+    if depth:
+        raise ValueError('unfinished shell expansion')
+    return offset
+
+
+def word(source, offset):
+    """Read one shell word; only quotes in THIS word quote a delimiter.
+
+    Shell-active expansions outside a document are opaque to this lint. A
+    nested heredoc in an expansion is rejected rather than silently unscanned.
+    This is a bounded installer scanner, not a replacement shell interpreter.
+    """
+    start, result, quoted = offset, '', False
+    while offset < len(source) and source[offset] not in ' \t\n;|&<>()':
+        char = source[offset]
+        if char == '\\':
+            offset += 1
+            if offset == len(source):
+                raise ValueError('unfinished shell escape')
+            if source[offset] != '\n':
+                # Line continuation is removed before tokenization; it does
+                # not quote the delimiter or make the document body inert.
+                # origin: hot-update S9 plan §12 P37 / T88 / M34
+                quoted = True
+                result += source[offset]
+            offset += 1
+        elif char == '`':
+            inner = offset
+            offset = backtick(source, offset)
+            # Backticks are expansion syntax, not delimiter quote removal.
+            # Keeping the spelling makes such delimiters explicitly unsupported.
+            result += source[inner:offset]
+        elif char in "'\"":
+            quote = char
+            quoted = True
+            offset += 1
+            inner = offset
+            while offset < len(source) and source[offset] != quote:
+                if quote != "'" and source.startswith('$(', offset):
+                    # Nested command substitutions can contain quotes of their
+                    # own. Parse the whole expansion, rather than letting an
+                    # inner quote expose literal << bytes as a fake opener.
+                    offset = expansion(source, offset)
+                    continue
+                if quote == '"' and source[offset] == '`':
+                    offset = backtick(source, offset)
+                    continue
+                if quote != "'" and source[offset] == '\\':
+                    offset += 1
+                    if offset == len(source):
+                        raise ValueError('unfinished quoted escape')
+                offset += 1
+            if offset == len(source):
+                raise ValueError('unfinished shell quote')
+            result += source[inner:offset]
+            offset += 1
+        elif source.startswith('$(', offset):
+            inner = offset
+            offset = expansion(source, offset)
+            result += source[inner:offset]
+        else:
+            result += char
+            offset += 1
+    if offset == start:
+        raise ValueError('missing heredoc delimiter')
+    return result, quoted, offset
+
+
+def substitutions(body):
+    """Apply unquoted-heredoc escape rules before looking for substitutions.
+
+    Quotes in a BODY are ordinary bytes. Backslash only protects backslash,
+    dollar, backtick and newline; an even number still leaves the next dollar
+    active. Remove line continuations before detecting a split dollar-paren.
+    """
+    cooked, offset = [], 0
+    while offset < len(body):
+        char = body[offset]
+        if char == '\\' and offset + 1 < len(body) and body[offset + 1] in '\\$`\n':
+            if body[offset + 1] != '\n':
+                cooked.append(None)  # Protected byte cannot begin a substitution.
+            offset += 2
+        else:
+            cooked.append(char)
+            offset += 1
+    return any(char == '`' or (char == '$' and cooked[i + 1:i + 2] == ['('])
+               for i, char in enumerate(cooked))
+
+
+def scan(source):
+    documents, pending, tokens = [], [], []
+    owner, target, offset = '', None, 0
+    while offset < len(source):
+        char = source[offset]
+        if char in ' \t':
+            offset += 1
+            continue
+        if char == '#':
+            end = source.find('\n', offset)
+            offset = len(source) if end < 0 else end
+            continue
+        if char == '\n':
+            if len(tokens) >= 4 and tokens[1:4] == ['(', ')', '{']:
+                owner = tokens[0]
+                target = None
+            elif tokens == ['}']:
+                if target is not None:
+                    raise ValueError('template target has no scanned heredoc')
+                owner, target = '', None
+            elif tokens[:1] == ['config_dest']:
+                if len(tokens) != 2 or target is not None:
+                    raise ValueError('ambiguous template target')
+                target = tokens[1]
+            offset += 1
+            for document in pending:
+                document['owner'] = owner
+                if '$CONFIG_DEST' in tokens:
+                    if target is None:
+                        raise ValueError('template heredoc has no config_dest')
+                    document['target'] = target
+                    target = None
+                else:
+                    if '>' in tokens or '>>' in tokens:
+                        raise ValueError('unregistered direct heredoc output')
+                    document['target'] = '$_dropin' if owner == 'write_journald_dropin' else 'stdout'
+                body = []
+                while offset < len(source):
+                    end = source.find('\n', offset)
+                    end = len(source) if end < 0 else end + 1
+                    line = source[offset:end]
+                    offset = end
+                    compared = line.lstrip('\t') if document['strip_tabs'] else line
+                    # The shell joins active backslash-newline before testing
+                    # the delimiter. A physical EOF after a continued body
+                    # line is still body, and cannot conceal the next command.
+                    while not document['quoted'] and compared.endswith('\n'):
+                        tail = compared[:-1]
+                        escapes = len(tail) - len(tail.rstrip('\\'))
+                        if escapes % 2 == 0 or offset == len(source):
+                            break
+                        next_end = source.find('\n', offset)
+                        next_end = len(source) if next_end < 0 else next_end + 1
+                        following = source[offset:next_end]
+                        offset = next_end
+                        line += following
+                        compared = compared[:-2] + (following.lstrip('\t') if document['strip_tabs'] else following)
+                    if compared.removesuffix('\n') == document['delimiter']:
+                        break
+                    body.append(line)
+                else:
+                    raise ValueError('unterminated heredoc: ' + document['delimiter'])
+                document['body'] = ''.join(body)
+                documents.append(document)
+            pending, tokens = [], []
+            continue
+        if source.startswith('<<', offset):
+            line = source.count('\n', 0, offset) + 1
+            offset += 2
+            strip_tabs = source[offset:offset + 1] == '-'
+            offset += int(strip_tabs)
+            while source[offset:offset + 1] in (' ', '\t'):
+                offset += 1
+            delimiter, quoted, offset = word(source, offset)
+            if re.fullmatch(r'[A-Za-z_][A-Za-z_0-9.-]*', delimiter) is None:
+                raise ValueError('unsupported heredoc delimiter')
+            pending.append(dict(line=line, delimiter=delimiter, quoted=quoted, strip_tabs=strip_tabs))
+            continue
+        if char in ';|&<>()' or (char in '{}' and not tokens):
+            end = offset + (2 if source[offset:offset + 2] == '>>' else 1)
+            tokens.append(source[offset:end])
+            offset = end
+        else:
+            value, _, offset = word(source, offset)
+            tokens.append(value)
+    if pending:
+        raise ValueError('heredoc opener without a body')
+    return documents
+
+
+def check(source):
+    documents = scan(source)
+    targets, stdout = Counter(), Counter()
+    for document in documents:
+        if not document['quoted'] and substitutions(document['body']):
+            raise ValueError('command substitution in unquoted heredoc at line ' + str(document['line']))
+        target = document['target']
+        if target == 'stdout':
+            stdout[document['owner']] += 1
+        elif target == '$INFRA_ETC_DIR/templates/$_wif_unit.service.d/90-tether-infra.conf':
+            # The source writer is deliberately shared; both concrete outputs
+            # belong to the targetset, and the loop must still enumerate both.
+            if re.findall(r'^    for _wif_component in (.*); do$', source, re.M) != ['nats caddy']:
+                raise ValueError('infra drop-in target loop changed')
+            if len(re.findall(r'^        if \[ "\$_wif_component" = nats \]; then _wif_unit=nats-server;.*else _wif_unit=caddy;', source, re.M)) != 1:
+                raise ValueError('infra drop-in target mapping changed')
+            for unit in ('nats-server', 'caddy'):
+                targets[(document['owner'], target.replace('$_wif_unit', unit))] += 1
+        else:
+            targets[(document['owner'], target)] += 1
+    if targets != Counter({identity: 1 for identity in EXPECTED_TARGETS}):
+        raise ValueError('exact template targetset mismatch: ' + repr(targets))
+    if stdout != EXPECTED_STDOUT:
+        raise ValueError('exact banner heredoc set mismatch: ' + repr(stdout))
+    if len(re.findall(r'^        } > "\$_dropin"$', source, re.M)) != 1:
+        raise ValueError('journald template output changed')
+    return documents
+
+
+def main():
+    try:
+        documents = check(Path(sys.argv[1]).read_text())
+    except (OSError, UnicodeError, ValueError) as error:
+        print('lint-install: ' + str(error), file=sys.stderr)
+        return 1
+    print('lint-install: OK (%d heredocs; exact template targetset; no active command substitution)' % len(documents))
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
+PYINSTALL

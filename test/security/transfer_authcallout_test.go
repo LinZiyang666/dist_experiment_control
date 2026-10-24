@@ -29,6 +29,7 @@ import (
 	"github.com/LinZiyang666/tether/internal/auth"
 	"github.com/LinZiyang666/tether/internal/broker"
 	"github.com/LinZiyang666/tether/internal/cli"
+	"github.com/LinZiyang666/tether/internal/jsstream"
 	"github.com/LinZiyang666/tether/internal/proto"
 	"github.com/LinZiyang666/tether/internal/session"
 	"github.com/LinZiyang666/tether/internal/storage"
@@ -569,7 +570,9 @@ func TestTierB_PullThenPush_AuthCallout(t *testing.T) {
 	if err != nil {
 		t.Fatalf("bind bucket: %v", err)
 	}
-	result, err := store.Get(getCtx, pr.ObjectKey)
+	// origin: control-connection-recovery internal validation. Exercise the
+	// production pull reader's consumer CREATE/NEXT/DELETE permissions too.
+	result, err := jsstream.GetTransferObject(getCtx, js, store, pr.Bucket, pr.ObjectKey)
 	if err != nil {
 		t.Fatalf("Get (PERM CHECK ctl side): %v", err)
 	}
@@ -580,6 +583,11 @@ func TestTierB_PullThenPush_AuthCallout(t *testing.T) {
 	}
 	if !bytes.Equal(got, payload) {
 		t.Errorf("pull byte mismatch (got=%d want=%d)", len(got), len(payload))
+	}
+	// The new reader owns an ephemeral consumer: successful bytes do not
+	// prove this role can release it. Assert DELETE under the same ctl JWT.
+	if err := result.Close(); err != nil {
+		t.Fatalf("Close (PERM CHECK ctl consumer cleanup): %v", err)
 	}
 
 	// Step 3: finalize so the broker writes audit + cleans the object.

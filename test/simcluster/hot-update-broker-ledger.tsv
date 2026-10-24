@@ -1,0 +1,11 @@
+# origin: hot-update S6 plan §12.1 P33 / §14
+# Claims stay NOT_RUN until source/artifact-bound native evidence is archived.
+# Costs here are measured marginal costs, never the launch estimates above.
+candidate_sha	arm	claim	status	blocked_by	legacy_owner	marginal_seconds	reader_digest	receipt
+-	37	native-parent-join	NOT_RUN	P29,P30,P35	-	-	-	-
+-	A	single-current-store-and-original-cohort	NOT_RUN	P01-P12,P18-P29,P30,P35	-	-	-	-
+-	A1	sole-voter-write-budget	NOT_RUN	P04,P11,P24,P26,P29,P30,P35	-	-	-	-
+-	B	quorum-maintenance-and-broker-scope	NOT_RUN	P11-P17,P24,P27,P29,P30,P35	-	-	-	-
+-	T	transfer-capable-live-cut-and-legacy-defer	NOT_RUN	P11,P24,P29,P30,P35	-	-	-	-
+-	R	held-salvage-and-active-current-rollback	NOT_RUN	P01-P12,P22,P26,P28,P29,P30,P35	-	-	-	-
+-	BR	legacy-n3-run-unwind	NOT_RUN	P29,P30,P35-signature-pin	hot-update-plan S6 legacy broker Run unwind; S8 legacy-to-capable first migration	-	-	-

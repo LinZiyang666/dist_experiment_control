@@ -11,7 +11,7 @@
 #
 # RULES (each has its own injection in tests/arm-manifest-selftest.sh):
 #   R1  manifest keys spelled exactly (`# fixtures:` is a typo the runner would silently ignore) and
-#       declared once each (a second line is silently ignored); arm names [A-Za-z0-9]+ and unique; at
+#       declared once each (a second line is silently ignored); arm names [A-Za-z0-9]+(-[A-Za-z0-9]+)* and unique; at
 #       least one arm
 #   R2  every arm has fixture ∈ the closed vocabulary, worst ≥ 60 (integer), grows an integer between
 #       the shared fixture's first grow site (floor — the lane would release the arm mid-grow) and the
@@ -55,7 +55,7 @@ case_block() {
         /^[ \t]*case "\$\{ARM:\?\}" in[ \t]*$/ && !inblk { inblk = 1; depth = 1; next }
         inblk {
             line = $0
-            if (depth == 1 && match(line, /^[ \t]*[A-Za-z0-9*|]+\)/)) {
+            if (depth == 1 && match(line, /^[ \t]*[-A-Za-z0-9*|]+\)/)) {
                 lab = substr(line, 1, RLENGTH); sub(/^[ \t]*/, "", lab); sub(/\)$/, "", lab)
                 printf "L\t%s\n", lab
                 line = substr(line, RLENGTH + 1)
@@ -89,13 +89,22 @@ for f in "$DRILLS"/*.sh; do
     arms=$(manifest_arms "$f")
     [ -n "$arms" ] || { bad "$d" "R1 '# arms:' names no arm"; continue; }
     for a in $arms; do
-        case "$a" in *[!A-Za-z0-9]*) bad "$d" "R1 arm name '$a' is not [A-Za-z0-9]+" ;; esac
+        manifest_arm_ok "$a" || bad "$d" "R1 arm name '$a' is not [A-Za-z0-9]+(-[A-Za-z0-9]+)*"
     done
     dups=$(printf '%s\n' $arms | sort | uniq -d)
     [ -z "$dups" ] || bad "$d" "R1 duplicate arm name(s): $(printf '%s' "$dups" | tr '\n' ' ')"
     # R2 — the bound is grow CAPACITY (grow_to_3 = two grows), not the token count: 96's arms each run
     # `grow_to_3 2 1` once and legitimately declare `# grows: 2`; a token count of 1 would refuse them.
-    tokens=$(manifest_grow_capacity "$f")
+    # The independent fixture registry must match every declaration, including
+    # N1 arms. Otherwise an N3 arm could release its grow lane before setup ends.
+    # origin: hot-update S8 plan §9.2 / P27 delegated N3 ledger request
+    delegated=$(manifest_delegated_grows "$f") || { bad "$d" "R2 delegated fixture call or growth registry is missing/invalid"; continue; }
+    if [ -n "$delegated" ]; then
+        declared=$(printf '%s\n' $arms | sort)
+        registered=$(printf '%s\n' "$delegated" | cut -f1 | sort)
+        [ "$declared" = "$registered" ] || bad "$d" "R2 delegated growth registry arms differ from the manifest"
+    fi
+    tokens=$(manifest_grow_capacity "$f") || { bad "$d" "R2 growth capacity cannot be read"; continue; }
     floor=$(manifest_shared_grow_floor "$f")
     for a in $arms; do
         fx=$(manifest_value "$f" fixture "$a")
@@ -116,6 +125,10 @@ for f in "$DRILLS"/*.sh; do
                # declaring fewer grows than that first shared grow site performs would leave the lane mid-grow.
                [ "$g" -ge "$floor" ] || bad "$d" "R2 arm $a declares grows=$g but the shared fixture above the ARM case performs $floor grow(s) before any arm runs (the lane would release it mid-grow)" ;;
         esac
+        if [ -n "$delegated" ]; then
+            registered=$(printf '%s\n' "$delegated" | awk -F'\t' -v a="$a" '$1 == a { print $2 " " $3 }')
+            [ "$registered" = "$fx $g" ] || bad "$d" "R2 arm $a fixture/grows differ from the delegated growth registry"
+        fi
         fg=$(manifest_value "$f" forgoes "$a")
         [ -n "$fg" ] || bad "$d" "R2 arm $a has no forgoes token ('-' means none)"
     done
@@ -176,7 +189,7 @@ EOF
         BEGIN { RE_OPEN = "(^|[;&|(){} \t])case[ \t]"; RE_CLOSE = "(^|[;&|(){} \t])esac([ \t;]|$)" }
         /^[ \t]*case "\$\{ARM:\?\}" in[ \t]*$/ && !s { s = 1; depth = 1; next }
         s { line = $0
-            if (depth == 1 && match(line, /^[ \t]*[A-Za-z0-9*|]+\)/)) line = substr(line, RLENGTH + 1)
+            if (depth == 1 && match(line, /^[ \t]*[-A-Za-z0-9*|]+\)/)) line = substr(line, RLENGTH + 1)
             code = line; if (code ~ /^[ \t]*#/) code = ""; else sub(/[ \t]#.*$/, "", code)
             depth += count(code, RE_OPEN) - count(code, RE_CLOSE)
             if (depth <= 0) { print NR; exit } }' "$f")

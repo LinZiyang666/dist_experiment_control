@@ -16,7 +16,7 @@
 # FALSE-GREEN GUARDS:
 #  - dry-run zero-write asserted by a CONTENT+metadata manifest (sha256/mode/numeric-uid-gid/link), fail-closed on
 #    any traversal/stat/hash error (_snap returns a unique sentinel), not exit-0 and not a path-name md5.
-#  - never-start asserted by `! pgrep -x tether` (NOT `is-active`, which a masked unit would also satisfy).
+#  - never-start asserts the complete product executable/cgroup set and management socket state.
 #  - ownership asserted with real stat -c %U against the install.sh layout (no sim chown — Mandate ①).
 #  - §8.4 asserted by REAL tunneled bytes recovering (curl the sentinel) + version-flip ∧ MainPID-changed together
 #    ("no upgrade happened" also satisfies convergence + would leave the version on v-cur).
@@ -37,7 +37,9 @@ F=fresh32
 # 128+signo on INT/TERM without resuming. Cleanup body unchanged.
 _cleanup() { artifact_down 2>/dev/null; rm_node "$F" --vols 2>/dev/null; }
 drill_install_traps _cleanup
-IN()    { dexec "$F" -- "$@"; }
+# origin: hot-update S9 plan §6.4 / T81. Offline validation consumes the
+# P26 supply directory; installed /usr/local/bin is not a release manifest.
+IN()    { dexec "$F" -- env INFRA_SUPPORT_DIR=/opt/sim/infra "$@"; }
 INSIM() { dexec -u sim "$F" -- env HOME=/home/sim "$@"; }
 _systemd_up() { IN systemctl is-system-running 2>/dev/null | grep -qE 'running|degraded|starting'; }
 # CONTENT+METADATA manifest (external-review M5 + self-review R3-M4): a --dry-run must change NOTHING, so the
@@ -47,35 +49,77 @@ _systemd_up() { IN systemctl is-system-running 2>/dev/null | grep -qE 'running|d
 # 1000→1001 keeping the same NAME left the digest byte-identical); (2) symlinks now record their OWN mode/uid/gid
 # (was path+target only — an owner change on a symlink was invisible); (3) a catch-all "O" branch records FIFO/
 # socket/device/other types (were dropped by the L/D/F chain); (4) `while IFS= read -r` replaces `for f in $(find)`
-# so whitespace-bearing paths are not word-split. Residual gap (noted, not faked): embedded-NEWLINE paths would
-# still split — dash `read` has no `-d ''`; the tether/nats system paths never contain newlines.
+# so whitespace-bearing paths are not word-split. S9 replaces that remaining line-oriented boundary with
+# Python path enumeration: embedded newlines now remain one path, and directory/read errors propagate.
+# A readable root plus an unreadable subtree must never become a partial successful manifest; that was the
+# R5-M4 find-pipeline defect. Absent roots are explicit records, while traversal/stat/hash failures stay red.
+# origin: hot-update S9 plan §6.4 / §9.4 / T81. Enumerate complete roots,
+# including absent roots and names without tether/nats. A filename filter hid
+# Caddy storage, helper slots, journals, keys and newly installed unit files.
+# INSTALL_MANIFEST_ROOT is only the hermetic test prefix; deploy leaves it empty.
 _manifest() {
-    # external-review R5-M4: CAPTURE the traversal rc + stderr — the old `find ... 2>/dev/null | grep | sort`
-    # made grep/sort the pipeline exit, so a PARTIAL traversal (a readable root + an unreadable subtree) emitted a
-    # nonempty partial list with NO error marker and was accepted as "zero write", HIDING files under the failed
-    # subtree. Now: enumerate only roots that EXIST (a not-yet-created root is benign ENOENT, not a failure), run
-    # find with stderr captured + rc checked, and emit MANIFEST-FIND-ERR (a fail-closed sentinel _snap rejects) on
-    # ANY traversal error (EACCES on a subtree) so a permission/read failure can never certify zero-write.
-    IN sh -c '_roots=""; for r in /etc/tether /home/sim/.tether /home/sim/.local/bin /etc/systemd/system; do [ -e "$r" ] && _roots="$_roots $r"; done
-[ -n "$_roots" ] || { echo "MANIFEST-EMPTY-ROOTS-MISSING"; exit 0; }
-_ferr=$(find $_roots 2>&1 1>/tmp/_mf.out); _frc=$?
-if [ "$_frc" != 0 ] || [ -n "$_ferr" ]; then echo "MANIFEST-FIND-ERR rc=$_frc"; rm -f /tmp/_mf.out; exit 0; fi
-_out=$(grep -iE "tether|nats" /tmp/_mf.out | sort); rm -f /tmp/_mf.out
-[ -n "$_out" ] || { echo "MANIFEST-EMPTY-ROOTS-MISSING"; exit 0; }
-printf "%s\n" "$_out" | while IFS= read -r f; do
-if [ -L "$f" ]; then printf "L %s [%s] -> %s\n" "$f" "$(stat -c "%a|%u|%g" "$f" 2>/dev/null || echo STATERR)" "$(readlink "$f" 2>/dev/null || echo LINKERR)";
-elif [ -d "$f" ]; then printf "D %s [%s]\n" "$f" "$(stat -c "%a|%u|%g" "$f" 2>/dev/null || echo STATERR)";
-elif [ -f "$f" ]; then _st=$(stat -c "%a|%u|%g|%s" "$f" 2>/dev/null || echo STATERR); _h=$(sha256sum "$f" 2>/dev/null | cut -d" " -f1); printf "F %s [%s] %s\n" "$f" "$_st" "${_h:-HASHERR}";
-else printf "O %s [%s]\n" "$f" "$(stat -c "%F|%a|%u|%g" "$f" 2>/dev/null || echo STATERR)";
-fi
-done'
+    IN python3 -c '
+import hashlib, json, os, stat, sys
+from pathlib import Path
+roots = (
+    "/etc/tether", "/etc/caddy", "/home/sim/.tether", "/home/sim/.local/bin",
+    "/home/sim/.config/systemd", "/etc/systemd/system", "/etc/systemd/journald.conf",
+    "/etc/systemd/journald.conf.d", "/usr/local/bin", "/usr/local/libexec",
+    "/var/lib/tether", "/var/lib/tether-infra", "/var/lib/caddy", "/var/log/tether",
+    "/root/.local/share/caddy", "/run/tether", "/run/tether-infra",
+    "/var/run/tether", "/var/lib/tether-upgrade", "/home/sim/.zsh/completions",
+    "/usr/local/share/zsh/site-functions", "/usr/share/zsh/site-functions",
+    "/etc/passwd", "/etc/group", "/etc/shadow", "/etc/gshadow", "/etc/subuid", "/etc/subgid",
+)
+prefix = Path(sys.argv[1] or "/")
+rows = []
+def visit(path, logical):
+    before = path.lstat()
+    row = dict(path=logical, type=stat.S_IFMT(before.st_mode), mode=stat.S_IMODE(before.st_mode),
+               uid=before.st_uid, gid=before.st_gid, size=before.st_size,
+               mtime_ns=before.st_mtime_ns, link="", sha256="")
+    if stat.S_ISLNK(before.st_mode):
+        row["link"] = os.readlink(path)
+    elif stat.S_ISREG(before.st_mode):
+        with path.open("rb") as source:
+            opened = os.fstat(source.fileno())
+            if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+                raise OSError("manifest file changed before read")
+            row["sha256"] = hashlib.file_digest(source, "sha256").hexdigest()
+    elif stat.S_ISDIR(before.st_mode):
+        for name in sorted(os.listdir(path)):
+            visit(path / name, logical + "/" + name)
+    after = path.lstat()
+    if (before.st_dev, before.st_ino, before.st_mode, before.st_uid, before.st_gid,
+        before.st_size, before.st_mtime_ns) != (after.st_dev, after.st_ino, after.st_mode,
+        after.st_uid, after.st_gid, after.st_size, after.st_mtime_ns):
+        raise OSError("manifest changed during observation")
+    rows.append(row)
+try:
+    for root in roots:
+        path = prefix / root.lstrip("/")
+        # lstat retains dangling symlinks and propagates EACCES. lexists would
+        # turn an unreadable parent into a benign absent root.
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            rows.append(dict(path=root, absent=True))
+        else:
+            visit(path, root)
+    if all(row.get("absent", False) for row in rows):
+        raise OSError("all install roots are missing")
+    print(json.dumps(sorted(rows, key=lambda row: row["path"]), sort_keys=True, separators=(",", ":")))
+except (OSError, ValueError) as error:
+    print("MANIFEST-FIND-ERR " + type(error).__name__)
+    sys.exit(2)
+' "${INSTALL_MANIFEST_ROOT:-}"
 }
 # fail-CLOSED (external-review R4-M4): the manifest must be NON-EMPTY (roots exist) AND carry NO error marker — an
 # empty digest or a serialized stat/hash/readlink error must NEVER certify "zero write" (two equally-failed snaps
 # would otherwise compare equal). _snap returns the md5 ONLY for a valid manifest; else a UNIQUE sentinel that
 # cannot equal any real snapshot (so every zero-write assertion FAILS on an invalid manifest).
 _snap() {
-    _m=$(_manifest)
+    _m=$(_manifest) || { printf 'MANIFEST-INVALID-READ'; return 1; }
     if [ -z "$_m" ] || printf '%s' "$_m" | grep -qE 'MANIFEST-EMPTY|MANIFEST-FIND|STATERR|HASHERR|LINKERR'; then
         printf 'MANIFEST-INVALID-%s' "$(printf '%s' "$_m" | md5sum | cut -d' ' -f1)"; return 1
     fi
@@ -94,7 +138,139 @@ _manifest_detects_content() {
     _mf2=$(_snap) || return 1
     [ "$_mf0" != "$_mf1" ] && [ "$_mf0" = "$_mf2" ]   # mutation MOVED the digest AND the byte-exact restore returned it
 }
-_no_tether_running() { ! IN pgrep -x tether >/dev/null 2>&1; }
+# origin: hot-update S9 plan §6.4 / T81. comm truncates helper/launcher names
+# to 15 bytes; inspect exe instead of pgrep -x. Scan all cgroups as well as
+# service state so a transient worker cannot hide outside a named service.
+_no_tether_running() {
+    IN python3 -c '
+import os, sys
+from pathlib import Path
+names = {"tether", "nats-server", "caddy", "tether-infra-helper", "tether-infra-launch"}
+def traversal_error(error):
+    raise error
+try:
+    for proc in Path("/proc").iterdir():
+        if not proc.name.isdigit():
+            continue
+        try:
+            exe = os.readlink(proc / "exe").removesuffix(" (deleted)")
+        except FileNotFoundError:
+            continue
+        if Path(exe).name in names or exe.startswith("/var/lib/tether-infra/artifacts/"):
+            sys.exit(1)
+    cgroups = Path("/sys/fs/cgroup")
+    if not cgroups.is_dir():
+        raise OSError("cgroup census unavailable")
+    for directory, _, files in os.walk(cgroups, onerror=traversal_error):
+        if "cgroup.procs" not in files:
+            continue
+        group = Path(directory) / "cgroup.procs"
+        if any(name in str(group) for name in names) and group.read_text().strip():
+            sys.exit(1)
+except OSError:
+    sys.exit(2)
+' || return 1
+    IN sh -eu -c '
+for unit in tether-broker.service tether-agent.service nats-server.service caddy.service tether-infra-helper.socket; do
+    state=$(systemctl show "$unit" -p ActiveState --value) || exit 1
+    case "$state" in inactive|failed) ;; *) exit 1 ;; esac
+done'
+}
+
+# origin: hot-update S9 plan §6.4 / T81. An inactive process check cannot see a
+# new firewall rule or listener. Observe the real sandbox kernel around installs;
+# these reads do not bootstrap management or write nft rules on its behalf.
+_install_kernel_snapshot() {
+    IN sh -eu -c 'nft --json list ruleset; ss -H -lntup' || return 1
+}
+_install_kernel_unchanged() {
+    _iks=$(_install_kernel_snapshot) || return 1
+    [ "$_iks" = "$INSTALL_KERNEL_BEFORE" ]
+}
+
+# origin: hot-update S9 plan §6.5 / §9.4 / T81. Use the P26 archive AS SUPPLIED,
+# not artifact_up's single-binary convenience tarball. Do not synthesize a
+# missing installer manifest: that is a release-supply defect, not drill setup.
+_broker_archive_supply() {
+    BROKER_ARCHIVE="$HERE/vendor/infra/tether_support_current_linux_amd64.tar.gz"
+    _bas_identity=$(python3 -c '
+import hashlib, json, re, sys, tarfile
+from pathlib import Path
+archive = Path(sys.argv[1])
+try:
+    supply = json.loads((archive.parent / "support-source.json").read_bytes())
+    generations = [row for row in supply["generations"] if row["version"] == "current"]
+    if len(generations) != 1:
+        raise ValueError("missing current archive identity")
+    digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+    if generations[0]["archive"] != archive.name or generations[0]["archive_sha256"] != digest:
+        raise ValueError("supplied archive hash mismatch")
+    with tarfile.open(archive) as package:
+        members = package.getmembers()
+        names = [member.name for member in members]
+        required = {"tether", "tether-infra-helper", "tether-infra-launch", "infra-catalog.json", "infra-support.manifest"}
+        if len(names) != len(set(names)) or not required <= set(names):
+            raise ValueError("archive lacks installer support members")
+        if any(not member.isfile() or member.name.startswith("/") or ".." in Path(member.name).parts for member in members):
+            raise ValueError("unsafe archive member")
+        manifest = package.extractfile("infra-support.manifest").read(4097)
+        if len(manifest) > 4096:
+            raise ValueError("oversize support manifest")
+        versions = re.findall(rb"(?m)^release ([A-Za-z0-9._+-]+)$", manifest)
+        if len(versions) != 1:
+            raise ValueError("missing exact release identity")
+        for name in required - {"infra-support.manifest", "tether"}:
+            expected = re.findall(rb"(?m)^sha256 ([a-f0-9]{64}) " + re.escape(name.encode()) + rb"$", manifest)
+            actual = hashlib.sha256(package.extractfile(name).read()).hexdigest().encode()
+            if expected != [actual]:
+                raise ValueError("support manifest does not bind archive bytes")
+    print(versions[0].decode(), digest, hashlib.sha256(manifest).hexdigest())
+except (OSError, ValueError, KeyError, TypeError, tarfile.TarError):
+    sys.exit(2)
+' "$BROKER_ARCHIVE") || return 2
+    BROKER_SUPPORT_SHA=${_bas_identity##* }
+    _bas_identity=${_bas_identity% *}
+    BROKER_ARCHIVE_VERSION=${_bas_identity% *}
+    BROKER_ARCHIVE_SHA=${_bas_identity##* }
+    BROKER_ARCHIVE_NAME="tether_${BROKER_ARCHIVE_VERSION#v}_linux_amd64.tar.gz"
+    d cp "$BROKER_ARCHIVE" "$(ctr_name "$ARTIFACT_NODE"):/artifacts/$BROKER_ARCHIVE_NAME" || return 2
+    _bas_actual=$(dexec "$ARTIFACT_NODE" -- sha256sum "/artifacts/$BROKER_ARCHIVE_NAME") || return 2
+    [ "${_bas_actual%% *}" = "$BROKER_ARCHIVE_SHA" ] || return 2
+    dexec "$ARTIFACT_NODE" -- sh -c 'printf "%s  %s\n" "$1" "$2" >> /artifacts/SHA256SUMS' \
+        archive-checksum "$BROKER_ARCHIVE_SHA" "$BROKER_ARCHIVE_NAME"
+}
+
+_broker_archive_install() {
+    IN sh "$INST" --role broker --source-base "https://$INSTANCE-artifact" \
+        --version "$BROKER_ARCHIVE_VERSION" --domain brkx --acme-email x@x.test
+}
+
+_broker_archive_installed() {
+    # A reinstall may stage-only under the product domain. Read immutable slots
+    # and require the manifest plus both complete executables, without invoking
+    # a privileged candidate just to discover its version.
+    IN python3 -c '
+import hashlib, sys
+from pathlib import Path
+try:
+    for manifest in Path("/var/lib/tether-infra/artifacts").glob("*/infra-support.manifest"):
+        if hashlib.sha256(manifest.read_bytes()).hexdigest() != sys.argv[2]:
+            continue
+        lines = manifest.read_text().splitlines()
+        if "release " + sys.argv[1] not in lines:
+            continue
+        for name in ("tether-infra-helper", "tether-infra-launch", "infra-catalog.json"):
+            path = manifest.parent / name
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            if lines.count("sha256 " + digest + " " + name) != 1:
+                raise ValueError("installed support hash mismatch")
+        sys.exit(0)
+except (OSError, ValueError):
+    sys.exit(1)
+sys.exit(1)
+' "$BROKER_ARCHIVE_VERSION" "$BROKER_SUPPORT_SHA"
+}
+
 _owner_is() { [ "$(IN stat -c '%U' "$1" 2>/dev/null)" = "$2" ]; }
 _broker_install() { IN sh -c "sh $INST --role broker --skip-download --domain brkx --acme-email x@x.test"; }
 _ownership_ok() { _owner_is /etc/tether root && _owner_is /etc/tether/nats.d tether; }
@@ -110,6 +286,10 @@ _agent_layout() {
     printf '%s' "$_o" | grep -qE '\.local/bin'
 }
 
+INFRA_LIBRARY_ONLY=1
+. "$HERE/drills/85-hot-update-nats.sh"
+unset INFRA_LIBRARY_ONLY
+infra_drill_supervise "$@"
 drill_begin "32-install-lifecycle (fresh container install.sh lifecycle)"
 "$SIM" nuke >/dev/null 2>&1 || true
 rm_node "$F" --vols 2>/dev/null || true
@@ -117,13 +297,18 @@ run_node broker "$F"
 assert_ok "fresh bare container systemd up (NOT provisioned)"  poll_until 30 2 "systemd running" -- _systemd_up
 
 # ── dry-run zero-write (three roles; tree byte-identical after all three) ─────
-B0=$(_snap); log "32: pre-dryrun tree md5=$B0"
+B0=$(_snap) || setup_fail 'complete install root snapshot failed'
+INSTALL_KERNEL_BEFORE=$(_install_kernel_snapshot) || setup_fail 'sandbox nft/listener observation unavailable'
+log "32: pre-dryrun tree md5=$B0"
 # M5: ctl/agent are USER tools — run their dry-runs as the SIM user (not root), the production identity. broker
 # is root (system service). The content+metadata manifest (B0) is captured as root so it still sees /home/sim writes.
 assert_ok "ctl --dry-run as sim (zero download/chmod/write)"     INSIM sh -c "sh $INST --role ctl --dry-run"
 assert_ok "agent --dry-run as sim (needs dummy broker/session/nid)"  INSIM sh -c "sh $INST --role agent --dry-run --broker wss://brkx/nats --session lab --nid a1 --pin 111111"
 assert_ok "broker --dry-run as root (skip-download)"              IN sh -c "sh $INST --role broker --dry-run --skip-download --domain brkx --acme-email x@x.test"
 assert_ok "dry-run ZERO write (CONTENT+metadata manifest byte-identical after 3 dry-runs — sha256/mode/owner/link, not just path names; M5)"  _snap_is "$B0"
+
+assert_ok "dry-run never starts tether NATS Caddy helper launcher or a management socket" _no_tether_running
+assert_ok "dry-run leaves sandbox nft rules and listeners unchanged" _install_kernel_unchanged
 
 # ── real broker install → never-start + ownership + manifest content-sensitivity self-test ─────
 assert_ok "broker install (real, skip-download uses baked binaries)"  _broker_install
@@ -217,6 +402,7 @@ assert_ok "reinstall broker idempotent after the full-symmetry uninstall"  _brok
 assert_ok "uninstall broker → tether-broker.service removed"  _uninstall_zeroed
 assert_ok "reinstall broker idempotent (clean second install)"  _broker_install
 assert_ok "reinstall still never-starts"  _no_tether_running
+assert_ok "all offline installs leave sandbox nft rules and listeners unchanged" _install_kernel_unchanged
 
 # ── agent install → ~/.local/bin (S0-layout: user-writable, per install.sh BIN_DIR=$HOME/.local/bin) ─────
 assert_ok "agent install (as sim) targets ~/.local/bin (user-writable BIN_DIR; node upgrade atomic-replace target; S0-layout)"  _agent_layout
@@ -247,6 +433,15 @@ assert_ok "CTL-real install.sh --role ctl REAL-downloads+extracts the S0-artifac
 assert_ok "CTL-real the placed ctl binary RUNS ('tether version' — genuine extraction, not a dry-run no-op)"  _ctl_bin_runs
 assert_ok "CTL-real never-start: install.sh --role ctl started nothing (ctl is a user tool — installs no service at all)"  _no_tether_running
 assert_ok "CTL-real uninstall REMOVES the placed ctl binary (~/.local/bin/tether gone)"  _ctl_uninstalled
+
+# Keep the existing agent/ctl real-download paths above. This extra broker
+# boundary exercises archive extraction of helper/launcher through install.sh.
+_broker_archive_supply || setup_fail 'BROKER-real P26 release archive lacks installer-compatible support files'
+assert_ok "BROKER-real P26 release archive contains installer-compatible support files" true
+assert_ok "BROKER-real install downloads and extracts the verified complete support archive" _broker_archive_install
+assert_ok "BROKER-real both supporting executables match the installed immutable manifest" _broker_archive_installed
+assert_ok "BROKER-real never-start includes NATS Caddy helper launcher units and cgroups" _no_tether_running
+assert_ok "BROKER-real installation leaves nft rules and listeners unchanged" _install_kernel_unchanged
 artifact_down 2>/dev/null || true
 
 # ── §8.4 SINGLE-BROKER MANUAL UPGRADE (external-review R5-M4: locked plan §4-32 §8.4; broker-ops.md:530-537) ──

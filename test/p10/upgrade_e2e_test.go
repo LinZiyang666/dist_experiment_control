@@ -11,19 +11,23 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
-	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/agent"
+	"github.com/LinZiyang666/tether/internal/agentimage"
+	"github.com/LinZiyang666/tether/internal/auth"
+	"github.com/LinZiyang666/tether/internal/binaryupgrade"
 	"github.com/LinZiyang666/tether/internal/broker"
 	"github.com/LinZiyang666/tether/internal/proto"
 	"github.com/LinZiyang666/tether/internal/session"
 	"github.com/LinZiyang666/tether/internal/testharness"
+	"github.com/LinZiyang666/tether/internal/upgradecli"
+	"github.com/LinZiyang666/tether/internal/upgradetx"
 	"github.com/LinZiyang666/tether/test/stackharness"
 	"github.com/nats-io/nats.go"
 )
@@ -57,7 +61,7 @@ func startBroker(t *testing.T, url string, db *sql.DB, allow []string) func() {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
 	go func() { done <- b.Run(ctx) }()
 	// Wait for broker.Run to actually install all subscriptions —
@@ -105,7 +109,7 @@ func startAgentWithUpgrade(t *testing.T, url, sid, nid string, exePath string, a
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
 	go func() { done <- a.Run(ctx) }()
 	time.Sleep(300 * time.Millisecond)
@@ -135,12 +139,45 @@ func upgradeRequest(t *testing.T, nc *nats.Conn, sid, actor, nid string, req pro
 	return resp
 }
 
+// Both legacy hops must refuse independently. Sending the old forwarded
+// envelope here is a negative control, never authority to install or migrate.
+// origin: hot-update S8 plan §7.2 / FIX-INST handoff
+func agentHandlerUpgradeRequest(t *testing.T, nc *nats.Conn, sid, actor, nid string, req proto.UpgradeReq) proto.UpgradeResp {
+	t.Helper()
+	refused := upgradeRequest(t, nc, sid, actor, nid, req)
+	if refused.OK || refused.NewVersion != "" || refused.Code != "try_again" || refused.Error != "legacy_quiescence_unproved" {
+		t.Fatalf("unfenced legacy request bypassed migration policy: %+v", refused)
+	}
+	fp, err := auth.FingerprintFromActor(actor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := json.Marshal(proto.UpgradeForwardedReq{URL: req.URL, SHA256: req.SHA256, ActorFP: fp})
+	if err != nil {
+		t.Fatal(err)
+	}
+	message, err := nc.Request(proto.SubjCmdForwarded(sid, nid, "upgrade"), body, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var forwarded proto.UpgradeForwardedResp
+	if err := json.Unmarshal(message.Data, &forwarded); err != nil {
+		t.Fatal(err)
+	}
+	if forwarded.BinaryReplaced {
+		t.Fatalf("grantless forwarded request replaced the binary: %+v", forwarded)
+	}
+	return proto.UpgradeResp{OK: forwarded.OK, Code: forwarded.Code, Error: forwarded.Error, NewVersion: forwarded.NewVersion}
+}
+
 // fakeTetherScript returns an EXECUTABLE stand-in for a tether release binary:
 // a shell script that answers `version` the way cmd/tether does
 // (`tether <tag> (proto vN)`). The upgrade-safety smoke gate execs the staged
 // binary before the install flips, so happy-path fixtures must actually run —
 // the old inert []byte("payload") fixtures only exercise the paths that fail
-// BEFORE the smoke gate. origin: upgrade-safety plan §7 (fixture migration).
+// BEFORE the smoke gate. S8 probes these bytes through FetchCandidate on the
+// ctl host; a normalized version alone confers no hot-cut capability or grant.
+// origin: upgrade-safety plan §7 (fixture migration); hot-update S8 plan §5.2.
 func fakeTetherScript(version string) []byte {
 	return []byte("#!/bin/sh\necho 'tether " + version + " (proto v2)'\n")
 }
@@ -362,145 +399,94 @@ func TestUpgradeNodeOfflineRejected(t *testing.T) {
 
 // ----- agent-side flow tests -----------------------------------------------
 
-// TestUpgradeReplacesBinaryHappyPath drives the full path: live
-// broker + live agent + a real local HTTP server hosting a fake
-// tarball. The agent's UpgradeExecutablePath is pinned to a
-// sandbox file so the install actually rewrites it (we then read
-// it back and assert the new content matches). Without
-// UpgradeExecutablePath the test would silently overwrite the
-// go-test binary, which is gross even when it works.
-func TestUpgradeReplacesBinaryHappyPath(t *testing.T) {
-	url := startNATS(t)
-	db := openDB(t)
-	pub, fp := freshUserPub(t)
-	seedSession(t, db, "lab", fp)
+// Fixtures using agentHandlerUpgradeRequest assert the legacy broker refusal
+// and the agent's independent refusal of the obsolete forwarded envelope.
+// origin: hot-update S8 plan §7.2 / FIX-INST handoff
 
-	binBody := fakeTetherScript("v9.9.9-test")
-	tarball, sum := makeTarball(t, binBody)
-
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write(tarball)
-	}))
-	defer srv.Close()
-
-	// Sandbox the install target. Pre-write a sentinel so we can
-	// detect the atomic rename actually happened.
-	sandbox := t.TempDir()
-	exePath := filepath.Join(sandbox, "tether")
-	if err := os.WriteFile(exePath, []byte("OLD"), 0o755); err != nil {
-		t.Fatal(err)
+// Candidate extraction still preserves the normalized release, exact content
+// and mode. The old fake release cannot authorize a disk flip: S8 requires
+// stage + Start under the original target-issued grant. The sandbox sentinel
+// and absence of a newly-created prev/marker must survive both legacy hops.
+// origin: hot-update S8 plan §3.3 / §5.1 / §5.2 / §7.2; S8 internal review R2/R5/R6 P10
+func TestUpgradeLegacyInstallRequiresTransaction(t *testing.T) {
+	g, fd := runtime.NumGoroutine(), testharness.FDCount()
+	for round := 0; round < 5; round++ {
+		t.Run(fmt.Sprintf("round-%d", round), func(t *testing.T) { exerciseUpgradeLegacyInstall(t) })
 	}
-
-	defer startBroker(t, url, db, []string{srv.URL})()
-	defer startAgentWithUpgrade(t, url, "lab", "lab-1", exePath, []string{srv.URL})()
-
-	nc, _ := nats.Connect(url)
-	defer nc.Close()
-
-	resp := upgradeRequest(t, nc, "lab", pub, "lab-1", proto.UpgradeReq{
-		URL:          srv.URL + "/tether.tar.gz",
-		SHA256:       sum,
-		ProtoVersion: proto.ProtoVersion,
-	})
-	if !resp.OK {
-		t.Fatalf("expected OK upgrade; got %+v", resp)
-	}
-	// The smoke gate guarantees NewVersion is the NORMALIZED release tag (what
-	// the new binary will report as ReleaseVersion on register) — ctl --wait's
-	// equality check rides on this exact string.
-	if resp.NewVersion != "v9.9.9-test" {
-		t.Errorf("NewVersion: got %q, want the normalized tag %q", resp.NewVersion, "v9.9.9-test")
-	}
-
-	// Sentinel must have been replaced with the new binary content.
-	got, err := os.ReadFile(exePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(got, binBody) {
-		t.Errorf("post-upgrade binary content:\n  got %q\n  want %q",
-			string(got), string(binBody))
-	}
-	fi, err := os.Stat(exePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if mode := fi.Mode().Perm(); mode != 0o755 {
-		t.Errorf("post-upgrade binary mode: got %o want 0755", mode)
-	}
-
-	// upgrade-safety plan §3.1: the flip must leave the OLD binary in the prev
-	// slot and a pending marker beside it — that pair IS the rollback path.
-	prev, err := os.ReadFile(exePath + ".prev")
-	if err != nil {
-		t.Fatalf("prev slot missing after install: %v", err)
-	}
-	if string(prev) != "OLD" {
-		t.Errorf("prev slot content: got %q, want the pre-upgrade sentinel", string(prev))
-	}
-	markerRaw, err := os.ReadFile(filepath.Join(sandbox, ".tether-upgrade.json"))
-	if err != nil {
-		t.Fatalf("upgrade marker missing after install: %v", err)
-	}
-	var marker struct {
-		State      string `json:"state"`
-		NewVersion string `json:"new_version"`
-	}
-	if err := json.Unmarshal(markerRaw, &marker); err != nil {
-		t.Fatal(err)
-	}
-	if marker.State != "pending" || marker.NewVersion != "v9.9.9-test" {
-		t.Errorf("marker after install: got state=%q new_version=%q, want pending/v9.9.9-test",
-			marker.State, marker.NewVersion)
-	}
+	testharness.AssertNoGoroutineLeak(t, "TestUpgradeLegacyInstallRequiresTransaction", g)
+	testharness.AssertNoFDLeak(t, "TestUpgradeLegacyInstallRequiresTransaction", fd, 0)
 }
 
-// TestUpgradeSmokeGateRejectsNonBinary: a tarball whose sha VERIFIES but whose
-// `tether` entry cannot exec (inert bytes — wrong arch, truncation, not a
-// binary) must be refused by the smoke gate BEFORE anything on disk changes:
-// no flip, no prev slot, no marker. origin: upgrade-safety plan §3.2 F2.
-func TestUpgradeSmokeGateRejectsNonBinary(t *testing.T) {
-	url := startNATS(t)
-	db := openDB(t)
-	pub, fp := freshUserPub(t)
-	seedSession(t, db, "lab", fp)
-
-	tarball, sum := makeTarball(t, []byte("real content, but not executable"))
-
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write(tarball)
-	}))
-	defer srv.Close()
-
-	sandbox := t.TempDir()
-	exePath := filepath.Join(sandbox, "tether")
-	if err := os.WriteFile(exePath, []byte("OLD"), 0o755); err != nil {
+func exerciseUpgradeLegacyInstall(t *testing.T) {
+	f := newUpgradeFixture(t, fakeTetherScript("v9.9.9-test"))
+	before := captureUpgradeDisk(t, f)
+	candidate, err := upgradecli.FetchCandidate(upgradetx.ComponentAgent, f.request().URL, f.archiveSHA,
+		binaryupgrade.FetchURL, probeUpgradeCandidate)
+	if err != nil {
 		t.Fatal(err)
 	}
+	defer func() { _ = candidate.Close() }()
+	// Keep the original extraction, normalized release and executable-mode
+	// assertions at the S8 candidate owner. They do not certify activation.
+	if candidate.Release != "v9.9.9-test" {
+		t.Fatalf("candidate release: got %q, want v9.9.9-test", candidate.Release)
+	}
+	got, err := os.ReadFile(candidate.Path)
+	if err != nil || !bytes.Equal(got, fakeTetherScript("v9.9.9-test")) {
+		t.Fatalf("candidate content: got %q err=%v", got, err)
+	}
+	info, err := os.Stat(candidate.Path)
+	if err != nil || info.Mode().Perm() != 0o755 {
+		t.Fatalf("candidate mode: got %v err=%v, want 0755", info, err)
+	}
+	target, err := upgradecli.DescribeNode(t.Context(), f.session(), "lab-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := upgradecli.BuildPrepare(target, candidate, f.fp, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	grant, err := upgradecli.NodeEndpoint(f.session(), "lab-1", 5*time.Second).Prepare(t.Context(), target.Key, req)
+	if err != nil || grant.Handle.Key != f.keys["lab-1"] || len(grant.Handle.TxID) != 32 ||
+		grant.SourceSHA != target.SourceSHA || grant.TargetSHA != candidate.SHA || grant.ActorFP != f.fp || grant.Issuer.PID != os.Getpid() {
+		t.Fatalf("target did not issue the inert candidate-bound grant: %+v err=%v", grant, err)
+	}
+	// A prepared grant still needs explicit publication and Start. Neither
+	// a successful version probe nor the old URL envelope supplies those.
+	requests := f.requests.Load()
+	resp := agentHandlerUpgradeRequest(t, f.nc, "lab", f.pub, "lab-1", f.request())
+	assertUpgradeRefusal(t, resp, "upgrade_deferred", "a target-issued upgrade transaction is required", 75)
+	assertNoUpgradeDownload(t, f, requests)
+	assertUpgradeDiskUnchanged(t, before)
+}
 
-	defer startBroker(t, url, db, []string{srv.URL})()
-	defer startAgentWithUpgrade(t, url, "lab", "lab-1", exePath, []string{srv.URL})()
+// A SHA-valid archive containing inert bytes (wrong arch or truncation) must
+// fail the real version probe before any binary/prev/marker mutation. S8 moved
+// download and the first smoke gate to the ctl's pre-prepare candidate owner.
+// origin: hot-update S8 plan §3.3 / §5.1 / §5.2 / §7.2; S8 internal review R2/R5/R6 P10
+func TestUpgradeSmokeGateRejectsNonBinary(t *testing.T) {
+	g, fd := runtime.NumGoroutine(), testharness.FDCount()
+	for round := 0; round < 5; round++ {
+		t.Run(fmt.Sprintf("round-%d", round), func(t *testing.T) { exerciseUpgradeSmokeGate(t) })
+	}
+	testharness.AssertNoGoroutineLeak(t, "TestUpgradeSmokeGateRejectsNonBinary", g)
+	testharness.AssertNoFDLeak(t, "TestUpgradeSmokeGateRejectsNonBinary", fd, 0)
+}
 
-	nc, _ := nats.Connect(url)
-	defer nc.Close()
-
-	resp := upgradeRequest(t, nc, "lab", pub, "lab-1", proto.UpgradeReq{
-		URL:          srv.URL + "/tether.tar.gz",
-		SHA256:       sum,
-		ProtoVersion: proto.ProtoVersion,
-	})
-	if resp.OK || !strings.Contains(resp.Code, "smoke_failed") {
-		t.Fatalf("expected smoke_failed; got %+v", resp)
+func exerciseUpgradeSmokeGate(t *testing.T) {
+	f := newUpgradeFixture(t, []byte("real content, but not executable"))
+	before := captureUpgradeDisk(t, f)
+	candidate, err := upgradecli.FetchCandidate(upgradetx.ComponentAgent, f.request().URL, f.archiveSHA,
+		binaryupgrade.FetchURL, probeUpgradeCandidate)
+	defer func() { _ = candidate.Close() }()
+	if upgradecli.ExitCode(err) != 64 || err == nil || !strings.Contains(err.Error(), "candidate executable failed its version probe") {
+		t.Fatalf("expected pre-prepare version-probe rejection (rc 64), got candidate=%+v err=%v", candidate, err)
 	}
-	if got, err := os.ReadFile(exePath); err != nil || string(got) != "OLD" {
-		t.Errorf("smoke_failed must leave the binary untouched; got %q err=%v", string(got), err)
+	if f.requests.Load() != 1 {
+		t.Fatal("smoke rejection was not reached after a real archive download")
 	}
-	if _, err := os.Stat(exePath + ".prev"); !os.IsNotExist(err) {
-		t.Errorf("smoke_failed must not create a prev slot (err=%v)", err)
-	}
-	if _, err := os.Stat(filepath.Join(sandbox, ".tether-upgrade.json")); !os.IsNotExist(err) {
-		t.Errorf("smoke_failed must not write an upgrade marker (err=%v)", err)
-	}
+	assertUpgradeDiskUnchanged(t, before)
 }
 
 // TestUpgradeCommitOnRegister: the health-check-in leg of the upgrade state
@@ -558,328 +544,151 @@ func TestUpgradeCommitOnRegister(t *testing.T) {
 	}
 }
 
-// TestUpgradeRejectedWhilePending: the install entry gate refuses a second
-// upgrade while a pending marker is inside its register deadline — installing
-// over it would clobber the only known-good binary in the prev slot.
-// origin: upgrade-safety plan §3.2 F6.
+// A second legacy request cannot overwrite pending recovery evidence or the
+// only known-good previous binary. Its envelope lacks S8 authorization even
+// when the former v1 install gate would have returned upgrade_in_progress.
+// origin: hot-update S8 plan §3.3 / §5.1 / §5.2 / §7.2; S8 internal review R2/R5/R6 P10
 func TestUpgradeRejectedWhilePending(t *testing.T) {
-	url := startNATS(t)
-	db := openDB(t)
-	pub, fp := freshUserPub(t)
-	seedSession(t, db, "lab", fp)
-
-	tarball, sum := makeTarball(t, fakeTetherScript("v9.9.9-test"))
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write(tarball)
-	}))
-	defer srv.Close()
-
-	sandbox := t.TempDir()
-	exePath := filepath.Join(sandbox, "tether")
-	if err := os.WriteFile(exePath, []byte("OLD"), 0o755); err != nil {
-		t.Fatal(err)
+	g, fd := runtime.NumGoroutine(), testharness.FDCount()
+	for round := 0; round < 5; round++ {
+		t.Run(fmt.Sprintf("round-%d", round), func(t *testing.T) { exerciseUpgradePendingRefusal(t) })
 	}
-	// A prior upgrade staged its binary and is awaiting its register deadline.
-	pending := fmt.Sprintf(`{"state":"pending","prev_sha":"aa","new_sha":"bb",`+
-		`"prev_version":"v0.0.1","new_version":"v0.0.2","deadline":%q,"boot_count":0,"boot_budget":3}`,
-		time.Now().UTC().Add(2*time.Minute).Format(time.RFC3339))
-	if err := os.WriteFile(filepath.Join(sandbox, ".tether-upgrade.json"), []byte(pending), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	defer startBroker(t, url, db, []string{srv.URL})()
-	defer startAgentWithUpgrade(t, url, "lab", "lab-1", exePath, []string{srv.URL})()
-
-	nc, _ := nats.Connect(url)
-	defer nc.Close()
-
-	resp := upgradeRequest(t, nc, "lab", pub, "lab-1", proto.UpgradeReq{
-		URL:          srv.URL + "/tether.tar.gz",
-		SHA256:       sum,
-		ProtoVersion: proto.ProtoVersion,
-	})
-	if resp.OK || !strings.Contains(resp.Code, "upgrade_in_progress") {
-		t.Fatalf("expected upgrade_in_progress; got %+v", resp)
-	}
-	if got, _ := os.ReadFile(exePath); string(got) != "OLD" {
-		t.Errorf("gate must leave the binary untouched; got %q", string(got))
-	}
+	testharness.AssertNoGoroutineLeak(t, "TestUpgradeRejectedWhilePending", g)
+	testharness.AssertNoFDLeak(t, "TestUpgradeRejectedWhilePending", fd, 0)
 }
 
-// TestUpgradeConcurrentInstallRejected: the install mutex (internal review
-// S2) — two upgrade messages racing the SAME agent must resolve to exactly
-// one install; the loser is refused with upgrade_in_progress BEFORE it can
-// touch the prev slot. Deliberately DRIVES THE AGENT'S FORWARDED SUBJECT
-// DIRECTLY, no broker: a single broker serializes upgrade.req in its one
-// subscription callback, so the hermetic broker path can never race — the
-// race S2 closes is the HA-cluster shape where two brokers forward to one
-// agent concurrently, and the agent's per-message dispatch goroutines
-// (exec.go dispatchForwarded) are the only concurrency that matters. The
-// stub mirror stalls so the two handler goroutines genuinely overlap.
-// Deleting the install mutex turns this red (both replies come back OK).
+func exerciseUpgradePendingRefusal(t *testing.T) {
+	f := newUpgradeFixtureWithDisk(t, fakeTetherScript("v9.9.9-test"), func(f *upgradeFixture) {
+		writeUpgradePending(t, f, time.Now().Add(2*time.Minute))
+	})
+	before := captureUpgradeDisk(t, f)
+	resp := agentHandlerUpgradeRequest(t, f.nc, "lab", f.pub, "lab-1", f.request())
+	assertUpgradeRefusal(t, resp, "upgrade_deferred", "a target-issued upgrade transaction is required", 75)
+	assertNoUpgradeDownload(t, f, 0)
+	assertUpgradeDiskUnchanged(t, before)
+}
+
+// Two HA forwards racing one agent must not touch its binary or prev slot.
+// S8 removes the old premise that one grantless request installs successfully:
+// both refuse. The real domain reservation separately admits exactly one
+// contender, replacing the former per-Agent install-mutex assertion.
+// origin: hot-update S8 plan §3.3 / §5.1 / §5.2 / §7.2; S8 internal review R2/R5/R6 P10
 func TestUpgradeConcurrentInstallRejected(t *testing.T) {
-	url := startNATS(t)
-	db := openDB(t)
-	_, fp := freshUserPub(t)
-	seedSession(t, db, "lab", fp)
-
-	tarball, sum := makeTarball(t, fakeTetherScript("v9.9.9-test"))
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		time.Sleep(500 * time.Millisecond) // hold the first install inside the pipeline
-		_, _ = w.Write(tarball)
-	}))
-	defer srv.Close()
-
-	sandbox := t.TempDir()
-	exePath := filepath.Join(sandbox, "tether")
-	if err := os.WriteFile(exePath, []byte("OLD"), 0o755); err != nil {
-		t.Fatal(err)
+	g, fd := runtime.NumGoroutine(), testharness.FDCount()
+	for round := 0; round < 5; round++ {
+		t.Run(fmt.Sprintf("round-%d", round), func(t *testing.T) { exerciseUpgradeConcurrentInstall(t) })
 	}
-
-	// The broker exists so the agent can register and install its forwarded
-	// subscription; the racing requests below bypass it on purpose.
-	defer startBroker(t, url, db, []string{srv.URL})()
-	defer startAgentWithUpgrade(t, url, "lab", "lab-1", exePath, []string{srv.URL})()
-
-	nc1, _ := nats.Connect(url)
-	defer nc1.Close()
-	nc2, _ := nats.Connect(url)
-	defer nc2.Close()
-
-	body, _ := json.Marshal(proto.UpgradeForwardedReq{
-		URL: srv.URL + "/tether.tar.gz", SHA256: sum, ActorFP: "test-fp",
-	})
-	subj := proto.SubjCmdForwarded("lab", "lab-1", "upgrade")
-	type result struct {
-		resp proto.UpgradeForwardedResp
-		err  error
-	}
-	results := make(chan result, 2)
-	for _, conn := range []*nats.Conn{nc1, nc2} {
-		go func(c *nats.Conn) {
-			msg, err := c.Request(subj, body, 10*time.Second)
-			if err != nil {
-				results <- result{err: err}
-				return
-			}
-			var resp proto.UpgradeForwardedResp
-			uerr := json.Unmarshal(msg.Data, &resp)
-			results <- result{resp: resp, err: uerr}
-		}(conn)
-	}
-	var oks, busy int
-	for i := 0; i < 2; i++ {
-		r := <-results
-		if r.err != nil {
-			t.Fatal(r.err)
-		}
-		switch {
-		case r.resp.OK:
-			oks++
-		case r.resp.Code == "upgrade_in_progress":
-			busy++
-		default:
-			t.Fatalf("unexpected reply: %+v", r.resp)
-		}
-	}
-	if oks != 1 || busy != 1 {
-		t.Fatalf("concurrent installs: got %d OK / %d busy, want exactly 1 / 1", oks, busy)
-	}
+	testharness.AssertNoGoroutineLeak(t, "TestUpgradeConcurrentInstallRejected", g)
+	testharness.AssertNoFDLeak(t, "TestUpgradeConcurrentInstallRejected", fd, 0)
 }
 
-// TestUpgradeConcurrentInstallAcrossAgentsRejected: external review F1
-// failure path two — two DIFFERENT agent instances (nids) sharing one binary
-// path race their installs. Their in-process install mutexes are per-Agent
-// and cannot see each other; the host-wide flock is the only serializer.
-// Deleting the flock turns this red (both replies come back OK and the prev
-// slot/marker are written by interleaved transactions).
+func exerciseUpgradeConcurrentInstall(t *testing.T) {
+	f := newUpgradeFixture(t, fakeTetherScript("v9.9.9-test"))
+	exerciseUpgradeConcurrentRefusals(t, f, []string{"lab-1", "lab-1"})
+	assertUpgradeReservationContention(t, f, []string{"lab-1", "lab-1"})
+}
+
+// Different agents sharing one canonical binary need a host-wide domain
+// reservation; per-Agent mutexes cannot see each other. Both old forwards
+// refuse without side effects, and their registered sibling keys compete for
+// exactly one real S8 lease held until both replies have been collected.
+// origin: hot-update S8 plan §3.3 / §5.1 / §5.2 / §7.2; S8 internal review R2/R5/R6 P10
 func TestUpgradeConcurrentInstallAcrossAgentsRejected(t *testing.T) {
-	url := startNATS(t)
-	db := openDB(t)
-	_, fp := freshUserPub(t)
-	seedSession(t, db, "lab", fp)
-
-	tarball, sum := makeTarball(t, fakeTetherScript("v9.9.9-test"))
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		time.Sleep(500 * time.Millisecond) // hold the winner inside the pipeline
-		_, _ = w.Write(tarball)
-	}))
-	defer srv.Close()
-
-	sandbox := t.TempDir()
-	exePath := filepath.Join(sandbox, "tether")
-	if err := os.WriteFile(exePath, []byte("OLD"), 0o755); err != nil {
-		t.Fatal(err)
+	g, fd := runtime.NumGoroutine(), testharness.FDCount()
+	for round := 0; round < 5; round++ {
+		t.Run(fmt.Sprintf("round-%d", round), func(t *testing.T) { exerciseUpgradeConcurrentAgents(t) })
 	}
+	testharness.AssertNoGoroutineLeak(t, "TestUpgradeConcurrentInstallAcrossAgentsRejected", g)
+	testharness.AssertNoFDLeak(t, "TestUpgradeConcurrentInstallAcrossAgentsRejected", fd, 0)
+}
 
-	defer startBroker(t, url, db, []string{srv.URL})()
-	defer startAgentWithUpgrade(t, url, "lab", "n1", exePath, []string{srv.URL})()
-	defer startAgentWithUpgrade(t, url, "lab", "n2", exePath, []string{srv.URL})()
+func exerciseUpgradeConcurrentAgents(t *testing.T) {
+	f := newUpgradeFixture(t, fakeTetherScript("v9.9.9-test"), "n1", "n2")
+	exerciseUpgradeConcurrentRefusals(t, f, []string{"n1", "n2"})
+	assertUpgradeReservationContention(t, f, []string{"n1", "n2"})
+}
 
-	nc, _ := nats.Connect(url)
-	defer nc.Close()
+// An expired legacy marker no longer authorizes an operator's fresh install.
+// Keep the failed-flip recovery evidence and previous binary intact across
+// repeated unfenced requests. Pending history is never GC'd merely by age.
+// origin: hot-update S8 plan §3.3 / §5.1 / §5.2 / §7.2; S8 internal review R2/R5/R6 P10
+func TestUpgradeExpiredLegacyMarkerCannotAuthorizeRetry(t *testing.T) {
+	g, fd := runtime.NumGoroutine(), testharness.FDCount()
+	for round := 0; round < 5; round++ {
+		t.Run(fmt.Sprintf("round-%d", round), func(t *testing.T) { exerciseUpgradeExpiredMarker(t) })
+	}
+	testharness.AssertNoGoroutineLeak(t, "TestUpgradeExpiredLegacyMarkerCannotAuthorizeRetry", g)
+	testharness.AssertNoFDLeak(t, "TestUpgradeExpiredLegacyMarkerCannotAuthorizeRetry", fd, 0)
+}
 
-	body, _ := json.Marshal(proto.UpgradeForwardedReq{
-		URL: srv.URL + "/tether.tar.gz", SHA256: sum, ActorFP: "test-fp",
+func exerciseUpgradeExpiredMarker(t *testing.T) {
+	f := newUpgradeFixtureWithDisk(t, fakeTetherScript("v9.9.9-test"), func(f *upgradeFixture) {
+		writeUpgradePending(t, f, time.Now().Add(-time.Hour))
 	})
-	type result struct {
-		resp proto.UpgradeForwardedResp
-		err  error
-	}
-	results := make(chan result, 2)
-	for _, nid := range []string{"n1", "n2"} {
-		go func(n string) {
-			msg, err := nc.Request(proto.SubjCmdForwarded("lab", n, "upgrade"), body, 10*time.Second)
-			if err != nil {
-				results <- result{err: err}
-				return
-			}
-			var resp proto.UpgradeForwardedResp
-			uerr := json.Unmarshal(msg.Data, &resp)
-			results <- result{resp: resp, err: uerr}
-		}(nid)
-	}
-	var oks, busy int
-	for i := 0; i < 2; i++ {
-		r := <-results
-		if r.err != nil {
-			t.Fatal(r.err)
-		}
-		switch {
-		case r.resp.OK:
-			oks++
-		case r.resp.Code == "upgrade_in_progress":
-			busy++
-		default:
-			t.Fatalf("unexpected reply: %+v", r.resp)
-		}
-	}
-	if oks != 1 || busy != 1 {
-		t.Fatalf("cross-agent concurrent installs: got %d OK / %d busy, want exactly 1 / 1", oks, busy)
+	before := captureUpgradeDisk(t, f)
+	// Marker expiry is not a grant and unresolved evidence must survive.
+	// Repeating the request must not turn that refusal into a fresh install.
+	for attempt := 0; attempt < 2; attempt++ {
+		resp := agentHandlerUpgradeRequest(t, f.nc, "lab", f.pub, "lab-1", f.request())
+		assertUpgradeRefusal(t, resp, "upgrade_deferred", "a target-issued upgrade transaction is required", 75)
+		assertNoUpgradeDownload(t, f, 0)
+		assertUpgradeDiskUnchanged(t, before)
 	}
 }
 
-// TestUpgradeStalePendingMarkerAdmitsRetry: the entry gate's other half
-// (internal review S18) — a pending marker whose register deadline has
-// ALREADY PASSED (a failed flip with nothing left alive to resolve it) must
-// NOT block: the operator's retry goes through and re-stages cleanly.
-func TestUpgradeStalePendingMarkerAdmitsRetry(t *testing.T) {
-	url := startNATS(t)
-	db := openDB(t)
-	pub, fp := freshUserPub(t)
-	seedSession(t, db, "lab", fp)
-
-	tarball, sum := makeTarball(t, fakeTetherScript("v9.9.9-test"))
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write(tarball)
-	}))
-	defer srv.Close()
-
-	sandbox := t.TempDir()
-	exePath := filepath.Join(sandbox, "tether")
-	if err := os.WriteFile(exePath, []byte("OLD"), 0o755); err != nil {
-		t.Fatal(err)
+// A syntactically valid 64-hex SHA must still match the actual HTTP archive.
+// S8 verifies this on the ctl before Prepare, extraction/probing or staging;
+// a mismatch must leave the agent binary and all recovery evidence untouched.
+// origin: hot-update S8 plan §3.3 / §5.1 / §5.2 / §7.2; S8 internal review R2/R5/R6 P10
+func TestUpgradeCandidateRejectsBadSHA(t *testing.T) {
+	g, fd := runtime.NumGoroutine(), testharness.FDCount()
+	for round := 0; round < 5; round++ {
+		t.Run(fmt.Sprintf("round-%d", round), func(t *testing.T) { exerciseUpgradeCandidateSHA(t) })
 	}
-	stale := fmt.Sprintf(`{"state":"pending","prev_sha":"aa","new_sha":"bb",`+
-		`"prev_version":"v0.0.1","new_version":"v0.0.2","deadline":%q,"boot_count":0,"boot_budget":3}`,
-		time.Now().UTC().Add(-time.Hour).Format(time.RFC3339))
-	if err := os.WriteFile(filepath.Join(sandbox, ".tether-upgrade.json"), []byte(stale), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	defer startBroker(t, url, db, []string{srv.URL})()
-	defer startAgentWithUpgrade(t, url, "lab", "lab-1", exePath, []string{srv.URL})()
-
-	nc, _ := nats.Connect(url)
-	defer nc.Close()
-
-	resp := upgradeRequest(t, nc, "lab", pub, "lab-1", proto.UpgradeReq{
-		URL:          srv.URL + "/tether.tar.gz",
-		SHA256:       sum,
-		ProtoVersion: proto.ProtoVersion,
-	})
-	if !resp.OK {
-		t.Fatalf("stale pending marker must not block a retry; got %+v", resp)
-	}
-	if got, _ := os.ReadFile(exePath); !bytes.Equal(got, fakeTetherScript("v9.9.9-test")) {
-		t.Errorf("retry did not re-stage the binary; got %q", string(got))
-	}
+	testharness.AssertNoGoroutineLeak(t, "TestUpgradeCandidateRejectsBadSHA", g)
+	testharness.AssertNoFDLeak(t, "TestUpgradeCandidateRejectsBadSHA", fd, 0)
 }
 
-// TestUpgradeAgentRejectsBadSHA: the broker accepts (its sanity
-// regex says 64 hex chars are fine) but the agent's cryptographic
-// verify against the actual download fails. Agent must reply
-// sha256_mismatch and NOT touch its own binary.
-func TestUpgradeAgentRejectsBadSHA(t *testing.T) {
-	url := startNATS(t)
-	db := openDB(t)
-	pub, fp := freshUserPub(t)
-	seedSession(t, db, "lab", fp)
-
-	tarball, _ := makeTarball(t, []byte("real content"))
-
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write(tarball)
-	}))
-	defer srv.Close()
-
-	defer startBroker(t, url, db, []string{srv.URL})()
-	defer startAgentWithUpgrade(t, url, "lab", "lab-1", "", []string{srv.URL})()
-
-	nc, _ := nats.Connect(url)
-	defer nc.Close()
-
-	bogus := strings.Repeat("d", 64)
-	resp := upgradeRequest(t, nc, "lab", pub, "lab-1", proto.UpgradeReq{
-		URL:          srv.URL + "/tether.tar.gz",
-		SHA256:       bogus,
-		ProtoVersion: proto.ProtoVersion,
-	})
-	if resp.OK {
-		t.Errorf("expected reject; got OK")
+func exerciseUpgradeCandidateSHA(t *testing.T) {
+	f := newUpgradeFixture(t, fakeTetherScript("v9.9.9-test"))
+	before := captureUpgradeDisk(t, f)
+	probes := 0
+	candidate, err := upgradecli.FetchCandidate(upgradetx.ComponentAgent, f.request().URL, strings.Repeat("d", 64),
+		binaryupgrade.FetchURL, func(path string) (string, agentimage.Capabilities, error) {
+			probes++
+			return probeUpgradeCandidate(path)
+		})
+	defer func() { _ = candidate.Close() }()
+	if upgradecli.ExitCode(err) != 64 || err == nil || !strings.Contains(err.Error(), "candidate archive does not match --sha256") {
+		t.Fatalf("expected archive SHA rejection (rc 64), got candidate=%+v err=%v", candidate, err)
 	}
-	if !strings.Contains(resp.Code, "sha256_mismatch") {
-		t.Errorf("expected sha256_mismatch in reply; got %+v", resp)
+	if probes != 0 || f.requests.Load() != 1 {
+		t.Fatalf("SHA mismatch must follow download and precede execution: downloads=%d probes=%d", f.requests.Load(), probes)
 	}
+	assertUpgradeDiskUnchanged(t, before)
 }
 
-// TestUpgradeAgentRejectsNonAllowlistedURL: even if the broker
-// somehow forwarded a URL the agent doesn't trust (operator
-// misconfiguration where agent's allowlist is stricter), agent
-// MUST refuse. We simulate by giving broker a permissive allow
-// list and agent a stricter one.
-func TestUpgradeAgentRejectsNonAllowlistedURL(t *testing.T) {
-	url := startNATS(t)
-	db := openDB(t)
-	pub, fp := freshUserPub(t)
-	seedSession(t, db, "lab", fp)
-
-	tarball, sum := makeTarball(t, []byte("payload"))
-
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write(tarball)
-	}))
-	defer srv.Close()
-
-	// Broker accepts the test-server URL; agent only accepts
-	// example.com so the mismatch surfaces as
-	// url_not_allowed_local from the agent.
-	defer startBroker(t, url, db, []string{srv.URL})()
-	defer startAgentWithUpgrade(t, url, "lab", "lab-1", "",
-		[]string{"https://only-this.example.com/"})()
-
-	nc, _ := nats.Connect(url)
-	defer nc.Close()
-
-	resp := upgradeRequest(t, nc, "lab", pub, "lab-1", proto.UpgradeReq{
-		URL:          srv.URL + "/tether.tar.gz",
-		SHA256:       sum,
-		ProtoVersion: proto.ProtoVersion,
-	})
-	if resp.OK {
-		t.Errorf("expected reject; got OK")
+// A permissive broker and stricter agent configuration cannot authorize a
+// download through the old forwarded envelope. S8 replaced agent URL installs
+// with immutable staged receipts; the legacy route refuses before fetching.
+// origin: hot-update S8 plan §3.3 / §5.1 / §5.2 / §7.2; S8 internal review R2/R5/R6 P10
+func TestUpgradeLegacyURLCannotAuthorizeDownload(t *testing.T) {
+	g, fd := runtime.NumGoroutine(), testharness.FDCount()
+	for round := 0; round < 5; round++ {
+		t.Run(fmt.Sprintf("round-%d", round), func(t *testing.T) { exerciseUpgradeLegacyURL(t) })
 	}
-	if !strings.Contains(resp.Code, "url_not_allowed_local") {
-		t.Errorf("expected url_not_allowed_local; got %+v", resp)
-	}
+	testharness.AssertNoGoroutineLeak(t, "TestUpgradeLegacyURLCannotAuthorizeDownload", g)
+	testharness.AssertNoFDLeak(t, "TestUpgradeLegacyURLCannotAuthorizeDownload", fd, 0)
+}
+
+func exerciseUpgradeLegacyURL(t *testing.T) {
+	f := newUpgradeFixture(t, []byte("payload"))
+	before := captureUpgradeDisk(t, f)
+	// The broker trusts this URL; the agent's configured allowlist does not.
+	// S8's URL-free Start consumes a staged receipt, while this old envelope
+	// is refused before any download even if its archive SHA is correct.
+	resp := agentHandlerUpgradeRequest(t, f.nc, "lab", f.pub, "lab-1", f.request())
+	assertUpgradeRefusal(t, resp, "upgrade_deferred", "a target-issued upgrade transaction is required", 75)
+	assertNoUpgradeDownload(t, f, 0)
+	assertUpgradeDiskUnchanged(t, before)
 }

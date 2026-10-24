@@ -22,6 +22,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -31,6 +32,7 @@ import (
 	"github.com/LinZiyang666/tether/internal/cli"
 	"github.com/LinZiyang666/tether/internal/proto"
 	"github.com/LinZiyang666/tether/internal/session"
+	"github.com/LinZiyang666/tether/test/stackharness"
 	"github.com/nats-io/jwt/v2"
 	natsserver "github.com/nats-io/nats-server/v2/server"
 	natstest "github.com/nats-io/nats-server/v2/test"
@@ -210,7 +212,7 @@ func seedSessionWithPIN(t *testing.T, db *sql.DB, sid, ownerFP, pin string) {
 // startAgentSecure boots an in-process agent that connects via nkey +
 // auth_callout. The first call for a given (sid, nid) supplies pin so the
 // broker provisions the agent fp.
-func startAgentSecure(t *testing.T, url, sid, nid, pin string, id *cli.Identity) func() {
+func startAgentSecure(t *testing.T, url, sid, nid, pin string, id *cli.Identity, brokerSeed []byte) func() {
 	t.Helper()
 	a, err := agent.New(agent.Config{
 		NATSURL:           url,
@@ -229,17 +231,35 @@ func startAgentSecure(t *testing.T, url, sid, nid, pin string, id *cli.Identity)
 	done := make(chan error, 1)
 	go func() { done <- a.Run(ctx) }()
 
-	// Give register + subscribe a moment to settle.
-	time.Sleep(300 * time.Millisecond)
-
-	return func() {
+	stop := sync.OnceFunc(func() {
 		cancel()
 		select {
 		case <-done:
 		case <-time.After(2 * time.Second):
 			t.Fatal("agent did not exit on cancel")
 		}
+	})
+	t.Cleanup(stop)
+	// Give register + subscribe a moment to settle.
+	// Registration and SUB are distinct readiness points in the merged stack;
+	// the command probe replaces the historical sleep with a serving proof.
+	// origin: S7 internal review MAKETEST-TRANSFER F5; S8 plan §4.2
+	key, err := nkeys.FromSeed(brokerSeed)
+	if err != nil {
+		t.Fatal(err)
 	}
+	defer key.Wipe()
+	pub, err := key.PublicKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	nc, err := nats.Connect(url, nats.Nkey(pub, key.Sign))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nc.Close()
+	stackharness.WaitAgentCommands(t, nc, sid, nid)
+	return stop
 }
 
 // ----- tests ------------------------------------------------------------
@@ -249,6 +269,8 @@ func startAgentSecure(t *testing.T, url, sid, nid, pin string, id *cli.Identity)
 //   - ctl CONNECT through auth_callout (activated-member role),
 //   - broker forwards exec.req → exec.req.forwarded with preserved Reply,
 //   - agent streams chunks back to ctl's _INBOX.
+//
+// origin: S7 internal review MAKETEST-TRANSFER F5
 func TestExecHappyPathThroughAuthCallout(t *testing.T) {
 	url, brokerSeed, accountSeed := startAuthNATS(t)
 	db := openDB(t)
@@ -259,7 +281,7 @@ func TestExecHappyPathThroughAuthCallout(t *testing.T) {
 	defer startBrokerWithAuth(t, url, db, brokerSeed, accountSeed)()
 
 	agentID, _ := freshAgentIdentity(t, "lab")
-	defer startAgentSecure(t, url, "lab", "lab-1", "test-pin", agentID)()
+	defer startAgentSecure(t, url, "lab", "lab-1", "test-pin", agentID, brokerSeed)()
 
 	nc, err := cli.ConnectNATSWithNkey(url, ctlID,
 		nats.Name(cli.CtlNameForSession("lab")))
@@ -294,11 +316,11 @@ func TestAgentReconnectsWithoutPINAfterBootstrap(t *testing.T) {
 
 	agentID, _ := freshAgentIdentity(t, "lab")
 	// Bootstrap: PIN supplied.
-	stop1 := startAgentSecure(t, url, "lab", "lab-1", "test-pin", agentID)
+	stop1 := startAgentSecure(t, url, "lab", "lab-1", "test-pin", agentID, brokerSeed)
 	stop1()
 
 	// Re-connect: no PIN, same identity. Must succeed.
-	stop2 := startAgentSecure(t, url, "lab", "lab-1", "" /* no PIN */, agentID)
+	stop2 := startAgentSecure(t, url, "lab", "lab-1", "" /* no PIN */, agentID, brokerSeed)
 	defer stop2()
 
 	nc, err := cli.ConnectNATSWithNkey(url, ctlID,

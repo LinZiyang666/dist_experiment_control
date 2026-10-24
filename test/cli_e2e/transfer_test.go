@@ -14,6 +14,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -21,6 +22,7 @@ import (
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/agent"
+	"github.com/LinZiyang666/tether/internal/jsstream"
 	"github.com/LinZiyang666/tether/internal/proto"
 	"github.com/LinZiyang666/tether/internal/testharness"
 	"github.com/nats-io/nats.go/jetstream"
@@ -50,6 +52,9 @@ func withTransferDisabled() func(*agent.Config) {
 // the receiver side writes bytes + emits ev.transfer.complete →
 // broker writes audit.
 func TestTransfer_TierA_PushHappyPath(t *testing.T) {
+	// origin: hot-update S5 PROC-LEAK / final process census.
+	testharness.GuardProcessDirectory(t, filepath.Dir(t.TempDir()))
+
 	url := startNATS(t)
 	db := openDB(t)
 	pub, fp := freshUserPub(t)
@@ -96,6 +101,9 @@ func TestTransfer_TierA_PushHappyPath(t *testing.T) {
 
 // Path validation: writes outside allow_roots reject without touching disk.
 func TestTransfer_TierA_PushRejectsOutsideAllowRoots(t *testing.T) {
+	// origin: hot-update S5 PROC-LEAK / final process census.
+	testharness.GuardProcessDirectory(t, filepath.Dir(t.TempDir()))
+
 	url := startNATS(t)
 	db := openDB(t)
 	pub, fp := freshUserPub(t)
@@ -139,6 +147,9 @@ func TestTransfer_TierA_PushRejectsOutsideAllowRoots(t *testing.T) {
 // post-unrestrict default — the old empty==transfer_disabled behavior is
 // gone (now spelled `allow_roots: []`, see ...OffSwitchDisables).
 func TestTransfer_TierA_OpenByDefaultPushSucceeds(t *testing.T) {
+	// origin: hot-update S5 PROC-LEAK / final process census.
+	testharness.GuardProcessDirectory(t, filepath.Dir(t.TempDir()))
+
 	url := startNATS(t)
 	db := openDB(t)
 	pub, fp := freshUserPub(t)
@@ -176,6 +187,9 @@ func TestTransfer_TierA_OpenByDefaultPushSucceeds(t *testing.T) {
 // Off-switch: an explicit `allow_roots: []` disables push/pull entirely,
 // short-circuiting before any disk write.
 func TestTransfer_TierA_OffSwitchDisables(t *testing.T) {
+	// origin: hot-update S5 PROC-LEAK / final process census.
+	testharness.GuardProcessDirectory(t, filepath.Dir(t.TempDir()))
+
 	url := startNATS(t)
 	db := openDB(t)
 	pub, fp := freshUserPub(t)
@@ -214,6 +228,9 @@ func TestTransfer_TierA_OffSwitchDisables(t *testing.T) {
 // false on this anonymous-no-JS harness, MaxPayload reflects the
 // server-advertised value.
 func TestTransfer_CapsProbe(t *testing.T) {
+	// origin: hot-update S5 PROC-LEAK / final process census.
+	testharness.GuardProcessDirectory(t, filepath.Dir(t.TempDir()))
+
 	url := startNATS(t)
 	db := openDB(t)
 	pub, fp := freshUserPub(t)
@@ -250,6 +267,9 @@ func TestTransfer_CapsProbe(t *testing.T) {
 
 // Pull happy path: agent reads back the bytes we just pushed.
 func TestTransfer_TierA_PullHappyPath(t *testing.T) {
+	// origin: hot-update S5 PROC-LEAK / final process census.
+	testharness.GuardProcessDirectory(t, filepath.Dir(t.TempDir()))
+
 	url := startNATS(t)
 	db := openDB(t)
 	pub, fp := freshUserPub(t)
@@ -319,6 +339,9 @@ func TestTransfer_TierA_PullHappyPath(t *testing.T) {
 // on the read side so the ValidateForRead open branch is exercised through
 // the broker→agent pull pipeline, not just in unit tests.
 func TestTransfer_TierA_OpenByDefaultPullSucceeds(t *testing.T) {
+	// origin: hot-update S5 PROC-LEAK / final process census.
+	testharness.GuardProcessDirectory(t, filepath.Dir(t.TempDir()))
+
 	url := startNATS(t)
 	db := openDB(t)
 	pub, fp := freshUserPub(t)
@@ -367,6 +390,9 @@ func TestTransfer_TierA_OpenByDefaultPullSucceeds(t *testing.T) {
 // a transfer started by actor-A in the same session — both connect
 // anonymously so the gate is purely broker-side.
 func TestTransfer_Finalize_RejectsForeignActor(t *testing.T) {
+	// origin: hot-update S5 PROC-LEAK / final process census.
+	testharness.GuardProcessDirectory(t, filepath.Dir(t.TempDir()))
+
 	url := startNATS(t)
 	db := openDB(t)
 	actorA, fpA := freshUserPub(t)
@@ -422,6 +448,9 @@ func TestTransfer_Finalize_RejectsForeignActor(t *testing.T) {
 
 // 8 MiB just at the tier boundary still routes through tier A (≤ 8 MiB).
 func TestTransfer_TierA_ExactBoundarySize(t *testing.T) {
+	// origin: hot-update S5 PROC-LEAK / final process census.
+	testharness.GuardProcessDirectory(t, filepath.Dir(t.TempDir()))
+
 	url := startNATS(t)
 	db := openDB(t)
 	pub, fp := freshUserPub(t)
@@ -466,6 +495,9 @@ func TestTransfer_TierA_ExactBoundarySize(t *testing.T) {
 
 // SHA mismatch on the wire → sha_mismatch refusal, no file written.
 func TestTransfer_TierA_SHAVerify(t *testing.T) {
+	// origin: hot-update S5 PROC-LEAK / final process census.
+	testharness.GuardProcessDirectory(t, filepath.Dir(t.TempDir()))
+
 	url := startNATS(t)
 	db := openDB(t)
 	pub, fp := freshUserPub(t)
@@ -512,6 +544,9 @@ func hexSHA256ForTest(b []byte) string {
 // Tier-B push: ctl Put, agent Get, sha verify, rename, ev.transfer.
 // On completion the broker must delete the OBJ_xfer-* stream.
 func TestTransfer_TierB_PushHappyPath(t *testing.T) {
+	// origin: hot-update S5 PROC-LEAK / final process census.
+	testharness.GuardProcessDirectory(t, filepath.Dir(t.TempDir()))
+
 	url := startJSNATS_xfer(t)
 	db := openDB(t)
 	pub, fp := freshUserPub(t)
@@ -648,6 +683,9 @@ func TestTransfer_TierB_PushHappyPath(t *testing.T) {
 // leaving rejected bytes at dst. Use force=true + an existing destination
 // so either regression is visible as clobbered "OLD" content.
 func TestTransfer_TierB_VerifiesBeforeDestinationCommit(t *testing.T) {
+	// origin: hot-update S5 PROC-LEAK / final process census.
+	testharness.GuardProcessDirectory(t, filepath.Dir(t.TempDir()))
+
 	url := startJSNATS_xfer(t)
 	db := openDB(t)
 	pub, fp := freshUserPub(t)
@@ -690,6 +728,9 @@ func TestTransfer_TierB_VerifiesBeforeDestinationCommit(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
+			// origin: hot-update S5 PROC-LEAK / final process census.
+			testharness.GuardProcessDirectory(t, filepath.Dir(t.TempDir()))
+
 			dst := filepath.Join(root, tc.tid+".bin")
 			if err := os.WriteFile(dst, []byte("OLD"), 0o600); err != nil {
 				t.Fatal(err)
@@ -782,6 +823,9 @@ func TestTransfer_TierB_VerifiesBeforeDestinationCommit(t *testing.T) {
 // not just tier A. Same flow as TierB_PushHappyPath but the agent has no
 // allow_roots (open mode) and the dst is an arbitrary temp path.
 func TestTransfer_TierB_OpenByDefaultPushSucceeds(t *testing.T) {
+	// origin: hot-update S5 PROC-LEAK / final process census.
+	testharness.GuardProcessDirectory(t, filepath.Dir(t.TempDir()))
+
 	url := startJSNATS_xfer(t)
 	db := openDB(t)
 	pub, fp := freshUserPub(t)
@@ -883,6 +927,9 @@ func TestTransfer_TierB_OpenByDefaultPushSucceeds(t *testing.T) {
 // Tier-B pull: agent Put, ctl Get, finalize.req → broker writes
 // audit + deletes the transfer object.
 func TestTransfer_TierB_PullHappyPath(t *testing.T) {
+	// origin: hot-update S5 PROC-LEAK / final process census.
+	testharness.GuardProcessDirectory(t, filepath.Dir(t.TempDir()))
+
 	url := startJSNATS_xfer(t)
 	db := openDB(t)
 	pub, fp := freshUserPub(t)
@@ -934,7 +981,9 @@ func TestTransfer_TierB_PullHappyPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("bind bucket: %v", err)
 	}
-	result, err := store.Get(getCtx, pr.ObjectKey)
+	// origin: control-connection-recovery internal validation. Keep this ctl
+	// stand-in on the same bounded object reader used by finishPullTierB.
+	result, err := jsstream.GetTransferObject(getCtx, js, store, pr.Bucket, pr.ObjectKey)
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}
@@ -987,10 +1036,13 @@ func TestTransfer_TierB_PullHappyPath(t *testing.T) {
 	}
 }
 
-func readAllResult(r jetstream.ObjectResult) ([]byte, error) {
+func readAllResult(r io.ReadCloser) ([]byte, error) {
 	defer func() { _ = r.Close() }()
 	var buf bytes.Buffer
 	if _, err := buf.ReadFrom(r); err != nil {
+		return nil, err
+	}
+	if err := r.Close(); err != nil {
 		return nil, err
 	}
 	return buf.Bytes(), nil

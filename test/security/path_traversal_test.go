@@ -10,11 +10,13 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/proto"
+	"github.com/LinZiyang666/tether/internal/testharness"
 )
 
 // === A.1 install.sh --prefix relative-path safety ===========================
@@ -143,104 +145,57 @@ func buildTarball(t *testing.T, entries []tarEntry) ([]byte, string) {
 	return buf.Bytes(), hex.EncodeToString(sum[:])
 }
 
-// runUpgrade is a thin wrapper so the path-traversal table tests
-// stay readable. Returns the agent's reply.
-func runUpgrade(t *testing.T, tarball []byte, sum string) (proto.UpgradeResp, string) {
-	t.Helper()
-	url := startNATS(t)
-	db := openDB(t)
-	pub, fp := freshUserPub(t)
-	seedSession(t, db, "lab", fp)
-	seedNodeOnline(t, db, "lab", "lab-1")
-
-	// Inline HTTP server for the tarball.
-	srv := newTestServer(t, tarball)
-	defer srv.Close()
-
-	defer startBroker(t, url, db, withUpgradeAllow([]string{srv.URL}))()
-	defer startAgentForUpgrade(t, url, "lab", "lab-1", []string{srv.URL})()
-
-	nc := connectAnon(t, url)
-	body, _ := json.Marshal(proto.UpgradeReq{
-		URL:          srv.URL + "/tether.tar.gz",
-		SHA256:       sum,
-		ProtoVersion: proto.ProtoVersion,
-	})
-	respMsg, err := nc.Request(proto.SubjCmdBy("lab", pub, "lab-1", "upgrade"), body, 5*time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var resp proto.UpgradeResp
-	if err := json.Unmarshal(respMsg.Data, &resp); err != nil {
-		t.Fatal(err)
-	}
-	return resp, srv.URL
-}
-
 // TestUpgradeTarballRelativePathEntryRejected: entry "../tether"
 // must be refused. C2 hardening pinned a strict allowlist (only
 // the literal name "tether"); this test exercises that contract.
+// origin: hot-update S8 internal review LEGACY-ROUTE-TESTS; plan §5.2 / §6.1
 func TestUpgradeTarballRelativePathEntryRejected(t *testing.T) {
-	tarball, sum := buildTarball(t, []tarEntry{
-		{name: "../tether", typeflag: tar.TypeReg, body: []byte("malicious")},
-	})
-	resp, _ := runUpgrade(t, tarball, sum)
-	if resp.OK {
-		t.Errorf("relative-path entry accepted: %+v", resp)
+	g, fd := runtime.NumGoroutine(), testharness.FDCount()
+	for round := 0; round < 5; round++ {
+		exerciseUpgradeTarballRejected(t, []tarEntry{{name: "../tether", typeflag: tar.TypeReg, body: []byte("malicious")}})
 	}
-	if !strings.Contains(resp.Code, "agent_rejected") || !strings.Contains(resp.Error, "missing tether") {
-		t.Errorf("expected agent_rejected:install_failed with 'missing tether'; got %+v", resp)
-	}
+	testharness.AssertNoGoroutineLeak(t, "relative archive entry", g)
+	testharness.AssertNoFDLeak(t, "relative archive entry", fd, 0)
 }
 
-// TestUpgradeTarballAbsolutePathEntryRejected: entry "/tmp/evil"
-// must be refused.
+// TestUpgradeTarballAbsolutePathEntryRejected: an absolute entry must be
+// refused. A private sentinel avoids colliding with another engineer's test.
+// origin: hot-update S8 internal review LEGACY-ROUTE-TESTS; plan §5.2 / §6.1
 func TestUpgradeTarballAbsolutePathEntryRejected(t *testing.T) {
-	tarball, sum := buildTarball(t, []tarEntry{
-		{name: "/tmp/evil-payload", typeflag: tar.TypeReg, body: []byte("malicious")},
-	})
-	resp, _ := runUpgrade(t, tarball, sum)
-	if resp.OK {
-		t.Errorf("absolute-path entry accepted: %+v", resp)
+	g, fd := runtime.NumGoroutine(), testharness.FDCount()
+	path := filepath.Join(t.TempDir(), "evil-payload")
+	for round := 0; round < 5; round++ {
+		exerciseUpgradeTarballRejected(t, []tarEntry{{name: path, typeflag: tar.TypeReg, body: []byte("malicious")}})
 	}
-	if !strings.Contains(resp.Code, "agent_rejected") {
-		t.Errorf("expected agent_rejected; got %+v", resp)
+	// Sentinel: the malicious path must not be created on disk.
+	if _, err := os.Lstat(path); !os.IsNotExist(err) {
+		t.Fatalf("candidate extraction created an absolute archive entry: %v", err)
 	}
-	// Sentinel: the malicious path was not created on disk.
-	if _, err := os.Stat("/tmp/evil-payload"); err == nil {
-		t.Errorf("agent created /tmp/evil-payload from malicious tarball")
-		_ = os.Remove("/tmp/evil-payload")
-	}
+	testharness.AssertNoGoroutineLeak(t, "absolute archive entry", g)
+	testharness.AssertNoFDLeak(t, "absolute archive entry", fd, 0)
 }
 
 // TestUpgradeTarballSymlinkEntryRejected: tar symlink entry must be
-// refused (extractTetherBinary checks Typeflag == TypeReg).
+// refused (ExtractBinary checks Typeflag == TypeReg).
+// origin: hot-update S8 internal review LEGACY-ROUTE-TESTS; plan §5.2 / §6.1
 func TestUpgradeTarballSymlinkEntryRejected(t *testing.T) {
-	tarball, sum := buildTarball(t, []tarEntry{
-		{name: "tether", typeflag: tar.TypeSymlink, linkname: "/etc/passwd"},
-	})
-	resp, _ := runUpgrade(t, tarball, sum)
-	if resp.OK {
-		t.Errorf("symlink entry accepted: %+v", resp)
+	g, fd := runtime.NumGoroutine(), testharness.FDCount()
+	for round := 0; round < 5; round++ {
+		exerciseUpgradeTarballRejected(t, []tarEntry{{name: "tether", typeflag: tar.TypeSymlink, linkname: "/etc/passwd"}})
 	}
-	if !strings.Contains(resp.Code, "agent_rejected") {
-		t.Errorf("expected agent_rejected; got %+v", resp)
-	}
+	testharness.AssertNoGoroutineLeak(t, "symlink archive entry", g)
+	testharness.AssertNoFDLeak(t, "symlink archive entry", fd, 0)
 }
 
-// TestUpgradeTarballHardlinkEntryRejected: hardlink entry must be
-// refused.
+// TestUpgradeTarballHardlinkEntryRejected: hardlink entry must be refused.
+// origin: hot-update S8 internal review LEGACY-ROUTE-TESTS; plan §5.2 / §6.1
 func TestUpgradeTarballHardlinkEntryRejected(t *testing.T) {
-	tarball, sum := buildTarball(t, []tarEntry{
-		{name: "tether", typeflag: tar.TypeLink, linkname: "/etc/passwd"},
-	})
-	resp, _ := runUpgrade(t, tarball, sum)
-	if resp.OK {
-		t.Errorf("hardlink entry accepted: %+v", resp)
+	g, fd := runtime.NumGoroutine(), testharness.FDCount()
+	for round := 0; round < 5; round++ {
+		exerciseUpgradeTarballRejected(t, []tarEntry{{name: "tether", typeflag: tar.TypeLink, linkname: "/etc/passwd"}})
 	}
-	if !strings.Contains(resp.Code, "agent_rejected") {
-		t.Errorf("expected agent_rejected; got %+v", resp)
-	}
+	testharness.AssertNoGoroutineLeak(t, "hardlink archive entry", g)
+	testharness.AssertNoFDLeak(t, "hardlink archive entry", fd, 0)
 }
 
 // TestUpgradeTarballMultipleEntriesOnlyTetherAccepted: a tar with
@@ -248,39 +203,32 @@ func TestUpgradeTarballHardlinkEntryRejected(t *testing.T) {
 // literal name "tether" is a regular file. The C2 allowlist
 // silently skips non-matching names; this test pins that
 // "tether" + decorative entries works.
+// origin: hot-update S8 internal review LEGACY-ROUTE-TESTS; plan §5.2 / §6.1
 func TestUpgradeTarballMultipleEntriesOnlyTetherAccepted(t *testing.T) {
-	// Executable AND smoke-gate-compatible: the upgrade pipeline now runs
-	// `<staged> version` before the flip (upgrade-safety §21.3), so a
-	// success-path fixture must answer with a real version line.
-	binBody := []byte("#!/bin/sh\necho 'tether v9.9.9-test (proto v2)'\n")
-	tarball, sum := buildTarball(t, []tarEntry{
-		{name: "README", typeflag: tar.TypeReg, body: []byte("hi")},
-		{name: "LICENSE", typeflag: tar.TypeReg, body: []byte("MIT")},
-		{name: "tether", typeflag: tar.TypeReg, body: binBody, mode: 0o755},
-	})
-	resp, _ := runUpgrade(t, tarball, sum)
-	if !resp.OK {
-		t.Errorf("legitimate multi-entry tarball rejected: %+v", resp)
+	g, fd := runtime.NumGoroutine(), testharness.FDCount()
+	for round := 0; round < 5; round++ {
+		exerciseUpgradeTarballAccepted(t)
 	}
+	testharness.AssertNoGoroutineLeak(t, "regular archive entry", g)
+	testharness.AssertNoFDLeak(t, "regular archive entry", fd, 0)
 }
 
 // TestUpgradeTarballOnlyTraversalEntriesNoTetherRejected: every
 // entry tries to escape the dir, none of them is "tether". Must
-// reject with "missing tether binary entry".
+// reject at extraction, before the version probe can run.
+// origin: hot-update S8 internal review LEGACY-ROUTE-TESTS; plan §5.2 / §6.1
 func TestUpgradeTarballOnlyTraversalEntriesNoTetherRejected(t *testing.T) {
-	tarball, sum := buildTarball(t, []tarEntry{
-		{name: "../tether", typeflag: tar.TypeReg, body: []byte("a")},
-		{name: "/tmp/tether", typeflag: tar.TypeReg, body: []byte("b")},
-		{name: "subdir/tether", typeflag: tar.TypeReg, body: []byte("c")},
-		{name: "./tether", typeflag: tar.TypeReg, body: []byte("d")},
-	})
-	resp, _ := runUpgrade(t, tarball, sum)
-	if resp.OK {
-		t.Errorf("traversal-only tarball accepted: %+v", resp)
+	g, fd := runtime.NumGoroutine(), testharness.FDCount()
+	for round := 0; round < 5; round++ {
+		exerciseUpgradeTarballRejected(t, []tarEntry{
+			{name: "../tether", typeflag: tar.TypeReg, body: []byte("a")},
+			{name: "/tmp/tether", typeflag: tar.TypeReg, body: []byte("b")},
+			{name: "subdir/tether", typeflag: tar.TypeReg, body: []byte("c")},
+			{name: "./tether", typeflag: tar.TypeReg, body: []byte("d")},
+		})
 	}
-	if !strings.Contains(resp.Error, "missing tether") {
-		t.Errorf("expected 'missing tether binary entry'; got %+v", resp)
-	}
+	testharness.AssertNoGoroutineLeak(t, "traversal-only archive", g)
+	testharness.AssertNoFDLeak(t, "traversal-only archive", fd, 0)
 }
 
 // === A.8 expose --name "../../foo" — SQLite/path safety ====================

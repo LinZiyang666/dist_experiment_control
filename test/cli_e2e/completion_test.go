@@ -40,6 +40,9 @@ func newCompletionTransport(url, actorPub, sid string) cli.Transport {
 // The broker auto-promotes the live agent to ONLINE; we additionally
 // seed a STALE row to confirm the filter drops it.
 func TestCompletion_E2E_OnlineNodesFiltered(t *testing.T) {
+	// origin: hot-update S5 PROC-LEAK / final process census.
+	testharness.GuardProcessDirectory(t, filepath.Dir(t.TempDir()))
+
 	cli.ClearCompletionCacheForTest()
 	t.Cleanup(cli.ClearCompletionCacheForTest)
 
@@ -76,6 +79,9 @@ func TestCompletion_E2E_OnlineNodesFiltered(t *testing.T) {
 // CompleteOwnedSessions returns only the owner-owned ACTIVE session,
 // while CompleteVisibleSessions surfaces both.
 func TestCompletion_E2E_OwnedSessionsOnly(t *testing.T) {
+	// origin: hot-update S5 PROC-LEAK / final process census.
+	testharness.GuardProcessDirectory(t, filepath.Dir(t.TempDir()))
+
 	cli.ClearCompletionCacheForTest()
 	t.Cleanup(cli.ClearCompletionCacheForTest)
 
@@ -115,6 +121,9 @@ func TestCompletion_E2E_OwnedSessionsOnly(t *testing.T) {
 // surface visible / owned sessions because ListSessions uses
 // CtlNameUnactivated, not CtlNameForSession(stale-sid).
 func TestCompletion_E2E_StaleSIDDoesNotBlockSessionList(t *testing.T) {
+	// origin: hot-update S5 PROC-LEAK / final process census.
+	testharness.GuardProcessDirectory(t, filepath.Dir(t.TempDir()))
+
 	cli.ClearCompletionCacheForTest()
 	t.Cleanup(cli.ClearCompletionCacheForTest)
 
@@ -145,6 +154,9 @@ func TestCompletion_E2E_StaleSIDDoesNotBlockSessionList(t *testing.T) {
 // + one FREED port_allocations row and verifies the FREED one is
 // filtered out from CompleteAllocatedExposeNames.
 func TestCompletion_E2E_AllocatedExposeNamesFiltered(t *testing.T) {
+	// origin: hot-update S5 PROC-LEAK / final process census.
+	testharness.GuardProcessDirectory(t, filepath.Dir(t.TempDir()))
+
 	cli.ClearCompletionCacheForTest()
 	t.Cleanup(cli.ClearCompletionCacheForTest)
 

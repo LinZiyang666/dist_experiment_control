@@ -9,8 +9,11 @@ import (
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/broker"
+	"github.com/LinZiyang666/tether/internal/controlbudget"
 	"github.com/LinZiyang666/tether/internal/jsstream"
 	"github.com/LinZiyang666/tether/internal/proto"
+	"github.com/LinZiyang666/tether/internal/xferbucket"
+	"github.com/LinZiyang666/tether/internal/xfercontract"
 	"github.com/nats-io/nats.go/jetstream"
 )
 
@@ -116,12 +119,42 @@ func TestD5AllThreeFamiliesReconcile(t *testing.T) {
 		t.Fatal("xfer bucket R1 never placed")
 	}
 
+	// S7 serializes every transfer configuration writer, including replica
+	// observation. Bind this fixture's one real owner instead of asking the
+	// unbound-writer guard to authorize a legacy full-config update.
+	// origin: S10 internal review E2E-PARALLEL-REAL-FAILS F6; S7 plan §2.1 / T05
+	authority, err := xferbucket.NewAuthority(xfercontract.ConfigWriterProof{
+		BrokerID: "d5-leader", InstanceID: "d5-reconcile", BootID: "d5-boot", Nonce: "d5-config", Generation: 1,
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	buckets, err := xferbucket.New(xferbucket.Config{JS: c.js[li], Authority: authority,
+		Base: xfercontract.Base{Clock: func() (string, int64, error) {
+			now, err := controlbudget.Now()
+			return "d5-boot", now, err
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		deadline, err := controlbudget.After(5 * time.Second)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		if err := buckets.Stop(deadline); err != nil {
+			t.Error(err)
+		}
+	})
+	bound := xferbucket.Bind(c.js[li], buckets)
 	p := broker.NewAuditPublisher(broker.AuditPublisherConfig{
 		Node:     c.nodes[li],
-		JS:       c.js[li],
+		JS:       bound,
 		ListSIDs: staticSIDs("lab"),
 		XferState: func(ctx context.Context, sid string, target int) (jsstream.StreamReplicaState, error) {
-			return broker.XferReplicaState(ctx, c.js[li], sid, target)
+			return broker.XferReplicaState(ctx, bound, sid, target)
 		},
 	})
 

@@ -82,7 +82,27 @@ mut "band signature undefined"      BAND-SIG-UNDEFINED sed -i 's|sig:known|sig:u
 mut "band on a CLOSED defect"       BAND-ON-CLOSED     sed -i 's|ASSERT-FAIL@#10@sig:known|ASSERT-FAIL@#99@sig:known|' "$TETHER_VERDICTS_TSV"
 mut "unknown verdict enum"          BAD-ENUM           sed -i 's|^90-d1\tGREEN|90-d1\tMOSTLY-OK|' "$TETHER_VERDICTS_TSV"
 mut "GREEN row with nc_gap>0"       GREEN-NCGAP        sed -i 's|^90-d1\tGREEN\t0|90-d1\tGREEN\t2|' "$TETHER_VERDICTS_TSV"
-mut "INCOMPLETE pinned at 0 gaps"   INCOMPLETE-ZERO    sed -i 's|^91-d2\tINCOMPLETE\t1|91-d2\tINCOMPLETE\t0|' "$TETHER_VERDICTS_TSV"
+# origin: S8 internal review s8-hermetic F7. A guard is native INCOMPLETE
+# with no coverage gap. Prove it using the real assertion owner, then require
+# the machine declaration to accept that counter shape without relabeling it.
+seed
+sed -i 's|^91-d2\tINCOMPLETE\t1|91-d2\tINCOMPLETE\t0|' "$TETHER_VERDICTS_TSV"
+if out=$(run_validator) && printf '%s\n' "$out" | grep -q 'validate-verdicts: OK'; then
+    pass "INCOMPLETE guard with zero coverage gaps is a valid declaration"
+else fail "INCOMPLETE guard declaration rejected: $out"; fi
+native=$(sh -c '
+    . "$1/../lib/assert.sh"
+    log() { :; }; err() { :; }; ok() { :; }
+    INSTANCE=drill-hermetic-guard; drill_begin hermetic-guard
+    not_covered "non_hot migration observation" "completion is unproven" runtime-guard
+    drill_end
+' guard "$HERE" 2>&1)
+rc=$?
+if [ "$rc" = 4 ] && printf '%s\n' "$native" | grep -q 'verdict=INCOMPLETE rc=4' &&
+    printf '%s\n' "$native" | grep -q 'nc_gap=0 nc_guard=1'; then
+    pass "real guard keeps INCOMPLETE rc4 nc_gap0 nc_guard1"
+else fail "real guard counters/status changed: rc=$rc $native"; fi
+
 mut "non-numeric nc_gap"            BAD-NCGAP          sed -i 's|^91-d2\tINCOMPLETE\t1|91-d2\tINCOMPLETE\tx|' "$TETHER_VERDICTS_TSV"
 mut "wrong field count (5 cols)"    ROW-FIELDS         sed -i 's|^90-d1\tGREEN\t0\t-\t-\t90-d1|90-d1\tGREEN\t0\t-\t90-d1|' "$TETHER_VERDICTS_TSV"
 mut "dangling note-ref"             NOTE-REF-MISSING   sed -i 's|\t90-d1$|\tno-such-section|' "$TETHER_VERDICTS_TSV"

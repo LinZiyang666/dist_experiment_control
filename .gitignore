@@ -90,3 +90,5 @@ Thumbs.db
 # specific on purpose: `*.bak` alone would also hide a deliberate, reviewed artefact someone
 # means to commit, whereas a DATE-stamped one is always a "just in case" copy.
 *.bak.[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]
+__pycache__/
+*.pyc

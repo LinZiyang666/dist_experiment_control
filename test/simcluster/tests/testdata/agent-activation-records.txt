@@ -1,0 +1,2 @@
+time=2026-10-02T00:00:00.000Z level=INFO msg="agent: image activated generation=1 tasks=1 freeze_window_ms=12 shim_ms=2 import_ms=4"
+{"time":"2026-10-02T00:00:00Z","level":"INFO","msg":"agent: image activated generation=1 tasks=1 freeze_window_ms=12 shim_ms=2 import_ms=4"}

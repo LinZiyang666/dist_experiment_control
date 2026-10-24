@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -126,6 +127,9 @@ func runExecWithCtx(ctx context.Context, t *testing.T, nc *nats.Conn, sid, actor
 // base64 is friendlier to stream comparators and still hits all the
 // 4KiB chunk boundaries the agent uses.
 func TestExecLargeStdoutDelivered(t *testing.T) {
+	// origin: hot-update S5 PROC-LEAK / final process census.
+	testharness.GuardProcessDirectory(t, filepath.Dir(t.TempDir()))
+
 	url := startNATS(t)
 	db := openDB(t)
 	pub, fp := freshUserPub(t)
@@ -168,6 +172,9 @@ func TestExecLargeStdoutDelivered(t *testing.T) {
 // Hits the dual-pipe streamer in agent.runChild (separate goroutine
 // per fd).
 func TestExecBothStreamsDeliveredFully(t *testing.T) {
+	// origin: hot-update S5 PROC-LEAK / final process census.
+	testharness.GuardProcessDirectory(t, filepath.Dir(t.TempDir()))
+
 	url := startNATS(t)
 	db := openDB(t)
 	pub, fp := freshUserPub(t)
@@ -205,6 +212,9 @@ func TestExecBothStreamsDeliveredFully(t *testing.T) {
 // B.9 — fast-path success. Pin the trivial happy-path code so a
 // regression in lifecycle handling shows up instantly.
 func TestExecImmediateExitZero(t *testing.T) {
+	// origin: hot-update S5 PROC-LEAK / final process census.
+	testharness.GuardProcessDirectory(t, filepath.Dir(t.TempDir()))
+
 	url := startNATS(t)
 	db := openDB(t)
 	pub, fp := freshUserPub(t)
@@ -229,6 +239,9 @@ func TestExecImmediateExitZero(t *testing.T) {
 // os.Exit). 42 is arbitrary; just want to prove the wire carries the
 // integer rather than collapsing to 1.
 func TestExecArbitraryExitCodePropagates(t *testing.T) {
+	// origin: hot-update S5 PROC-LEAK / final process census.
+	testharness.GuardProcessDirectory(t, filepath.Dir(t.TempDir()))
+
 	url := startNATS(t)
 	db := openDB(t)
 	pub, fp := freshUserPub(t)
@@ -253,6 +266,9 @@ func TestExecArbitraryExitCodePropagates(t *testing.T) {
 // translation is exercised in cmd/tether tests). The child SIGKILLs
 // itself so we don't need to spawn a watcher.
 func TestExecChildKilledBySignal(t *testing.T) {
+	// origin: hot-update S5 PROC-LEAK / final process census.
+	testharness.GuardProcessDirectory(t, filepath.Dir(t.TempDir()))
+
 	url := startNATS(t)
 	db := openDB(t)
 	pub, fp := freshUserPub(t)
@@ -285,6 +301,9 @@ func TestExecChildKilledBySignal(t *testing.T) {
 // local-side behavior so a future change that adds a hang here gets
 // caught.)
 func TestExecCtlContextCancelReturnsLocally(t *testing.T) {
+	// origin: hot-update S5 PROC-LEAK / final process census.
+	testharness.GuardProcessDirectory(t, filepath.Dir(t.TempDir()))
+
 	url := startNATS(t)
 	db := openDB(t)
 	pub, fp := freshUserPub(t)
@@ -319,6 +338,9 @@ func TestExecCtlContextCancelReturnsLocally(t *testing.T) {
 // interpolation), so `echo` should print the literal arg with the
 // emoji + Chinese chars.
 func TestExecPreservesUnicodeAndShellMeta(t *testing.T) {
+	// origin: hot-update S5 PROC-LEAK / final process census.
+	testharness.GuardProcessDirectory(t, filepath.Dir(t.TempDir()))
+
 	url := startNATS(t)
 	db := openDB(t)
 	pub, fp := freshUserPub(t)

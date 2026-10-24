@@ -1,0 +1,357 @@
+{
+  "schema": "fullstack-mutations-v1",
+  "required_children": ["M01A", "M01B", "M02E", "M02P", "M02F", "M02X", "M03E", "M03P", "M03F", "M03X", "M04A", "M04B", "M04P", "M05E", "M05P", "M05X", "M05R", "M06A", "M06B", "M06R", "M06F", "M07A", "M07B", "M07N", "M07C", "M08E", "M08P", "M08A", "M08B", "M08D", "M08X", "M08C", "M08O", "M09A", "M09B", "M10S", "M10C", "M11W", "M11I", "M11O", "M11P", "M11Q", "M11F", "M11S", "M11X", "M11D", "M11C", "M11L", "M11U", "M11K"],
+  "expected_native": [0, 1, 0],
+  "mutations": [
+    {
+      "id": "M01A", "defect": "bare agent reexec after accepted cut", "surface": "product",
+      "source_path": "internal/agent/upgrade.go", "function": "reExecInPlace", "predicate": "err = prepared.Exec(exePath, argv, execEnv())",
+      "compatible_artifact_set": "tether-T0-T5", "role": "agent", "topologies": ["single"],
+      "window": "accepted-cut-retained-exec", "hit_event": "M01A-predicate-hit", "expected_assertion": "fullstackCheckRetained",
+      "integration": {"path": "test/hotupdate/fullstack_task_exec_test.go", "test": "TestFullstackTasksRetainCurrentRollbackState", "exercise": "exerciseTaskRollback", "oracle_path": "test/hotupdate/fullstack_task_exec_test.go", "oracle": "fullstackCheckRetained"}, "pending_owners": ["S8 P18/P19", "S10 P06/P07/P16"], "deploy_only": false
+    },
+    {
+      "id": "M01B", "defect": "broker Run unwind after accepted cut", "surface": "product",
+      "source_path": "internal/broker/reexec.go", "function": "runBrokerImageReloadUsing", "predicate": "return brokerimage.ReloadCurrentStore",
+      "compatible_artifact_set": "tether-T0-T5", "role": "broker", "topologies": ["single", "quorum"],
+      "window": "original-socket-unacked-duplex", "hit_event": "M01B-predicate-hit", "expected_assertion": "fullstackFlowTransition",
+      "integration": {"path": "test/hotupdate/fullstack_flow_exec_test.go", "test": "TestFullstackOriginalFlowsUseEveryInfraCut", "exercise": "exerciseOriginalFlowCut", "oracle_path": "test/hotupdate/fullstack_flow_exec_test.go", "oracle": "fullstackFlowTransition"}, "pending_owners": ["S10 P19/P25 assembly", "S9 P15/P16/P22/P23"], "deploy_only": false
+    },
+    {
+      "id": "M02E", "defect": "omit exec replay or retained checkpoint", "surface": "product",
+      "source_path": "internal/execsession/image.go", "function": "Export", "predicate": "ti.Stdout =",
+      "compatible_artifact_set": "tether-T0-T5", "role": "agent", "topologies": ["single"],
+      "window": "accepted-cut-retained-exec", "hit_event": "M02E-predicate-hit", "expected_assertion": "fullstackCheckRetained",
+      "integration": {"path": "test/hotupdate/fullstack_task_exec_test.go", "test": "TestFullstackTasksRetainCurrentRollbackState", "exercise": "exerciseTaskRollback", "oracle_path": "test/hotupdate/fullstack_task_exec_test.go", "oracle": "fullstackCheckRetained"}, "pending_owners": ["S8 P18/P19", "S10 P06/P07/P16"], "deploy_only": false
+    },
+    {
+      "id": "M02P", "defect": "omit PTY pending suffix, control or absolute KA state", "surface": "product",
+      "source_path": "internal/ptysession/image.go", "function": "snapshotLocked", "predicate": "s.Pending =",
+      "compatible_artifact_set": "tether-T0-T5", "role": "agent", "topologies": ["single"],
+      "window": "partial-write-pending-control-unacked-output", "hit_event": "M02P-predicate-hit", "expected_assertion": "fullstackCheckPTYCheckpoint",
+      "integration": {"path": "test/hotupdate/fullstack_pty_exec_test.go", "test": "TestFullstackPTYPendingControlAcrossLayers", "exercise": "exercisePTYPendingControl", "oracle_path": "test/hotupdate/fullstack_pty_exec_test.go", "oracle": "fullstackCheckPTYCheckpoint"}, "pending_owners": ["S8 P18/P19", "S10 P06/P07/P16"], "deploy_only": false
+    },
+    {
+      "id": "M02F", "defect": "omit flow replay or FIN checkpoint", "surface": "product",
+      "source_path": "internal/flow/image.go", "function": "Export", "predicate": "encodeFlowState(",
+      "compatible_artifact_set": "tether-T0-T5", "role": "agent", "topologies": ["single", "quorum"],
+      "window": "original-socket-unacked-duplex", "hit_event": "M02F-predicate-hit", "expected_assertion": "fullstackFlowTransition",
+      "integration": {"path": "test/hotupdate/fullstack_flow_exec_test.go", "test": "TestFullstackOriginalFlowsUseEveryInfraCut", "exercise": "exerciseOriginalFlowCut", "oracle_path": "test/hotupdate/fullstack_flow_exec_test.go", "oracle": "fullstackFlowTransition"}, "pending_owners": ["S10 P19/P25 assembly", "S9 P15/P16/P22/P23"], "deploy_only": false
+    },
+    {
+      "id": "M02X", "defect": "omit transfer Sync prefix", "surface": "product",
+      "source_path": "internal/xferreceive/receiver.go", "function": "confirmCheckpoint", "predicate": "r.config.Reader.ConfirmSynced(cp)",
+      "compatible_artifact_set": "tether-T0-T5", "role": "agent", "topologies": ["single"],
+      "window": "nonzero-sync-prefix", "hit_event": "M02X-predicate-hit", "expected_assertion": "fullstackCheckTransferCheckpoint",
+      "integration": {"path": "test/hotupdate/fullstack_transfer_exec_test.go", "test": "TestFullstackTransferCohortsRespectOriginalBudget", "exercise": "exerciseTransferCohort", "oracle_path": "test/hotupdate/fullstack_transfer_helpers_test.go", "oracle": "fullstackCheckTransferCheckpoint"}, "pending_owners": ["S7 s7-p9m", "S10 P14/P19/P25"], "deploy_only": false
+    },
+    {
+      "id": "M03E", "defect": "shift actual exec applied offset by one", "surface": "product",
+      "source_path": "internal/workload/input.go", "function": "run", "predicate": "p.log.Ack(state.Base + uint64(written))",
+      "compatible_artifact_set": "tether-T0-T5", "role": "agent", "topologies": ["single"],
+      "window": "accepted-cut-retained-exec", "hit_event": "M03E-predicate-hit", "expected_assertion": "fullstackCheckRetained",
+      "integration": {"path": "test/hotupdate/fullstack_task_exec_test.go", "test": "TestFullstackTasksRetainCurrentRollbackState", "exercise": "exerciseTaskRollback", "oracle_path": "test/hotupdate/fullstack_task_exec_test.go", "oracle": "fullstackCheckRetained"}, "pending_owners": ["S8 P18/P19", "S10 P06/P07/P16"], "deploy_only": false
+    },
+    {
+      "id": "M03P", "defect": "shift actual PTY applied offset by one", "surface": "product",
+      "source_path": "internal/ptysession/input.go", "function": "writeLoop", "predicate": "a.cfg.Input.Ack(s.Base + uint64(written))",
+      "compatible_artifact_set": "tether-T0-T5", "role": "agent", "topologies": ["single"],
+      "window": "partial-write-pending-control-unacked-output", "hit_event": "M03P-predicate-hit", "expected_assertion": "fullstackCheckPTYCheckpoint",
+      "integration": {"path": "test/hotupdate/fullstack_pty_exec_test.go", "test": "TestFullstackPTYPendingControlAcrossLayers", "exercise": "exercisePTYPendingControl", "oracle_path": "test/hotupdate/fullstack_pty_exec_test.go", "oracle": "fullstackCheckPTYCheckpoint"}, "pending_owners": ["S8 P18/P19", "S10 P06/P07/P16"], "deploy_only": false
+    },
+    {
+      "id": "M03F", "defect": "shift actual flow applied offset by one", "surface": "product",
+      "source_path": "internal/flow/pump.go", "function": "sinkPump", "predicate": "r.rxApplied += uint64(n)",
+      "compatible_artifact_set": "tether-T0-T5", "role": "agent", "topologies": ["single", "quorum"],
+      "window": "original-socket-unacked-duplex", "hit_event": "M03F-predicate-hit", "expected_assertion": "fullstackFlowTransition",
+      "integration": {"path": "test/hotupdate/fullstack_flow_exec_test.go", "test": "TestFullstackOriginalFlowsUseEveryInfraCut", "exercise": "exerciseOriginalFlowCut", "oracle_path": "test/hotupdate/fullstack_flow_exec_test.go", "oracle": "fullstackFlowTransition"}, "pending_owners": ["S10 P19/P25 assembly", "S9 P15/P16/P22/P23"], "deploy_only": false
+    },
+    {
+      "id": "M03X", "defect": "shift actual transfer durable offset by one", "surface": "product",
+      "source_path": "internal/xferreceive/checkpoint.go", "function": "extendCheckpoint", "predicate": "DurableOffset: cp.DurableOffset + int64(len(chunk.Data))",
+      "compatible_artifact_set": "tether-T0-T5", "role": "agent", "topologies": ["single"],
+      "window": "nonzero-sync-prefix", "hit_event": "M03X-predicate-hit", "expected_assertion": "fullstackCheckTransferCheckpoint",
+      "integration": {"path": "test/hotupdate/fullstack_transfer_exec_test.go", "test": "TestFullstackTransferCohortsRespectOriginalBudget", "exercise": "exerciseTransferCohort", "oracle_path": "test/hotupdate/fullstack_transfer_helpers_test.go", "oracle": "fullstackCheckTransferCheckpoint"}, "pending_owners": ["S7 s7-p9m", "S10 P14/P19/P25"], "deploy_only": false
+    },
+    {
+      "id": "M04A", "defect": "close original agent raw socket before handoff", "surface": "product",
+      "source_path": "internal/rawsocket/socket.go", "function": "Hold", "predicate": "st.frozen = true",
+      "compatible_artifact_set": "tether-T0-T5", "role": "agent", "topologies": ["single", "quorum"],
+      "window": "original-socket-unacked-duplex", "hit_event": "M04A-predicate-hit", "expected_assertion": "fullstackFlowTransition",
+      "integration": {"path": "test/hotupdate/fullstack_flow_exec_test.go", "test": "TestFullstackOriginalFlowsUseEveryInfraCut", "exercise": "exerciseOriginalFlowCut", "oracle_path": "test/hotupdate/fullstack_flow_exec_test.go", "oracle": "fullstackFlowTransition"}, "pending_owners": ["S10 P19/P25 assembly", "S9 P15/P16/P22/P23"], "deploy_only": false
+    },
+    {
+      "id": "M04B", "defect": "close original broker accepted socket before handoff", "surface": "product",
+      "source_path": "internal/tunnel/server_image.go", "function": "snapshotServerEndpoint", "predicate": "e.pendingRaw",
+      "compatible_artifact_set": "tether-T0-T5", "role": "broker", "topologies": ["single", "quorum"],
+      "window": "original-socket-unacked-duplex", "hit_event": "M04B-predicate-hit", "expected_assertion": "fullstackFlowTransition",
+      "integration": {"path": "test/hotupdate/fullstack_flow_exec_test.go", "test": "TestFullstackOriginalFlowsUseEveryInfraCut", "exercise": "exerciseOriginalFlowCut", "oracle_path": "test/hotupdate/fullstack_flow_exec_test.go", "oracle": "fullstackFlowTransition"}, "pending_owners": ["S10 P19/P25 assembly", "S9 P15/P16/P22/P23"], "deploy_only": false
+    },
+    {
+      "id": "M04P", "defect": "close original PTY master before handoff", "surface": "product",
+      "source_path": "internal/ptysession/fence.go", "function": "freezeReplays", "predicate": "files[\"master\"] = a.cfg.Master.Borrow()",
+      "compatible_artifact_set": "tether-T0-T5", "role": "agent", "topologies": ["single"],
+      "window": "held-zombie-tail-before-eof", "hit_event": "M04P-predicate-hit", "expected_assertion": "fullstackCheckHeldTail",
+      "integration": {"path": "test/hotupdate/fullstack_pty_exec_test.go", "test": "TestFullstackPTYZombieTailAndSessionCleanup", "exercise": "exercisePTYRetirement", "oracle_path": "test/hotupdate/fullstack_pty_exec_test.go", "oracle": "fullstackCheckHeldTail"}, "pending_owners": ["S8 P18/P19/P24/P26", "S9 managed infra"], "deploy_only": false
+    },
+    {
+      "id": "M05E", "defect": "omit exec create registry entry after real spawn", "surface": "product",
+      "source_path": "internal/execsession/runtime.go", "function": "resolveExecRecordLocked", "predicate": "r.tasks[record.PID] = t",
+      "compatible_artifact_set": "tether-T0-T5", "role": "agent", "topologies": ["single"],
+      "window": "accepted-cut-retained-exec", "hit_event": "M05E-predicate-hit", "expected_assertion": "fullstackCheckRetained",
+      "integration": {"path": "test/hotupdate/fullstack_task_exec_test.go", "test": "TestFullstackTasksRetainCurrentRollbackState", "exercise": "exerciseTaskRollback", "oracle_path": "test/hotupdate/fullstack_task_exec_test.go", "oracle": "fullstackCheckRetained"}, "pending_owners": ["S8 P18/P19", "S10 P06/P07/P16"], "deploy_only": false
+    },
+    {
+      "id": "M05P", "defect": "omit PTY create registry entry after real spawn", "surface": "product",
+      "source_path": "internal/execsession/pty.go", "function": "createPTYLocked", "predicate": "r.tasks[rec.PID] = pending",
+      "compatible_artifact_set": "tether-T0-T5", "role": "agent", "topologies": ["single"],
+      "window": "partial-write-pending-control-unacked-output", "hit_event": "M05P-predicate-hit", "expected_assertion": "fullstackCheckPTYCheckpoint",
+      "integration": {"path": "test/hotupdate/fullstack_pty_exec_test.go", "test": "TestFullstackPTYPendingControlAcrossLayers", "exercise": "exercisePTYPendingControl", "oracle_path": "test/hotupdate/fullstack_pty_exec_test.go", "oracle": "fullstackCheckPTYCheckpoint"}, "pending_owners": ["S8 P18/P19", "S10 P06/P07/P16"], "deploy_only": false
+    },
+    {
+      "id": "M05X", "defect": "duplicate transfer permit or tracker entry", "surface": "product",
+      "source_path": "internal/xfertrack/grant.go", "function": "Admit", "predicate": "o.entries[",
+      "compatible_artifact_set": "tether-T0-T5", "role": "broker", "topologies": ["single", "quorum"],
+      "window": "nonzero-sync-prefix", "hit_event": "M05X-predicate-hit", "expected_assertion": "fullstackCheckTransferCheckpoint",
+      "integration": {"path": "test/hotupdate/fullstack_transfer_exec_test.go", "test": "TestFullstackTransferCohortsRespectOriginalBudget", "exercise": "exerciseTransferCohort", "oracle_path": "test/hotupdate/fullstack_transfer_helpers_test.go", "oracle": "fullstackCheckTransferCheckpoint"}, "pending_owners": ["S7 s7-p9m", "S10 P14/P19/P25"], "deploy_only": false
+    },
+    {
+      "id": "M05R", "defect": "omit new retained work on ACTIVE current reverse", "surface": "product",
+      "source_path": "internal/agent/upgrade_image.go", "function": "rollbackCurrentImage", "predicate": "freezeForUpgrade(",
+      "compatible_artifact_set": "tether-T0-T5", "role": "agent", "topologies": ["single"],
+      "window": "active-current-reverse-new-retained-work", "hit_event": "M05R-predicate-hit", "expected_assertion": "fullstackJudgeRollback",
+      "integration": {"path": "test/hotupdate/fullstack_transaction_test.go", "test": "TestFullstackRollbackRequiresFreshCurrentProof", "exercise": "exerciseCurrentRollback", "oracle_path": "test/hotupdate/fullstack_transaction_test.go", "oracle": "fullstackJudgeRollback"}, "pending_owners": ["S8 P14/P15/P17/P19/P26", "S10 P18/P19/P25"], "deploy_only": false
+    },
+    {
+      "id": "M06A", "defect": "activate two same SHA agent owners", "surface": "product",
+      "source_path": "internal/agentboot/image.go", "function": "Activate", "predicate": "imp.Thaw()",
+      "compatible_artifact_set": "tether-T0-T5", "role": "agent", "topologies": ["single"],
+      "window": "activation-effect-interval", "hit_event": "M06A-predicate-hit", "expected_assertion": "fullstackJudgeOwnership",
+      "integration": {"path": "test/hotupdate/fullstack_ownership_test.go", "test": "TestFullstackOwnershipIntervalsAreExclusive", "exercise": "exerciseOwnershipCut", "oracle_path": "test/hotupdate/fullstack_ownership_test.go", "oracle": "fullstackJudgeOwnership"}, "pending_owners": ["S8 P14/P15/P17/P26", "S10 P08/P16/P18/P19/P25"], "deploy_only": false
+    },
+    {
+      "id": "M06B", "defect": "activate two same SHA broker owners", "surface": "product",
+      "source_path": "internal/brokerimage/import.go", "function": "Activate", "predicate": "i.active = true",
+      "compatible_artifact_set": "tether-T0-T5", "role": "broker", "topologies": ["single", "quorum"],
+      "window": "activation-effect-interval", "hit_event": "M06B-predicate-hit", "expected_assertion": "fullstackJudgeOwnership",
+      "integration": {"path": "test/hotupdate/fullstack_ownership_test.go", "test": "TestFullstackOwnershipIntervalsAreExclusive", "exercise": "exerciseOwnershipCut", "oracle_path": "test/hotupdate/fullstack_ownership_test.go", "oracle": "fullstackJudgeOwnership"}, "pending_owners": ["S8 P14/P15/P17/P26", "S10 P08/P16/P18/P19/P25"], "deploy_only": false
+    },
+    {
+      "id": "M06R", "defect": "briefly activate a third resource generation", "surface": "product",
+      "source_path": "internal/agentboot/image.go", "function": "Activate", "predicate": "i.activated = true",
+      "compatible_artifact_set": "tether-T0-T5", "role": "agent", "topologies": ["single", "quorum"],
+      "window": "activation-effect-interval", "hit_event": "M06R-predicate-hit", "expected_assertion": "fullstackJudgeOwnership",
+      "integration": {"path": "test/hotupdate/fullstack_ownership_test.go", "test": "TestFullstackOwnershipIntervalsAreExclusive", "exercise": "exerciseOwnershipCut", "oracle_path": "test/hotupdate/fullstack_ownership_test.go", "oracle": "fullstackJudgeOwnership"}, "pending_owners": ["S8 P14/P15/P17/P26", "S10 P08/P16/P18/P19/P25"], "deploy_only": false
+    },
+    {
+      "id": "M06F", "defect": "install a third fleet release on a nonvoter or agent", "surface": "product",
+      "source_path": "internal/upgradecompat/fleet.go", "function": "CheckFleet", "predicate": "releases[participant.Release] = true",
+      "compatible_artifact_set": "tether-T0-T5", "role": "agent", "topologies": ["single", "quorum"],
+      "window": "activation-effect-interval", "hit_event": "M06F-predicate-hit", "expected_assertion": "fullstackJudgeOwnership",
+      "integration": {"path": "test/hotupdate/fullstack_ownership_test.go", "test": "TestFullstackOwnershipIntervalsAreExclusive", "exercise": "exerciseOwnershipCut", "oracle_path": "test/hotupdate/fullstack_ownership_test.go", "oracle": "fullstackJudgeOwnership"}, "pending_owners": ["S8 P14/P15/P17/P26", "S10 P08/P16/P18/P19/P25"], "deploy_only": false
+    },
+    {
+      "id": "M07A", "defect": "replace disk bytes but skip agent exec", "surface": "product",
+      "source_path": "internal/agent/upgrade.go", "function": "reExecInPlace", "predicate": "err = prepared.Exec(exePath, argv, execEnv())",
+      "compatible_artifact_set": "tether-T0-T5", "role": "agent", "topologies": ["single"],
+      "window": "same-image-five-effect-settle-cycles", "hit_event": "M07A-predicate-hit", "expected_assertion": "fullstackCutIdentity",
+      "integration": {"path": "test/hotupdate/fullstack_resource_test.go", "test": "TestFiveGenerationResourceBaseline", "exercise": "exerciseGenerationResourceCycle", "oracle_path": "test/hotupdate/fullstack_helpers_test.go", "oracle": "fullstackCutIdentity"}, "pending_owners": ["S8 P18/P19", "S10 P19/P25", "S9 managed infra"], "deploy_only": false
+    },
+    {
+      "id": "M07B", "defect": "replace disk bytes but skip broker exec", "surface": "product",
+      "source_path": "internal/brokerimage/cut.go", "function": "ExecCommit", "predicate": "return prepared.Exec(path, args, handoff.CleanEnvironment(env))",
+      "compatible_artifact_set": "tether-T0-T5", "role": "broker", "topologies": ["single", "quorum"],
+      "window": "same-image-five-effect-settle-cycles", "hit_event": "M07B-predicate-hit", "expected_assertion": "fullstackCutIdentity",
+      "integration": {"path": "test/hotupdate/fullstack_resource_test.go", "test": "TestFiveGenerationResourceBaseline", "exercise": "exerciseGenerationResourceCycle", "oracle_path": "test/hotupdate/fullstack_helpers_test.go", "oracle": "fullstackCutIdentity"}, "pending_owners": ["S8 P18/P19", "S10 P19/P25", "S9 managed infra"], "deploy_only": false
+    },
+    {
+      "id": "M07N", "defect": "replace disk bytes but skip NATS restart", "surface": "product",
+      "source_path": "internal/infraupgrade/nats_single.go", "function": "cutover", "predicate": "d.host(r, c.ReleaseStart, r.cohort.Proof)",
+      "compatible_artifact_set": "nats-2.14.5-2.14.6", "role": "nats", "topologies": ["single", "quorum"],
+      "window": "same-image-five-effect-settle-cycles", "hit_event": "M07N-predicate-hit", "expected_assertion": "fullstackCutIdentity",
+      "integration": {"path": "test/hotupdate/fullstack_resource_test.go", "test": "TestFiveGenerationResourceBaseline", "exercise": "exerciseGenerationResourceCycle", "oracle_path": "test/hotupdate/fullstack_helpers_test.go", "oracle": "fullstackCutIdentity"}, "pending_owners": ["S8 P18/P19", "S10 P19/P25", "S9 managed infra"], "deploy_only": true
+    },
+    {
+      "id": "M07C", "defect": "replace disk bytes but skip Caddy binary switch", "surface": "product",
+      "source_path": "internal/infraupgrade/caddy_reload.go", "function": "cutoverBarrier", "predicate": "d.host(x, c.ReleaseStart, p.Before, deadline, stop)",
+      "compatible_artifact_set": "caddy-2.7.5-2.7.6", "role": "caddy", "topologies": ["single", "quorum"],
+      "window": "same-image-five-effect-settle-cycles", "hit_event": "M07C-predicate-hit", "expected_assertion": "fullstackCutIdentity",
+      "integration": {"path": "test/hotupdate/fullstack_resource_test.go", "test": "TestFiveGenerationResourceBaseline", "exercise": "exerciseGenerationResourceCycle", "oracle_path": "test/hotupdate/fullstack_helpers_test.go", "oracle": "fullstackCutIdentity"}, "pending_owners": ["S8 P18/P19", "S10 P19/P25", "S9 managed infra"], "deploy_only": true
+    },
+    {
+      "id": "M08E", "defect": "park one exec goroutine per settled cycle", "surface": "product",
+      "source_path": "internal/execsession/runtime.go", "function": "conclude", "predicate": "r.retireLocked(t)",
+      "compatible_artifact_set": "tether-T0-T5", "role": "agent", "topologies": ["single"],
+      "window": "same-image-five-effect-settle-cycles", "hit_event": "M08E-predicate-hit", "expected_assertion": "fullstackFloorWithinImage",
+      "integration": {"path": "test/hotupdate/fullstack_resource_test.go", "test": "TestFiveGenerationResourceBaseline", "exercise": "exerciseGenerationResourceCycle", "oracle_path": "test/hotupdate/fullstack_resource_test.go", "oracle": "fullstackFloorWithinImage"}, "pending_owners": ["S8 P18/P19", "S10 P19/P25", "S9 managed infra"], "deploy_only": false
+    },
+    {
+      "id": "M08P", "defect": "park one PTY goroutine per settled cycle", "surface": "product",
+      "source_path": "internal/ptysession/actor.go", "function": "Close", "predicate": "a.cfg.Input.Close()",
+      "compatible_artifact_set": "tether-T0-T5", "role": "agent", "topologies": ["single"],
+      "window": "same-image-five-effect-settle-cycles", "hit_event": "M08P-predicate-hit", "expected_assertion": "fullstackFloorWithinImage",
+      "integration": {"path": "test/hotupdate/fullstack_resource_test.go", "test": "TestFiveGenerationResourceBaseline", "exercise": "exerciseGenerationResourceCycle", "oracle_path": "test/hotupdate/fullstack_resource_test.go", "oracle": "fullstackFloorWithinImage"}, "pending_owners": ["S8 P18/P19", "S10 P19/P25", "S9 managed infra"], "deploy_only": false
+    },
+    {
+      "id": "M08A", "defect": "retain one agent descriptor per settled cycle", "surface": "product",
+      "source_path": "internal/execsession/runtime.go", "function": "retireLocked", "predicate": "delete(r.tasks, t.pid)",
+      "compatible_artifact_set": "tether-T0-T5", "role": "agent", "topologies": ["single"],
+      "window": "same-image-five-effect-settle-cycles", "hit_event": "M08A-predicate-hit", "expected_assertion": "fullstackFloorWithinImage",
+      "integration": {"path": "test/hotupdate/fullstack_resource_test.go", "test": "TestFiveGenerationResourceBaseline", "exercise": "exerciseGenerationResourceCycle", "oracle_path": "test/hotupdate/fullstack_resource_test.go", "oracle": "fullstackFloorWithinImage"}, "pending_owners": ["S8 P18/P19", "S10 P19/P25", "S9 managed infra"], "deploy_only": false
+    },
+    {
+      "id": "M08B", "defect": "park one broker goroutine per settled cycle", "surface": "product",
+      "source_path": "internal/broker/reexec.go", "function": "StopCurrent", "predicate": "owner.Stop(d)",
+      "compatible_artifact_set": "tether-T0-T5", "role": "broker", "topologies": ["single", "quorum"],
+      "window": "same-image-five-effect-settle-cycles", "hit_event": "M08B-predicate-hit", "expected_assertion": "fullstackFloorWithinImage",
+      "integration": {"path": "test/hotupdate/fullstack_resource_test.go", "test": "TestFiveGenerationResourceBaseline", "exercise": "exerciseGenerationResourceCycle", "oracle_path": "test/hotupdate/fullstack_resource_test.go", "oracle": "fullstackFloorWithinImage"}, "pending_owners": ["S8 P18/P19", "S10 P19/P25", "S9 managed infra"], "deploy_only": false
+    },
+    {
+      "id": "M08D", "defect": "retain one broker descriptor per settled cycle", "surface": "product",
+      "source_path": "internal/brokerimage/single_store.go", "function": "closeColdSingleStore", "predicate": "closeErr := db.Close()",
+      "compatible_artifact_set": "tether-T0-T5", "role": "broker", "topologies": ["single", "quorum"],
+      "window": "same-image-five-effect-settle-cycles", "hit_event": "M08D-predicate-hit", "expected_assertion": "fullstackFloorWithinImage",
+      "integration": {"path": "test/hotupdate/fullstack_resource_test.go", "test": "TestFiveGenerationResourceBaseline", "exercise": "exerciseGenerationResourceCycle", "oracle_path": "test/hotupdate/fullstack_resource_test.go", "oracle": "fullstackFloorWithinImage"}, "pending_owners": ["S8 P18/P19", "S10 P19/P25", "S9 managed infra"], "deploy_only": false
+    },
+    {
+      "id": "M08X", "defect": "retain transfer consumer after owner retirement", "surface": "product",
+      "source_path": "internal/jsstream/object_reader.go", "function": "Close", "predicate": "r.cancel()",
+      "compatible_artifact_set": "tether-T0-T5", "role": "agent", "topologies": ["single", "quorum"],
+      "window": "primitive-or-consumer-retirement-before-seal", "hit_event": "M08X-predicate-hit", "expected_assertion": "fullstackCheckTransferConsumers",
+      "integration": {"path": "test/hotupdate/fullstack_transfer_exec_test.go", "test": "TestFullstackTransferSealsLateTerminal", "exercise": "exerciseTransferEndSeal", "oracle_path": "test/hotupdate/fullstack_transfer_helpers_test.go", "oracle": "fullstackCheckTransferConsumers"}, "pending_owners": ["S7 s7-p9m", "S10 P14/P16/P19/P25"], "deploy_only": false
+    },
+    {
+      "id": "M08C", "defect": "retain old or temporary Caddy process", "surface": "product",
+      "source_path": "internal/infraupgrade/caddy_reload.go", "function": "returnBarrier", "predicate": "d.host(x, c.RetireWarm, x.Warm, deadline, stop)",
+      "compatible_artifact_set": "caddy-2.7.5-2.7.6", "role": "caddy", "topologies": ["single", "quorum"],
+      "window": "same-image-five-effect-settle-cycles", "hit_event": "M08C-predicate-hit", "expected_assertion": "fullstackFloorWithinImage",
+      "integration": {"path": "test/hotupdate/fullstack_resource_test.go", "test": "TestFiveGenerationResourceBaseline", "exercise": "exerciseGenerationResourceCycle", "oracle_path": "test/hotupdate/fullstack_resource_test.go", "oracle": "fullstackFloorWithinImage"}, "pending_owners": ["S8 P18/P19", "S10 P19/P25", "S9 managed infra"], "deploy_only": true
+    },
+    {
+      "id": "M08O", "defect": "retain collector worker after Close and Join", "surface": "harness",
+      "source_path": "test/simcluster/drills/lib/fullstack_collect.py", "function": "Collector.join", "predicate": "thread.join(max(0, deadline - time.monotonic()))",
+      "compatible_artifact_set": "tether-T0-T5", "role": "fixture", "topologies": ["single", "quorum"],
+      "window": "same-image-five-effect-settle-cycles", "hit_event": "M08O-predicate-hit", "expected_assertion": "fullstackFloorWithinImage",
+      "integration": {"path": "test/hotupdate/fullstack_resource_test.go", "test": "TestFiveGenerationResourceBaseline", "exercise": "exerciseGenerationResourceCycle", "oracle_path": "test/hotupdate/fullstack_resource_test.go", "oracle": "fullstackFloorWithinImage"}, "pending_owners": ["S8 P18/P19", "S10 P19/P25", "S9 managed infra"], "deploy_only": false
+    },
+    {
+      "id": "M09A", "defect": "report target SHA while agent executes old bytes", "surface": "product",
+      "source_path": "internal/agentupgrade/boot_identity.go", "function": "RunningImageSHA", "predicate": "path = \"/proc/self/exe\"",
+      "compatible_artifact_set": "tether-T0-T5", "role": "agent", "topologies": ["single"],
+      "window": "active-current-reverse-new-retained-work", "hit_event": "M09A-predicate-hit", "expected_assertion": "fullstackJudgeRollback",
+      "integration": {"path": "test/hotupdate/fullstack_transaction_test.go", "test": "TestFullstackRollbackRequiresFreshCurrentProof", "exercise": "exerciseCurrentRollback", "oracle_path": "test/hotupdate/fullstack_transaction_test.go", "oracle": "fullstackJudgeRollback"}, "pending_owners": ["S8 P14/P15/P17/P19/P26", "S10 P18/P19/P25"], "deploy_only": false
+    },
+    {
+      "id": "M09B", "defect": "report target SHA while broker executes old bytes", "surface": "product",
+      "source_path": "internal/broker/reexec.go", "function": "runningBinarySHA256", "predicate": "brokerimage.RunningArtifactSHA256()",
+      "compatible_artifact_set": "tether-T0-T5", "role": "broker", "topologies": ["single", "quorum"],
+      "window": "active-current-reverse-new-retained-work", "hit_event": "M09B-predicate-hit", "expected_assertion": "fullstackJudgeRollback",
+      "integration": {"path": "test/hotupdate/fullstack_transaction_test.go", "test": "TestFullstackRollbackRequiresFreshCurrentProof", "exercise": "exerciseCurrentRollback", "oracle_path": "test/hotupdate/fullstack_transaction_test.go", "oracle": "fullstackJudgeRollback"}, "pending_owners": ["S8 P14/P15/P17/P19/P26", "S10 P18/P19/P25"], "deploy_only": false
+    },
+    {
+      "id": "M10S", "defect": "omit exactly one presealed scheduler launch", "surface": "harness",
+      "source_path": "test/simcluster/drills/lib/fullstack_requests.py", "function": "Scheduler.tick", "predicate": "self.launch(request)",
+      "compatible_artifact_set": "tether-T0-T5", "role": "fixture", "topologies": ["single"],
+      "window": "sealed-required-slot-or-cut-probe", "hit_event": "M10S-predicate-hit", "expected_assertion": "fullstackScheduledRequests",
+      "integration": {"path": "test/hotupdate/fullstack_rollout_test.go", "test": "TestMixedWorkloadSurvivesFullStackRollout", "exercise": "exerciseMixedRollout", "oracle_path": "test/hotupdate/fullstack_rollout_test.go", "oracle": "fullstackScheduledRequests"}, "pending_owners": ["S10 P17/P19/P25"], "deploy_only": false
+    },
+    {
+      "id": "M10C", "defect": "omit exactly one predeclared targeted cut probe", "surface": "harness",
+      "source_path": "test/simcluster/drills/lib/fullstack_fixture.py", "function": "Assembly.apply", "predicate": "self.ports.before_step(step, entry['obligations'])",
+      "compatible_artifact_set": "tether-T0-T5", "role": "fixture", "topologies": ["single", "quorum"],
+      "window": "sealed-required-slot-or-cut-probe", "hit_event": "M10C-predicate-hit", "expected_assertion": "fullstackScheduledRequests",
+      "integration": {"path": "test/hotupdate/fullstack_rollout_test.go", "test": "TestMixedWorkloadSurvivesFullStackRollout", "exercise": "exerciseMixedRollout", "oracle_path": "test/hotupdate/fullstack_rollout_test.go", "oracle": "fullstackScheduledRequests"}, "pending_owners": ["S10 P17/P19/P25"], "deploy_only": false
+    },
+    {
+      "id": "M11W", "defect": "run a second waiter for one original child", "surface": "product",
+      "source_path": "internal/workload/process.go", "function": "Thaw", "predicate": "if !m.polling {",
+      "compatible_artifact_set": "tether-T0-T5", "role": "agent", "topologies": ["single"],
+      "window": "held-zombie-tail-before-eof", "hit_event": "M11W-predicate-hit", "expected_assertion": "fullstackCheckHeldTail",
+      "integration": {"path": "test/hotupdate/fullstack_pty_exec_test.go", "test": "TestFullstackPTYZombieTailAndSessionCleanup", "exercise": "exercisePTYRetirement", "oracle_path": "test/hotupdate/fullstack_pty_exec_test.go", "oracle": "fullstackCheckHeldTail"}, "pending_owners": ["S8 P18/P19/P24/P26", "S9 managed infra"], "deploy_only": false
+    },
+    {
+      "id": "M11I", "defect": "run a second exec input actor", "surface": "product",
+      "source_path": "internal/workload/input.go", "function": "startLocked", "predicate": "go p.run()",
+      "compatible_artifact_set": "tether-T0-T5", "role": "agent", "topologies": ["single"],
+      "window": "accepted-cut-retained-exec", "hit_event": "M11I-predicate-hit", "expected_assertion": "fullstackCheckRetained",
+      "integration": {"path": "test/hotupdate/fullstack_task_exec_test.go", "test": "TestFullstackTasksRetainCurrentRollbackState", "exercise": "exerciseTaskRollback", "oracle_path": "test/hotupdate/fullstack_task_exec_test.go", "oracle": "fullstackCheckRetained"}, "pending_owners": ["S8 P18/P19", "S10 P06/P07/P16"], "deploy_only": false
+    },
+    {
+      "id": "M11O", "defect": "run a second exec output actor", "surface": "product",
+      "source_path": "internal/workload/output.go", "function": "startLocked", "predicate": "go p.run()",
+      "compatible_artifact_set": "tether-T0-T5", "role": "agent", "topologies": ["single"],
+      "window": "accepted-cut-retained-exec", "hit_event": "M11O-predicate-hit", "expected_assertion": "fullstackCheckRetained",
+      "integration": {"path": "test/hotupdate/fullstack_task_exec_test.go", "test": "TestFullstackTasksRetainCurrentRollbackState", "exercise": "exerciseTaskRollback", "oracle_path": "test/hotupdate/fullstack_task_exec_test.go", "oracle": "fullstackCheckRetained"}, "pending_owners": ["S8 P18/P19", "S10 P06/P07/P16"], "deploy_only": false
+    },
+    {
+      "id": "M11P", "defect": "run a second PTY input actor", "surface": "product",
+      "source_path": "internal/ptysession/actor.go", "function": "startPumpLocked", "predicate": "go a.writeLoop(p.stop)",
+      "compatible_artifact_set": "tether-T0-T5", "role": "agent", "topologies": ["single"],
+      "window": "partial-write-pending-control-unacked-output", "hit_event": "M11P-predicate-hit", "expected_assertion": "fullstackCheckPTYCheckpoint",
+      "integration": {"path": "test/hotupdate/fullstack_pty_exec_test.go", "test": "TestFullstackPTYPendingControlAcrossLayers", "exercise": "exercisePTYPendingControl", "oracle_path": "test/hotupdate/fullstack_pty_exec_test.go", "oracle": "fullstackCheckPTYCheckpoint"}, "pending_owners": ["S8 P18/P19", "S10 P06/P07/P16"], "deploy_only": false
+    },
+    {
+      "id": "M11Q", "defect": "apply one PTY control from a second actor", "surface": "product",
+      "source_path": "internal/ptysession/control.go", "function": "ApplyControl", "predicate": "a.cfg.Master.Resize(",
+      "compatible_artifact_set": "tether-T0-T5", "role": "agent", "topologies": ["single"],
+      "window": "partial-write-pending-control-unacked-output", "hit_event": "M11Q-predicate-hit", "expected_assertion": "fullstackCheckPTYCheckpoint",
+      "integration": {"path": "test/hotupdate/fullstack_pty_exec_test.go", "test": "TestFullstackPTYPendingControlAcrossLayers", "exercise": "exercisePTYPendingControl", "oracle_path": "test/hotupdate/fullstack_pty_exec_test.go", "oracle": "fullstackCheckPTYCheckpoint"}, "pending_owners": ["S8 P18/P19", "S10 P06/P07/P16"], "deploy_only": false
+    },
+    {
+      "id": "M11F", "defect": "run a second raw flow actor", "surface": "product",
+      "source_path": "internal/flow/pump.go", "function": "startPumpsLocked", "predicate": "go runPumps(",
+      "compatible_artifact_set": "tether-T0-T5", "role": "agent", "topologies": ["single", "quorum"],
+      "window": "original-socket-unacked-duplex", "hit_event": "M11F-predicate-hit", "expected_assertion": "fullstackFlowTransition",
+      "integration": {"path": "test/hotupdate/fullstack_flow_exec_test.go", "test": "TestFullstackOriginalFlowsUseEveryInfraCut", "exercise": "exerciseOriginalFlowCut", "oracle_path": "test/hotupdate/fullstack_flow_exec_test.go", "oracle": "fullstackFlowTransition"}, "pending_owners": ["S10 P19/P25 assembly", "S9 P15/P16/P22/P23"], "deploy_only": false
+    },
+    {
+      "id": "M11S", "defect": "run a second SS cipher actor", "surface": "product",
+      "source_path": "internal/agent/ssproxy/actor.go", "function": "startActorLocked", "predicate": "go runActor(s, a)",
+      "compatible_artifact_set": "tether-T0-T5", "role": "agent", "topologies": ["single", "quorum"],
+      "window": "pending-frame-current-nonce", "hit_event": "M11S-predicate-hit", "expected_assertion": "fullstackSSPrimitiveLedger",
+      "integration": {"path": "test/hotupdate/fullstack_ss_exec_test.go", "test": "TestFullstackSSStateAcrossInfraRollback", "exercise": "exerciseSSCut", "oracle_path": "test/hotupdate/fullstack_ss_exec_test.go", "oracle": "fullstackSSPrimitiveLedger"}, "pending_owners": ["S10 P19/P25 assembly", "S9 P15/P16/P22/P23"], "deploy_only": false
+    },
+    {
+      "id": "M11X", "defect": "enter the transfer commit primitive twice", "surface": "product",
+      "source_path": "internal/xferreceive/receiver.go", "function": "commit", "predicate": "r.config.Atomic.Commit(grant, deadline)",
+      "compatible_artifact_set": "tether-T0-T5", "role": "agent", "topologies": ["single", "quorum"],
+      "window": "primitive-or-consumer-retirement-before-seal", "hit_event": "M11X-predicate-hit", "expected_assertion": "fullstackCheckTransferEffects",
+      "integration": {"path": "test/hotupdate/fullstack_transfer_exec_test.go", "test": "TestFullstackTransferSealsLateTerminal", "exercise": "exerciseTransferEndSeal", "oracle_path": "test/hotupdate/fullstack_transfer_helpers_test.go", "oracle": "fullstackCheckTransferEffects"}, "pending_owners": ["S7 s7-p9m", "S10 P14/P16/P19/P25"], "deploy_only": false
+    },
+    {
+      "id": "M11D", "defect": "admit a second SQL writer at actual creation boundary", "surface": "product",
+      "source_path": "internal/storage/connection_registry.go", "function": "Open", "predicate": "counts.writers != 0 || counts.readers != 0",
+      "compatible_artifact_set": "tether-T0-T5", "role": "broker", "topologies": ["single", "quorum"],
+      "window": "activation-effect-interval", "hit_event": "M11D-predicate-hit", "expected_assertion": "fullstackJudgePrivateCustody",
+      "integration": {"path": "test/hotupdate/fullstack_ownership_test.go", "test": "TestFullstackOwnershipIntervalsAreExclusive", "exercise": "exerciseOwnershipCut", "oracle_path": "test/hotupdate/fullstack_ownership_test.go", "oracle": "fullstackJudgePrivateCustody"}, "pending_owners": ["S8 P14/P15/P17/P26", "S10 P08/P16/P18/P19/P25"], "deploy_only": false
+    },
+    {
+      "id": "M11C", "defect": "activate two owners of the same sealed Caddy responsibility", "surface": "product",
+      "source_path": "internal/infraupgrade/caddy_reload.go", "function": "cutoverBarrier", "predicate": "d.host(x, c.ReleaseStart, p.Before, deadline, stop)",
+      "compatible_artifact_set": "caddy-2.7.5-2.7.6", "role": "caddy", "topologies": ["single", "quorum"],
+      "window": "activation-effect-interval", "hit_event": "M11C-predicate-hit", "expected_assertion": "fullstackJudgeOwnership",
+      "integration": {"path": "test/hotupdate/fullstack_ownership_test.go", "test": "TestFullstackOwnershipIntervalsAreExclusive", "exercise": "exerciseOwnershipCut", "oracle_path": "test/hotupdate/fullstack_ownership_test.go", "oracle": "fullstackJudgeOwnership"}, "pending_owners": ["S8 P14/P15/P17/P26", "S10 P08/P16/P18/P19/P25"], "deploy_only": true
+    },
+    {
+      "id": "M11L", "defect": "release the held upgrade domain lock early", "surface": "product",
+      "source_path": "internal/upgradelock/lease.go", "function": "Adopt", "predicate": "requireHeldOFD(fd)",
+      "compatible_artifact_set": "tether-T0-T5", "role": "agent", "topologies": ["single", "quorum"],
+      "window": "activation-effect-interval", "hit_event": "M11L-predicate-hit", "expected_assertion": "fullstackJudgePrivateCustody",
+      "integration": {"path": "test/hotupdate/fullstack_ownership_test.go", "test": "TestFullstackOwnershipIntervalsAreExclusive", "exercise": "exerciseOwnershipCut", "oracle_path": "test/hotupdate/fullstack_ownership_test.go", "oracle": "fullstackJudgePrivateCustody"}, "pending_owners": ["S8 P14/P15/P17/P26", "S10 P08/P16/P18/P19/P25"], "deploy_only": false
+    },
+    {
+      "id": "M11U", "defect": "close original FD while leaving duplicate reference", "surface": "product",
+      "source_path": "internal/handoff/image_linux.go", "function": "restoreDescriptor", "predicate": "unix.F_SETFD, unix.FD_CLOEXEC",
+      "compatible_artifact_set": "tether-T0-T5", "role": "agent", "topologies": ["single", "quorum"],
+      "window": "activation-effect-interval", "hit_event": "M11U-predicate-hit", "expected_assertion": "fullstackJudgePrivateCustody",
+      "integration": {"path": "test/hotupdate/fullstack_ownership_test.go", "test": "TestFullstackOwnershipIntervalsAreExclusive", "exercise": "exerciseOwnershipCut", "oracle_path": "test/hotupdate/fullstack_ownership_test.go", "oracle": "fullstackJudgePrivateCustody"}, "pending_owners": ["S8 P14/P15/P17/P26", "S10 P08/P16/P18/P19/P25"], "deploy_only": false
+    },
+    {
+      "id": "M11K", "defect": "leak observer custody FD into a business child", "surface": "product",
+      "source_path": "internal/spawnsafe/command.go", "function": "MergeChildEnv", "predicate": "return drillobserve.StripEnvironment(out)",
+      "compatible_artifact_set": "tether-T0-T5", "role": "agent", "topologies": ["single", "quorum"],
+      "window": "activation-effect-interval", "hit_event": "M11K-predicate-hit", "expected_assertion": "fullstackJudgePrivateCustody",
+      "integration": {"path": "test/hotupdate/fullstack_ownership_test.go", "test": "TestFullstackOwnershipIntervalsAreExclusive", "exercise": "exerciseOwnershipCut", "oracle_path": "test/hotupdate/fullstack_ownership_test.go", "oracle": "fullstackJudgePrivateCustody"}, "pending_owners": ["S8 P14/P15/P17/P26", "S10 P08/P16/P18/P19/P25"], "deploy_only": false
+    }
+  ]
+}

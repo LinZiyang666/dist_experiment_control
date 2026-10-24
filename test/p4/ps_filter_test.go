@@ -12,6 +12,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -23,6 +24,8 @@ import (
 
 	"github.com/LinZiyang666/tether/internal/auth"
 	"github.com/LinZiyang666/tether/internal/proto"
+	"github.com/LinZiyang666/tether/internal/testharness"
+	"github.com/LinZiyang666/tether/internal/upgradebudget"
 	"github.com/LinZiyang666/tether/test/stackharness"
 	"github.com/nats-io/nats.go"
 )
@@ -520,8 +523,10 @@ func TestPsDisplay_RunningAndLost_NotExited(t *testing.T) {
 }
 
 // --------------------------------------------------------------------
-// C7 — client timeout is now 15s (was 5s). We hold the response for
-// 6s — old 5s timeout would fail, new 15s wins.
+// C7's historical test name remains in the append-only inventory. S6 supersedes
+// the fifteen-second request allowance with one five-second admission budget,
+// including CONNECT. Even the old explicit timeout override cannot extend it.
+// origin: hot-update S6 plan §8.2 / T30 / TESTFIX
 // --------------------------------------------------------------------
 
 func TestPsFilter_ClientTimeoutRaisedTo15s(t *testing.T) {
@@ -531,14 +536,19 @@ func TestPsFilter_ClientTimeoutRaisedTo15s(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer conn.Close()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
 
 	home := t.TempDir()
 	pub := writeIdentity(t, home, "lab")
 
 	sub, err := conn.Subscribe(proto.SubjCtrlPs(pub, "lab"),
 		func(msg *nats.Msg) {
-			time.Sleep(6 * time.Second) // longer than old 5s timeout
-			_ = msg.Respond([]byte(`{"processes":[]}`))
+			select {
+			case <-time.After(upgradebudget.RequestLatency + time.Second):
+				_ = msg.Respond([]byte(`{"processes":[]}`))
+			case <-ctx.Done():
+			}
 		},
 	)
 	if err != nil {
@@ -549,17 +559,18 @@ func TestPsFilter_ClientTimeoutRaisedTo15s(t *testing.T) {
 	bin := buildCtl(t)
 	start := time.Now()
 	cmd := exec.Command(bin, "ps", "--nats-url", url, "--home", home)
-	cmd.Env = append(os.Environ(), "TETHER_DEV_NO_AUTH=1")
-	out, err := cmd.CombinedOutput()
+	cmd.Env = append(os.Environ(), "TETHER_DEV_NO_AUTH=1", "TETHER_PS_TIMEOUT=15s")
+	out, err := testharness.CombinedOutput(cmd)
 	elapsed := time.Since(start)
-	if err != nil {
-		t.Fatalf("ctl ps with 6s block: %v\n%s\nelapsed=%v", err, out, elapsed)
+	var exit *exec.ExitError
+	if !errors.As(err, &exit) || exit.ExitCode() != 75 || !strings.Contains(string(out), "admission is bounded to 5s") {
+		t.Fatalf("late ps read must return retryable admission refusal: %v\n%s", err, out)
 	}
-	if elapsed < 5*time.Second {
-		t.Errorf("ctl returned in %v; expected ~6s (response delayed)", elapsed)
+	if elapsed < upgradebudget.RequestLatency-time.Second {
+		t.Errorf("ctl returned before exercising the admission deadline: %v", elapsed)
 	}
-	if elapsed > 8*time.Second {
-		t.Errorf("ctl took %v; should be ~6s — timeout not raised to 15s?", elapsed)
+	if elapsed >= upgradebudget.RequestLatency+time.Second {
+		t.Errorf("ctl waited for a reply outside its admission budget: %v", elapsed)
 	}
 }
 

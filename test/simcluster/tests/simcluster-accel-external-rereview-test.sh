@@ -15,7 +15,17 @@ trap 'rm -rf "$RT"' EXIT
 runner_world() {
     _w=$1
     mkdir -p "$_w/drills"
-    ln -sf "$SIMROOT/run-drills.sh" "$_w/run-drills.sh"
+    # origin: S10 internal review RUNALL-A F1 / hot-update S10 plan §6.
+    # Own the scratch runner from its first subprocess. Bash defers handled
+    # TERM until the foreground canary leaves its kernel wait and is joined.
+    # The deployment runner is only copied; this test's simcluster is private.
+    cat >"$_w/run-drills.sh" <<'EOF'
+#!/bin/bash
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+EOF
+    cat "$SIMROOT/run-drills.sh" >>"$_w/run-drills.sh"
     ln -sf "$SIMROOT/lib" "$_w/lib"    # the runner sources lib/manifest.sh and refuses to run without it
     cat >"$_w/simcluster" <<'EOF'
 #!/bin/sh
@@ -136,12 +146,11 @@ cat >"$S/expected-verdicts.tsv" <<'EOF'
 00-slow	GREEN	0	-	-	00-slow
 EOF
 printf '## 00-slow\n' >"$S/expected-verdicts-log.md"
-bash "$S/run-drills.sh" --skip-preflight --no-retry --no-attribute \
-    --logdir "$S/log" 00-slow >/dev/null 2>&1 &
-spid=$!
-/bin/sleep 1
-kill -TERM "$spid" 2>/dev/null || true
-wait "$spid" 2>/dev/null || true
+if python3 -I -B "$HERE/testdata/runner-signal-custody.py" "$SIMROOT" "$S"; then
+    pass "TERM joins the owned scratch canary and preserves native143"
+else
+    fail "scratch runner left a descendant or abandoned its original waiter"
+fi
 if [ -f "$S/log/progress.tsv" ] && grep -q '^RUN-COMPLETE' "$S/log/progress.tsv"; then
     fail "TERM trap returned to the runner and forged RUN-COMPLETE for an interrupted sweep"
 else

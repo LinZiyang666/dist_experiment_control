@@ -16,7 +16,7 @@ func TestRunRecordsProcessLifecycleForPs(t *testing.T) {
 	pub, fp := freshUserPub(t)
 	seed(t, db, "lab", fp)
 	defer startBroker(t, url, db)()
-	defer startAgent(t, url, "lab", "lab-1")()
+	defer startAgent(t, db, url, "lab", "lab-1")()
 
 	nc, err := nats.Connect(url)
 	if err != nil {

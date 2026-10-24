@@ -1,0 +1,41 @@
+{
+  "schema": "fullstack-fixture-v1",
+  "required_children": ["C1", "C3", "A", "B", "S1", "S3", "F1", "F3", "K"],
+  "arms": [
+    {"id": "C1", "topology": "single", "mode": "calibration", "rounds": [], "cohorts": ["C0"], "calibration": ""},
+    {"id": "C3", "topology": "quorum", "mode": "calibration", "rounds": [], "cohorts": ["C0"], "calibration": ""},
+    {"id": "A", "topology": "single", "mode": "fullstack", "rounds": ["R1", "R2", "R3", "R4", "R5", "R6", "R7"], "cohorts": ["C0", "C1"], "calibration": "C1"},
+    {"id": "B", "topology": "quorum", "mode": "fullstack", "rounds": ["R1", "R2", "R3", "R4", "R5", "R6", "R7"], "cohorts": ["C0", "C1"], "calibration": "C3"},
+    {"id": "S1", "topology": "single", "mode": "ss", "rounds": ["R1", "R2", "R3"], "cohorts": ["C0"], "calibration": "inline"},
+    {"id": "S3", "topology": "quorum", "mode": "ss", "rounds": ["R1", "R2", "R3"], "cohorts": ["C0"], "calibration": "inline"},
+    {"id": "F1", "topology": "single", "mode": "remote-fs", "rounds": ["R1", "R2", "R3"], "cohorts": ["C0"], "calibration": "inline"},
+    {"id": "F3", "topology": "quorum", "mode": "remote-fs", "rounds": ["R1", "R2", "R3"], "cohorts": ["C0"], "calibration": "inline"},
+    {"id": "K", "topology": "quorum", "mode": "soak", "rounds": [], "cohorts": [], "calibration": "inline"}
+  ],
+  "rows": [
+    {"id": "R1", "from": ["T0", "A"], "to": ["T1", "B"], "cohort": "C0", "leg": "leg1", "actions": [["agent", "forward"], ["broker", "forward"], ["nats", "forward"], ["caddy", "forward"]]},
+    {"id": "R2", "from": ["T1", "B"], "to": ["T0", "A"], "cohort": "C0", "leg": "leg2", "actions": [["caddy", "reverse"], ["nats", "reverse"], ["broker", "reverse"], ["agent", "reverse"]]},
+    {"id": "R3", "from": ["T0", "A"], "to": ["T2", "B"], "cohort": "C0", "leg": "leg2", "actions": [["agent", "forward"], ["broker", "forward"], ["nats", "forward"], ["caddy", "forward"]]},
+    {"id": "R4", "from": ["T2", "B"], "to": ["T3", "A"], "cohort": "C1", "leg": "leg1", "actions": [["caddy", "reverse"], ["nats", "reverse"], ["agent", "forward"], ["broker", "forward"]]},
+    {"id": "R5", "from": ["T3", "A"], "to": ["T4", "B"], "cohort": "C1", "leg": "leg2", "actions": [["agent", "forward"], ["broker", "forward"], ["nats", "forward"], ["caddy", "forward"]]},
+    {"id": "R6", "from": ["T4", "B"], "to": ["T5", "A"], "cohort": "C1", "leg": "leg2", "actions": [["caddy", "reverse"], ["nats", "reverse"], ["agent", "forward"], ["broker", "forward"]]},
+    {"id": "R7", "from": ["T5", "A"], "to": ["T5", "B"], "cohort": "C1", "leg": "leg2", "actions": [["nats", "forward"], ["caddy", "forward"]]}
+  ],
+  "obligations": ["prepare", "product-stage", "start", "control-ready", "resources-ready", "old-released"],
+  "infra_obligations": ["physical-cohort", "temporary-ingress", "helper", "launcher", "canonical-ingress", "old-worker-exit", "temporary-owner-exit"],
+  "cohort_windows": {"start_skew_s": 5, "leg1_s": 900, "leg2_ready_s": 1050, "leg2_s": 840, "last_cut_s": 1890, "small_budget_s": 2092, "large_budget_s": 2108},
+  "unit_ceilings": [
+    {"unit": "99-hot-update-fullstack.C1", "worst_s": 2400, "ceiling_s": 4800, "minimum_s": 2048},
+    {"unit": "99-hot-update-fullstack.C3", "worst_s": 2400, "ceiling_s": 4800, "minimum_s": 2048},
+    {"unit": "99-hot-update-fullstack.A", "worst_s": 6000, "ceiling_s": 12000, "minimum_s": 4096},
+    {"unit": "99-hot-update-fullstack.B", "worst_s": 6000, "ceiling_s": 12000, "minimum_s": 4096},
+    {"unit": "99-hot-update-fullstack.S1", "worst_s": 2700, "ceiling_s": 5400, "minimum_s": 2048},
+    {"unit": "99-hot-update-fullstack.S3", "worst_s": 2700, "ceiling_s": 5400, "minimum_s": 2048},
+    {"unit": "99-hot-update-fullstack.F1", "worst_s": 2700, "ceiling_s": 5400, "minimum_s": 2048},
+    {"unit": "99-hot-update-fullstack.F3", "worst_s": 2700, "ceiling_s": 5400, "minimum_s": 2048},
+    {"unit": "99-hot-update-fullstack.K", "worst_s": 1800, "ceiling_s": 3600, "minimum_s": 1}
+  ],
+  "soak_cycles": 6,
+  "probe_rate": 10,
+  "expected_native": 0
+}

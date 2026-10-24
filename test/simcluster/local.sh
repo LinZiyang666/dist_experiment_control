@@ -48,7 +48,15 @@ command -v docker >/dev/null 2>&1 || {
 
 do_build=0
 if [ "${1:-}" = "--build" ]; then do_build=1; shift; fi
-if [ "$do_build" = "1" ]; then sim_stage_binaries; fi
+if [ "$do_build" = "1" ]; then
+    # S8 staging refuses to run without the shared FIX-ORPHAN adapter (lib/supervisor.sh says why).
+    # The adapter lives only for staging: the exec below would skip an EXIT trap, so remove it here.
+    . "$HERE/lib/supervisor.sh"
+    _sup_dir=$(mktemp -d); trap 'rm -rf "$_sup_dir"' EXIT
+    sim_supervisor_provision "$_sup_dir"
+    sim_stage_binaries
+    rm -rf "$_sup_dir"; trap - EXIT
+fi
 
 [ -x "$SIM_VENDOR/tether" ] || {
     echo "[local] no vendor/tether — run './local.sh --build build' first" >&2

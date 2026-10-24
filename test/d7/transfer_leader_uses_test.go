@@ -47,7 +47,13 @@ func TestD7ReviewTransferLeaderUsesRequestedTarget(t *testing.T) {
 	if strings.Contains(src, "case adminsock.OpClusterTransfer:\n\t\t\tif err := b.admin.node.TransferLeadership();") {
 		t.Fatal("cluster transfer-leader <node-id> ignores node_id and calls untargeted TransferLeadership")
 	}
-	if !strings.Contains(src, "LeadershipTransferToServer") {
+	// The command adapter and extracted owner must both retain the target.
+	// origin: hot-update S6 plan §5 / T38
+	if !strings.Contains(src, "b.admin.TransferLeaderTo(req.NodeID)") {
+		t.Fatal("cluster transfer-leader adapter lost the requested node_id")
+	}
+	owner := readFile(t, filepath.Join(moduleRoot(t), "internal/brokercontrol/clusterstatus.go"))
+	if !strings.Contains(owner, "a.Node.LeadershipTransferToServer(nodeID, s.Addr)") {
 		t.Fatal("cluster transfer-leader should route to LeadershipTransferToServer(req.NodeID, addr)")
 	}
 }
@@ -95,7 +101,8 @@ func TestD7ReviewRunbookRecoverMatchesCLI(t *testing.T) {
 }
 
 func TestD7ReviewDrainHonorsRebuildOff(t *testing.T) {
-	src := readFile(t, filepath.Join(moduleRoot(t), "internal/broker/clusterdrain.go"))
+	// origin: hot-update S6 plan §9.3 / BROKER-SLIM
+	src := readFile(t, filepath.Join(moduleRoot(t), "internal/brokercontrol/clusterdrain.go"))
 	if !strings.Contains(src, "rebuild_on_failure") {
 		t.Fatal("drain migrateExposes never reads rebuild_on_failure; rebuild-OFF exposes are silently rehomed")
 	}

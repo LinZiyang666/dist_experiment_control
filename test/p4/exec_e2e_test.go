@@ -15,6 +15,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -24,6 +25,7 @@ import (
 	"github.com/LinZiyang666/tether/internal/proto"
 	"github.com/LinZiyang666/tether/internal/session"
 	"github.com/LinZiyang666/tether/internal/testharness"
+	"github.com/LinZiyang666/tether/test/stackharness"
 	"github.com/nats-io/nats.go"
 )
 
@@ -45,7 +47,7 @@ func freshUserPub(t *testing.T) (pub, fp string) { return testharness.FreshUserP
 func seed(t *testing.T, db *sql.DB, sid, fp string) {
 	t.Helper()
 	now := time.Now().UTC()
-	if _, err := session.Create(db, sid, sid, fp, "test-pin-hash", now); err != nil {
+	if _, err := session.Create(db, sid, sid, fp, stackharness.SessionPINHash(t), now); err != nil {
 		t.Fatalf("session.Create: %v", err)
 	}
 	// Create() already added fp as the owner; nothing else to do.
@@ -54,7 +56,9 @@ func seed(t *testing.T, db *sql.DB, sid, fp string) {
 // startBroker boots a broker without auth_callout.
 func startBroker(t *testing.T, url string, db *sql.DB) func() {
 	t.Helper()
+	ready := make(chan struct{})
 	b, err := broker.New(broker.Config{
+		ReadyCh:           ready,
 		NATSURL:           url,
 		DB:                db,
 		Logger:            silentLog(),
@@ -65,28 +69,29 @@ func startBroker(t *testing.T, url string, db *sql.DB) func() {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
 	go func() { done <- b.Run(ctx) }()
 
-	// crude readiness: probe by direct nats.Connect.
-	for i := 0; i < 30; i++ {
-		if nc, err := nats.Connect(url); err == nil {
-			nc.Close()
-			break
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	time.Sleep(50 * time.Millisecond) // let subscribes settle
-
-	return func() {
+	stop := sync.OnceFunc(func() {
 		cancel()
 		select {
 		case <-done:
 		case <-time.After(2 * time.Second):
 			t.Fatal("broker did not exit")
 		}
+	})
+
+	// Subscribing is part of broker readiness; a live NATS socket proves only
+	// that the separate server has started. Join even when readiness fails.
+	// origin: hot-update S6 plan §8.1 / TESTFIX
+	t.Cleanup(stop)
+	select {
+	case <-ready:
+	case <-time.After(2 * time.Second):
+		t.Fatal("broker did not become ready")
 	}
+	return stop
 }
 
 // startAgent boots an in-process agent for the given (sid, nid).

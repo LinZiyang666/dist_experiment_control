@@ -1,0 +1,779 @@
+# origin: hot-update S10 plan §8 / §9 / P20 / P31
+# Mutation-cell declarations, not deployment evidence. All native triplet columns stay unset.
+mutation_id	topology	surface	source_path	function	compatible_artifact_set	role	window	hit_event	expected_assertion	status	pending_owners	baseline_rc	mutant_native_rc	restore_rc
+M01A	single	product	internal/agent/upgrade.go	reExecInPlace	tether-T0-T5	agent	accepted-cut-retained-exec	M01A-predicate-hit	fullstackCheckRetained	NOT_RUN	S8 P18/P19, S10 P06/P07/P16	-	-	-
+M01B	single	product	internal/broker/reexec.go	runBrokerImageReloadUsing	tether-T0-T5	broker	original-socket-unacked-duplex	M01B-predicate-hit	fullstackFlowTransition	NOT_RUN	S10 P19/P25 assembly, S9 P15/P16/P22/P23	-	-	-
+M01B	quorum	product	internal/broker/reexec.go	runBrokerImageReloadUsing	tether-T0-T5	broker	original-socket-unacked-duplex	M01B-predicate-hit	fullstackFlowTransition	NOT_RUN	S10 P19/P25 assembly, S9 P15/P16/P22/P23	-	-	-
+M02E	single	product	internal/execsession/image.go	Export	tether-T0-T5	agent	accepted-cut-retained-exec	M02E-predicate-hit	fullstackCheckRetained	NOT_RUN	S8 P18/P19, S10 P06/P07/P16	-	-	-
+M02P	single	product	internal/ptysession/image.go	snapshotLocked	tether-T0-T5	agent	partial-write-pending-control-unacked-output	M02P-predicate-hit	fullstackCheckPTYCheckpoint	NOT_RUN	S8 P18/P19, S10 P06/P07/P16	-	-	-
+M02F	single	product	internal/flow/image.go	Export	tether-T0-T5	agent	original-socket-unacked-duplex	M02F-predicate-hit	fullstackFlowTransition	NOT_RUN	S10 P19/P25 assembly, S9 P15/P16/P22/P23	-	-	-
+M02F	quorum	product	internal/flow/image.go	Export	tether-T0-T5	agent	original-socket-unacked-duplex	M02F-predicate-hit	fullstackFlowTransition	NOT_RUN	S10 P19/P25 assembly, S9 P15/P16/P22/P23	-	-	-
+M02X	single	product	internal/xferreceive/receiver.go	confirmCheckpoint	tether-T0-T5	agent	nonzero-sync-prefix	M02X-predicate-hit	fullstackCheckTransferCheckpoint	NOT_RUN	S7 s7-p9m, S10 P14/P19/P25	-	-	-
+M03E	single	product	internal/workload/input.go	run	tether-T0-T5	agent	accepted-cut-retained-exec	M03E-predicate-hit	fullstackCheckRetained	NOT_RUN	S8 P18/P19, S10 P06/P07/P16	-	-	-
+M03P	single	product	internal/ptysession/input.go	writeLoop	tether-T0-T5	agent	partial-write-pending-control-unacked-output	M03P-predicate-hit	fullstackCheckPTYCheckpoint	NOT_RUN	S8 P18/P19, S10 P06/P07/P16	-	-	-
+M03F	single	product	internal/flow/pump.go	sinkPump	tether-T0-T5	agent	original-socket-unacked-duplex	M03F-predicate-hit	fullstackFlowTransition	NOT_RUN	S10 P19/P25 assembly, S9 P15/P16/P22/P23	-	-	-
+M03F	quorum	product	internal/flow/pump.go	sinkPump	tether-T0-T5	agent	original-socket-unacked-duplex	M03F-predicate-hit	fullstackFlowTransition	NOT_RUN	S10 P19/P25 assembly, S9 P15/P16/P22/P23	-	-	-
+M03X	single	product	internal/xferreceive/checkpoint.go	extendCheckpoint	tether-T0-T5	agent	nonzero-sync-prefix	M03X-predicate-hit	fullstackCheckTransferCheckpoint	NOT_RUN	S7 s7-p9m, S10 P14/P19/P25	-	-	-
+M04A	single	product	internal/rawsocket/socket.go	Hold	tether-T0-T5	agent	original-socket-unacked-duplex	M04A-predicate-hit	fullstackFlowTransition	NOT_RUN	S10 P19/P25 assembly, S9 P15/P16/P22/P23	-	-	-
+M04A	quorum	product	internal/rawsocket/socket.go	Hold	tether-T0-T5	agent	original-socket-unacked-duplex	M04A-predicate-hit	fullstackFlowTransition	NOT_RUN	S10 P19/P25 assembly, S9 P15/P16/P22/P23	-	-	-
+M04B	single	product	internal/tunnel/server_image.go	snapshotServerEndpoint	tether-T0-T5	broker	original-socket-unacked-duplex	M04B-predicate-hit	fullstackFlowTransition	NOT_RUN	S10 P19/P25 assembly, S9 P15/P16/P22/P23	-	-	-
+M04B	quorum	product	internal/tunnel/server_image.go	snapshotServerEndpoint	tether-T0-T5	broker	original-socket-unacked-duplex	M04B-predicate-hit	fullstackFlowTransition	NOT_RUN	S10 P19/P25 assembly, S9 P15/P16/P22/P23	-	-	-
+M04P	single	product	internal/ptysession/fence.go	freezeReplays	tether-T0-T5	agent	held-zombie-tail-before-eof	M04P-predicate-hit	fullstackCheckHeldTail	NOT_RUN	S8 P18/P19/P24/P26, S9 managed infra	-	-	-
+M05E	single	product	internal/execsession/runtime.go	resolveExecRecordLocked	tether-T0-T5	agent	accepted-cut-retained-exec	M05E-predicate-hit	fullstackCheckRetained	NOT_RUN	S8 P18/P19, S10 P06/P07/P16	-	-	-
+M05P	single	product	internal/execsession/pty.go	createPTYLocked	tether-T0-T5	agent	partial-write-pending-control-unacked-output	M05P-predicate-hit	fullstackCheckPTYCheckpoint	NOT_RUN	S8 P18/P19, S10 P06/P07/P16	-	-	-
+M05X	single	product	internal/xfertrack/grant.go	Admit	tether-T0-T5	broker	nonzero-sync-prefix	M05X-predicate-hit	fullstackCheckTransferCheckpoint	NOT_RUN	S7 s7-p9m, S10 P14/P19/P25	-	-	-
+M05X	quorum	product	internal/xfertrack/grant.go	Admit	tether-T0-T5	broker	nonzero-sync-prefix	M05X-predicate-hit	fullstackCheckTransferCheckpoint	NOT_RUN	S7 s7-p9m, S10 P14/P19/P25	-	-	-
+M05R	single	product	internal/agent/upgrade_image.go	rollbackCurrentImage	tether-T0-T5	agent	active-current-reverse-new-retained-work	M05R-predicate-hit	fullstackJudgeRollback	NOT_RUN	S8 P14/P15/P17/P19/P26, S10 P18/P19/P25	-	-	-
+M06A	single	product	internal/agentboot/image.go	Activate	tether-T0-T5	agent	activation-effect-interval	M06A-predicate-hit	fullstackJudgeOwnership	NOT_RUN	S8 P14/P15/P17/P26, S10 P08/P16/P18/P19/P25	-	-	-
+M06B	single	product	internal/brokerimage/import.go	Activate	tether-T0-T5	broker	activation-effect-interval	M06B-predicate-hit	fullstackJudgeOwnership	NOT_RUN	S8 P14/P15/P17/P26, S10 P08/P16/P18/P19/P25	-	-	-
+M06B	quorum	product	internal/brokerimage/import.go	Activate	tether-T0-T5	broker	activation-effect-interval	M06B-predicate-hit	fullstackJudgeOwnership	NOT_RUN	S8 P14/P15/P17/P26, S10 P08/P16/P18/P19/P25	-	-	-
+M06R	single	product	internal/agentboot/image.go	Activate	tether-T0-T5	agent	activation-effect-interval	M06R-predicate-hit	fullstackJudgeOwnership	NOT_RUN	S8 P14/P15/P17/P26, S10 P08/P16/P18/P19/P25	-	-	-
+M06R	quorum	product	internal/agentboot/image.go	Activate	tether-T0-T5	agent	activation-effect-interval	M06R-predicate-hit	fullstackJudgeOwnership	NOT_RUN	S8 P14/P15/P17/P26, S10 P08/P16/P18/P19/P25	-	-	-
+M06F	single	product	internal/upgradecompat/fleet.go	CheckFleet	tether-T0-T5	agent	activation-effect-interval	M06F-predicate-hit	fullstackJudgeOwnership	NOT_RUN	S8 P14/P15/P17/P26, S10 P08/P16/P18/P19/P25	-	-	-
+M06F	quorum	product	internal/upgradecompat/fleet.go	CheckFleet	tether-T0-T5	agent	activation-effect-interval	M06F-predicate-hit	fullstackJudgeOwnership	NOT_RUN	S8 P14/P15/P17/P26, S10 P08/P16/P18/P19/P25	-	-	-
+M07A	single	product	internal/agent/upgrade.go	reExecInPlace	tether-T0-T5	agent	same-image-five-effect-settle-cycles	M07A-predicate-hit	fullstackCutIdentity	NOT_RUN	S8 P18/P19, S10 P19/P25, S9 managed infra	-	-	-
+M07B	single	product	internal/brokerimage/cut.go	ExecCommit	tether-T0-T5	broker	same-image-five-effect-settle-cycles	M07B-predicate-hit	fullstackCutIdentity	NOT_RUN	S8 P18/P19, S10 P19/P25, S9 managed infra	-	-	-
+M07B	quorum	product	internal/brokerimage/cut.go	ExecCommit	tether-T0-T5	broker	same-image-five-effect-settle-cycles	M07B-predicate-hit	fullstackCutIdentity	NOT_RUN	S8 P18/P19, S10 P19/P25, S9 managed infra	-	-	-
+M07N	single	product	internal/infraupgrade/nats_single.go	cutover	nats-2.14.5-2.14.6	nats	same-image-five-effect-settle-cycles	M07N-predicate-hit	fullstackCutIdentity	NOT_RUN	S8 P18/P19, S10 P19/P25, S9 managed infra	-	-	-
+M07N	quorum	product	internal/infraupgrade/nats_single.go	cutover	nats-2.14.5-2.14.6	nats	same-image-five-effect-settle-cycles	M07N-predicate-hit	fullstackCutIdentity	NOT_RUN	S8 P18/P19, S10 P19/P25, S9 managed infra	-	-	-
+M07C	single	product	internal/infraupgrade/caddy_reload.go	cutoverBarrier	caddy-2.7.5-2.7.6	caddy	same-image-five-effect-settle-cycles	M07C-predicate-hit	fullstackCutIdentity	NOT_RUN	S8 P18/P19, S10 P19/P25, S9 managed infra	-	-	-
+M07C	quorum	product	internal/infraupgrade/caddy_reload.go	cutoverBarrier	caddy-2.7.5-2.7.6	caddy	same-image-five-effect-settle-cycles	M07C-predicate-hit	fullstackCutIdentity	NOT_RUN	S8 P18/P19, S10 P19/P25, S9 managed infra	-	-	-
+M08E	single	product	internal/execsession/runtime.go	conclude	tether-T0-T5	agent	same-image-five-effect-settle-cycles	M08E-predicate-hit	fullstackFloorWithinImage	NOT_RUN	S8 P18/P19, S10 P19/P25, S9 managed infra	-	-	-
+M08P	single	product	internal/ptysession/actor.go	Close	tether-T0-T5	agent	same-image-five-effect-settle-cycles	M08P-predicate-hit	fullstackFloorWithinImage	NOT_RUN	S8 P18/P19, S10 P19/P25, S9 managed infra	-	-	-
+M08A	single	product	internal/execsession/runtime.go	retireLocked	tether-T0-T5	agent	same-image-five-effect-settle-cycles	M08A-predicate-hit	fullstackFloorWithinImage	NOT_RUN	S8 P18/P19, S10 P19/P25, S9 managed infra	-	-	-
+M08B	single	product	internal/broker/reexec.go	StopCurrent	tether-T0-T5	broker	same-image-five-effect-settle-cycles	M08B-predicate-hit	fullstackFloorWithinImage	NOT_RUN	S8 P18/P19, S10 P19/P25, S9 managed infra	-	-	-
+M08B	quorum	product	internal/broker/reexec.go	StopCurrent	tether-T0-T5	broker	same-image-five-effect-settle-cycles	M08B-predicate-hit	fullstackFloorWithinImage	NOT_RUN	S8 P18/P19, S10 P19/P25, S9 managed infra	-	-	-
+M08D	single	product	internal/brokerimage/single_store.go	closeColdSingleStore	tether-T0-T5	broker	same-image-five-effect-settle-cycles	M08D-predicate-hit	fullstackFloorWithinImage	NOT_RUN	S8 P18/P19, S10 P19/P25, S9 managed infra	-	-	-
+M08D	quorum	product	internal/brokerimage/single_store.go	closeColdSingleStore	tether-T0-T5	broker	same-image-five-effect-settle-cycles	M08D-predicate-hit	fullstackFloorWithinImage	NOT_RUN	S8 P18/P19, S10 P19/P25, S9 managed infra	-	-	-
+M08X	single	product	internal/jsstream/object_reader.go	Close	tether-T0-T5	agent	primitive-or-consumer-retirement-before-seal	M08X-predicate-hit	fullstackCheckTransferConsumers	NOT_RUN	S7 s7-p9m, S10 P14/P16/P19/P25	-	-	-
+M08X	quorum	product	internal/jsstream/object_reader.go	Close	tether-T0-T5	agent	primitive-or-consumer-retirement-before-seal	M08X-predicate-hit	fullstackCheckTransferConsumers	NOT_RUN	S7 s7-p9m, S10 P14/P16/P19/P25	-	-	-
+M08C	single	product	internal/infraupgrade/caddy_reload.go	returnBarrier	caddy-2.7.5-2.7.6	caddy	same-image-five-effect-settle-cycles	M08C-predicate-hit	fullstackFloorWithinImage	NOT_RUN	S8 P18/P19, S10 P19/P25, S9 managed infra	-	-	-
+M08C	quorum	product	internal/infraupgrade/caddy_reload.go	returnBarrier	caddy-2.7.5-2.7.6	caddy	same-image-five-effect-settle-cycles	M08C-predicate-hit	fullstackFloorWithinImage	NOT_RUN	S8 P18/P19, S10 P19/P25, S9 managed infra	-	-	-
+M08O	single	harness	test/simcluster/drills/lib/fullstack_collect.py	Collector.join	tether-T0-T5	fixture	same-image-five-effect-settle-cycles	M08O-predicate-hit	fullstackFloorWithinImage	NOT_RUN	S8 P18/P19, S10 P19/P25, S9 managed infra	-	-	-
+M08O	quorum	harness	test/simcluster/drills/lib/fullstack_collect.py	Collector.join	tether-T0-T5	fixture	same-image-five-effect-settle-cycles	M08O-predicate-hit	fullstackFloorWithinImage	NOT_RUN	S8 P18/P19, S10 P19/P25, S9 managed infra	-	-	-
+M09A	single	product	internal/agentupgrade/boot_identity.go	RunningImageSHA	tether-T0-T5	agent	active-current-reverse-new-retained-work	M09A-predicate-hit	fullstackJudgeRollback	NOT_RUN	S8 P14/P15/P17/P19/P26, S10 P18/P19/P25	-	-	-
+M09B	single	product	internal/broker/reexec.go	runningBinarySHA256	tether-T0-T5	broker	active-current-reverse-new-retained-work	M09B-predicate-hit	fullstackJudgeRollback	NOT_RUN	S8 P14/P15/P17/P19/P26, S10 P18/P19/P25	-	-	-
+M09B	quorum	product	internal/broker/reexec.go	runningBinarySHA256	tether-T0-T5	broker	active-current-reverse-new-retained-work	M09B-predicate-hit	fullstackJudgeRollback	NOT_RUN	S8 P14/P15/P17/P19/P26, S10 P18/P19/P25	-	-	-
+M10S	single	harness	test/simcluster/drills/lib/fullstack_requests.py	Scheduler.tick	tether-T0-T5	fixture	sealed-required-slot-or-cut-probe	M10S-predicate-hit	fullstackScheduledRequests	NOT_RUN	S10 P17/P19/P25	-	-	-
+M10C	single	harness	test/simcluster/drills/lib/fullstack_fixture.py	Assembly.apply	tether-T0-T5	fixture	sealed-required-slot-or-cut-probe	M10C-predicate-hit	fullstackScheduledRequests	NOT_RUN	S10 P17/P19/P25	-	-	-
+M10C	quorum	harness	test/simcluster/drills/lib/fullstack_fixture.py	Assembly.apply	tether-T0-T5	fixture	sealed-required-slot-or-cut-probe	M10C-predicate-hit	fullstackScheduledRequests	NOT_RUN	S10 P17/P19/P25	-	-	-
+M11W	single	product	internal/workload/process.go	Thaw	tether-T0-T5	agent	held-zombie-tail-before-eof	M11W-predicate-hit	fullstackCheckHeldTail	NOT_RUN	S8 P18/P19/P24/P26, S9 managed infra	-	-	-
+M11I	single	product	internal/workload/input.go	startLocked	tether-T0-T5	agent	accepted-cut-retained-exec	M11I-predicate-hit	fullstackCheckRetained	NOT_RUN	S8 P18/P19, S10 P06/P07/P16	-	-	-
+M11O	single	product	internal/workload/output.go	startLocked	tether-T0-T5	agent	accepted-cut-retained-exec	M11O-predicate-hit	fullstackCheckRetained	NOT_RUN	S8 P18/P19, S10 P06/P07/P16	-	-	-
+M11P	single	product	internal/ptysession/actor.go	startPumpLocked	tether-T0-T5	agent	partial-write-pending-control-unacked-output	M11P-predicate-hit	fullstackCheckPTYCheckpoint	NOT_RUN	S8 P18/P19, S10 P06/P07/P16	-	-	-
+M11Q	single	product	internal/ptysession/control.go	ApplyControl	tether-T0-T5	agent	partial-write-pending-control-unacked-output	M11Q-predicate-hit	fullstackCheckPTYCheckpoint	NOT_RUN	S8 P18/P19, S10 P06/P07/P16	-	-	-
+M11F	single	product	internal/flow/pump.go	startPumpsLocked	tether-T0-T5	agent	original-socket-unacked-duplex	M11F-predicate-hit	fullstackFlowTransition	NOT_RUN	S10 P19/P25 assembly, S9 P15/P16/P22/P23	-	-	-
+M11F	quorum	product	internal/flow/pump.go	startPumpsLocked	tether-T0-T5	agent	original-socket-unacked-duplex	M11F-predicate-hit	fullstackFlowTransition	NOT_RUN	S10 P19/P25 assembly, S9 P15/P16/P22/P23	-	-	-
+M11S	single	product	internal/agent/ssproxy/actor.go	startActorLocked	tether-T0-T5	agent	pending-frame-current-nonce	M11S-predicate-hit	fullstackSSPrimitiveLedger	NOT_RUN	S10 P19/P25 assembly, S9 P15/P16/P22/P23	-	-	-
+M11S	quorum	product	internal/agent/ssproxy/actor.go	startActorLocked	tether-T0-T5	agent	pending-frame-current-nonce	M11S-predicate-hit	fullstackSSPrimitiveLedger	NOT_RUN	S10 P19/P25 assembly, S9 P15/P16/P22/P23	-	-	-
+M11X	single	product	internal/xferreceive/receiver.go	commit	tether-T0-T5	agent	primitive-or-consumer-retirement-before-seal	M11X-predicate-hit	fullstackCheckTransferEffects	NOT_RUN	S7 s7-p9m, S10 P14/P16/P19/P25	-	-	-
+M11X	quorum	product	internal/xferreceive/receiver.go	commit	tether-T0-T5	agent	primitive-or-consumer-retirement-before-seal	M11X-predicate-hit	fullstackCheckTransferEffects	NOT_RUN	S7 s7-p9m, S10 P14/P16/P19/P25	-	-	-
+M11D	single	product	internal/storage/connection_registry.go	Open	tether-T0-T5	broker	activation-effect-interval	M11D-predicate-hit	fullstackJudgePrivateCustody	NOT_RUN	S8 P14/P15/P17/P26, S10 P08/P16/P18/P19/P25	-	-	-
+M11D	quorum	product	internal/storage/connection_registry.go	Open	tether-T0-T5	broker	activation-effect-interval	M11D-predicate-hit	fullstackJudgePrivateCustody	NOT_RUN	S8 P14/P15/P17/P26, S10 P08/P16/P18/P19/P25	-	-	-
+M11C	single	product	internal/infraupgrade/caddy_reload.go	cutoverBarrier	caddy-2.7.5-2.7.6	caddy	activation-effect-interval	M11C-predicate-hit	fullstackJudgeOwnership	NOT_RUN	S8 P14/P15/P17/P26, S10 P08/P16/P18/P19/P25	-	-	-
+M11C	quorum	product	internal/infraupgrade/caddy_reload.go	cutoverBarrier	caddy-2.7.5-2.7.6	caddy	activation-effect-interval	M11C-predicate-hit	fullstackJudgeOwnership	NOT_RUN	S8 P14/P15/P17/P26, S10 P08/P16/P18/P19/P25	-	-	-
+M11L	single	product	internal/upgradelock/lease.go	Adopt	tether-T0-T5	agent	activation-effect-interval	M11L-predicate-hit	fullstackJudgePrivateCustody	NOT_RUN	S8 P14/P15/P17/P26, S10 P08/P16/P18/P19/P25	-	-	-
+M11L	quorum	product	internal/upgradelock/lease.go	Adopt	tether-T0-T5	agent	activation-effect-interval	M11L-predicate-hit	fullstackJudgePrivateCustody	NOT_RUN	S8 P14/P15/P17/P26, S10 P08/P16/P18/P19/P25	-	-	-
+M11U	single	product	internal/handoff/image_linux.go	restoreDescriptor	tether-T0-T5	agent	activation-effect-interval	M11U-predicate-hit	fullstackJudgePrivateCustody	NOT_RUN	S8 P14/P15/P17/P26, S10 P08/P16/P18/P19/P25	-	-	-
+M11U	quorum	product	internal/handoff/image_linux.go	restoreDescriptor	tether-T0-T5	agent	activation-effect-interval	M11U-predicate-hit	fullstackJudgePrivateCustody	NOT_RUN	S8 P14/P15/P17/P26, S10 P08/P16/P18/P19/P25	-	-	-
+M11K	single	product	internal/spawnsafe/command.go	MergeChildEnv	tether-T0-T5	agent	activation-effect-interval	M11K-predicate-hit	fullstackJudgePrivateCustody	NOT_RUN	S8 P14/P15/P17/P26, S10 P08/P16/P18/P19/P25	-	-	-
+M11K	quorum	product	internal/spawnsafe/command.go	MergeChildEnv	tether-T0-T5	agent	activation-effect-interval	M11K-predicate-hit	fullstackJudgePrivateCustody	NOT_RUN	S8 P14/P15/P17/P26, S10 P08/P16/P18/P19/P25	-	-	-
+# Launch declarations from the on-disk full directory; NOT_RUN pending final upstream artifact/cell provenance and S10/P27/P32/P35 execution.
+# Control cell sets reference the per-topology rows above; each shell arm launches once. Parent summaries carry no launch cost.
+# Build, actual wall, resource peaks, candidate, native rc and raw remain unset. Functional rows require candidate re-seal.
+# launch-catalog-v1
+# receipt-columns: candidate_id native_rc actual_wall_s peak_fd peak_rss_bytes peak_js_bytes raw_path
+regime	drill	arm	artifact_set	mutation	cell	required	expected_native	fixture	grows	estimate_s	worst_s	ceiling_s	before_build_s	after_build_s	status	pending_owner	candidate_id	native_rc	actual_wall_s	peak_fd	peak_rss_bytes	peak_js_bytes	raw_path
+default	00-skeleton	-	upstream-manifest	-	-	yes	0	-	-	34	-	-	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	00-skeleton	-	upstream-manifest	-	-	yes	0	-	-	34	-	-	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	10-grow-to-3	-	upstream-manifest	-	-	yes	0	-	-	218	-	-	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	10-grow-to-3	-	upstream-manifest	-	-	yes	0	-	-	218	-	-	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	100-hot-update-fullstack-controls	M01A	tether-T0-T5	M01A	single	yes	1	N1	0	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+live-grow	100-hot-update-fullstack-controls	M01A	tether-T0-T5	M01A	single	yes	1	N1	0	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+controls	100-hot-update-fullstack-controls	M01A	tether-T0-T5	M01A	single	yes	1	N1	0	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+default	100-hot-update-fullstack-controls	M01B	tether-T0-T5	M01B	single,quorum	yes	1	N3-live	2	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+live-grow	100-hot-update-fullstack-controls	M01B	tether-T0-T5	M01B	single,quorum	yes	1	N3-live	2	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+controls	100-hot-update-fullstack-controls	M01B	tether-T0-T5	M01B	single,quorum	yes	1	N3-live	2	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+default	100-hot-update-fullstack-controls	M02E	tether-T0-T5	M02E	single	yes	1	N1	0	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+live-grow	100-hot-update-fullstack-controls	M02E	tether-T0-T5	M02E	single	yes	1	N1	0	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+controls	100-hot-update-fullstack-controls	M02E	tether-T0-T5	M02E	single	yes	1	N1	0	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+default	100-hot-update-fullstack-controls	M02P	tether-T0-T5	M02P	single	yes	1	N1	0	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+live-grow	100-hot-update-fullstack-controls	M02P	tether-T0-T5	M02P	single	yes	1	N1	0	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+controls	100-hot-update-fullstack-controls	M02P	tether-T0-T5	M02P	single	yes	1	N1	0	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+default	100-hot-update-fullstack-controls	M02F	tether-T0-T5	M02F	single,quorum	yes	1	N3-live	2	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+live-grow	100-hot-update-fullstack-controls	M02F	tether-T0-T5	M02F	single,quorum	yes	1	N3-live	2	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+controls	100-hot-update-fullstack-controls	M02F	tether-T0-T5	M02F	single,quorum	yes	1	N3-live	2	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+default	100-hot-update-fullstack-controls	M02X	tether-T0-T5	M02X	single	yes	1	N1	0	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+live-grow	100-hot-update-fullstack-controls	M02X	tether-T0-T5	M02X	single	yes	1	N1	0	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+controls	100-hot-update-fullstack-controls	M02X	tether-T0-T5	M02X	single	yes	1	N1	0	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+default	100-hot-update-fullstack-controls	M03E	tether-T0-T5	M03E	single	yes	1	N1	0	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+live-grow	100-hot-update-fullstack-controls	M03E	tether-T0-T5	M03E	single	yes	1	N1	0	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+controls	100-hot-update-fullstack-controls	M03E	tether-T0-T5	M03E	single	yes	1	N1	0	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+default	100-hot-update-fullstack-controls	M03P	tether-T0-T5	M03P	single	yes	1	N1	0	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+live-grow	100-hot-update-fullstack-controls	M03P	tether-T0-T5	M03P	single	yes	1	N1	0	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+controls	100-hot-update-fullstack-controls	M03P	tether-T0-T5	M03P	single	yes	1	N1	0	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+default	100-hot-update-fullstack-controls	M03F	tether-T0-T5	M03F	single,quorum	yes	1	N3-live	2	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+live-grow	100-hot-update-fullstack-controls	M03F	tether-T0-T5	M03F	single,quorum	yes	1	N3-live	2	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+controls	100-hot-update-fullstack-controls	M03F	tether-T0-T5	M03F	single,quorum	yes	1	N3-live	2	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+default	100-hot-update-fullstack-controls	M03X	tether-T0-T5	M03X	single	yes	1	N1	0	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+live-grow	100-hot-update-fullstack-controls	M03X	tether-T0-T5	M03X	single	yes	1	N1	0	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+controls	100-hot-update-fullstack-controls	M03X	tether-T0-T5	M03X	single	yes	1	N1	0	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+default	100-hot-update-fullstack-controls	M04A	tether-T0-T5	M04A	single,quorum	yes	1	N3-live	2	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+live-grow	100-hot-update-fullstack-controls	M04A	tether-T0-T5	M04A	single,quorum	yes	1	N3-live	2	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+controls	100-hot-update-fullstack-controls	M04A	tether-T0-T5	M04A	single,quorum	yes	1	N3-live	2	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+default	100-hot-update-fullstack-controls	M04B	tether-T0-T5	M04B	single,quorum	yes	1	N3-live	2	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+live-grow	100-hot-update-fullstack-controls	M04B	tether-T0-T5	M04B	single,quorum	yes	1	N3-live	2	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+controls	100-hot-update-fullstack-controls	M04B	tether-T0-T5	M04B	single,quorum	yes	1	N3-live	2	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+default	100-hot-update-fullstack-controls	M04P	tether-T0-T5	M04P	single	yes	1	N1	0	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+live-grow	100-hot-update-fullstack-controls	M04P	tether-T0-T5	M04P	single	yes	1	N1	0	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+controls	100-hot-update-fullstack-controls	M04P	tether-T0-T5	M04P	single	yes	1	N1	0	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+default	100-hot-update-fullstack-controls	M05E	tether-T0-T5	M05E	single	yes	1	N1	0	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+live-grow	100-hot-update-fullstack-controls	M05E	tether-T0-T5	M05E	single	yes	1	N1	0	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+controls	100-hot-update-fullstack-controls	M05E	tether-T0-T5	M05E	single	yes	1	N1	0	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+default	100-hot-update-fullstack-controls	M05P	tether-T0-T5	M05P	single	yes	1	N1	0	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+live-grow	100-hot-update-fullstack-controls	M05P	tether-T0-T5	M05P	single	yes	1	N1	0	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+controls	100-hot-update-fullstack-controls	M05P	tether-T0-T5	M05P	single	yes	1	N1	0	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+default	100-hot-update-fullstack-controls	M05X	tether-T0-T5	M05X	single,quorum	yes	1	N3-live	2	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+live-grow	100-hot-update-fullstack-controls	M05X	tether-T0-T5	M05X	single,quorum	yes	1	N3-live	2	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+controls	100-hot-update-fullstack-controls	M05X	tether-T0-T5	M05X	single,quorum	yes	1	N3-live	2	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+default	100-hot-update-fullstack-controls	M05R	tether-T0-T5	M05R	single	yes	1	N1	0	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+live-grow	100-hot-update-fullstack-controls	M05R	tether-T0-T5	M05R	single	yes	1	N1	0	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+controls	100-hot-update-fullstack-controls	M05R	tether-T0-T5	M05R	single	yes	1	N1	0	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+default	100-hot-update-fullstack-controls	M06A	tether-T0-T5	M06A	single	yes	1	N1	0	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+live-grow	100-hot-update-fullstack-controls	M06A	tether-T0-T5	M06A	single	yes	1	N1	0	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+controls	100-hot-update-fullstack-controls	M06A	tether-T0-T5	M06A	single	yes	1	N1	0	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+default	100-hot-update-fullstack-controls	M06B	tether-T0-T5	M06B	single,quorum	yes	1	N3-live	2	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+live-grow	100-hot-update-fullstack-controls	M06B	tether-T0-T5	M06B	single,quorum	yes	1	N3-live	2	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+controls	100-hot-update-fullstack-controls	M06B	tether-T0-T5	M06B	single,quorum	yes	1	N3-live	2	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+default	100-hot-update-fullstack-controls	M06R	tether-T0-T5	M06R	single,quorum	yes	1	N3-live	2	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+live-grow	100-hot-update-fullstack-controls	M06R	tether-T0-T5	M06R	single,quorum	yes	1	N3-live	2	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+controls	100-hot-update-fullstack-controls	M06R	tether-T0-T5	M06R	single,quorum	yes	1	N3-live	2	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+default	100-hot-update-fullstack-controls	M06F	tether-T0-T5	M06F	single,quorum	yes	1	N3-live	2	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+live-grow	100-hot-update-fullstack-controls	M06F	tether-T0-T5	M06F	single,quorum	yes	1	N3-live	2	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+controls	100-hot-update-fullstack-controls	M06F	tether-T0-T5	M06F	single,quorum	yes	1	N3-live	2	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+default	100-hot-update-fullstack-controls	M07A	tether-T0-T5	M07A	single	yes	1	N1	0	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+live-grow	100-hot-update-fullstack-controls	M07A	tether-T0-T5	M07A	single	yes	1	N1	0	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+controls	100-hot-update-fullstack-controls	M07A	tether-T0-T5	M07A	single	yes	1	N1	0	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+default	100-hot-update-fullstack-controls	M07B	tether-T0-T5	M07B	single,quorum	yes	1	N3-live	2	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+live-grow	100-hot-update-fullstack-controls	M07B	tether-T0-T5	M07B	single,quorum	yes	1	N3-live	2	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+controls	100-hot-update-fullstack-controls	M07B	tether-T0-T5	M07B	single,quorum	yes	1	N3-live	2	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+default	100-hot-update-fullstack-controls	M07N	nats-2.14.5-2.14.6	M07N	single,quorum	yes	1	N3-live	2	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+live-grow	100-hot-update-fullstack-controls	M07N	nats-2.14.5-2.14.6	M07N	single,quorum	yes	1	N3-live	2	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+controls	100-hot-update-fullstack-controls	M07N	nats-2.14.5-2.14.6	M07N	single,quorum	yes	1	N3-live	2	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+default	100-hot-update-fullstack-controls	M07C	caddy-2.7.5-2.7.6	M07C	single,quorum	yes	1	N3-live	2	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+live-grow	100-hot-update-fullstack-controls	M07C	caddy-2.7.5-2.7.6	M07C	single,quorum	yes	1	N3-live	2	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+controls	100-hot-update-fullstack-controls	M07C	caddy-2.7.5-2.7.6	M07C	single,quorum	yes	1	N3-live	2	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+default	100-hot-update-fullstack-controls	M08E	tether-T0-T5	M08E	single	yes	1	N1	0	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+live-grow	100-hot-update-fullstack-controls	M08E	tether-T0-T5	M08E	single	yes	1	N1	0	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+controls	100-hot-update-fullstack-controls	M08E	tether-T0-T5	M08E	single	yes	1	N1	0	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+default	100-hot-update-fullstack-controls	M08P	tether-T0-T5	M08P	single	yes	1	N1	0	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+live-grow	100-hot-update-fullstack-controls	M08P	tether-T0-T5	M08P	single	yes	1	N1	0	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+controls	100-hot-update-fullstack-controls	M08P	tether-T0-T5	M08P	single	yes	1	N1	0	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+default	100-hot-update-fullstack-controls	M08A	tether-T0-T5	M08A	single	yes	1	N1	0	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+live-grow	100-hot-update-fullstack-controls	M08A	tether-T0-T5	M08A	single	yes	1	N1	0	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+controls	100-hot-update-fullstack-controls	M08A	tether-T0-T5	M08A	single	yes	1	N1	0	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+default	100-hot-update-fullstack-controls	M08B	tether-T0-T5	M08B	single,quorum	yes	1	N3-live	2	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+live-grow	100-hot-update-fullstack-controls	M08B	tether-T0-T5	M08B	single,quorum	yes	1	N3-live	2	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+controls	100-hot-update-fullstack-controls	M08B	tether-T0-T5	M08B	single,quorum	yes	1	N3-live	2	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+default	100-hot-update-fullstack-controls	M08D	tether-T0-T5	M08D	single,quorum	yes	1	N3-live	2	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+live-grow	100-hot-update-fullstack-controls	M08D	tether-T0-T5	M08D	single,quorum	yes	1	N3-live	2	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+controls	100-hot-update-fullstack-controls	M08D	tether-T0-T5	M08D	single,quorum	yes	1	N3-live	2	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+default	100-hot-update-fullstack-controls	M08X	tether-T0-T5	M08X	single,quorum	yes	1	N3-live	2	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+live-grow	100-hot-update-fullstack-controls	M08X	tether-T0-T5	M08X	single,quorum	yes	1	N3-live	2	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+controls	100-hot-update-fullstack-controls	M08X	tether-T0-T5	M08X	single,quorum	yes	1	N3-live	2	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+default	100-hot-update-fullstack-controls	M08C	caddy-2.7.5-2.7.6	M08C	single,quorum	yes	1	N3-live	2	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+live-grow	100-hot-update-fullstack-controls	M08C	caddy-2.7.5-2.7.6	M08C	single,quorum	yes	1	N3-live	2	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+controls	100-hot-update-fullstack-controls	M08C	caddy-2.7.5-2.7.6	M08C	single,quorum	yes	1	N3-live	2	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+default	100-hot-update-fullstack-controls	M08O	tether-T0-T5	M08O	single,quorum	yes	1	N3-live	2	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+live-grow	100-hot-update-fullstack-controls	M08O	tether-T0-T5	M08O	single,quorum	yes	1	N3-live	2	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+controls	100-hot-update-fullstack-controls	M08O	tether-T0-T5	M08O	single,quorum	yes	1	N3-live	2	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+default	100-hot-update-fullstack-controls	M09A	tether-T0-T5	M09A	single	yes	1	N1	0	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+live-grow	100-hot-update-fullstack-controls	M09A	tether-T0-T5	M09A	single	yes	1	N1	0	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+controls	100-hot-update-fullstack-controls	M09A	tether-T0-T5	M09A	single	yes	1	N1	0	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+default	100-hot-update-fullstack-controls	M09B	tether-T0-T5	M09B	single,quorum	yes	1	N3-live	2	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+live-grow	100-hot-update-fullstack-controls	M09B	tether-T0-T5	M09B	single,quorum	yes	1	N3-live	2	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+controls	100-hot-update-fullstack-controls	M09B	tether-T0-T5	M09B	single,quorum	yes	1	N3-live	2	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+default	100-hot-update-fullstack-controls	M10S	tether-T0-T5	M10S	single	yes	1	N1	0	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+live-grow	100-hot-update-fullstack-controls	M10S	tether-T0-T5	M10S	single	yes	1	N1	0	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+controls	100-hot-update-fullstack-controls	M10S	tether-T0-T5	M10S	single	yes	1	N1	0	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+default	100-hot-update-fullstack-controls	M10C	tether-T0-T5	M10C	single,quorum	yes	1	N3-live	2	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+live-grow	100-hot-update-fullstack-controls	M10C	tether-T0-T5	M10C	single,quorum	yes	1	N3-live	2	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+controls	100-hot-update-fullstack-controls	M10C	tether-T0-T5	M10C	single,quorum	yes	1	N3-live	2	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+default	100-hot-update-fullstack-controls	M11W	tether-T0-T5	M11W	single	yes	1	N1	0	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+live-grow	100-hot-update-fullstack-controls	M11W	tether-T0-T5	M11W	single	yes	1	N1	0	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+controls	100-hot-update-fullstack-controls	M11W	tether-T0-T5	M11W	single	yes	1	N1	0	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+default	100-hot-update-fullstack-controls	M11I	tether-T0-T5	M11I	single	yes	1	N1	0	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+live-grow	100-hot-update-fullstack-controls	M11I	tether-T0-T5	M11I	single	yes	1	N1	0	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+controls	100-hot-update-fullstack-controls	M11I	tether-T0-T5	M11I	single	yes	1	N1	0	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+default	100-hot-update-fullstack-controls	M11O	tether-T0-T5	M11O	single	yes	1	N1	0	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+live-grow	100-hot-update-fullstack-controls	M11O	tether-T0-T5	M11O	single	yes	1	N1	0	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+controls	100-hot-update-fullstack-controls	M11O	tether-T0-T5	M11O	single	yes	1	N1	0	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+default	100-hot-update-fullstack-controls	M11P	tether-T0-T5	M11P	single	yes	1	N1	0	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+live-grow	100-hot-update-fullstack-controls	M11P	tether-T0-T5	M11P	single	yes	1	N1	0	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+controls	100-hot-update-fullstack-controls	M11P	tether-T0-T5	M11P	single	yes	1	N1	0	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+default	100-hot-update-fullstack-controls	M11Q	tether-T0-T5	M11Q	single	yes	1	N1	0	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+live-grow	100-hot-update-fullstack-controls	M11Q	tether-T0-T5	M11Q	single	yes	1	N1	0	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+controls	100-hot-update-fullstack-controls	M11Q	tether-T0-T5	M11Q	single	yes	1	N1	0	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+default	100-hot-update-fullstack-controls	M11F	tether-T0-T5	M11F	single,quorum	yes	1	N3-live	2	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+live-grow	100-hot-update-fullstack-controls	M11F	tether-T0-T5	M11F	single,quorum	yes	1	N3-live	2	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+controls	100-hot-update-fullstack-controls	M11F	tether-T0-T5	M11F	single,quorum	yes	1	N3-live	2	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+default	100-hot-update-fullstack-controls	M11S	tether-T0-T5	M11S	single,quorum	yes	1	N3-live	2	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+live-grow	100-hot-update-fullstack-controls	M11S	tether-T0-T5	M11S	single,quorum	yes	1	N3-live	2	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+controls	100-hot-update-fullstack-controls	M11S	tether-T0-T5	M11S	single,quorum	yes	1	N3-live	2	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+default	100-hot-update-fullstack-controls	M11X	tether-T0-T5	M11X	single,quorum	yes	1	N3-live	2	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+live-grow	100-hot-update-fullstack-controls	M11X	tether-T0-T5	M11X	single,quorum	yes	1	N3-live	2	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+controls	100-hot-update-fullstack-controls	M11X	tether-T0-T5	M11X	single,quorum	yes	1	N3-live	2	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+default	100-hot-update-fullstack-controls	M11D	tether-T0-T5	M11D	single,quorum	yes	1	N3-live	2	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+live-grow	100-hot-update-fullstack-controls	M11D	tether-T0-T5	M11D	single,quorum	yes	1	N3-live	2	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+controls	100-hot-update-fullstack-controls	M11D	tether-T0-T5	M11D	single,quorum	yes	1	N3-live	2	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+default	100-hot-update-fullstack-controls	M11C	caddy-2.7.5-2.7.6	M11C	single,quorum	yes	1	N3-live	2	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+live-grow	100-hot-update-fullstack-controls	M11C	caddy-2.7.5-2.7.6	M11C	single,quorum	yes	1	N3-live	2	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+controls	100-hot-update-fullstack-controls	M11C	caddy-2.7.5-2.7.6	M11C	single,quorum	yes	1	N3-live	2	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+default	100-hot-update-fullstack-controls	M11L	tether-T0-T5	M11L	single,quorum	yes	1	N3-live	2	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+live-grow	100-hot-update-fullstack-controls	M11L	tether-T0-T5	M11L	single,quorum	yes	1	N3-live	2	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+controls	100-hot-update-fullstack-controls	M11L	tether-T0-T5	M11L	single,quorum	yes	1	N3-live	2	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+default	100-hot-update-fullstack-controls	M11U	tether-T0-T5	M11U	single,quorum	yes	1	N3-live	2	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+live-grow	100-hot-update-fullstack-controls	M11U	tether-T0-T5	M11U	single,quorum	yes	1	N3-live	2	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+controls	100-hot-update-fullstack-controls	M11U	tether-T0-T5	M11U	single,quorum	yes	1	N3-live	2	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+default	100-hot-update-fullstack-controls	M11K	tether-T0-T5	M11K	single,quorum	yes	1	N3-live	2	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+live-grow	100-hot-update-fullstack-controls	M11K	tether-T0-T5	M11K	single,quorum	yes	1	N3-live	2	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+controls	100-hot-update-fullstack-controls	M11K	tether-T0-T5	M11K	single,quorum	yes	1	N3-live	2	180	600	1200	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+default	11-grow-gaps	-	upstream-manifest	-	-	yes	0	-	-	88	-	-	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	11-grow-gaps	-	upstream-manifest	-	-	yes	0	-	-	88	-	-	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	12-ghost-voter	-	upstream-manifest	-	-	yes	0	-	-	109	-	-	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	12-ghost-voter	-	upstream-manifest	-	-	yes	0	-	-	109	-	-	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	13-inbroker-reconcile-perm	-	upstream-manifest	-	-	yes	0	-	-	168	-	-	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	13-inbroker-reconcile-perm	-	upstream-manifest	-	-	yes	0	-	-	168	-	-	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	20-forcesingle-natsconf	-	upstream-manifest	-	-	yes	0	-	-	189	-	-	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	20-forcesingle-natsconf	-	upstream-manifest	-	-	yes	0	-	-	189	-	-	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	21-smalldisk-tierb	-	upstream-manifest	-	-	yes	0	-	-	29	-	-	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	21-smalldisk-tierb	-	upstream-manifest	-	-	yes	0	-	-	29	-	-	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	22-forcesingle-online	-	upstream-manifest	-	-	yes	0	-	-	370	-	-	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	22-forcesingle-online	-	upstream-manifest	-	-	yes	0	-	-	370	-	-	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	30-rolling-upgrade	-	upstream-manifest	-	-	yes	4	-	-	263	-	-	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	30-rolling-upgrade	-	upstream-manifest	-	-	yes	4	-	-	263	-	-	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	31-node-upgrade-fleet	V1	upstream-manifest	-	V1	yes	4	install	0	57	300	600	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	31-node-upgrade-fleet	V1	upstream-manifest	-	V1	yes	4	install	0	57	300	600	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	31-node-upgrade-fleet	V2	upstream-manifest	-	V2	yes	0	install	0	900	900	1800	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	31-node-upgrade-fleet	V2	upstream-manifest	-	V2	yes	0	install	0	900	900	1800	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	32-install-lifecycle	-	upstream-manifest	-	-	yes	0	-	-	63	-	-	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	32-install-lifecycle	-	upstream-manifest	-	-	yes	0	-	-	63	-	-	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	33-node-upgrade-success	V1	upstream-manifest	-	V1	yes	4	install	0	219	600	1200	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	33-node-upgrade-success	V1	upstream-manifest	-	V1	yes	4	install	0	219	600	1200	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	33-node-upgrade-success	V2	upstream-manifest	-	V2	yes	0	install	0	900	900	1800	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	33-node-upgrade-success	V2	upstream-manifest	-	V2	yes	0	install	0	900	900	1800	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	34-hot-update-process	A	upstream-manifest	-	A	yes	0	N1	0	67	300	600	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	34-hot-update-process	A	upstream-manifest	-	A	yes	0	N1	0	67	300	600	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	34-hot-update-process	G	upstream-manifest	-	G	yes	0	N1	0	78	420	840	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	34-hot-update-process	G	upstream-manifest	-	G	yes	0	N1	0	78	420	840	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	34-hot-update-process	U	upstream-manifest	-	U	yes	0	N1	0	69	420	840	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	34-hot-update-process	U	upstream-manifest	-	U	yes	0	N1	0	69	420	840	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	34-hot-update-process	N	upstream-manifest	-	N	yes	0	N1	0	72	360	720	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	34-hot-update-process	N	upstream-manifest	-	N	yes	0	N1	0	72	360	720	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	34-hot-update-process	P	upstream-manifest	-	P	yes	0	N1	0	103	420	840	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	34-hot-update-process	P	upstream-manifest	-	P	yes	0	N1	0	103	420	840	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	34-hot-update-process	W	upstream-manifest	-	W	yes	0	N1	0	218	600	1200	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	34-hot-update-process	W	upstream-manifest	-	W	yes	0	N1	0	218	600	1200	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	34-hot-update-process	F	upstream-manifest	-	F	yes	0	N1	0	82	420	840	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	34-hot-update-process	F	upstream-manifest	-	F	yes	0	N1	0	82	420	840	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	35-hot-update-exec-carrier	A	upstream-manifest	-	A	yes	0	N1	0	89	360	720	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	35-hot-update-exec-carrier	A	upstream-manifest	-	A	yes	0	N1	0	89	360	720	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	35-hot-update-exec-carrier	B	upstream-manifest	-	B	yes	0	N1	0	51	300	600	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	35-hot-update-exec-carrier	B	upstream-manifest	-	B	yes	0	N1	0	51	300	600	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	35-hot-update-exec-carrier	C	upstream-manifest	-	C	yes	0	N1	0	86	420	840	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	35-hot-update-exec-carrier	C	upstream-manifest	-	C	yes	0	N1	0	86	420	840	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	36-hot-update-pty	A	upstream-manifest	-	A	yes	0	N1	0	107	300	600	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	36-hot-update-pty	A	upstream-manifest	-	A	yes	0	N1	0	107	300	600	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	36-hot-update-pty	W	upstream-manifest	-	W	yes	0	N1	0	218	420	840	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	36-hot-update-pty	W	upstream-manifest	-	W	yes	0	N1	0	218	420	840	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	36-hot-update-pty	C	upstream-manifest	-	C	yes	0	N1	0	115	360	720	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	36-hot-update-pty	C	upstream-manifest	-	C	yes	0	N1	0	115	360	720	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	36-hot-update-pty	L	upstream-manifest	-	L	yes	0	N1	0	201	300	600	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	36-hot-update-pty	L	upstream-manifest	-	L	yes	0	N1	0	201	300	600	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	37-hot-update-broker	A	upstream-manifest	-	A	yes	0	install	0	180	420	840	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	37-hot-update-broker	A	upstream-manifest	-	A	yes	0	install	0	180	420	840	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	37-hot-update-broker	A1	upstream-manifest	-	A1	yes	0	N1	0	180	420	840	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	37-hot-update-broker	A1	upstream-manifest	-	A1	yes	0	N1	0	180	420	840	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	37-hot-update-broker	B	upstream-manifest	-	B	yes	0	N3-live	2	360	720	1440	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	37-hot-update-broker	B	upstream-manifest	-	B	yes	0	N3-live	2	360	720	1440	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	37-hot-update-broker	T	upstream-manifest	-	T	yes	0	N3-live	2	1200	1200	2400	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	37-hot-update-broker	T	upstream-manifest	-	T	yes	0	N3-live	2	1200	1200	2400	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	37-hot-update-broker	R	upstream-manifest	-	R	yes	0	N1	0	120	360	720	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	37-hot-update-broker	R	upstream-manifest	-	R	yes	0	N1	0	120	360	720	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	38-hot-update-rollback-compat	A-single	upstream-manifest	-	A-single	yes	0	N1	0	1100	1100	2200	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	38-hot-update-rollback-compat	A-single	upstream-manifest	-	A-single	yes	0	N1	0	1100	1100	2200	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	38-hot-update-rollback-compat	A-sole	upstream-manifest	-	A-sole	yes	0	N1	0	1100	1100	2200	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	38-hot-update-rollback-compat	A-sole	upstream-manifest	-	A-sole	yes	0	N1	0	1100	1100	2200	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	38-hot-update-rollback-compat	A-n3	upstream-manifest	-	A-n3	yes	0	N3-live	2	1100	1100	2200	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	38-hot-update-rollback-compat	A-n3	upstream-manifest	-	A-n3	yes	0	N3-live	2	1100	1100	2200	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	38-hot-update-rollback-compat	R0	upstream-manifest	-	R0	yes	0	N1	0	120	120	240	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	38-hot-update-rollback-compat	R0	upstream-manifest	-	R0	yes	0	N1	0	120	120	240	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	38-hot-update-rollback-compat	R1	upstream-manifest	-	R1	yes	0	N1	0	120	120	240	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	38-hot-update-rollback-compat	R1	upstream-manifest	-	R1	yes	0	N1	0	120	120	240	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	38-hot-update-rollback-compat	R2	upstream-manifest	-	R2	yes	0	N1	0	120	120	240	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	38-hot-update-rollback-compat	R2	upstream-manifest	-	R2	yes	0	N1	0	120	120	240	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	38-hot-update-rollback-compat	H-root	upstream-manifest	-	H-root	yes	0	N1	0	120	120	240	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	38-hot-update-rollback-compat	H-root	upstream-manifest	-	H-root	yes	0	N1	0	120	120	240	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	38-hot-update-rollback-compat	H-user	upstream-manifest	-	H-user	yes	0	N1	0	120	120	240	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	38-hot-update-rollback-compat	H-user	upstream-manifest	-	H-user	yes	0	N1	0	120	120	240	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	38-hot-update-rollback-compat	H-no-systemd	upstream-manifest	-	H-no-systemd	yes	0	N1	0	120	120	240	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	38-hot-update-rollback-compat	H-no-systemd	upstream-manifest	-	H-no-systemd	yes	0	N1	0	120	120	240	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	38-hot-update-rollback-compat	H-colocated	upstream-manifest	-	H-colocated	yes	0	N1	0	120	120	240	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	38-hot-update-rollback-compat	H-colocated	upstream-manifest	-	H-colocated	yes	0	N1	0	120	120	240	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	38-hot-update-rollback-compat	H-sibling	upstream-manifest	-	H-sibling	yes	0	N1	0	120	120	240	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	38-hot-update-rollback-compat	H-sibling	upstream-manifest	-	H-sibling	yes	0	N1	0	120	120	240	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	38-hot-update-rollback-compat	H-readonly	upstream-manifest	-	H-readonly	yes	0	N1	0	120	120	240	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	38-hot-update-rollback-compat	H-readonly	upstream-manifest	-	H-readonly	yes	0	N1	0	120	120	240	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	38-hot-update-rollback-compat	G-two	upstream-manifest	-	G-two	yes	0	N1	0	120	120	240	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	38-hot-update-rollback-compat	G-two	upstream-manifest	-	G-two	yes	0	N1	0	120	120	240	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	38-hot-update-rollback-compat	G-third	upstream-manifest	-	G-third	yes	0	N1	0	120	120	240	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	38-hot-update-rollback-compat	G-third	upstream-manifest	-	G-third	yes	0	N1	0	120	120	240	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	38-hot-update-rollback-compat	G-concurrent	upstream-manifest	-	G-concurrent	yes	0	N1	0	120	120	240	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	38-hot-update-rollback-compat	G-concurrent	upstream-manifest	-	G-concurrent	yes	0	N1	0	120	120	240	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	38-hot-update-rollback-compat	C-driver	upstream-manifest	-	C-driver	yes	0	N1	0	120	120	240	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	38-hot-update-rollback-compat	C-driver	upstream-manifest	-	C-driver	yes	0	N1	0	120	120	240	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	38-hot-update-rollback-compat	C-reopen	upstream-manifest	-	C-reopen	yes	0	N1	0	120	120	240	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	38-hot-update-rollback-compat	C-reopen	upstream-manifest	-	C-reopen	yes	0	N1	0	120	120	240	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	38-hot-update-rollback-compat	C-gc	upstream-manifest	-	C-gc	yes	0	N1	0	120	120	240	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	38-hot-update-rollback-compat	C-gc	upstream-manifest	-	C-gc	yes	0	N1	0	120	120	240	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	38-hot-update-rollback-compat	C-late-writer	upstream-manifest	-	C-late-writer	yes	0	N1	0	120	120	240	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	38-hot-update-rollback-compat	C-late-writer	upstream-manifest	-	C-late-writer	yes	0	N1	0	120	120	240	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	38-hot-update-rollback-compat	C-history-rollback	upstream-manifest	-	C-history-rollback	yes	0	N1	0	120	120	240	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	38-hot-update-rollback-compat	C-history-rollback	upstream-manifest	-	C-history-rollback	yes	0	N1	0	120	120	240	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	38-hot-update-rollback-compat	C-owner-dead	upstream-manifest	-	C-owner-dead	yes	0	N1	0	120	120	240	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	38-hot-update-rollback-compat	C-owner-dead	upstream-manifest	-	C-owner-dead	yes	0	N1	0	120	120	240	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	38-hot-update-rollback-compat	W00-F0-agent-L-known-none	upstream-manifest	-	W00-F0-agent-L-known-none	yes	0	N1	0	180	180	360	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	38-hot-update-rollback-compat	W00-F0-agent-L-known-none	upstream-manifest	-	W00-F0-agent-L-known-none	yes	0	N1	0	180	180	360	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	38-hot-update-rollback-compat	W01-F1-single-L-known-none	upstream-manifest	-	W01-F1-single-L-known-none	yes	0	N1	0	180	180	360	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	38-hot-update-rollback-compat	W01-F1-single-L-known-none	upstream-manifest	-	W01-F1-single-L-known-none	yes	0	N1	0	180	180	360	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	38-hot-update-rollback-compat	W02-F2-sole-voter-L-known-none	upstream-manifest	-	W02-F2-sole-voter-L-known-none	yes	0	N1	0	180	180	360	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	38-hot-update-rollback-compat	W02-F2-sole-voter-L-known-none	upstream-manifest	-	W02-F2-sole-voter-L-known-none	yes	0	N1	0	180	180	360	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	38-hot-update-rollback-compat	W03-F3-N3-L-known-none	upstream-manifest	-	W03-F3-N3-L-known-none	yes	0	N3-live	2	180	180	360	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	38-hot-update-rollback-compat	W03-F3-N3-L-known-none	upstream-manifest	-	W03-F3-N3-L-known-none	yes	0	N3-live	2	180	180	360	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	38-hot-update-rollback-compat	W04-F4-agent-L-known-none	upstream-manifest	-	W04-F4-agent-L-known-none	yes	0	N1	0	180	180	360	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	38-hot-update-rollback-compat	W04-F4-agent-L-known-none	upstream-manifest	-	W04-F4-agent-L-known-none	yes	0	N1	0	180	180	360	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	38-hot-update-rollback-compat	W05-F5-single-L-known-inside	upstream-manifest	-	W05-F5-single-L-known-inside	yes	0	N1	0	180	180	360	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	38-hot-update-rollback-compat	W05-F5-single-L-known-inside	upstream-manifest	-	W05-F5-single-L-known-inside	yes	0	N1	0	180	180	360	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	38-hot-update-rollback-compat	W06-F6-sole-voter-L-known-none	upstream-manifest	-	W06-F6-sole-voter-L-known-none	yes	0	N1	0	180	180	360	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	38-hot-update-rollback-compat	W06-F6-sole-voter-L-known-none	upstream-manifest	-	W06-F6-sole-voter-L-known-none	yes	0	N1	0	180	180	360	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	38-hot-update-rollback-compat	W07-F7-N3-L-known-inside	upstream-manifest	-	W07-F7-N3-L-known-inside	yes	0	N3-live	2	180	180	360	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	38-hot-update-rollback-compat	W07-F7-N3-L-known-inside	upstream-manifest	-	W07-F7-N3-L-known-inside	yes	0	N3-live	2	180	180	360	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	38-hot-update-rollback-compat	W08-F0-agent-D-known-none	upstream-manifest	-	W08-F0-agent-D-known-none	yes	0	N1	0	180	180	360	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	38-hot-update-rollback-compat	W08-F0-agent-D-known-none	upstream-manifest	-	W08-F0-agent-D-known-none	yes	0	N1	0	180	180	360	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	38-hot-update-rollback-compat	W09-F1-single-D-known-none	upstream-manifest	-	W09-F1-single-D-known-none	yes	0	N1	0	180	180	360	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	38-hot-update-rollback-compat	W09-F1-single-D-known-none	upstream-manifest	-	W09-F1-single-D-known-none	yes	0	N1	0	180	180	360	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	38-hot-update-rollback-compat	W10-F2-sole-voter-D-known-none	upstream-manifest	-	W10-F2-sole-voter-D-known-none	yes	0	N1	0	180	180	360	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	38-hot-update-rollback-compat	W10-F2-sole-voter-D-known-none	upstream-manifest	-	W10-F2-sole-voter-D-known-none	yes	0	N1	0	180	180	360	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	38-hot-update-rollback-compat	W11-F8-N3-D-known-none	upstream-manifest	-	W11-F8-N3-D-known-none	yes	0	N3-live	2	180	180	360	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	38-hot-update-rollback-compat	W11-F8-N3-D-known-none	upstream-manifest	-	W11-F8-N3-D-known-none	yes	0	N3-live	2	180	180	360	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	38-hot-update-rollback-compat	W12-F9-N3-D-known-none	upstream-manifest	-	W12-F9-N3-D-known-none	yes	0	N3-live	2	180	180	360	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	38-hot-update-rollback-compat	W12-F9-N3-D-known-none	upstream-manifest	-	W12-F9-N3-D-known-none	yes	0	N3-live	2	180	180	360	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	38-hot-update-rollback-compat	W05-F5-single-L-known-outside	upstream-manifest	-	W05-F5-single-L-known-outside	yes	0	N1	0	180	180	360	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	38-hot-update-rollback-compat	W05-F5-single-L-known-outside	upstream-manifest	-	W05-F5-single-L-known-outside	yes	0	N1	0	180	180	360	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	38-hot-update-rollback-compat	W07-F7-N3-L-known-outside	upstream-manifest	-	W07-F7-N3-L-known-outside	yes	0	N3-live	2	180	180	360	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	38-hot-update-rollback-compat	W07-F7-N3-L-known-outside	upstream-manifest	-	W07-F7-N3-L-known-outside	yes	0	N3-live	2	180	180	360	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	38-hot-update-rollback-compat	W09-F5-agent-D-known-inside	upstream-manifest	-	W09-F5-agent-D-known-inside	yes	0	N1	0	180	180	360	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	38-hot-update-rollback-compat	W09-F5-agent-D-known-inside	upstream-manifest	-	W09-F5-agent-D-known-inside	yes	0	N1	0	180	180	360	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	38-hot-update-rollback-compat	W09-F5-agent-D-known-outside	upstream-manifest	-	W09-F5-agent-D-known-outside	yes	0	N1	0	180	180	360	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	38-hot-update-rollback-compat	W09-F5-agent-D-known-outside	upstream-manifest	-	W09-F5-agent-D-known-outside	yes	0	N1	0	180	180	360	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	38-hot-update-rollback-compat	W09-F7-N3-D-known-inside	upstream-manifest	-	W09-F7-N3-D-known-inside	yes	0	N3-live	2	180	180	360	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	38-hot-update-rollback-compat	W09-F7-N3-D-known-inside	upstream-manifest	-	W09-F7-N3-D-known-inside	yes	0	N3-live	2	180	180	360	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	38-hot-update-rollback-compat	W09-F7-N3-D-known-outside	upstream-manifest	-	W09-F7-N3-D-known-outside	yes	0	N3-live	2	180	180	360	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	38-hot-update-rollback-compat	W09-F7-N3-D-known-outside	upstream-manifest	-	W09-F7-N3-D-known-outside	yes	0	N3-live	2	180	180	360	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	38-hot-update-rollback-compat	W08-F0-single-D-unknown-none	upstream-manifest	-	W08-F0-single-D-unknown-none	yes	0	N1	0	180	180	360	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	38-hot-update-rollback-compat	W08-F0-single-D-unknown-none	upstream-manifest	-	W08-F0-single-D-unknown-none	yes	0	N1	0	180	180	360	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	38-hot-update-rollback-compat	W09-F1-agent-D-unknown-none	upstream-manifest	-	W09-F1-agent-D-unknown-none	yes	0	N1	0	180	180	360	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	38-hot-update-rollback-compat	W09-F1-agent-D-unknown-none	upstream-manifest	-	W09-F1-agent-D-unknown-none	yes	0	N1	0	180	180	360	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	38-hot-update-rollback-compat	W12-F9-N3-D-unknown-none	upstream-manifest	-	W12-F9-N3-D-unknown-none	yes	0	N3-live	2	180	180	360	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	38-hot-update-rollback-compat	W12-F9-N3-D-unknown-none	upstream-manifest	-	W12-F9-N3-D-unknown-none	yes	0	N3-live	2	180	180	360	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	38-hot-update-rollback-compat	W08-F3-single-D-known-none	upstream-manifest	-	W08-F3-single-D-known-none	yes	0	N1	0	180	180	360	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	38-hot-update-rollback-compat	W08-F3-single-D-known-none	upstream-manifest	-	W08-F3-single-D-known-none	yes	0	N1	0	180	180	360	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	38-hot-update-rollback-compat	W09-F4-sole-voter-D-known-none	upstream-manifest	-	W09-F4-sole-voter-D-known-none	yes	0	N1	0	180	180	360	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	38-hot-update-rollback-compat	W09-F4-sole-voter-D-known-none	upstream-manifest	-	W09-F4-sole-voter-D-known-none	yes	0	N1	0	180	180	360	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	38-hot-update-rollback-compat	W09-F6-agent-D-known-none	upstream-manifest	-	W09-F6-agent-D-known-none	yes	0	N1	0	180	180	360	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	38-hot-update-rollback-compat	W09-F6-agent-D-known-none	upstream-manifest	-	W09-F6-agent-D-known-none	yes	0	N1	0	180	180	360	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	38-hot-update-rollback-compat	I-late-revoke-current-rollback	upstream-manifest	-	I-late-revoke-current-rollback	yes	0	N1	0	180	180	360	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	38-hot-update-rollback-compat	I-late-revoke-current-rollback	upstream-manifest	-	I-late-revoke-current-rollback	yes	0	N1	0	180	180	360	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	38-hot-update-rollback-compat	I-nats-cut-leader-move	upstream-manifest	-	I-nats-cut-leader-move	yes	0	N3-live	2	180	180	360	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	38-hot-update-rollback-compat	I-nats-cut-leader-move	upstream-manifest	-	I-nats-cut-leader-move	yes	0	N3-live	2	180	180	360	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	38-hot-update-rollback-compat	I-begin-archive-gc	upstream-manifest	-	I-begin-archive-gc	yes	0	N1	0	180	180	360	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	38-hot-update-rollback-compat	I-begin-archive-gc	upstream-manifest	-	I-begin-archive-gc	yes	0	N1	0	180	180	360	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	38-hot-update-rollback-compat	I-driver-death-host-reservation	upstream-manifest	-	I-driver-death-host-reservation	yes	0	N3-live	2	180	180	360	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	38-hot-update-rollback-compat	I-driver-death-host-reservation	upstream-manifest	-	I-driver-death-host-reservation	yes	0	N3-live	2	180	180	360	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	38-hot-update-rollback-compat	M01	upstream-manifest	-	M01	yes	1	N1	0	90	90	180	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	38-hot-update-rollback-compat	M01	upstream-manifest	-	M01	yes	1	N1	0	90	90	180	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	38-hot-update-rollback-compat	M02	upstream-manifest	-	M02	yes	1	N1	0	90	90	180	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	38-hot-update-rollback-compat	M02	upstream-manifest	-	M02	yes	1	N1	0	90	90	180	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	38-hot-update-rollback-compat	M03	upstream-manifest	-	M03	yes	1	N1	0	90	90	180	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	38-hot-update-rollback-compat	M03	upstream-manifest	-	M03	yes	1	N1	0	90	90	180	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	38-hot-update-rollback-compat	M04	upstream-manifest	-	M04	yes	1	N1	0	90	90	180	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	38-hot-update-rollback-compat	M04	upstream-manifest	-	M04	yes	1	N1	0	90	90	180	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	38-hot-update-rollback-compat	M05	upstream-manifest	-	M05	yes	1	N1	0	90	90	180	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	38-hot-update-rollback-compat	M05	upstream-manifest	-	M05	yes	1	N1	0	90	90	180	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	38-hot-update-rollback-compat	M06	upstream-manifest	-	M06	yes	1	N1	0	90	90	180	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	38-hot-update-rollback-compat	M06	upstream-manifest	-	M06	yes	1	N1	0	90	90	180	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	38-hot-update-rollback-compat	M07	upstream-manifest	-	M07	yes	1	N1	0	90	90	180	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	38-hot-update-rollback-compat	M07	upstream-manifest	-	M07	yes	1	N1	0	90	90	180	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	38-hot-update-rollback-compat	M08	upstream-manifest	-	M08	yes	1	N1	0	90	90	180	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	38-hot-update-rollback-compat	M08	upstream-manifest	-	M08	yes	1	N1	0	90	90	180	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	38-hot-update-rollback-compat	M09	upstream-manifest	-	M09	yes	1	N1	0	90	90	180	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	38-hot-update-rollback-compat	M09	upstream-manifest	-	M09	yes	1	N1	0	90	90	180	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	38-hot-update-rollback-compat	M10	upstream-manifest	-	M10	yes	1	N1	0	90	90	180	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	38-hot-update-rollback-compat	M10	upstream-manifest	-	M10	yes	1	N1	0	90	90	180	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	38-hot-update-rollback-compat	M11	upstream-manifest	-	M11	yes	1	N1	0	90	90	180	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	38-hot-update-rollback-compat	M11	upstream-manifest	-	M11	yes	1	N1	0	90	90	180	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	38-hot-update-rollback-compat	M12	upstream-manifest	-	M12	yes	1	N1	0	90	90	180	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	38-hot-update-rollback-compat	M12	upstream-manifest	-	M12	yes	1	N1	0	90	90	180	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	38-hot-update-rollback-compat	M13	upstream-manifest	-	M13	yes	1	N1	0	90	90	180	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	38-hot-update-rollback-compat	M13	upstream-manifest	-	M13	yes	1	N1	0	90	90	180	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	38-hot-update-rollback-compat	M14	upstream-manifest	-	M14	yes	1	N1	0	90	90	180	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	38-hot-update-rollback-compat	M14	upstream-manifest	-	M14	yes	1	N1	0	90	90	180	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	38-hot-update-rollback-compat	M15	upstream-manifest	-	M15	yes	1	N1	0	90	90	180	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	38-hot-update-rollback-compat	M15	upstream-manifest	-	M15	yes	1	N1	0	90	90	180	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	38-hot-update-rollback-compat	M16	upstream-manifest	-	M16	yes	1	N1	0	90	90	180	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	38-hot-update-rollback-compat	M16	upstream-manifest	-	M16	yes	1	N1	0	90	90	180	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	38-hot-update-rollback-compat	M17	upstream-manifest	-	M17	yes	1	N1	0	90	90	180	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	38-hot-update-rollback-compat	M17	upstream-manifest	-	M17	yes	1	N1	0	90	90	180	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	38-hot-update-rollback-compat	M18	upstream-manifest	-	M18	yes	1	N1	0	90	90	180	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	38-hot-update-rollback-compat	M18	upstream-manifest	-	M18	yes	1	N1	0	90	90	180	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	38-hot-update-rollback-compat	M19	upstream-manifest	-	M19	yes	1	N1	0	90	90	180	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	38-hot-update-rollback-compat	M19	upstream-manifest	-	M19	yes	1	N1	0	90	90	180	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	38-hot-update-rollback-compat	M20	upstream-manifest	-	M20	yes	1	N1	0	90	90	180	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	38-hot-update-rollback-compat	M20	upstream-manifest	-	M20	yes	1	N1	0	90	90	180	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	38-hot-update-rollback-compat	M21	upstream-manifest	-	M21	yes	1	N1	0	90	90	180	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	38-hot-update-rollback-compat	M21	upstream-manifest	-	M21	yes	1	N1	0	90	90	180	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	39-hot-update-legacy-n1	X	upstream-manifest	-	X	yes	0	N1	0	63	300	600	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	39-hot-update-legacy-n1	X	upstream-manifest	-	X	yes	0	N1	0	63	300	600	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	39-hot-update-legacy-n1	Y	upstream-manifest	-	Y	yes	3	N1	0	114	420	840	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	39-hot-update-legacy-n1	Y	upstream-manifest	-	Y	yes	3	N1	0	114	420	840	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	39-hot-update-legacy-n1	P	upstream-manifest	-	P	yes	3	N1	0	349	300	600	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	39-hot-update-legacy-n1	P	upstream-manifest	-	P	yes	3	N1	0	349	300	600	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	39-hot-update-legacy-n1	F	upstream-manifest	-	F	yes	3	N1	0	141	420	840	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	39-hot-update-legacy-n1	F	upstream-manifest	-	F	yes	3	N1	0	141	420	840	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	39-hot-update-legacy-n1	BR	upstream-manifest	-	BR	yes	3	N3-live	2	90	300	600	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	39-hot-update-legacy-n1	BR	upstream-manifest	-	BR	yes	3	N3-live	2	90	300	600	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	39-hot-update-legacy-n1	Q00B0-exec	upstream-manifest	-	Q00B0-exec	yes	0	N1	0	60	60	120	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	39-hot-update-legacy-n1	Q00B0-exec	upstream-manifest	-	Q00B0-exec	yes	0	N1	0	60	60	120	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	39-hot-update-legacy-n1	Q00B0-run	upstream-manifest	-	Q00B0-run	yes	0	N1	0	90	90	180	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	39-hot-update-legacy-n1	Q00B0-run	upstream-manifest	-	Q00B0-run	yes	0	N1	0	90	90	180	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	39-hot-update-legacy-n1	Q00B0-kill	upstream-manifest	-	Q00B0-kill	yes	0	N1	0	90	90	180	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	39-hot-update-legacy-n1	Q00B0-kill	upstream-manifest	-	Q00B0-kill	yes	0	N1	0	90	90	180	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	39-hot-update-legacy-n1	Q00B0-expose	upstream-manifest	-	Q00B0-expose	yes	0	N1	0	90	90	180	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	39-hot-update-legacy-n1	Q00B0-expose	upstream-manifest	-	Q00B0-expose	yes	0	N1	0	90	90	180	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	39-hot-update-legacy-n1	Q00B0-transfer	upstream-manifest	-	Q00B0-transfer	yes	0	N1	0	120	120	240	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	39-hot-update-legacy-n1	Q00B0-transfer	upstream-manifest	-	Q00B0-transfer	yes	0	N1	0	120	120	240	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	39-hot-update-legacy-n1	Q01B0-exec	upstream-manifest	-	Q01B0-exec	yes	0	N1	0	60	60	120	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	39-hot-update-legacy-n1	Q01B0-exec	upstream-manifest	-	Q01B0-exec	yes	0	N1	0	60	60	120	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	39-hot-update-legacy-n1	Q01B0-run	upstream-manifest	-	Q01B0-run	yes	0	N1	0	90	90	180	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	39-hot-update-legacy-n1	Q01B0-run	upstream-manifest	-	Q01B0-run	yes	0	N1	0	90	90	180	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	39-hot-update-legacy-n1	Q01B0-kill	upstream-manifest	-	Q01B0-kill	yes	0	N1	0	90	90	180	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	39-hot-update-legacy-n1	Q01B0-kill	upstream-manifest	-	Q01B0-kill	yes	0	N1	0	90	90	180	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	39-hot-update-legacy-n1	Q01B0-expose	upstream-manifest	-	Q01B0-expose	yes	0	N1	0	90	90	180	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	39-hot-update-legacy-n1	Q01B0-expose	upstream-manifest	-	Q01B0-expose	yes	0	N1	0	90	90	180	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	39-hot-update-legacy-n1	Q01B0-transfer	upstream-manifest	-	Q01B0-transfer	yes	0	N1	0	120	120	240	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	39-hot-update-legacy-n1	Q01B0-transfer	upstream-manifest	-	Q01B0-transfer	yes	0	N1	0	120	120	240	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	39-hot-update-legacy-n1	Q10B0-exec	upstream-manifest	-	Q10B0-exec	yes	0	N1	0	60	60	120	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	39-hot-update-legacy-n1	Q10B0-exec	upstream-manifest	-	Q10B0-exec	yes	0	N1	0	60	60	120	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	39-hot-update-legacy-n1	Q10B0-run	upstream-manifest	-	Q10B0-run	yes	0	N1	0	90	90	180	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	39-hot-update-legacy-n1	Q10B0-run	upstream-manifest	-	Q10B0-run	yes	0	N1	0	90	90	180	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	39-hot-update-legacy-n1	Q10B0-kill	upstream-manifest	-	Q10B0-kill	yes	0	N1	0	90	90	180	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	39-hot-update-legacy-n1	Q10B0-kill	upstream-manifest	-	Q10B0-kill	yes	0	N1	0	90	90	180	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	39-hot-update-legacy-n1	Q10B0-expose	upstream-manifest	-	Q10B0-expose	yes	0	N1	0	90	90	180	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	39-hot-update-legacy-n1	Q10B0-expose	upstream-manifest	-	Q10B0-expose	yes	0	N1	0	90	90	180	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	39-hot-update-legacy-n1	Q10B0-transfer	upstream-manifest	-	Q10B0-transfer	yes	0	N1	0	120	120	240	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	39-hot-update-legacy-n1	Q10B0-transfer	upstream-manifest	-	Q10B0-transfer	yes	0	N1	0	120	120	240	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	39-hot-update-legacy-n1	Q11B0-exec	upstream-manifest	-	Q11B0-exec	yes	0	N1	0	60	60	120	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	39-hot-update-legacy-n1	Q11B0-exec	upstream-manifest	-	Q11B0-exec	yes	0	N1	0	60	60	120	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	39-hot-update-legacy-n1	Q11B0-run	upstream-manifest	-	Q11B0-run	yes	0	N1	0	90	90	180	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	39-hot-update-legacy-n1	Q11B0-run	upstream-manifest	-	Q11B0-run	yes	0	N1	0	90	90	180	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	39-hot-update-legacy-n1	Q11B0-kill	upstream-manifest	-	Q11B0-kill	yes	0	N1	0	90	90	180	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	39-hot-update-legacy-n1	Q11B0-kill	upstream-manifest	-	Q11B0-kill	yes	0	N1	0	90	90	180	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	39-hot-update-legacy-n1	Q11B0-expose	upstream-manifest	-	Q11B0-expose	yes	0	N1	0	90	90	180	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	39-hot-update-legacy-n1	Q11B0-expose	upstream-manifest	-	Q11B0-expose	yes	0	N1	0	90	90	180	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	39-hot-update-legacy-n1	Q11B0-transfer	upstream-manifest	-	Q11B0-transfer	yes	0	N1	0	120	120	240	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	39-hot-update-legacy-n1	Q11B0-transfer	upstream-manifest	-	Q11B0-transfer	yes	0	N1	0	120	120	240	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	39-hot-update-legacy-n1	Q00B1-exec	upstream-manifest	-	Q00B1-exec	yes	0	N1	0	60	60	120	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	39-hot-update-legacy-n1	Q00B1-exec	upstream-manifest	-	Q00B1-exec	yes	0	N1	0	60	60	120	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	39-hot-update-legacy-n1	Q00B1-run	upstream-manifest	-	Q00B1-run	yes	0	N1	0	90	90	180	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	39-hot-update-legacy-n1	Q00B1-run	upstream-manifest	-	Q00B1-run	yes	0	N1	0	90	90	180	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	39-hot-update-legacy-n1	Q00B1-kill	upstream-manifest	-	Q00B1-kill	yes	0	N1	0	90	90	180	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	39-hot-update-legacy-n1	Q00B1-kill	upstream-manifest	-	Q00B1-kill	yes	0	N1	0	90	90	180	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	39-hot-update-legacy-n1	Q00B1-expose	upstream-manifest	-	Q00B1-expose	yes	0	N1	0	90	90	180	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	39-hot-update-legacy-n1	Q00B1-expose	upstream-manifest	-	Q00B1-expose	yes	0	N1	0	90	90	180	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	39-hot-update-legacy-n1	Q00B1-transfer	upstream-manifest	-	Q00B1-transfer	yes	0	N1	0	120	120	240	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	39-hot-update-legacy-n1	Q00B1-transfer	upstream-manifest	-	Q00B1-transfer	yes	0	N1	0	120	120	240	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	39-hot-update-legacy-n1	Q01B1-exec	upstream-manifest	-	Q01B1-exec	yes	0	N1	0	60	60	120	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	39-hot-update-legacy-n1	Q01B1-exec	upstream-manifest	-	Q01B1-exec	yes	0	N1	0	60	60	120	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	39-hot-update-legacy-n1	Q01B1-run	upstream-manifest	-	Q01B1-run	yes	0	N1	0	90	90	180	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	39-hot-update-legacy-n1	Q01B1-run	upstream-manifest	-	Q01B1-run	yes	0	N1	0	90	90	180	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	39-hot-update-legacy-n1	Q01B1-kill	upstream-manifest	-	Q01B1-kill	yes	0	N1	0	90	90	180	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	39-hot-update-legacy-n1	Q01B1-kill	upstream-manifest	-	Q01B1-kill	yes	0	N1	0	90	90	180	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	39-hot-update-legacy-n1	Q01B1-expose	upstream-manifest	-	Q01B1-expose	yes	0	N1	0	90	90	180	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	39-hot-update-legacy-n1	Q01B1-expose	upstream-manifest	-	Q01B1-expose	yes	0	N1	0	90	90	180	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	39-hot-update-legacy-n1	Q01B1-transfer	upstream-manifest	-	Q01B1-transfer	yes	0	N1	0	120	120	240	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	39-hot-update-legacy-n1	Q01B1-transfer	upstream-manifest	-	Q01B1-transfer	yes	0	N1	0	120	120	240	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	39-hot-update-legacy-n1	Q10B1-exec	upstream-manifest	-	Q10B1-exec	yes	0	N1	0	60	60	120	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	39-hot-update-legacy-n1	Q10B1-exec	upstream-manifest	-	Q10B1-exec	yes	0	N1	0	60	60	120	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	39-hot-update-legacy-n1	Q10B1-run	upstream-manifest	-	Q10B1-run	yes	0	N1	0	90	90	180	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	39-hot-update-legacy-n1	Q10B1-run	upstream-manifest	-	Q10B1-run	yes	0	N1	0	90	90	180	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	39-hot-update-legacy-n1	Q10B1-kill	upstream-manifest	-	Q10B1-kill	yes	0	N1	0	90	90	180	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	39-hot-update-legacy-n1	Q10B1-kill	upstream-manifest	-	Q10B1-kill	yes	0	N1	0	90	90	180	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	39-hot-update-legacy-n1	Q10B1-expose	upstream-manifest	-	Q10B1-expose	yes	0	N1	0	90	90	180	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	39-hot-update-legacy-n1	Q10B1-expose	upstream-manifest	-	Q10B1-expose	yes	0	N1	0	90	90	180	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	39-hot-update-legacy-n1	Q10B1-transfer	upstream-manifest	-	Q10B1-transfer	yes	0	N1	0	120	120	240	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	39-hot-update-legacy-n1	Q10B1-transfer	upstream-manifest	-	Q10B1-transfer	yes	0	N1	0	120	120	240	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	39-hot-update-legacy-n1	Q11B1-exec	upstream-manifest	-	Q11B1-exec	yes	0	N1	0	60	60	120	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	39-hot-update-legacy-n1	Q11B1-exec	upstream-manifest	-	Q11B1-exec	yes	0	N1	0	60	60	120	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	39-hot-update-legacy-n1	Q11B1-run	upstream-manifest	-	Q11B1-run	yes	0	N1	0	90	90	180	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	39-hot-update-legacy-n1	Q11B1-run	upstream-manifest	-	Q11B1-run	yes	0	N1	0	90	90	180	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	39-hot-update-legacy-n1	Q11B1-kill	upstream-manifest	-	Q11B1-kill	yes	0	N1	0	90	90	180	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	39-hot-update-legacy-n1	Q11B1-kill	upstream-manifest	-	Q11B1-kill	yes	0	N1	0	90	90	180	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	39-hot-update-legacy-n1	Q11B1-expose	upstream-manifest	-	Q11B1-expose	yes	0	N1	0	90	90	180	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	39-hot-update-legacy-n1	Q11B1-expose	upstream-manifest	-	Q11B1-expose	yes	0	N1	0	90	90	180	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	39-hot-update-legacy-n1	Q11B1-transfer	upstream-manifest	-	Q11B1-transfer	yes	0	N1	0	120	120	240	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	39-hot-update-legacy-n1	Q11B1-transfer	upstream-manifest	-	Q11B1-transfer	yes	0	N1	0	120	120	240	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	39-hot-update-legacy-n1	LB-new	upstream-manifest	-	LB-new	yes	0	N1	0	120	120	240	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	39-hot-update-legacy-n1	LB-new	upstream-manifest	-	LB-new	yes	0	N1	0	120	120	240	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	39-hot-update-legacy-n1	LB-old	upstream-manifest	-	LB-old	yes	0	N1	0	120	120	240	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	39-hot-update-legacy-n1	LB-old	upstream-manifest	-	LB-old	yes	0	N1	0	120	120	240	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	39-hot-update-legacy-n1	LI-defer	upstream-manifest	-	LI-defer	yes	0	N1	0	120	120	240	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	39-hot-update-legacy-n1	LI-defer	upstream-manifest	-	LI-defer	yes	0	N1	0	120	120	240	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	39-hot-update-legacy-n1	LI-interrupting	upstream-manifest	-	LI-interrupting	yes	4	N1	0	120	120	240	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	39-hot-update-legacy-n1	LI-interrupting	upstream-manifest	-	LI-interrupting	yes	4	N1	0	120	120	240	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	39-hot-update-legacy-n1	M-route	upstream-manifest	-	M-route	yes	0	N3-live	2	240	240	480	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	39-hot-update-legacy-n1	M-route	upstream-manifest	-	M-route	yes	0	N3-live	2	240	240	480	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	39-hot-update-legacy-n1	CC-idle	upstream-manifest	-	CC-idle	yes	0	N1	0	240	240	480	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	39-hot-update-legacy-n1	CC-idle	upstream-manifest	-	CC-idle	yes	0	N1	0	240	240	480	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	39-hot-update-legacy-n1	CC-late-create	upstream-manifest	-	CC-late-create	yes	0	N1	0	240	240	480	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	39-hot-update-legacy-n1	CC-late-create	upstream-manifest	-	CC-late-create	yes	0	N1	0	240	240	480	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	39-hot-update-legacy-n1	CL-reject	upstream-manifest	-	CL-reject	yes	0	N1	0	120	120	240	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	39-hot-update-legacy-n1	CL-reject	upstream-manifest	-	CL-reject	yes	0	N1	0	120	120	240	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	39-hot-update-legacy-n1	ABI-adjacent	upstream-manifest	-	ABI-adjacent	yes	0	N1	0	240	240	480	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	39-hot-update-legacy-n1	ABI-adjacent	upstream-manifest	-	ABI-adjacent	yes	0	N1	0	240	240	480	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	39-hot-update-legacy-n1	ABI-too-far	upstream-manifest	-	ABI-too-far	yes	0	N1	0	120	120	240	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	39-hot-update-legacy-n1	ABI-too-far	upstream-manifest	-	ABI-too-far	yes	0	N1	0	120	120	240	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	39-hot-update-legacy-n1	ABI-unknown	upstream-manifest	-	ABI-unknown	yes	0	N1	0	120	120	240	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	39-hot-update-legacy-n1	ABI-unknown	upstream-manifest	-	ABI-unknown	yes	0	N1	0	120	120	240	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	39-hot-update-legacy-n1	GO-hash	upstream-manifest	-	GO-hash	yes	0	N1	0	120	120	240	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	39-hot-update-legacy-n1	GO-hash	upstream-manifest	-	GO-hash	yes	0	N1	0	120	120	240	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	39-hot-update-legacy-n1	CFG-nats-old	upstream-manifest	-	CFG-nats-old	yes	0	install	0	60	60	120	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	39-hot-update-legacy-n1	CFG-nats-old	upstream-manifest	-	CFG-nats-old	yes	0	install	0	60	60	120	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	39-hot-update-legacy-n1	CFG-nats-new	upstream-manifest	-	CFG-nats-new	yes	0	install	0	60	60	120	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	39-hot-update-legacy-n1	CFG-nats-new	upstream-manifest	-	CFG-nats-new	yes	0	install	0	60	60	120	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	39-hot-update-legacy-n1	CFG-caddy-old	upstream-manifest	-	CFG-caddy-old	yes	0	install	0	60	60	120	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	39-hot-update-legacy-n1	CFG-caddy-old	upstream-manifest	-	CFG-caddy-old	yes	0	install	0	60	60	120	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	39-hot-update-legacy-n1	CFG-caddy-new	upstream-manifest	-	CFG-caddy-new	yes	0	install	0	60	60	120	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	39-hot-update-legacy-n1	CFG-caddy-new	upstream-manifest	-	CFG-caddy-new	yes	0	install	0	60	60	120	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	39-hot-update-legacy-n1	NI	upstream-manifest	-	NI	yes	0	N1	0	300	300	600	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	39-hot-update-legacy-n1	NI	upstream-manifest	-	NI	yes	0	N1	0	300	300	600	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	39-hot-update-legacy-n1	CI	upstream-manifest	-	CI	yes	0	N1	0	300	300	600	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	39-hot-update-legacy-n1	CI	upstream-manifest	-	CI	yes	0	N1	0	300	300	600	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	40-drain-retire	-	upstream-manifest	-	-	yes	0	-	-	497	-	-	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	40-drain-retire	-	upstream-manifest	-	-	yes	0	-	-	497	-	-	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	41-shrink-to-standalone	-	upstream-manifest	-	-	yes	4	-	-	374	-	-	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	41-shrink-to-standalone	-	upstream-manifest	-	-	yes	4	-	-	374	-	-	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	42-rejoin-returning	-	upstream-manifest	-	-	yes	0	-	-	222	-	-	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	42-rejoin-returning	-	upstream-manifest	-	-	yes	0	-	-	222	-	-	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	43-migrate-live-data	-	upstream-manifest	-	-	yes	0	-	-	37	-	-	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	43-migrate-live-data	-	upstream-manifest	-	-	yes	0	-	-	37	-	-	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	50-backup-restore	-	upstream-manifest	-	-	yes	0	-	-	166	-	-	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	50-backup-restore	-	upstream-manifest	-	-	yes	0	-	-	166	-	-	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	51-full-dr	-	upstream-manifest	-	-	yes	4	-	-	315	-	-	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	51-full-dr	-	upstream-manifest	-	-	yes	4	-	-	315	-	-	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	52-credential-rotation	-	upstream-manifest	-	-	yes	0	-	-	179	-	-	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	52-credential-rotation	-	upstream-manifest	-	-	yes	0	-	-	179	-	-	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	60-user-journey	-	upstream-manifest	-	-	yes	0	-	-	59	-	-	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	60-user-journey	-	upstream-manifest	-	-	yes	0	-	-	59	-	-	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	61-transfer-edges	-	upstream-manifest	-	-	yes	0	-	-	92	-	-	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	61-transfer-edges	-	upstream-manifest	-	-	yes	0	-	-	92	-	-	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	62-remote-fs-safe	-	upstream-manifest	-	-	yes	4	-	-	94	-	-	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	62-remote-fs-safe	-	upstream-manifest	-	-	yes	4	-	-	94	-	-	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	63-hot-update-transfer	A	upstream-manifest	-	A	yes	0	install	0	600	1200	2400	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	63-hot-update-transfer	A	upstream-manifest	-	A	yes	0	install	0	600	1200	2400	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	63-hot-update-transfer	A1	upstream-manifest	-	A1	yes	0	N1	0	650	1200	2400	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	63-hot-update-transfer	A1	upstream-manifest	-	A1	yes	0	N1	0	650	1200	2400	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	63-hot-update-transfer	B	upstream-manifest	-	B	yes	0	N3-live	2	750	1200	2400	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	63-hot-update-transfer	B	upstream-manifest	-	B	yes	0	N3-live	2	750	1200	2400	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	63-hot-update-transfer	C1	upstream-manifest	-	C1	yes	0	N1	0	570	1000	2000	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	63-hot-update-transfer	C1	upstream-manifest	-	C1	yes	0	N1	0	570	1000	2000	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	63-hot-update-transfer	C2	upstream-manifest	-	C2	yes	0	N1	0	570	1000	2000	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	63-hot-update-transfer	C2	upstream-manifest	-	C2	yes	0	N1	0	570	1000	2000	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	63-hot-update-transfer	C3	upstream-manifest	-	C3	yes	0	N1	0	570	1000	2000	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	63-hot-update-transfer	C3	upstream-manifest	-	C3	yes	0	N1	0	570	1000	2000	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	63-hot-update-transfer	R1	upstream-manifest	-	R1	yes	0	N1	0	650	1200	2400	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	63-hot-update-transfer	R1	upstream-manifest	-	R1	yes	0	N1	0	650	1200	2400	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	63-hot-update-transfer	R2	upstream-manifest	-	R2	yes	0	N1	0	650	1200	2400	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	63-hot-update-transfer	R2	upstream-manifest	-	R2	yes	0	N1	0	650	1200	2400	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	63-hot-update-transfer	X	upstream-manifest	-	X	yes	0	N1	0	580	1100	2200	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	63-hot-update-transfer	X	upstream-manifest	-	X	yes	0	N1	0	580	1100	2200	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	63-hot-update-transfer	W1	upstream-manifest	-	W1	yes	0	N1	0	450	1100	2200	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	63-hot-update-transfer	W1	upstream-manifest	-	W1	yes	0	N1	0	450	1100	2200	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	63-hot-update-transfer	W2	upstream-manifest	-	W2	yes	0	N1	0	450	1100	2200	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	63-hot-update-transfer	W2	upstream-manifest	-	W2	yes	0	N1	0	450	1100	2200	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	64-hot-update-transfer-controls	M01	upstream-manifest	-	M01	yes	1	N1	0	220	900	1800	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	64-hot-update-transfer-controls	M01	upstream-manifest	-	M01	yes	1	N1	0	220	900	1800	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	64-hot-update-transfer-controls	M02	upstream-manifest	-	M02	yes	1	N1	0	220	900	1800	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	64-hot-update-transfer-controls	M02	upstream-manifest	-	M02	yes	1	N1	0	220	900	1800	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	64-hot-update-transfer-controls	M03	upstream-manifest	-	M03	yes	1	N1	0	220	900	1800	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	64-hot-update-transfer-controls	M03	upstream-manifest	-	M03	yes	1	N1	0	220	900	1800	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	64-hot-update-transfer-controls	M04	upstream-manifest	-	M04	yes	1	N1	0	220	900	1800	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	64-hot-update-transfer-controls	M04	upstream-manifest	-	M04	yes	1	N1	0	220	900	1800	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	64-hot-update-transfer-controls	M05	upstream-manifest	-	M05	yes	1	N1	0	220	900	1800	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	64-hot-update-transfer-controls	M05	upstream-manifest	-	M05	yes	1	N1	0	220	900	1800	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	64-hot-update-transfer-controls	M06	upstream-manifest	-	M06	yes	1	N1	0	220	900	1800	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	64-hot-update-transfer-controls	M06	upstream-manifest	-	M06	yes	1	N1	0	220	900	1800	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	64-hot-update-transfer-controls	M07	upstream-manifest	-	M07	yes	1	N1	0	220	900	1800	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	64-hot-update-transfer-controls	M07	upstream-manifest	-	M07	yes	1	N1	0	220	900	1800	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	64-hot-update-transfer-controls	M08A	upstream-manifest	-	M08A	yes	1	N1	0	220	900	1800	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	64-hot-update-transfer-controls	M08A	upstream-manifest	-	M08A	yes	1	N1	0	220	900	1800	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	64-hot-update-transfer-controls	M08B	upstream-manifest	-	M08B	yes	1	N1	0	220	900	1800	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	64-hot-update-transfer-controls	M08B	upstream-manifest	-	M08B	yes	1	N1	0	220	900	1800	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	64-hot-update-transfer-controls	M08C	upstream-manifest	-	M08C	yes	1	N1	0	220	900	1800	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	64-hot-update-transfer-controls	M08C	upstream-manifest	-	M08C	yes	1	N1	0	220	900	1800	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	64-hot-update-transfer-controls	M09	upstream-manifest	-	M09	yes	1	N1	0	220	900	1800	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	64-hot-update-transfer-controls	M09	upstream-manifest	-	M09	yes	1	N1	0	220	900	1800	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	64-hot-update-transfer-controls	M10A	upstream-manifest	-	M10A	yes	1	N1	0	220	900	1800	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	64-hot-update-transfer-controls	M10A	upstream-manifest	-	M10A	yes	1	N1	0	220	900	1800	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	64-hot-update-transfer-controls	M10B	upstream-manifest	-	M10B	yes	1	N1	0	220	900	1800	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	64-hot-update-transfer-controls	M10B	upstream-manifest	-	M10B	yes	1	N1	0	220	900	1800	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	64-hot-update-transfer-controls	M11A	upstream-manifest	-	M11A	yes	1	N1	0	220	900	1800	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	64-hot-update-transfer-controls	M11A	upstream-manifest	-	M11A	yes	1	N1	0	220	900	1800	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	64-hot-update-transfer-controls	M11B	upstream-manifest	-	M11B	yes	1	N1	0	220	900	1800	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	64-hot-update-transfer-controls	M11B	upstream-manifest	-	M11B	yes	1	N1	0	220	900	1800	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	64-hot-update-transfer-controls	M11C	upstream-manifest	-	M11C	yes	1	N1	0	220	900	1800	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	64-hot-update-transfer-controls	M11C	upstream-manifest	-	M11C	yes	1	N1	0	220	900	1800	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	64-hot-update-transfer-controls	M12A	upstream-manifest	-	M12A	yes	1	N1	0	220	900	1800	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	64-hot-update-transfer-controls	M12A	upstream-manifest	-	M12A	yes	1	N1	0	220	900	1800	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	64-hot-update-transfer-controls	M12B	upstream-manifest	-	M12B	yes	1	N1	0	220	900	1800	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	64-hot-update-transfer-controls	M12B	upstream-manifest	-	M12B	yes	1	N1	0	220	900	1800	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	64-hot-update-transfer-controls	M12C	upstream-manifest	-	M12C	yes	1	N1	0	220	900	1800	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	64-hot-update-transfer-controls	M12C	upstream-manifest	-	M12C	yes	1	N1	0	220	900	1800	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	64-hot-update-transfer-controls	M13A	upstream-manifest	-	M13A	yes	1	N1	0	220	900	1800	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	64-hot-update-transfer-controls	M13A	upstream-manifest	-	M13A	yes	1	N1	0	220	900	1800	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	64-hot-update-transfer-controls	M13B	upstream-manifest	-	M13B	yes	1	N1	0	220	900	1800	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	64-hot-update-transfer-controls	M13B	upstream-manifest	-	M13B	yes	1	N1	0	220	900	1800	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	64-hot-update-transfer-controls	M13C	upstream-manifest	-	M13C	yes	1	N1	0	220	900	1800	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	64-hot-update-transfer-controls	M13C	upstream-manifest	-	M13C	yes	1	N1	0	220	900	1800	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	64-hot-update-transfer-controls	M14	upstream-manifest	-	M14	yes	1	N1	0	220	900	1800	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	64-hot-update-transfer-controls	M14	upstream-manifest	-	M14	yes	1	N1	0	220	900	1800	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	67-transient-js-refusal	-	upstream-manifest	-	-	yes	4	-	-	186	-	-	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	67-transient-js-refusal	-	upstream-manifest	-	-	yes	4	-	-	186	-	-	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	70-expose-journey	-	upstream-manifest	-	-	yes	0	-	-	53	-	-	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	70-expose-journey	-	upstream-manifest	-	-	yes	0	-	-	53	-	-	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	71-expose-rehome-failover	-	upstream-manifest	-	-	yes	4	-	-	240	-	-	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	71-expose-rehome-failover	-	upstream-manifest	-	-	yes	4	-	-	240	-	-	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	72-proxy-subscription	-	upstream-manifest	-	-	yes	0	-	-	90	-	-	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	72-proxy-subscription	-	upstream-manifest	-	-	yes	0	-	-	90	-	-	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	73-proxy-cluster-ha	-	upstream-manifest	-	-	yes	0	-	-	328	-	-	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	73-proxy-cluster-ha	-	upstream-manifest	-	-	yes	0	-	-	328	-	-	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	74-rebalance-on-return	SRAB	upstream-manifest	-	SRAB	yes	4	N3-live	2	379	1350	2700	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	74-rebalance-on-return	SRAB	upstream-manifest	-	SRAB	yes	4	N3-live	2	379	1350	2700	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	74-rebalance-on-return	C	upstream-manifest	-	C	yes	4	N3-live	2	394	1350	2700	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	74-rebalance-on-return	C	upstream-manifest	-	C	yes	4	N3-live	2	394	1350	2700	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	75-hot-update-flows	A	upstream-manifest	-	A	yes	0	N1	0	166	420	840	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	75-hot-update-flows	A	upstream-manifest	-	A	yes	0	N1	0	166	420	840	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	75-hot-update-flows	C	upstream-manifest	-	C	yes	0	N3-live	2	385	600	1200	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	75-hot-update-flows	C	upstream-manifest	-	C	yes	0	N3-live	2	385	600	1200	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	75-hot-update-flows	R	upstream-manifest	-	R	yes	0	N1	0	163	420	840	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	75-hot-update-flows	R	upstream-manifest	-	R	yes	0	N1	0	163	420	840	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	75-hot-update-flows	B	upstream-manifest	-	B	yes	0	N1	0	157	540	1080	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	75-hot-update-flows	B	upstream-manifest	-	B	yes	0	N1	0	157	540	1080	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	75-hot-update-flows	W	upstream-manifest	-	W	yes	0	N1	0	271	660	1320	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	75-hot-update-flows	W	upstream-manifest	-	W	yes	0	N1	0	271	660	1320	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	75-hot-update-flows	L	upstream-manifest	-	L	yes	0	N1	0	136	420	840	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	75-hot-update-flows	L	upstream-manifest	-	L	yes	0	N1	0	136	420	840	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	78-proxy-dial-backoff	-	upstream-manifest	-	-	yes	4	-	-	296	-	-	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	78-proxy-dial-backoff	-	upstream-manifest	-	-	yes	4	-	-	296	-	-	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	80-session-isolation	-	upstream-manifest	-	-	yes	0	-	-	60	-	-	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	80-session-isolation	-	upstream-manifest	-	-	yes	0	-	-	60	-	-	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	81-admin-evict-session-rm	-	upstream-manifest	-	-	yes	0	-	-	62	-	-	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	81-admin-evict-session-rm	-	upstream-manifest	-	-	yes	0	-	-	62	-	-	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	82-agent-onboarding-invite	-	upstream-manifest	-	-	yes	4	-	-	127	-	-	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	82-agent-onboarding-invite	-	upstream-manifest	-	-	yes	4	-	-	127	-	-	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	83-cloned-image-instances	-	upstream-manifest	-	-	yes	0	-	-	40	-	-	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	83-cloned-image-instances	-	upstream-manifest	-	-	yes	0	-	-	40	-	-	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	84-shared-home-instances	-	upstream-manifest	-	-	yes	0	-	-	52	-	-	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	84-shared-home-instances	-	upstream-manifest	-	-	yes	0	-	-	52	-	-	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	85-hot-update-nats	A	upstream-manifest	-	A	yes	0	N1	0	720	720	1440	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	85-hot-update-nats	A	upstream-manifest	-	A	yes	0	N1	0	720	720	1440	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	85-hot-update-nats	A1	upstream-manifest	-	A1	yes	0	N1	0	720	720	1440	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	85-hot-update-nats	A1	upstream-manifest	-	A1	yes	0	N1	0	720	720	1440	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	85-hot-update-nats	B	upstream-manifest	-	B	yes	0	N3-live	2	1200	1200	2400	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	85-hot-update-nats	B	upstream-manifest	-	B	yes	0	N3-live	2	1200	1200	2400	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	85-hot-update-nats	D	upstream-manifest	-	D	yes	0	N2-live	1	300	300	600	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	85-hot-update-nats	D	upstream-manifest	-	D	yes	0	N2-live	1	300	300	600	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	85-hot-update-nats	Q	upstream-manifest	-	Q	yes	0	N3-live	2	360	360	720	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	85-hot-update-nats	Q	upstream-manifest	-	Q	yes	0	N3-live	2	360	360	720	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	85-hot-update-nats	L	upstream-manifest	-	L	yes	0	N3-live	2	360	360	720	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	85-hot-update-nats	L	upstream-manifest	-	L	yes	0	N3-live	2	360	360	720	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	85-hot-update-nats	S	upstream-manifest	-	S	yes	0	N1	0	300	300	600	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	85-hot-update-nats	S	upstream-manifest	-	S	yes	0	N1	0	300	300	600	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	85-hot-update-nats	J	upstream-manifest	-	J	yes	0	N3-live	2	360	360	720	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	85-hot-update-nats	J	upstream-manifest	-	J	yes	0	N3-live	2	360	360	720	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	85-hot-update-nats	F	upstream-manifest	-	F	yes	0	N3-live	2	540	540	1080	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	85-hot-update-nats	F	upstream-manifest	-	F	yes	0	N3-live	2	540	540	1080	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	86-hot-update-caddy	R	upstream-manifest	-	R	yes	0	N1	0	600	600	1200	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	86-hot-update-caddy	R	upstream-manifest	-	R	yes	0	N1	0	600	600	1200	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	86-hot-update-caddy	B	upstream-manifest	-	B	yes	0	N3-live	2	1200	1200	2400	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	86-hot-update-caddy	B	upstream-manifest	-	B	yes	0	N3-live	2	1200	1200	2400	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	86-hot-update-caddy	I	upstream-manifest	-	I	yes	0	N1	0	840	840	1680	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	86-hot-update-caddy	I	upstream-manifest	-	I	yes	0	N1	0	840	840	1680	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	86-hot-update-caddy	H	upstream-manifest	-	H	yes	0	N2-live	1	720	720	1440	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	86-hot-update-caddy	H	upstream-manifest	-	H	yes	0	N2-live	1	720	720	1440	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	86-hot-update-caddy	C	upstream-manifest	-	C	yes	0	N1	0	300	300	600	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	86-hot-update-caddy	C	upstream-manifest	-	C	yes	0	N1	0	300	300	600	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	86-hot-update-caddy	K	upstream-manifest	-	K	yes	0	N1	0	300	300	600	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	86-hot-update-caddy	K	upstream-manifest	-	K	yes	0	N1	0	300	300	600	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	86-hot-update-caddy	F	upstream-manifest	-	F	yes	0	N1	0	600	600	1200	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	86-hot-update-caddy	F	upstream-manifest	-	F	yes	0	N1	0	600	600	1200	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	86-hot-update-caddy	U	upstream-manifest	-	U	yes	0	N1	0	720	720	1440	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	86-hot-update-caddy	U	upstream-manifest	-	U	yes	0	N1	0	720	720	1440	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	90-alerts-lifecycle	-	upstream-manifest	-	-	yes	0	-	-	520	-	-	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	90-alerts-lifecycle	-	upstream-manifest	-	-	yes	0	-	-	520	-	-	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	91-client-converge	-	upstream-manifest	-	-	yes	0	-	-	290	-	-	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	91-client-converge	-	upstream-manifest	-	-	yes	0	-	-	290	-	-	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	92-js503-remote-alert	-	upstream-manifest	-	-	yes	0	-	-	271	-	-	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	92-js503-remote-alert	-	upstream-manifest	-	-	yes	0	-	-	271	-	-	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	93-metrics-observability	-	upstream-manifest	-	-	yes	4	-	-	359	-	-	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	93-metrics-observability	-	upstream-manifest	-	-	yes	4	-	-	359	-	-	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	94-agent-reconcile	-	upstream-manifest	-	-	yes	0	-	-	128	-	-	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	94-agent-reconcile	-	upstream-manifest	-	-	yes	0	-	-	128	-	-	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	95-broker-selfheal	-	upstream-manifest	-	-	yes	0	-	-	214	-	-	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	95-broker-selfheal	-	upstream-manifest	-	-	yes	0	-	-	214	-	-	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	96-mid-flight-chaos	A	upstream-manifest	-	A	yes	4	N3-live	2	741	1350	2700	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	96-mid-flight-chaos	A	upstream-manifest	-	A	yes	4	N3-live	2	741	1350	2700	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	96-mid-flight-chaos	D	upstream-manifest	-	D	yes	4	N3-live	2	324	1500	2700	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	96-mid-flight-chaos	D	upstream-manifest	-	D	yes	4	N3-live	2	324	1500	2700	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	96-mid-flight-chaos	F	upstream-manifest	-	F	yes	4	N3-live	2	219	800	1600	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	96-mid-flight-chaos	F	upstream-manifest	-	F	yes	4	N3-live	2	219	800	1600	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	97-soak-cycles	-	upstream-manifest	-	-	yes	0	-	-	464	-	-	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	97-soak-cycles	-	upstream-manifest	-	-	yes	0	-	-	464	-	-	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	98-stuck-redial-recovery	-	upstream-manifest	-	-	yes	4	-	-	245	-	-	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+live-grow	98-stuck-redial-recovery	-	upstream-manifest	-	-	yes	4	-	-	245	-	-	-	-	NOT_RUN	S10/P27,P32,P35	-	-	-	-	-	-	-
+default	99-hot-update-fullstack	C1	tether-T0-T5+nats-adjacent+caddy-adjacent	-	single	yes	0	N1	0	2200	2400	4800	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+live-grow	99-hot-update-fullstack	C1	tether-T0-T5+nats-adjacent+caddy-adjacent	-	single	yes	0	N1	0	2200	2400	4800	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+quiet	99-hot-update-fullstack	C1	tether-T0-T5+nats-adjacent+caddy-adjacent	-	single	yes	0	N1	0	2200	2400	4800	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+default	99-hot-update-fullstack	C3	tether-T0-T5+nats-adjacent+caddy-adjacent	-	quorum	yes	0	N3-live	2	2200	2400	4800	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+live-grow	99-hot-update-fullstack	C3	tether-T0-T5+nats-adjacent+caddy-adjacent	-	quorum	yes	0	N3-live	2	2200	2400	4800	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+quiet	99-hot-update-fullstack	C3	tether-T0-T5+nats-adjacent+caddy-adjacent	-	quorum	yes	0	N3-live	2	2200	2400	4800	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+default	99-hot-update-fullstack	A	tether-T0-T5+nats-adjacent+caddy-adjacent	-	single	yes	0	N1	0	4800	6000	12000	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+live-grow	99-hot-update-fullstack	A	tether-T0-T5+nats-adjacent+caddy-adjacent	-	single	yes	0	N1	0	4800	6000	12000	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+quiet	99-hot-update-fullstack	A	tether-T0-T5+nats-adjacent+caddy-adjacent	-	single	yes	0	N1	0	4800	6000	12000	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+default	99-hot-update-fullstack	B	tether-T0-T5+nats-adjacent+caddy-adjacent	-	quorum	yes	0	N3-live	2	4800	6000	12000	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+live-grow	99-hot-update-fullstack	B	tether-T0-T5+nats-adjacent+caddy-adjacent	-	quorum	yes	0	N3-live	2	4800	6000	12000	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+quiet	99-hot-update-fullstack	B	tether-T0-T5+nats-adjacent+caddy-adjacent	-	quorum	yes	0	N3-live	2	4800	6000	12000	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+default	99-hot-update-fullstack	S1	tether-T0-T5+nats-adjacent+caddy-adjacent	-	single	yes	0	N1	0	2000	2700	5400	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+live-grow	99-hot-update-fullstack	S1	tether-T0-T5+nats-adjacent+caddy-adjacent	-	single	yes	0	N1	0	2000	2700	5400	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+quiet	99-hot-update-fullstack	S1	tether-T0-T5+nats-adjacent+caddy-adjacent	-	single	yes	0	N1	0	2000	2700	5400	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+default	99-hot-update-fullstack	S3	tether-T0-T5+nats-adjacent+caddy-adjacent	-	quorum	yes	0	N3-live	2	2000	2700	5400	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+live-grow	99-hot-update-fullstack	S3	tether-T0-T5+nats-adjacent+caddy-adjacent	-	quorum	yes	0	N3-live	2	2000	2700	5400	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+quiet	99-hot-update-fullstack	S3	tether-T0-T5+nats-adjacent+caddy-adjacent	-	quorum	yes	0	N3-live	2	2000	2700	5400	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+default	99-hot-update-fullstack	F1	tether-T0-T5+nats-adjacent+caddy-adjacent	-	single	yes	0	N1	0	2000	2700	5400	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+live-grow	99-hot-update-fullstack	F1	tether-T0-T5+nats-adjacent+caddy-adjacent	-	single	yes	0	N1	0	2000	2700	5400	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+quiet	99-hot-update-fullstack	F1	tether-T0-T5+nats-adjacent+caddy-adjacent	-	single	yes	0	N1	0	2000	2700	5400	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+default	99-hot-update-fullstack	F3	tether-T0-T5+nats-adjacent+caddy-adjacent	-	quorum	yes	0	N3-live	2	2000	2700	5400	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+live-grow	99-hot-update-fullstack	F3	tether-T0-T5+nats-adjacent+caddy-adjacent	-	quorum	yes	0	N3-live	2	2000	2700	5400	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+quiet	99-hot-update-fullstack	F3	tether-T0-T5+nats-adjacent+caddy-adjacent	-	quorum	yes	0	N3-live	2	2000	2700	5400	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+default	99-hot-update-fullstack	K	tether-T0-T5+nats-adjacent+caddy-adjacent	-	quorum	yes	0	N3-live	2	1500	1800	3600	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+live-grow	99-hot-update-fullstack	K	tether-T0-T5+nats-adjacent+caddy-adjacent	-	quorum	yes	0	N3-live	2	1500	1800	3600	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-
+quiet	99-hot-update-fullstack	K	tether-T0-T5+nats-adjacent+caddy-adjacent	-	quorum	yes	0	N3-live	2	1500	1800	3600	-	-	NOT_RUN	S10/P19,P20,P26,P27,P32,P35	-	-	-	-	-	-	-

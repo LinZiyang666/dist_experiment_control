@@ -9,18 +9,19 @@ package chaos_test
 
 import (
 	"context"
-	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/adminsock"
-	"github.com/LinZiyang666/tether/internal/agent"
 	"github.com/LinZiyang666/tether/internal/broker"
 	"github.com/LinZiyang666/tether/internal/proto"
 	"github.com/LinZiyang666/tether/internal/storage"
+	"github.com/LinZiyang666/tether/internal/testharness"
 	"github.com/nats-io/nats.go"
 )
 
@@ -121,95 +122,18 @@ func TestAdminSockStartFailsOnReadOnlyParent(t *testing.T) {
 	}
 }
 
-// TestUpgradeWriteToReadOnlyDirReturnsError pins D.17: when the
-// agent's binary destination dir is unwritable the install path must
-// return a clean install_failed-style error, not panic.
-//
-// We can't drive the full forwarded handler easily here (would need
-// PIN/auth wiring); instead we directly call installNewBinary via a
-// nearby test surface — but agent doesn't export it. Drive through
-// the broker→agent forwarded path with a tarball that the agent can
-// download successfully (data-URL is not supported by net/http;
-// we serve via httptest), then point UpgradeExecutablePath into a
-// read-only dir.
-//
-// This is heavy for one test, so instead we pin the lower-level
-// non-panic invariant: a forwarded.req with a URL that fails the
-// agent's local allowlist still returns a clean error reply
-// (= no panic, no hang). The "really fails to write" case is
-// covered by the agent_test in the upgrade unit tests.
-func TestAgentUpgradeRejectsURLOutsideAllowlistCleanly(t *testing.T) {
-	ctx, cancel := withTestDeadline(t, 10*time.Second)
-	defer cancel()
-
-	url := startNATS(t)
-	db := openDB(t)
-	_, fp := freshUserPub(t)
-	seedSession(t, db, "lab", fp)
-
-	_ = startBrokerExplicit(t, url, db)
-
-	// Boot agent with a tightly-scoped allowlist that won't match the
-	// URL we send.
-	a, err := agent.New(agent.Config{
-		NATSURL:             url,
-		SID:                 "lab",
-		NID:                 "n1",
-		Logger:              silentLog(),
-		HeartbeatInterval:   100 * time.Millisecond,
-		RegisterTimeout:     1500 * time.Millisecond,
-		UpgradeURLAllowlist: []string{"https://only-this-host.invalid/"},
-		UpgradeNoExit:       true,
-	})
-	if err != nil {
-		t.Fatal(err)
+// The D.17 lower-level non-panic invariant remains: a forwarded request
+// returns a clean error without downloading or writing. S8 moves candidate
+// fetching to ctl; a bare URL cannot authorize the agent's old install path.
+// The actual write-failure case remains covered by agent upgrade unit tests.
+// origin: hot-update S8 internal review LEGACY-ROUTE-TESTS; plan §5.2 / §7.2
+func TestAgentUpgradeRequiresTransactionBeforeURLFetch(t *testing.T) {
+	g, fd := runtime.NumGoroutine(), testharness.FDCount()
+	for round := 0; round < 5; round++ {
+		t.Run(fmt.Sprintf("round-%d", round), func(t *testing.T) { exerciseAgentUpgradeUnfencedURL(t) })
 	}
-	agentCtx, cancelAgent := context.WithCancel(ctx)
-	agentDone := make(chan error, 1)
-	go func() { agentDone <- a.Run(agentCtx) }()
-	t.Cleanup(func() {
-		cancelAgent()
-		select {
-		case <-agentDone:
-		case <-time.After(3 * time.Second):
-		}
-	})
-
-	// Wait for register.
-	nc, err := nats.Connect(url)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer nc.Close()
-
-	// Hit the agent's forwarded subject directly with a known-bad URL.
-	// We're not going through the broker's owner-only gate for this
-	// test — the focus is the agent's local defense.
-	body := []byte(`{"url":"https://evil.example.invalid/x.tar.gz","sha256":"deadbeef","actor_fp":"x"}`)
-	subj := proto.SubjCmdForwarded("lab", "n1", "upgrade")
-
-	// Give the agent a moment to subscribe.
-	time.Sleep(200 * time.Millisecond)
-
-	respMsg, err := nc.Request(subj, body, 3*time.Second)
-	if err != nil {
-		// Acceptable if the agent isn't subscribed yet (eg the
-		// register handshake is still in flight). The non-acceptable
-		// failure is a panic, which would not return here.
-		if errors.Is(err, nats.ErrNoResponders) {
-			t.Skip("agent not yet subscribed to forwarded subject; race ok")
-		}
-		t.Fatal(err)
-	}
-	// Reply must be a JSON ack with Code=url_not_allowed_local. Just
-	// pin "non-empty body, no panic in agent" — exact code matches
-	// the agent's contract.
-	if len(respMsg.Data) == 0 {
-		t.Fatal("agent returned empty body for bad-URL upgrade")
-	}
-	if !strings.Contains(string(respMsg.Data), "url_not_allowed_local") {
-		t.Errorf("expected url_not_allowed_local in reply; got %s", respMsg.Data)
-	}
+	testharness.AssertNoGoroutineLeak(t, "unfenced agent URL", g)
+	testharness.AssertNoFDLeak(t, "unfenced agent URL", fd, 0)
 }
 
 // TestDiskUsageFnInjectionTriggersPressureEvent pins H.4: with a

@@ -73,6 +73,23 @@
 #   Reasons: docs/reviews/simcluster-speed-review-round2.md.
 #   73 (same change, after the round-2 -j5 re-run): Q-xcheck reworded — the vended endpoint is polled into agreement for
 #       60 s before the assert (3/14 one-shot mismatches were a leg still serving through the previous home).
+# 2026-09-21 hot-update S1 (same change): +72 rows, 35-hot-update-exec-carrier (new arm-split drill: A/B/C + _shared),
+#   keyed per arm. 34-hot-update-process rows unchanged in identity (the assert_bug's SIGNATURE regex moved to the S1
+#   shape `ctl=owner_lost_rc74`, which this gate does not key on); the file is re-emitted in scanner order, so the 34
+#   block that the S0 hand-off had appended at the tail now sits in place. Reason: docs/reviews/hot-update-reliable-exec-plan.md §5.
+# 2026-09-21 hot-update S1 internal review dispositions (same change): 35-hot-update-exec-carrier −1 / +5 rows.
+#   D3: "A1 non-vacuity: source still advancing after the restart" (assert_setup) → "A1 original child and its stream
+#   still advancing after the nats-server restart" (assert_ok) — after an injection it is a product claim, so it lands
+#   ASSERT-FAIL, not SETUP-RED. deploy-V2: +"A2 agent slog readable…" / +"C1.1 agent slog readable…" (assert_setup) —
+#   an unreadable slog is a fixture failure split off before the product's rebuild assertion. deploy-V3: +"C-gate
+#   tether-prev-source.json retained…" (arm C) and +"vendor/tether-source.json describes the staged vendor/tether"
+#   (_shared) — both identity JSONs into the evidence, the staged one die-gated. Reason: docs/reviews/hot-update-reliable-exec-review.md.
+# S3 plan §8: 34 re-keyed by arm; legacy assert_bug promoted to same-description assert_ok in A.
+# 39 owns the real N-1 negative control. New arm claims extend the existing coverage floor.
+# 2026-10-02 DR-1/2/4/5: real slog records, mount-before-boot, observed switch and exercised workload guards.
+# 2026-10-02 hot-update S4 plan §9.4: drill 36 and 39.P declared NOT_RUN; scanner regeneration, no claims deleted.
+# 2026-10-03 FX-D-MERGE: regenerated from the current FX-D drills via the scanner report mode;
+#   DRILL-1..7 / V1 change resize, carrier, ownership-loss and pending-admission evidence.
 00-skeleton	assert_ok	up 1 broker + 1 agent + 1 ctl
 00-skeleton	assert_ok	init brk1 (standalone → N=1 cluster)
 00-skeleton	assert_ok	N=1 healthy floor (leader + DEGRADED)
@@ -257,37 +274,37 @@
 30-rolling-upgrade	not_covered	30 the G5 roll MECHANISM (per-hop advance, whole-host dual-version, skew, cluster unlock recovery, PID-preserving re-exec, write continuity) THIS RUN
 30-rolling-upgrade	not_covered	30 (with stated reasons — Stage-C mandate-2/cluster-2): (b) Arm 30-C N=2 write-fence NEGATIVE CONTROL
 30-rolling-upgrade	not_covered	30 (with stated reasons — Stage-C mandate-2/cluster-2): (c) mid-run HALT/resume of the LEADER hop
-31-node-upgrade-fleet	assert_ok	up 1 broker + 2 agents + 1 ctl
-31-node-upgrade-fleet	assert_ok	init brk1 (N=1 cluster)
-31-node-upgrade-fleet	assert_ok	SETUP broker.upgrade.url_allow += artifact prefix (labeled operator config) + broker restart
-31-node-upgrade-fleet	assert_ok	session lab + ctl login (owner)
-31-node-upgrade-fleet	assert_ok	agent-join agt1
-31-node-upgrade-fleet	assert_ok	agent-join agt2
-31-node-upgrade-fleet	assert_ok	SETUP artifact serving tether-next (ART_URL/ART_SHA populated)
-31-node-upgrade-fleet	assert_ok	SETUP inject instance CA into agt1 trust store (so the fetch is trusted — isolates #28)
-31-node-upgrade-fleet	assert_ok	SETUP agt1 agent.upgrade.url_allow += artifact prefix (labeled operator config) + agent restart + ONLINE
-31-node-upgrade-fleet	assert_ok	P28-i  precondition: agt1 can FETCH+TRUST the artifact URL (so the flip reaches the sha gate, not download_failed)
-31-node-upgrade-fleet	assert_ok	P28-ii precondition: broker WHITELISTED the URL (so the request forwards, not broker url_not_allowed)
-31-node-upgrade-fleet	assert_ok	P28-iii precondition: agt1 ONLINE + owner=caller (rules out node_offline/not_owner)
-31-node-upgrade-fleet	assert_refuses	#28 FLIPPED (R15): the CONFIGURED artifact URL PASSES the agent local allow-list — it now fails on the WRONG sha (sha256_mismatch), NOT url_not_allowed_local (was: unconfigurable → always url_not_allowed_local)
-31-node-upgrade-fleet	assert_refuses	#28 non-vacuity: the agent allow-list is LIVE, not disabled — a broker-whitelisted-but-agent-denied URL (VALID sha) is still refused url_not_allowed_local AT THE AGENT gate (broker-side url_not_allowed would MISS this sig → FAIL LOUD)
-31-node-upgrade-fleet	assert_refuses	N1 broker url_not_allowed (off-allowlist URL + VALID sha → not the sha gate)
-31-node-upgrade-fleet	assert_refuses	N2 broker sha256_invalid (malformed sha, not 64-lowercase-hex)
-31-node-upgrade-fleet	assert_ok	N3 not_owner (a joined member, not the session owner, is refused node upgrade)
-31-node-upgrade-fleet	assert_ok	F1 --all target set (node ls --json ONLINE filter) includes agt1 (ONLINE)
-31-node-upgrade-fleet	assert_ok	F1b --all target set includes agt2 (ONLINE) — a real 2-node fleet
-31-node-upgrade-fleet	assert_ok	F2-setup stop agt2 daemon → make it OFFLINE/STALE
-31-node-upgrade-fleet	assert_ok	F2 agt2 goes OFFLINE/STALE in the broker view
-31-node-upgrade-fleet	assert_ok	F2b OFFLINE agt2 is EXCLUDED from the --all target set (listOnlineNIDs ONLINE-only)
-31-node-upgrade-fleet	assert_ok	F2c ONLINE agt1 stays in the --all target set
-31-node-upgrade-fleet	assert_ok	F3 --all dispatched to ONLINE agt1 → aborted on the agent's url_not_allowed_local gate (isConfigError aborts the fleet; reached an agent, not a no-op)
-31-node-upgrade-fleet	assert_ok	F3b --all did NOT dispatch to the OFFLINE agt2 (enumerated out — the abort names agt1, never agt2)
-31-node-upgrade-fleet	assert_ok	F4-setup restart agt2 daemon
-31-node-upgrade-fleet	assert_ok	F4-setup2 agt2 back ONLINE (2-node fleet again)
-31-node-upgrade-fleet	assert_ok	F4a --all --timeout 0 announces the canary hold-back ('canary: agt1' with the rest held) — proves 2-node enumeration reached the canary split
-31-node-upgrade-fleet	assert_ok	F4b canary transient failure ABORTS the fleet non-zero: rc!=0 AND 'canary agt1 failed, 1 node(s) untouched' (a canary that cannot even dispatch must hold the fleet — upgrade-safety plan §5)
-31-node-upgrade-fleet	assert_ok	F4c agt2 was NEVER dispatched (NO line mentioning agt2 at all — a success line must fail this too, not just skipped/failed)
-31-node-upgrade-fleet	not_covered	31 (external-review M4, honest — rescoped after drill 33 took single-node ownership): a SUCCESSFUL fleet-wide --all rollout (healthy canary COMMITTED + fan-out + two-node summary)
+31-node-upgrade-fleet.V1	assert_ok	up 1 broker + 2 agents + 1 ctl
+31-node-upgrade-fleet.V1	assert_ok	init brk1 (N=1 cluster)
+31-node-upgrade-fleet.V1	assert_ok	SETUP broker.upgrade.url_allow += artifact prefix (labeled operator config) + broker restart
+31-node-upgrade-fleet.V1	assert_ok	session lab + ctl login (owner)
+31-node-upgrade-fleet.V1	assert_ok	agent-join agt1
+31-node-upgrade-fleet.V1	assert_ok	agent-join agt2
+31-node-upgrade-fleet.V1	assert_ok	SETUP artifact serving tether-next (ART_URL/ART_SHA populated)
+31-node-upgrade-fleet.V1	assert_ok	SETUP inject instance CA into agt1 trust store (so the fetch is trusted — isolates #28)
+31-node-upgrade-fleet.V1	assert_ok	SETUP agt1 agent.upgrade.url_allow += artifact prefix (labeled operator config) + agent restart + ONLINE
+31-node-upgrade-fleet.V1	assert_ok	P28-i  precondition: agt1 can FETCH+TRUST the artifact URL (so the flip reaches the sha gate, not download_failed)
+31-node-upgrade-fleet.V1	assert_ok	P28-ii precondition: broker WHITELISTED the URL (so the request forwards, not broker url_not_allowed)
+31-node-upgrade-fleet.V1	assert_ok	P28-iii precondition: agt1 ONLINE + owner=caller (rules out node_offline/not_owner)
+31-node-upgrade-fleet.V1	assert_refuses	#28 FLIPPED (R15): the CONFIGURED artifact URL PASSES the agent local allow-list — it now fails on the WRONG sha (sha256_mismatch), NOT url_not_allowed_local (was: unconfigurable → always url_not_allowed_local)
+31-node-upgrade-fleet.V1	assert_refuses	#28 non-vacuity: the agent allow-list is LIVE, not disabled — a broker-whitelisted-but-agent-denied URL (VALID sha) is still refused url_not_allowed_local AT THE AGENT gate (broker-side url_not_allowed would MISS this sig → FAIL LOUD)
+31-node-upgrade-fleet.V1	assert_refuses	N1 broker url_not_allowed (off-allowlist URL + VALID sha → not the sha gate)
+31-node-upgrade-fleet.V1	assert_refuses	N2 broker sha256_invalid (malformed sha, not 64-lowercase-hex)
+31-node-upgrade-fleet.V1	assert_ok	N3 not_owner (a joined member, not the session owner, is refused node upgrade)
+31-node-upgrade-fleet.V1	assert_ok	F1 --all target set (node ls --json ONLINE filter) includes agt1 (ONLINE)
+31-node-upgrade-fleet.V1	assert_ok	F1b --all target set includes agt2 (ONLINE) — a real 2-node fleet
+31-node-upgrade-fleet.V1	assert_ok	F2-setup stop agt2 daemon → make it OFFLINE/STALE
+31-node-upgrade-fleet.V1	assert_ok	F2 agt2 goes OFFLINE/STALE in the broker view
+31-node-upgrade-fleet.V1	assert_ok	F2b OFFLINE agt2 is EXCLUDED from the --all target set (listOnlineNIDs ONLINE-only)
+31-node-upgrade-fleet.V1	assert_ok	F2c ONLINE agt1 stays in the --all target set
+31-node-upgrade-fleet.V1	assert_ok	F3 --all dispatched to ONLINE agt1 → aborted on the agent's url_not_allowed_local gate (isConfigError aborts the fleet; reached an agent, not a no-op)
+31-node-upgrade-fleet.V1	assert_ok	F3b --all did NOT dispatch to the OFFLINE agt2 (enumerated out — the abort names agt1, never agt2)
+31-node-upgrade-fleet.V1	assert_ok	F4-setup restart agt2 daemon
+31-node-upgrade-fleet.V1	assert_ok	F4-setup2 agt2 back ONLINE (2-node fleet again)
+31-node-upgrade-fleet.V1	assert_ok	F4a --all --timeout 0 announces the canary hold-back ('canary: agt1' with the rest held) — proves 2-node enumeration reached the canary split
+31-node-upgrade-fleet.V1	assert_ok	F4b canary transient failure ABORTS the fleet non-zero: rc!=0 AND 'canary agt1 failed, 1 node(s) untouched' (a canary that cannot even dispatch must hold the fleet — upgrade-safety plan §5)
+31-node-upgrade-fleet.V1	assert_ok	F4c agt2 was NEVER dispatched (NO line mentioning agt2 at all — a success line must fail this too, not just skipped/failed)
+31-node-upgrade-fleet.V1	not_covered	31 (external-review M4, honest — rescoped after drill 33 took single-node ownership): a SUCCESSFUL fleet-wide --all rollout (healthy canary COMMITTED + fan-out + two-node summary)
 32-install-lifecycle	assert_ok	fresh bare container systemd up (NOT provisioned)
 32-install-lifecycle	assert_ok	ctl --dry-run as sim (zero download/chmod/write)
 32-install-lifecycle	assert_ok	agent --dry-run as sim (needs dummy broker/session/nid)
@@ -350,36 +367,304 @@
 32-install-lifecycle	assert_ok	84-converge-write a NEW expose biz2 created POST-upgrade serves the sentinel (control-plane WRITE + data plane BOTH work on the new binary — real read-write, not a health field)
 32-install-lifecycle	assert_ok	84-version-flip brk1 running (self-reported) version flipped v-cur→$NEXTVER via cluster status .release_version (a 'no upgrade happened' run would leave it on v-cur — the false-green guard the plan mandates)
 32-install-lifecycle	assert_ok	84-pid-changed tether-broker MainPID CHANGED across §8.4 (a real systemctl stop/start swap, NOT drill 30's syscall.Exec in-place re-exec — version-flip ∧ PID-changed TOGETHER prove a genuine swap happened)
-33-node-upgrade-success	assert_ok	up 1 broker + 1 agent + 1 ctl
-33-node-upgrade-success	assert_ok	init brk1 (N=1 cluster)
-33-node-upgrade-success	assert_ok	SETUP broker.upgrade.url_allow += artifact prefix (labeled operator config) + broker restart
-33-node-upgrade-success	assert_ok	session lab + ctl login (owner)
-33-node-upgrade-success	assert_ok	agent-join agt1
-33-node-upgrade-success	assert_ok	SETUP agt1b sibling unit (own HOME/nkey, SAME binary path) + ONLINE
-33-node-upgrade-success	assert_ok	DIE-GATE both units execute the same binary path AND inode (upgrade-domain premise non-vacuous)
-33-node-upgrade-success	assert_ok	SETUP artifact serving tether-next (ART_URL/ART_SHA populated)
-33-node-upgrade-success	assert_ok	SETUP inject instance CA into agt1 trust store
-33-node-upgrade-success	assert_ok	SETUP agt1 agent.upgrade.url_allow += artifact prefix + restart + ONLINE
-33-node-upgrade-success	assert_ok	SETUP agt1b agent.upgrade.url_allow (own HOME tree, unit tether-agent-b) + restart + ONLINE
-33-node-upgrade-success	assert_ok	B1 syn-block agt1 -> brk1:4222 (new connections only)
-33-node-upgrade-success	assert_ok	B1b self-proof: rule took effect — a NEW connection to brk1:4222 black-holes (rc 124, not refused)
-33-node-upgrade-success	assert_ok	B1c established flows live: agt1 still ONLINE through its pre-fault registration
-33-node-upgrade-success	assert_ok	B2 staged: ctl printed the verbatim staged line (both url gates + download + sha + smoke + flip all passed)
-33-node-upgrade-success	assert_ok	B3 pending window (whole conjunction): marker pending ∧ boot_count>=1 ∧ dst==NEXT ∧ MainPID==PID0 ∧ /proc/exe==NEXT (in-place exec of the staged image, and its boot shim really ran)
-33-node-upgrade-success	assert_ok	C-pre agt1b still ONLINE (its established registration is untouched by the SYN-only block)
-33-node-upgrade-success	assert_refuses	C sibling agt1b refused BY THE AGENT while B pends — agent_rejected:upgrade_in_progress (a broker-side refusal carries no agent_rejected: prefix; which agent-side gate fired is not observable from ctl — see the header note)
-33-node-upgrade-success	assert_ok	B4 watchdog rollback (whole conjunction, fault still armed ⇒ marker static): rolled_back ∧ Detail~'register deadline exceeded' ∧ dst==OLD ∧ .prev consumed ∧ MainPID==PID0 ∧ /proc/exe==OLD
-33-node-upgrade-success	assert_ok	B5 ctl verdict: rc!=0 AND the output carries BOTH the staged line AND 'likely ROLLED BACK' naming $OLD_RELEASE (inference oracle — the truth is B4's disk/process conjunction)
-33-node-upgrade-success	assert_ok	B6 heal: lift the syn-block
-33-node-upgrade-success	assert_ok	B6b the rolled-back OLD binary re-registers ONLINE at OLD_RELEASE (pure product self-heal, no operator action)
-33-node-upgrade-success	assert_ok	B6c broker journal carries the agent-reported rolled_back outcome (only a register carrying upgrade_state from the marker's target can emit it)
-33-node-upgrade-success	assert_ok	B6d delivered terminal marker is REMOVED (one-shot delivery proof — S24 asymmetry)
-33-node-upgrade-success	assert_ok	A1 ctl success: rc=0 ∧ staged line ∧ 'waiting for re-register (deadline 120s)' ∧ 'upgrade COMMITTED' naming $NEXT_RELEASE (phrases not whole lines — two COMMITTED variants exist)
-33-node-upgrade-success	assert_ok	A2 in-place exec: MainPID unchanged ∧ ExecMainStartTimestamp unchanged ∧ /proc/PID0/exe sha==NEXT (same PID through THREE execs; only a real re-exec runs the new bytes)
-33-node-upgrade-success	assert_ok	A3 registration/disk interlock: node ls RELEASE==NEXT ∧ ONLINE; dst==NEXT; .prev==OLD; marker committed ∧ boot_count==1 ∧ new_sha==NEXT ∧ target_nid==agt1; journal committed outcome
-33-node-upgrade-success	assert_ok	A4 version-skew pin: agt1b still ONLINE at OLD_RELEASE (the sibling keeps running the old image; the four-part proof kept it from claiming A's commit)
-33-node-upgrade-success	assert_ok	C2 domain released: sibling's own upgrade COMMITs (rc=0 ∧ COMMITTED ∧ agt1b ONLINE@NEXT ∧ agt1b MainPID unchanged ∧ marker target_nid==agt1b)
-33-node-upgrade-success	not_covered	33 (gotcha #73, honest): a NON-tether artifact that fakes the frozen version line passes the smoke gate, then has NO boot shim — budget never ticks, the watchdog died with the old image, the marker pends forever, the node is stranded behind NAT
+33-node-upgrade-success.V1	assert_ok	up 1 broker + 1 agent + 1 ctl
+33-node-upgrade-success.V1	assert_ok	init brk1 (N=1 cluster)
+33-node-upgrade-success.V1	assert_ok	SETUP broker.upgrade.url_allow += artifact prefix (labeled operator config) + broker restart
+33-node-upgrade-success.V1	assert_ok	session lab + ctl login (owner)
+33-node-upgrade-success.V1	assert_ok	agent-join agt1
+33-node-upgrade-success.V1	assert_ok	SETUP agt1b sibling unit (own HOME/nkey, SAME binary path) + ONLINE
+33-node-upgrade-success.V1	assert_ok	DIE-GATE both units execute the same binary path AND inode (upgrade-domain premise non-vacuous)
+33-node-upgrade-success.V1	assert_ok	SETUP artifact serving tether-next (ART_URL/ART_SHA populated)
+33-node-upgrade-success.V1	assert_ok	SETUP inject instance CA into agt1 trust store
+33-node-upgrade-success.V1	assert_ok	SETUP agt1 agent.upgrade.url_allow += artifact prefix + restart + ONLINE
+33-node-upgrade-success.V1	assert_ok	SETUP agt1b agent.upgrade.url_allow (own HOME tree, unit tether-agent-b) + restart + ONLINE
+33-node-upgrade-success.V1	assert_ok	B1 syn-block agt1 -> brk1:4222 (new connections only)
+33-node-upgrade-success.V1	assert_ok	B1b self-proof: rule took effect — a NEW connection to brk1:4222 black-holes (rc 124, not refused)
+33-node-upgrade-success.V1	assert_ok	B1c established flows live: agt1 still ONLINE through its pre-fault registration
+33-node-upgrade-success.V1	assert_ok	B2 staged: ctl printed the verbatim staged line (both url gates + download + sha + smoke + flip all passed)
+33-node-upgrade-success.V1	assert_ok	B3 pending window (whole conjunction): marker pending ∧ boot_count>=1 ∧ dst==NEXT ∧ MainPID==PID0 ∧ /proc/exe==NEXT (in-place exec of the staged image, and its boot shim really ran)
+33-node-upgrade-success.V1	assert_ok	C-pre agt1b still ONLINE (its established registration is untouched by the SYN-only block)
+33-node-upgrade-success.V1	assert_refuses	C sibling agt1b refused BY THE AGENT while B pends — agent_rejected:upgrade_in_progress (a broker-side refusal carries no agent_rejected: prefix; which agent-side gate fired is not observable from ctl — see the header note)
+33-node-upgrade-success.V1	assert_ok	B4 watchdog rollback (whole conjunction, fault still armed ⇒ marker static): rolled_back ∧ Detail~'register deadline exceeded' ∧ dst==OLD ∧ .prev consumed ∧ MainPID==PID0 ∧ /proc/exe==OLD
+33-node-upgrade-success.V1	assert_ok	B5 ctl verdict: rc!=0 AND the output carries BOTH the staged line AND 'likely ROLLED BACK' naming $OLD_RELEASE (inference oracle — the truth is B4's disk/process conjunction)
+33-node-upgrade-success.V1	assert_ok	B6 heal: lift the syn-block
+33-node-upgrade-success.V1	assert_ok	B6b the rolled-back OLD binary re-registers ONLINE at OLD_RELEASE (pure product self-heal, no operator action)
+33-node-upgrade-success.V1	assert_ok	B6c broker journal carries the agent-reported rolled_back outcome (only a register carrying upgrade_state from the marker's target can emit it)
+33-node-upgrade-success.V1	assert_ok	B6d delivered terminal marker is REMOVED (one-shot delivery proof — S24 asymmetry)
+33-node-upgrade-success.V1	assert_ok	A1 ctl success: rc=0 ∧ staged line ∧ 'waiting for re-register (deadline 120s)' ∧ 'upgrade COMMITTED' naming $NEXT_RELEASE (phrases not whole lines — two COMMITTED variants exist)
+33-node-upgrade-success.V1	assert_ok	A2 in-place exec: MainPID unchanged ∧ ExecMainStartTimestamp unchanged ∧ /proc/PID0/exe sha==NEXT (same PID through THREE execs; only a real re-exec runs the new bytes)
+33-node-upgrade-success.V1	assert_ok	A3 registration/disk interlock: node ls RELEASE==NEXT ∧ ONLINE; dst==NEXT; .prev==OLD; marker committed ∧ boot_count==1 ∧ new_sha==NEXT ∧ target_nid==agt1; journal committed outcome
+33-node-upgrade-success.V1	assert_ok	A4 version-skew pin: agt1b still ONLINE at OLD_RELEASE (the sibling keeps running the old image; the four-part proof kept it from claiming A's commit)
+33-node-upgrade-success.V1	assert_ok	C2 domain released: sibling's own upgrade COMMITs (rc=0 ∧ COMMITTED ∧ agt1b ONLINE@NEXT ∧ agt1b MainPID unchanged ∧ marker target_nid==agt1b)
+33-node-upgrade-success.V1	not_covered	33 (gotcha #73, honest): a NON-tether artifact that fakes the frozen version line passes the smoke gate, then has NO boot shim — budget never ticks, the watchdog died with the old image, the marker pends forever, the node is stranded behind NAT
+34-hot-update-process._shared	assert_setup	independent oracle positive, negative and nonempty controls
+34-hot-update-process._shared	assert_setup	up isolated broker + agent + ctl
+34-hot-update-process._shared	assert_setup	init brk1 N=1
+34-hot-update-process._shared	assert_setup	operator broker artifact allowlist
+34-hot-update-process._shared	assert_setup	create session and activate real ctl
+34-hot-update-process._shared	assert_setup	onboard real agent
+34-hot-update-process._shared	assert_setup	artifact TLS trust supply
+34-hot-update-process._shared	assert_setup	F mount healthy hangfs before the final agent setup restart
+34-hot-update-process._shared	assert_setup	F healthy statfs positive control before agent boot
+34-hot-update-process._shared	assert_setup	operator agent allowlist and its required restart
+34-hot-update-process._shared	assert_setup	copy workload/oracle without changing product or unit
+34-hot-update-process._shared	assert_setup	U supply: product user-unit body under User=sim system manager
+34-hot-update-process._shared	assert_setup	N supply: disable system unit and launch setsid nohup as sim
+34-hot-update-process._shared	assert_setup	N nonce pidfile identifies one agent, vendor SHA, MainPID zero
+34-hot-update-process._shared	assert_setup	agent ONLINE before workload
+34-hot-update-process._shared	assert_setup	candidate binary differs from running image
+34-hot-update-process._shared	assert_setup	real ctl receives a nonempty ordered output baseline
+34-hot-update-process._shared	assert_setup	no-upgrade source/output and RUNNING task positive control
+34-hot-update-process._shared	assert_setup	non-vacuity: source and original ctl advance by 20 before injection
+34-hot-update-process._shared	assert_setup	initial agent identity and descriptor census
+34-hot-update-process.A	assert_ok	A same PID and service start, new SHA and committed marker
+34-hot-update-process.A	assert_ok	A staged, waiting deadline, COMMITTED and broker outcome receipts
+34-hot-update-process.A	assert_ok	A original child progresses and courier delivers EXITED(23)
+34-hot-update-process.A	assert_ok	original process output and management survive real agent upgrade
+34-hot-update-process.A	assert_ok	A image generation, audit, FD ownership and final task agree
+34-hot-update-process.G	assert_ok	G first hop committed with original PID and new SHA
+34-hot-update-process.G	assert_ok	G non-vacuity: original source and ctl advance before reverse hop
+34-hot-update-process.G	assert_ok	G reverse hop committed with original PID and original SHA
+34-hot-update-process.G	assert_ok	G original child progresses and courier delivers EXITED(23)
+34-hot-update-process.G	assert_ok	G two generations form A to B to A with one execution and stable FD ownership
+34-hot-update-process.U	assert_ok	U body-equivalent system unit keeps PID, timestamp and commits
+34-hot-update-process.U	assert_ok	U original child progresses and courier delivers EXITED(23)
+34-hot-update-process.U	assert_ok	U original child and ctl continuity under the product unit body
+34-hot-update-process.U	assert_ok	U image marker, NRestarts and descriptor ownership remain sound
+34-hot-update-process.N	assert_ok	N unsupervised same PID and startticks commits new image
+34-hot-update-process.N	assert_ok	N original child progresses and courier delivers EXITED(23)
+34-hot-update-process.N	assert_ok	N original child and ctl continuity without a supervisor
+34-hot-update-process.N	assert_ok	N image marker, stable fd2 inode and descriptor ownership
+34-hot-update-process.P	assert_setup	P mixed probe directory in ctl container
+34-hot-update-process.P	assert_setup	P mixed probe installed in ctl container
+34-hot-update-process.P	assert_setup	P mixed probe budgets installed beside it
+34-hot-update-process.P	assert_setup	P0 agent-side ledger directory
+34-hot-update-process.P	assert_setup	P0 calibration runs at the required rate for 30 seconds
+34-hot-update-process.P	assert_setup	P0 retain calibration samples and source ledger
+34-hot-update-process.P	assert_setup	P0 sensor has zero request/connect failures and at least nine requests per second
+34-hot-update-process.P	assert_setup	P1 agent-side ledger directory
+34-hot-update-process.P	assert_setup	P1 probe start receipt precedes the upgrade
+34-hot-update-process.P	assert_ok	P1 observes cut and activation in the probe clock
+34-hot-update-process.P	assert_ok	P1 mixed workload continued through observed activation and its tail
+34-hot-update-process.P	assert_ok	P1 upgrade committed
+34-hot-update-process.P	assert_setup	P1 retain mixed samples and source ledger
+34-hot-update-process.P	assert_ok	P1 exercised read write and short work with a successful write across the observed cut and no unsafe refusals
+34-hot-update-process.P	assert_setup	P1 record reliable and legacy exec path counts for the probe nonce
+34-hot-update-process.W	assert_setup	W inject new-connection SYN blackhole after producer is established
+34-hot-update-process.W	assert_setup	W fault self-proof: new NATS connections are blackholed
+34-hot-update-process.W	assert_ok	W candidate imports and thaws while unable to register
+34-hot-update-process.W	assert_ok	W watchdog reexports current state and restores old image under the same PID
+34-hot-update-process.W	assert_ok	W broker saw original task LOST before reconnection
+34-hot-update-process.W	assert_ok	W rollback descriptor census
+34-hot-update-process.W	assert_ok	W heal the new-connection blackhole
+34-hot-update-process.W	assert_ok	W previous image re-registers
+34-hot-update-process.W	assert_ok	W original source progresses and previous courier reports EXITED(23); ctl outcome recorded
+34-hot-update-process.W	assert_ok	W two activations, one execution, LOST to RUNNING, original pipes retained
+34-hot-update-process.F	assert_setup	F hangfs remains mounted before injection
+34-hot-update-process.F	assert_setup	F healthy statfs positive control before injection
+34-hot-update-process.F	assert_setup	F wedge hangfs
+34-hot-update-process.F	assert_setup	F non-vacuity: statfs actually times out
+34-hot-update-process.F	assert_setup	F remote filesystem probe was exercised
+34-hot-update-process.F	assert_refuses	F upgrade defers while a remote filesystem probe is in flight
+34-hot-update-process.F	assert_ok	F deferral carries remote_fs_probe_in_flight and a retained probe census on wire and in agent slog
+34-hot-update-process.F	assert_ok	F deferral leaves disk and PID untouched while source and ctl advance
+34-hot-update-process.F	assert_setup	F heal hangfs
+34-hot-update-process.F	assert_ok	F retry imports and commits the image
+34-hot-update-process.F	assert_ok	F original child progresses and courier delivers EXITED(23)
+34-hot-update-process.F	assert_ok	F original child and ctl continuity after deferred retry
+34-hot-update-process.F	assert_ok	F one generation after deferral with stable descriptor ownership
+35-hot-update-exec-carrier._shared	assert_setup	independent oracle positive, negative and nonempty controls
+35-hot-update-exec-carrier._shared	assert_setup	vendor/tether-source.json describes the staged vendor/tether
+35-hot-update-exec-carrier._shared	assert_setup	up isolated broker + agent + ctl
+35-hot-update-exec-carrier._shared	assert_setup	init brk1 N=1
+35-hot-update-exec-carrier._shared	assert_setup	create session and activate real ctl
+35-hot-update-exec-carrier._shared	assert_setup	onboard real agent
+35-hot-update-exec-carrier._shared	assert_setup	copy workload/oracle without changing product or unit
+35-hot-update-exec-carrier.A	assert_setup	A0 real ctl streams a nonempty ordered baseline on both streams
+35-hot-update-exec-carrier.A	assert_setup	A0 baseline: source/output agree and the task is RUNNING
+35-hot-update-exec-carrier.A	assert_setup	A0 non-vacuity: the source is provably advancing before injection
+35-hot-update-exec-carrier.A	assert_setup	A1 inject: restart nats-server on brk1
+35-hot-update-exec-carrier.A	assert_setup	A1 recovery: nats-server active
+35-hot-update-exec-carrier.A	assert_setup	A1 recovery: broker up
+35-hot-update-exec-carrier.A	assert_setup	A1 recovery: agt1 ONLINE
+35-hot-update-exec-carrier.A	assert_ok	A1 original child and its stream still advancing after the nats-server restart
+35-hot-update-exec-carrier.A	assert_setup	A2 inject: nats-server stopped for 25 s then started
+35-hot-update-exec-carrier.A	assert_setup	A2 recovery: nats-server active
+35-hot-update-exec-carrier.A	assert_setup	A2 recovery: broker up (Restart=always revives a self-exit)
+35-hot-update-exec-carrier.A	assert_setup	A2 recovery: agt1 ONLINE
+35-hot-update-exec-carrier.A	assert_setup	A2 agent slog readable after the outage (an unreadable log is a fixture failure, never a zero)
+35-hot-update-exec-carrier.A	assert_ok	A2 the outage really crossed redialAfter: agent logged 'NATS stuck-disconnected; rebuilding session'
+35-hot-update-exec-carrier.A	assert_ok	A3 original child alive under the same identity, source advancing, task still RUNNING after both faults
+35-hot-update-exec-carrier.A	assert_setup	A4 request the producer's normal stop
+35-hot-update-exec-carrier.A	assert_ok	A4 workload wrote its terminal record (exit 23)
+35-hot-update-exec-carrier.A	assert_ok	A4 original ctl exited on its own within 30 s of the stop
+35-hot-update-exec-carrier.A	assert_setup	A4 capture source ledger and unmodified ctl transcripts
+35-hot-update-exec-carrier.A	assert_ok	A4 ps -a shows exactly one nonce row, EXITED(23)
+35-hot-update-exec-carrier.A	assert_setup	A5 carrier record (agent identity, fault windows, audit counts)
+35-hot-update-exec-carrier.A	assert_ok	A5 CARRIER: original child + both streams + exact exit survived nats restart AND 25 s outage on the reliable path, executed once
+35-hot-update-exec-carrier.B	assert_setup	B0 real ctl streams a nonempty ordered baseline on both streams
+35-hot-update-exec-carrier.B	assert_setup	B0 baseline: source/output agree and the task is RUNNING
+35-hot-update-exec-carrier.B	assert_setup	B0 non-vacuity: the source is provably advancing before injection
+35-hot-update-exec-carrier.B	assert_setup	B1 inject: restart tether-broker on brk1
+35-hot-update-exec-carrier.B	assert_setup	B1 recovery: broker up
+35-hot-update-exec-carrier.B	assert_setup	B1 recovery: agt1 ONLINE
+35-hot-update-exec-carrier.B	assert_ok	B2 original child alive under the same identity, source advancing, task still RUNNING after the broker restart
+35-hot-update-exec-carrier.B	assert_setup	B3 request the producer's normal stop
+35-hot-update-exec-carrier.B	assert_ok	B3 workload wrote its terminal record (exit 23)
+35-hot-update-exec-carrier.B	assert_ok	B3 original ctl exited on its own within 30 s of the stop
+35-hot-update-exec-carrier.B	assert_setup	B3 capture source ledger and unmodified ctl transcripts
+35-hot-update-exec-carrier.B	assert_ok	B3 ps -a shows exactly one nonce row, EXITED(23)
+35-hot-update-exec-carrier.B	assert_setup	B4 carrier record (agent identity, fault windows, audit counts)
+35-hot-update-exec-carrier.B	assert_ok	B4 CARRIER: original child + both streams + exact exit survived the tether-broker restart on the reliable path, executed once
+35-hot-update-exec-carrier.C	assert_setup	C-gate previous release $PREV_TAG: source.json vouches, in-container sha matches, version prints the tag, differs from today
+35-hot-update-exec-carrier.C	assert_setup	C-gate selected dynamic source receipt retained in the evidence
+35-hot-update-exec-carrier.C	assert_setup	C1.0 $PREV_TAG ctl streams a nonempty ordered baseline (N-1 interoperability)
+35-hot-update-exec-carrier.C	assert_setup	C1.0 baseline: source/output agree and the task is RUNNING
+35-hot-update-exec-carrier.C	assert_setup	C1.0 non-vacuity: the source is provably advancing before injection
+35-hot-update-exec-carrier.C	assert_setup	C1.1 inject: nats-server stopped for 25 s then started
+35-hot-update-exec-carrier.C	assert_setup	C1.1 recovery: nats-server active
+35-hot-update-exec-carrier.C	assert_setup	C1.1 recovery: broker up
+35-hot-update-exec-carrier.C	assert_setup	C1.1 recovery: agt1 ONLINE
+35-hot-update-exec-carrier.C	assert_setup	C1.1 agent slog readable after the outage
+35-hot-update-exec-carrier.C	assert_ok	C1.1 the outage really crossed redialAfter: agent logged the session rebuild
+35-hot-update-exec-carrier.C	assert_ok	C1.2 today's agent kept the legacy child alive and RUNNING through the outage
+35-hot-update-exec-carrier.C	assert_setup	C1.3 request the producer's normal stop
+35-hot-update-exec-carrier.C	assert_ok	C1.3 workload wrote its terminal record (exit 23)
+35-hot-update-exec-carrier.C	assert_setup	C1.3 capture source ledger and unmodified $PREV_TAG ctl transcripts
+35-hot-update-exec-carrier.C	assert_ok	C1.3 ps -a shows exactly one nonce row, EXITED(23) (today's agent reported the real exit)
+35-hot-update-exec-carrier.C	assert_setup	C1.4 carrier record (agent identity, fault window, audit counts)
+35-hot-update-exec-carrier.C	assert_ok	C1.4 N-1 CTL: legacy path taken (0 reliable lines), executed once, discontinuity recorded honestly in legacy-outcome.json
+35-hot-update-exec-carrier.C	assert_setup	C2.0 stop today's agent
+35-hot-update-exec-carrier.C	assert_setup	C2.0 install $PREV_TAG as agt1's binary
+35-hot-update-exec-carrier.C	assert_setup	C2.0 binary ownership/mode as install.sh leaves it
+35-hot-update-exec-carrier.C	assert_setup	C2.0 start the $PREV_TAG agent
+35-hot-update-exec-carrier.C	assert_setup	C2.0 agt1 ONLINE at release $PREV_TAG
+35-hot-update-exec-carrier.C	assert_setup	C2.1 today's ctl streams a nonempty ordered baseline from the $PREV_TAG agent (after the 2 s probe tax)
+35-hot-update-exec-carrier.C	assert_setup	C2.1 baseline: source/output agree and the task is RUNNING
+35-hot-update-exec-carrier.C	assert_ok	C2.2 child alive under the same identity and source advancing (no fault: the claim is interoperability)
+35-hot-update-exec-carrier.C	assert_setup	C2.3 request the producer's normal stop
+35-hot-update-exec-carrier.C	assert_ok	C2.3 workload wrote its terminal record (exit 23)
+35-hot-update-exec-carrier.C	assert_ok	C2.3 today's ctl exited on its own within 30 s of the stop
+35-hot-update-exec-carrier.C	assert_setup	C2.3 capture source ledger and unmodified ctl transcripts
+35-hot-update-exec-carrier.C	assert_ok	C2.3 ps -a shows exactly one nonce row, EXITED(23)
+35-hot-update-exec-carrier.C	assert_setup	C2.4 carrier record (agent identity, audit counts incl. the old agent's 'unknown forwarded verb' receipt)
+35-hot-update-exec-carrier.C	assert_ok	C2.4 N-1 AGENT: probe reached the $PREV_TAG agent, ctl fell back to legacy, executed once, complete transcript and exact exit
+36-hot-update-pty._shared	assert_setup	PTY driver is supplied by P14
+36-hot-update-pty._shared	assert_setup	independent raw-byte PTY positive and negative controls
+36-hot-update-pty._shared	assert_setup	up independent N1 broker agent and ctl
+36-hot-update-pty._shared	assert_setup	init brk1 N1
+36-hot-update-pty._shared	assert_setup	operator broker artifact allowlist
+36-hot-update-pty._shared	assert_setup	create session and activate ctl
+36-hot-update-pty._shared	assert_setup	onboard original agent
+36-hot-update-pty._shared	assert_setup	serve real distinct candidate
+36-hot-update-pty._shared	assert_setup	artifact TLS trust
+36-hot-update-pty._shared	assert_setup	operator agent allowlist and setup restart
+36-hot-update-pty._shared	assert_setup	real old ctl provenance and binary SHA
+36-hot-update-pty._shared	assert_setup	P real previous exporter, never a current binary with an old label
+36-hot-update-pty._shared	assert_setup	running image and served candidate are distinct and identified
+36-hot-update-pty._shared	assert_setup	real controlling tty and one original ctl
+36-hot-update-pty._shared	assert_setup	L pause original legacy run before attach
+36-hot-update-pty._shared	assert_ok	L pre-attach legacy admission refuses upgrade without disk mutation
+36-hot-update-pty._shared	assert_setup	L release original attach and exercise legacy resize and dual publish
+36-hot-update-pty._shared	assert_setup	two-sided nonempty original PTY progress before injection
+36-hot-update-pty._shared	assert_setup	resize original terminal before cut
+36-hot-update-pty._shared	assert_setup	supply strict mixed workload
+36-hot-update-pty._shared	assert_setup	stable 30 second strict workload calibration
+36-hot-update-pty._shared	assert_setup	retain calibration data
+36-hot-update-pty._shared	assert_setup	retain calibration side effects
+36-hot-update-pty._shared	assert_setup	calibration has zero failures and the declared schedule rate
+36-hot-update-pty._shared	assert_setup	fresh mixed effect ledger
+36-hot-update-pty._shared	assert_setup	mixed workload started before upgrade
+36-hot-update-pty._shared	assert_setup	retain image fault start on original ctl clock
+36-hot-update-pty._shared	assert_ok	strict workload observes the actual cut and activation
+36-hot-update-pty._shared	assert_ok	strict workload completes through activation
+36-hot-update-pty._shared	assert_ok	strict new requests and effects meet the five second budget
+36-hot-update-pty._shared	assert_ok	upgrade command succeeds
+36-hot-update-pty._shared	assert_setup	fault really execs candidate under original PID and commits
+36-hot-update-pty._shared	assert_setup	retain observed image activation window
+36-hot-update-pty._shared	assert_setup	P collect post-fault death without requiring a live foreground
+36-hot-update-pty._shared	assert_setup	P retain original waitpid and raw evidence even if foreground died
+36-hot-update-pty._shared	assert_setup	P complete readable four-stream logs and resource census
+36-hot-update-pty._shared	assert_setup	resize the original terminal after cut
+36-hot-update-pty._shared	assert_ok	original PTY exact bytes foreground rc23 and resources survive upgrade
+36-hot-update-pty.W	assert_setup	W resize original terminal before blackhole
+36-hot-update-pty.W	assert_setup	W commit KA and retain accepted pending input plus unACKed output
+36-hot-update-pty.W	assert_setup	W retain blackhole start on original ctl clock
+36-hot-update-pty.W	assert_setup	W inject new connection SYN blackhole
+36-hot-update-pty.W	assert_setup	W blackhole is timeout rather than refusal
+36-hot-update-pty.W	assert_ok	W candidate activates without registering
+36-hot-update-pty.W	assert_setup	W release queued input on the current candidate
+36-hot-update-pty.W	assert_ok	W original node crosses node_offline
+36-hot-update-pty.W	assert_ok	W real 120 second watchdog restores previous image
+36-hot-update-pty.W	assert_setup	W retain current state before heal
+36-hot-update-pty.W	assert_setup	W retain measured watchdog interval and consumed prev
+36-hot-update-pty.W	assert_ok	W candidate current cut proves actual kernel progress
+36-hot-update-pty.W	assert_ok	W current state is preserved and KA was not granted again
+36-hot-update-pty.W	assert_ok	W rollback has a new generation and the exact watchdog cause
+36-hot-update-pty.W	assert_setup	W heal after rollback evidence
+36-hot-update-pty.W	assert_ok	W previous image registers
+36-hot-update-pty.W	assert_setup	W retain actual recovery window through registration
+36-hot-update-pty.W	assert_setup	W resize original terminal after heal
+36-hot-update-pty.W	assert_ok	W original ctl and handle finish after heal with exact bytes and rc23
+36-hot-update-pty.C	assert_setup	C1 resize original terminal before carrier fault
+36-hot-update-pty.C	assert_setup	C1 carrier starts on original PTY
+36-hot-update-pty.C	assert_setup	C1 retain carrier fault start
+36-hot-update-pty.C	assert_setup	C1 stop actual NATS server
+36-hot-update-pty.C	assert_setup	C1 restart NATS server after 25 second outage
+36-hot-update-pty.C	assert_ok	C1 agent actually rebuilds session
+36-hot-update-pty.C	assert_setup	C1 retain observed session rebuild window
+36-hot-update-pty.C	assert_setup	C1 resize original terminal after carrier recovery
+36-hot-update-pty.C	assert_ok	C1 raw duplex continues with original terminal and KA
+36-hot-update-pty.C	assert_ok	C1 exact original bytes and autonomous ctl rc23
+36-hot-update-pty.C	assert_setup	C2 independent draining leader tail FIN canonical and raw fixture
+36-hot-update-pty.C	assert_setup	C2 nonempty input and output
+36-hot-update-pty.C	assert_setup	C2 resize before draining cut
+36-hot-update-pty.C	assert_setup	C2 canonical Ctrl-D and Ctrl-C have measured remote effects
+36-hot-update-pty.C	assert_setup	C2 leader exits before more than 200ms of slave tail
+36-hot-update-pty.C	assert_setup	C2 retain image fault start
+36-hot-update-pty.C	assert_ok	C2 upgrade during draining tail succeeds
+36-hot-update-pty.C	assert_ok	C2 draining terminal crosses an actual image activation
+36-hot-update-pty.C	assert_setup	C2 retain observed draining image cut
+36-hot-update-pty.C	assert_setup	C2 resize after draining cut
+36-hot-update-pty.C	assert_setup	C2 retain real tail bytes intersecting the cut
+36-hot-update-pty.C	assert_ok	C2 tail FIN Ctrl-D Ctrl-C and terminal outcome are complete
+36-hot-update-pty.L	assert_setup	L resize original terminal before refusal
+36-hot-update-pty.L	assert_setup	L retain refusal window start
+36-hot-update-pty.L	assert_ok	L running legacy terminal defers upgrade and keeps original disk
+36-hot-update-pty.L	assert_setup	L retain observed unchanged-image refusal window
+36-hot-update-pty.L	assert_setup	L resize original terminal after refusal
+36-hot-update-pty.L	assert_ok	L legacy resize and dual publish preserve exact byte trace
+36-hot-update-pty.L	assert_ok	L original old ctl finishes before provisioning other quadrants
+36-hot-update-pty.L	assert_setup	L new ctl old agent and old broker fallback quadrants
+36-hot-update-pty.L	assert_ok	L gate closed legacy75 and zero spawn receipts
+39-hot-update-legacy-n1._shared	assert_bug	original PTY survives a real legacy exporter upgrade
+39-hot-update-legacy-n1._shared	assert_setup	independent continuity and legacy exporter controls
+39-hot-update-legacy-n1._shared	assert_setup	up isolated N1 broker agent and ctl
+39-hot-update-legacy-n1._shared	assert_setup	init brk1 N1
+39-hot-update-legacy-n1._shared	assert_setup	broker artifact allowlist
+39-hot-update-legacy-n1._shared	assert_setup	create session and activate ctl
+39-hot-update-legacy-n1._shared	assert_setup	onboard agent
+39-hot-update-legacy-n1._shared	assert_setup	previous release provenance, distinct sha, tag and absent ABI line
+39-hot-update-legacy-n1._shared	assert_setup	artifact TLS trust
+39-hot-update-legacy-n1._shared	assert_setup	agent artifact allowlist and setup restart
+39-hot-update-legacy-n1._shared	assert_setup	install producer and independent oracle
+39-hot-update-legacy-n1._shared	assert_setup	Y supply: run real previous release agent
+39-hot-update-legacy-n1._shared	assert_setup	Y old agent ONLINE at the previous release
+39-hot-update-legacy-n1._shared	assert_setup	nonempty original ctl stdout and stderr baseline
+39-hot-update-legacy-n1._shared	assert_setup	original source agrees with RUNNING task
+39-hot-update-legacy-n1._shared	assert_setup	non-vacuity: original source and ctl advance by 20 before injection
+39-hot-update-legacy-n1._shared	assert_setup	non-vacuity: running agent owns nonempty pipe descriptors
+39-hot-update-legacy-n1.X	assert_refuses	X live image refuses a legacy candidate
+39-hot-update-legacy-n1.X	assert_ok	X refusal leaves disk, marker and running identity untouched while producer advances
+39-hot-update-legacy-n1.X	assert_ok	X original process advances after refused upgrade
+39-hot-update-legacy-n1.X	assert_ok	X original producer stops and ctl receives its terminal outcome
+39-hot-update-legacy-n1.X	assert_ok	X original task ends EXITED(23)
+39-hot-update-legacy-n1.X	assert_ok	X complete original output and rc23 survive ABI refusal
+39-hot-update-legacy-n1.Y	assert_setup	Y real bare exec changes SHA and commits under original agent PID
+39-hot-update-legacy-n1.Y	assert_setup	Y original child identity survives and independent source advances
+39-hot-update-legacy-n1.Y	assert_setup	Y preserve final source, original transcripts and ctl timeout
+39-hot-update-legacy-n1.Y	assert_setup	Y agent audit proves exactly one legacy execution after reliable probe fallback
+39-hot-update-legacy-n1.Y	assert_bug	original process output and management survive a legacy exporter upgrade
 40-drain-retire	assert_setup	create session fixture
 40-drain-retire	assert_setup	join expose-capable agent fixture
 40-drain-retire	assert_ok	D-drain: cluster drain $T succeeds (rc=0)
@@ -1713,3 +1998,137 @@ lib/setup-forcesingle	assert_ok	agent-join agt1
 lib/setup-forcesingle	assert_ok	JS meta FORMED at N=2 (cluster_size==2) before kill
 lib/setup-forcesingle	assert_ok	baseline: build the 12 MB tier-B payload
 lib/setup-forcesingle	product_red	#67 residual: the tier-B refusal said it was transient and told the operator to retry shortly, but the documented retry window (5 attempts over ~25s) NEVER succeeded on a healthy N=2 — the documented remedy does not work here
+
+# origin: hot-update S5 plan §9.4 / §10.1. Append-only registration of 75 and 39.F claims.
+39-hot-update-legacy-n1.F	assert_bug	original legacy flow survives historical bare exec
+75-hot-update-flows._shared	assert_setup	independent raw and AEAD oracle controls
+75-hot-update-flows._shared	assert_setup	both artifacts read flow/SS domains
+75-hot-update-flows._shared	assert_setup	discard only isolated drill instance
+75-hot-update-flows._shared	assert_setup	N1 broker agent and ctl
+75-hot-update-flows._shared	assert_setup	initialize N1
+75-hot-update-flows._shared	assert_setup	broker artifact allowlist deployment
+75-hot-update-flows._shared	assert_setup	fixed historical broker before first business
+75-hot-update-flows._shared	assert_setup	create isolated session
+75-hot-update-flows._shared	assert_setup	onboard agent
+75-hot-update-flows._shared	assert_setup	agent artifact allowlist deployment
+75-hot-update-flows._shared	assert_setup	fixed historical exporter before business
+75-hot-update-flows._shared	assert_setup	serve candidate artifact
+75-hot-update-flows._shared	assert_setup	artifact CA deployment
+75-hot-update-flows._shared	assert_setup	serve original reader for reverse hop
+75-hot-update-flows._shared	assert_setup	declare original cohort and finite final ledger
+75-hot-update-flows._shared	assert_setup	start original SSH TCP OPEN half-close SS and ten requests/s
+75-hot-update-flows._shared	assert_setup	at least twenty samples in each original direction
+75-hot-update-flows._shared	assert_setup	running historical broker still owns first business
+75-hot-update-flows._shared	assert_setup	capture empty ALPN and unframed original bytes
+75-hot-update-flows._shared	assert_setup	legacy transport evidence is nonempty
+75-hot-update-flows._shared	assert_setup	upgrade native command succeeded
+75-hot-update-flows._shared	assert_setup	same PID different running SHA and committed marker
+75-hot-update-flows._shared	assert_setup	finish original finite streams and save final identity
+75-hot-update-flows._shared	assert_setup	collect original ledgers SQL per-domain FD/replay and four logs before cleanup
+75-hot-update-flows._shared	assert_ok	original bidirectional bytes identities and maximum five-second stalls
+75-hot-update-flows._shared	assert_setup	observed original cut event before revoke
+75-hot-update-flows._shared	assert_setup	revoke silent alice through real product authority
+75-hot-update-flows._shared	assert_setup	applied revision silent victim shutdown dup and replay zero while bob advances
+75-hot-update-flows._shared	assert_setup	retain actual bare exec event and historical supply proof
+75-hot-update-flows._shared	assert_setup	finish original legacy workload and capture sticky EOF/RST loss
+75-hot-update-flows._shared	assert_setup	collect legacy oracle inputs before cleanup
+75-hot-update-flows._shared	assert_setup	real bare exec fault was observed
+75-hot-update-flows.A	assert_setup	target-specific SYN block for original OPEN
+75-hot-update-flows.A	assert_setup	collect original EINPROGRESS and partial cipher prior
+75-hot-update-flows.A	assert_setup	true original EINPROGRESS FD and nonempty partial SS ciphertext
+75-hot-update-flows.A	assert_setup	same pending FD completes without redial
+75-hot-update-flows.A	assert_setup	same survivors progress after committed upgrade
+75-hot-update-flows.A	assert_setup	force current carrier TCP replacement with same original cohort
+75-hot-update-flows.C	assert_setup	N3 live topology without join bypass or retries
+75-hot-update-flows.C	assert_setup	same SQL allocation home epoch and live default reaper
+75-hot-update-flows.R	assert_setup	arm three actual product revoke event barriers
+75-hot-update-flows.R	assert_setup	each applied revoke clears original victim while bob advances
+75-hot-update-flows.B	assert_setup	B offsets Base nonce retirement actually advance
+75-hot-update-flows.B	assert_setup	second committed cut uses current B state
+75-hot-update-flows.W	assert_setup	arm bounded NATS-only SYN fault
+75-hot-update-flows.W	assert_setup	first real register commit filesystem failure after persisted boot count
+75-hot-update-flows.W	assert_setup	watchdog upgrade native rc
+75-hot-update-flows.W	assert_setup	original deadline automatically creates second current cut
+75-hot-update-flows.W	assert_setup	capture real ready pending watchdog receipt
+75-hot-update-flows.W	assert_setup	watchdog fault and current-cut priors are nonempty
+75-hot-update-flows.L	assert_ok	live legacy responsibility safely refuses with native 75 and exact reason
+75-hot-update-flows.L	assert_setup	legacy refusal leaves running disk marker and business unchanged
+lib/hot_update_flow_faults	assert_bug	original legacy flow survives historical bare exec
+
+# 2026-10-11 S5 DRILL-RUN final acceptance (GATES-FINAL-3): 36._shared adds two 39.P
+#   original-read-barrier/backlog claims; 75.A replaces pending-OPEN setup with four
+#   final-artifact-byte/native-extraction claims; SYN release moves to 75._shared
+#   after the cut; 75._shared adds C1 saturation/refusal/natural-FIN/recovery.
+#   All other claim identities and multiplicities are unchanged. Regenerated with:
+#   cd test/simcluster && sh tests/assert-identity.sh
+#   Existing row order is retained; new report rows are appended as a multiset.
+#   Receipt: s5-evidence/drills/RECEIPTS.md final acceptance on image 9d8a232c.
+36-hot-update-pty._shared	assert_setup	P original read barrier and nonempty output backlog before bare exec
+36-hot-update-pty._shared	assert_setup	P release original read barrier after actual bare exec
+75-hot-update-flows._shared	assert_ok	32 active reservations typed capacity refusals natural FIN and recovery
+75-hot-update-flows._shared	assert_setup	release only target SYN block after cut
+75-hot-update-flows.A	assert_setup	gate final artifact byte before pending OPEN
+75-hot-update-flows.A	assert_setup	real artifact download reached final byte
+75-hot-update-flows.A	assert_setup	start original OPEN after native extraction under target fault
+75-hot-update-flows.A	assert_setup	verify artifact delivery and original OPEN prior
+lib/hot_update_broker	assert_bug	original broker cohort survives legacy Run unwind
+
+# origin: hot-update S7 plan §10.6 / T43 / T44; scanner-visible claims, NOT_RUN.
+63-hot-update-transfer._shared	assert_setup	positive manifest requires every leg and child
+64-hot-update-transfer-controls._shared	assert_setup	production control source build and runtime receipt are bound
+
+# origin: hot-update S8 plan §9 / S9 plan §9.3 / S10 plan §9; declared source claims only.
+# P29 moves preserve all V1 claim texts; s8-p9cons rewords the selected receipt.
+# upgrade_legacy_assert callers retain their historical assert_bug identities;
+# the scanner owner must trace literal caller descriptions through that helper.
+100-hot-update-fullstack-controls._shared	assert_ok	fullstack source mutation hits its exact window and independent assertion with native 0 to 1 to 0
+100-hot-update-fullstack-controls._shared	not_covered	all required fullstack mutation cells have native chains
+31-node-upgrade-fleet.V2	assert_ok	v2 regression receipts (native rc $_reg_rc)
+31-node-upgrade-fleet.V2	assert_setup	v2 regression adapters available
+31-node-upgrade-fleet.V2	product_red	v2 regression product oracle failed; evidence retained
+31-node-upgrade-fleet.V2	not_covered	v2 regression observation incomplete
+32-install-lifecycle	assert_ok	dry-run never starts tether NATS Caddy helper launcher or a management socket
+32-install-lifecycle	assert_ok	dry-run leaves sandbox nft rules and listeners unchanged
+32-install-lifecycle	assert_ok	all offline installs leave sandbox nft rules and listeners unchanged
+32-install-lifecycle	assert_ok	BROKER-real P26 release archive contains installer-compatible support files
+32-install-lifecycle	assert_ok	BROKER-real install downloads and extracts the verified complete support archive
+32-install-lifecycle	assert_ok	BROKER-real both supporting executables match the installed immutable manifest
+32-install-lifecycle	assert_ok	BROKER-real never-start includes NATS Caddy helper launcher units and cgroups
+32-install-lifecycle	assert_ok	BROKER-real installation leaves nft rules and listeners unchanged
+33-node-upgrade-success.V2	assert_ok	v2 regression receipts (native rc $_reg_rc)
+33-node-upgrade-success.V2	assert_setup	v2 regression adapters available
+33-node-upgrade-success.V2	product_red	v2 regression product oracle failed; evidence retained
+33-node-upgrade-success.V2	not_covered	v2 regression observation incomplete
+36-hot-update-pty._shared	assert_setup	historical PTY original role identities
+36-hot-update-pty._shared	assert_setup	fixed PTY source
+36-hot-update-pty._shared	assert_setup	old PTY broker and upgrade ctl before business
+36-hot-update-pty._shared	assert_setup	old PTY broker ready
+36-hot-update-pty._shared	assert_setup	historical PTY exec kernel evidence
+36-hot-update-pty._shared	assert_setup	historical PTY exec is required
+38-hot-update-rollback-compat._shared	not_covered	38.$ARM native INCOMPLETE
+39-hot-update-legacy-n1._shared	assert_setup	fixed old source before control-stack installation
+39-hot-update-legacy-n1._shared	assert_setup	old broker and explicit old ctl before business
+39-hot-update-legacy-n1._shared	assert_setup	old broker ready
+39-hot-update-legacy-n1._shared	assert_setup	all historical roles before original business
+39-hot-update-legacy-n1._shared	assert_ok	historical capability refusal uses explicit unsupported CLI exit 64
+39-hot-update-legacy-n1.F	assert_setup	F historical exec before loss classification
+39-hot-update-legacy-n1.Y	assert_setup	Y capture actual old exporter exec
+39-hot-update-legacy-n1.Y	assert_setup	Y source and original control stack really executed
+75-hot-update-flows._shared	assert_setup	fixed flow exporter source
+75-hot-update-flows._shared	assert_setup	old flow broker and explicit upgrade ctl before business
+75-hot-update-flows._shared	assert_setup	old flow broker ready
+75-hot-update-flows._shared	assert_setup	historical flow original role identities
+75-hot-update-flows._shared	assert_setup	historical flow exec kernel evidence
+75-hot-update-flows._shared	assert_setup	historical flow exec is required
+85-hot-update-nats._shared	assert_ok	independent infra oracle satisfies the selected frozen scope
+85-hot-update-nats._shared	assert_ok	independent infra oracle satisfies the selected frozen scope
+85-hot-update-nats._shared	not_covered	original infra required cell remains exercisable
+85-hot-update-nats._shared	assert_ok	declared infra prerequisite completed with retained command evidence
+85-hot-update-nats._shared	assert_ok	product bootstrap activates management successfully during original business
+85-hot-update-nats._shared	assert_ok	normal component roll returns completed CLI status
+86-hot-update-caddy._shared	assert_ok	valid managed Caddy reload completes
+86-hot-update-caddy._shared	assert_ok	invalid Caddy input is explicitly refused with CLI exit 64
+99-hot-update-fullstack._shared	assert_ok	fullstack required children and original cohorts satisfy the independent judges
+99-hot-update-fullstack._shared	assert_ok	fullstack required children and original cohorts satisfy the independent judges
+99-hot-update-fullstack._shared	product_red	original fullstack judge receipt: verdict=PRODUCT-RED rc=3
+99-hot-update-fullstack._shared	not_covered	fullstack required live windows and upstream receipts are complete

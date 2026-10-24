@@ -58,7 +58,7 @@ func TestExposeHonorsRequestedRemotePort(t *testing.T) {
 	pub, fp := freshUserPub(t)
 	seed(t, db, "lab", fp)
 	defer startBroker(t, url, db)()
-	defer startAgent(t, url, "lab", "lab-1", t.TempDir(), &recordingAdapter{})()
+	defer startAgent(t, db, url, "lab", "lab-1", t.TempDir(), &recordingAdapter{})()
 
 	nc, _ := nats.Connect(url)
 	defer nc.Close()
@@ -90,7 +90,7 @@ func TestExposeRequestedPortTakenHardFails(t *testing.T) {
 	seed(t, db, "lab", fp)
 	defer startBroker(t, url, db)()
 	adapter := &recordingAdapter{}
-	defer startAgent(t, url, "lab", "lab-1", t.TempDir(), adapter)()
+	defer startAgent(t, db, url, "lab", "lab-1", t.TempDir(), adapter)()
 
 	nc, _ := nats.Connect(url)
 	defer nc.Close()
@@ -142,7 +142,7 @@ func TestExposeRequestedPortOutOfBand(t *testing.T) {
 	seed(t, db, "lab", fp)
 	defer startBroker(t, url, db)()
 	adapter := &recordingAdapter{}
-	defer startAgent(t, url, "lab", "lab-1", t.TempDir(), adapter)()
+	defer startAgent(t, db, url, "lab", "lab-1", t.TempDir(), adapter)()
 
 	nc, _ := nats.Connect(url)
 	defer nc.Close()
@@ -172,7 +172,7 @@ func TestExposeRequestedPortReusableAfterRm(t *testing.T) {
 	pub, fp := freshUserPub(t)
 	seed(t, db, "lab", fp)
 	defer startBroker(t, url, db)()
-	defer startAgent(t, url, "lab", "lab-1", t.TempDir(), &recordingAdapter{})()
+	defer startAgent(t, db, url, "lab", "lab-1", t.TempDir(), &recordingAdapter{})()
 
 	nc, _ := nats.Connect(url)
 	defer nc.Close()
@@ -200,7 +200,7 @@ func TestExposeOmittedRemotePortUnchanged(t *testing.T) {
 	pub, fp := freshUserPub(t)
 	seed(t, db, "lab", fp)
 	defer startBroker(t, url, db)()
-	defer startAgent(t, url, "lab", "lab-1", t.TempDir(), &recordingAdapter{})()
+	defer startAgent(t, db, url, "lab", "lab-1", t.TempDir(), &recordingAdapter{})()
 
 	nc, _ := nats.Connect(url)
 	defer nc.Close()

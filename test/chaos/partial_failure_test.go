@@ -186,6 +186,7 @@ func TestUpgradeAllAbortsImmediatelyOnConfigError(t *testing.T) {
 // with a registered agent must transition cleanly to DELETING when
 // the owner runs `session rm`. C.1 §6 then makes subsequent ingress
 // (register, exec, ps) reject with session_not_found_or_deleting.
+// origin: S7 internal review MAKETEST-TRANSFER F2
 func TestSessionRmWithLiveAgentTombstones(t *testing.T) {
 	ctx, cancel := withTestDeadline(t, 15*time.Second)
 	defer cancel()

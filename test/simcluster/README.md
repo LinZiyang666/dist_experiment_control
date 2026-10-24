@@ -93,7 +93,8 @@ ssh-run). On `weilandserver` itself, skip it — it would rsync the machine onto
 | File | Runs where | Job |
 |---|---|---|
 | `local.sh` | **`weilandserver` (normal)** | The on-host driver. Same vendor staging as `remote.sh`, minus rsync/ssh — builds in place and execs `./simcluster`. Refuses to run off-host (escape hatch: `SIM_ALLOW_ANY_HOST=1`). |
-| `lib/stage.sh` | both drivers | Shared vendor staging (tether + tether-next + pinned `nats-server` + `nats`/`nk` + `install.sh`) and the `sim_is_sim_host` probe, so the two drivers cannot drift. |
+| `lib/stage.sh` | both drivers | Shared vendor staging (tether + tether-next + **tether-prev** + pinned `nats-server` + verified `caddy` + `nats`/`nk` + `install.sh`) and the `sim_is_sim_host` probe, so the two drivers cannot drift. `vendor/tether-prev` is the REAL previous release (hot-update S1): `sim_prev_tag` resolves the newest `v*` tag reachable from HEAD (or the next older one when HEAD sits exactly on a tag — never a literal, which would turn into "same version" on release day), `sim_stage_prev` builds it in a detached worktree with that tag's own Makefile/go.mod (fail-closed: a build failure never substitutes tether-next), and `vendor/tether-prev-source.json` `{tag, commit, binary_sha256, toolchain, built_at}` is the receipt `sim_prev_source_ok` checks. `vendor/tether-source.json` binds every staged tether binary to HEAD/dirty-count/sha for evidence. tether-prev is NOT baked into the image (the COPY list is image-identity); drills `d cp` it in. Hermetic controls: `tests/prev-supply-test.sh`. |
+| `lib/supervisor.sh` | both drivers + `tests/run-all.sh` | The adapter the S8 supply path requires as `SIM_UPGRADE_SUPERVISOR` (`-- argv...`, caller's stdio/cwd/env, native child status): `sim_supervisor_build` compiles the repository's FIX-ORPHAN test launcher `test/fullstackharness/cmd/supervise` (over `internal/testharness.StartProcess`) from the caller's own tree; `sim_supervisor_provision` keeps an exported adapter or builds one for `--build`. Exit 125 = descendants survived the child, 126 = launcher setup failure — never success. Linux only. |
 | `remote.sh` | **an external driver box (optional)** | Only needed when you are *not* on `weilandserver`. Compiles `tether` + stages `vendor/` binaries + rsyncs the tree + ssh-runs `simcluster` on the server. On the server itself, call `./simcluster` directly. |
 | `simcluster` | server | The brain: ~19 verbs. Orchestrates docker + in-container `systemctl` + the real `tether` CLI. |
 | `lib/log.sh` | server | logging + `poll_until` (wait-for-condition, never a fixed sleep) |
@@ -108,6 +109,16 @@ ssh-run). On `weilandserver` itself, skip it — it would rsync the machine onto
 | `drills/lib/colocated.sh` | server | **OQ-6 SUPPLY (R9-D)**: provisions a tether AGENT co-located on a BROKER host — declares it in broker.yaml (`broker.cluster.colocated_agent_nid`), binds it into the session via the `--pin` first-connect, and runs it as a system unit out of the ROOT-owned `/usr/local/bin/tether` (the re-exec-only path `cluster upgrade`'s agent leg uses; NOT the `~/.local/bin` copy the standalone agent role needs for `node upgrade`'s atomic replace). This is machine SUPPLY, per Mandate ③ — the sim builds the host shape, every upgrade action stays tether's. Without it drill 30's whole-host (broker + agent dual-version) leg was structurally uncoverable |
 | `drills/*.sh` | server | one reproducible deploy scenario each (acceptance/regression); see the Drills table |
 | `tests/r9d-nonvacuity.sh` | dev box | **the NON-VACUITY gate (R9-D)**: extracts each drill oracle VERBATIM from its drill file and drives it with deliberately BAD input, proving it can go RED. Running the drills cannot catch a permanently-true oracle — it passes every run, forever (H1: a jq path matching nothing; H12: an empty grep needle; and, found BY this harness, a `.assumed // empty` whose jq `//` swallows `false`, making `assumed=false` permanently unassertable). Wired into `tests/run-all.sh` |
+| `tests/hot-update-transfer-drill-test.py` | dev box | The r9d arm controls for drills 63/64 (`--arm <ARM>`; r9d fans `--arm all --results DIR` out once and gives every arm its own section). Runs the REAL drill file, driver and `transfer_mutations.py` in a private sandbox where only the deployment boundary is a recording double (`TRANSFER_PROCESS_SUPERVISOR` protocol; docker/ssh/systemctl/tether poisoned): each arm must reach its expected native verdict with every scheduled cell cut and be driven off it by its own fault; each control's kill is two-sided over its owner, roles, 120s window (M02/M12B) and native ASSERT-FAIL. No transfer, cut, kill or deploy receipt is claimed. |
+| `tests/hot-update-rollback-drill-test.py` | dev box | The r9d arm controls for drill 38 (`--arm <ARM>\|all [--results DIR] [--jobs N]`; r9d fans `--arm all --results DIR` out once and gives every arm its own section). Runs the REAL drill file, its PY38 program and `upgrade38_native` mapping against the arm's REAL row in `drills/lib/upgrade_tx_arms.tsv` and `upgrade_fault_cases.tsv` under the shared FIX-ORPHAN supervisor (`SIM_UPGRADE_SUPERVISOR`; rc 2 without it or for an unknown arm). Only the deployment boundary is a recording double (`tests/hot_update_rollback_{fixture,faults,clock}_double.py`: the P26 fixture's live verbs, the supervisor's command execution, the fault injector's effect, the mutation build supplier and the calibration clock; docker/ssh/sudo/systemctl/journalctl/tether poisoned): each arm must reach its expected native verdict with a trace of exactly its declared operations, and bad input aimed at its own obligation (last CLI rc, proof set, R checkpoint/reverse receipts, W injector hit, A calibration interval, H reverse step, M causal kill receipt, I judge binding) must drive it to one specific other native status. Zero tests or any skip is red. No cut, rollback, kill or deploy receipt is claimed. |
+| `tests/hot-update-compat-drill-test.py` | dev box | The r9d arm controls for drill 39's S8 compatibility arms (`--arm <ARM>\|all [--results DIR] [--jobs N]`, same fan-out). Runs the REAL `drills/39-hot-update-legacy-n1.sh` dispatch (`_upgrade_39_new_arm` → the REAL `drills/lib/hot_update_broker.sh` `upgrade_39_compat` → its embedded PYCOMPAT driver → `broker_native` → `drill_end`) under the shared supervisor. Doubles: `SIM_UPGRADE_COMPAT_SUPPLIER` is a recorder speaking the P24/P22 port protocol, every product command is a finite local actor exiting with the scenario status, and for ABI-adjacent alone `drills/lib/upgrade_tx_fixture.py` is replaced by a double of the P26 live-fixture interface (the real P26 judge needs a live cohort); wire plans come from the REAL `test/hotupdate/testdata/upgrade_wire_argv.json`. Each arm must reach its expected native verdict with its own CASES39 CLI statuses, and an independent per-arm pin of PYCOMPAT's checks, wire checks and config obligations goes red if the drill drops one. No compatibility, migration or deploy receipt is claimed. |
+| `tests/hot-update-infra-arm-test.py` | dev box | The r9d arm controls for drills 85/86 and 39.NI/CI (`--arm <85.A\|86.R\|39.NI\|...\|all>`, same fan-out). Runs the REAL drill files (case branch, every `infra_drill_*` helper, `drills/lib/cluster.sh` grow fixtures, `drills/lib/logs.sh` `sim_log_snapshot`, `lib/assert.sh`, the FIX-ORPHAN supervisor exec). Recording doubles replace `$SIM`, the vendor supply verifiers, the release-source supplier behind `sim_prev_source_ok`, `$DOCKER` and the whole P32 `drills/lib/hot_update_infra.sh` seam, whose landed verbs differ from the ones 85/86 call (reported, not repaired). Each arm's recorded trace must equal its own obligation sequence (topology, rounds, hops, refusal/heal/halt/recover, reload/support steps, CLI binary and verb, the CLI rc forwarded to each judge call), and faults aimed at its distinctive obligation must reach an exact other native verdict. No infra cut, roll, refusal or deploy receipt is claimed. |
+| `tests/hot-update-fullstack-arm-test.py` | dev box | The r9d arm controls for drills 99/100 (`--arm <99.ARM\|100.ARM>\|all`, same fan-out). Runs the REAL drill shell (supervisor re-exec, native case mapping, `drill_end`), `drills/lib/fullstack_fixture.py run` and `drills/lib/fullstack_mutations.py run-arm`; only the deployment boundary is a double (`tests/hot_update_fullstack_arm_boundary.py`: the P25 source-pinned tool rebuild, the P10 source archive, the Go assembly host, the P01 judge and the P19/P25 mutation host), and failed `require` criteria are recorded so each negative proves which guard fired. A 99 arm must reach GREEN on its own sealed profile and go SETUP-RED for a missing step or execution of its own runtime, a flipped topology, another arm's profile, a GREEN judge with unmet criteria, foreign running bytes or an out-of-vocabulary host status. A 100 arm must reach its 0→1→0 ASSERT-FAIL kill on its own catalog row and go SETUP-RED for a comment-only or unbound patch, a surviving or translated mutant, a red outside its window or at another assertion, an unclassified driver crash (Python's default exit 1 is the kill status) and its row-specific tier/cell/overlay/restore obligation; 100.M10C stays INCOMPLETE until P19/P25 supplies its targeted-cut probe sender. No fullstack deployment, cut, kill or judge receipt is claimed. |
+| `tests/hot-update-process-probe-test.sh` | Hermetic process/image oracle controls for drills 34/35/39: synthetic positive and negative judges, real local pipes and FD census, pidfd cleanup, extracted shell predicates, artifact packing and Go source literal pins. S1 loss remains a negative of the S3 judge. Never runs tether or Docker. |
+| `drills/lib/hot_update_process_probe.py` | Independent producer, process identity, FD census, continuity/image/legacy judges, freeze samples and pidfd cleanup. |
+| `drills/lib/hot_update_budget.sh` | Deploy half of the single-source upgrade budgets (`internal/upgradebudget`): sourced by drill 34; rate is fixed, freeze/request samples are calibration only. |
+| `drills/lib/hot_update_mixed_probe.py` | Mixed read/write/short request sensor for 34.P (MIXEDPROBE package); calibrated traffic, source-ledger side-effect judge and latency distributions. |
+| `tests/prev-supply-test.sh` | dev box | Hermetic controls for the `vendor/tether-prev` supply: `sim_prev_tag` on a scratch git repo (HEAD past a tag / exactly on a tag / on the oldest tag / non-`v*` tags ignored), `sim_prev_source_ok` two-sided (wrong tag, swapped binary, missing/partial source.json refused), `sim_stage_prev` fail-closed (a failing build leaves nothing behind and removes its worktree; a matching cache triple never rebuilds) and `sim_write_tether_source`. Wired into `tests/run-all.sh`. |
 | `run-drills.sh` | server | run the WHOLE drill suite in PARALLEL — inotify preflight + concurrency cap (`-j`) + infra-flake re-run; the preferred way to run all drills (see Drills) |
 
 **Edit-loop:** the control scripts (`simcluster`, `lib/*`, `drills/*`) take effect via rsync alone — just
@@ -120,6 +131,37 @@ Linux with cgroup v2 + Docker (systemd-in-docker needs `--privileged --cgroupns=
 toolchain to build `tether` in place. The `nats-server` (pinned to the `install.sh` version), `nats`
 and `nk` binaries live in `vendor/` and are staged by `./simcluster build`. When driving from an
 external box instead, `remote.sh` builds and rsyncs them over.
+
+Caddy provisioning requires Python 3.9+ and curl on the staging driver and Python 3.9+
+on the image-build host. The entire image profile remains **Linux amd64**; Caddy
+staging refuses another `SIM_TARGET_OS` / `SIM_TARGET_ARCH`. `lib/stage-caddy.sh`
+reads the exact `CADDY_VERSION` default from `scripts/install.sh` (an explicit numeric
+`TETHER_CADDY_VERSION` override is forwarded by `remote.sh`). It downloads the official
+release archive and its checksum list on every stage; **there is no Caddy download cache**.
+The archive name must have exactly one checksum entry (SHA256/SHA512, matching the
+installer's policy). The receipt records both that official checksum and the archive /
+binary / installer SHA256, release, source URL and target platform.
+
+Serialize vendor staging, rsync and image build. Files are prepared in the same vendor
+directory, fsynced and atomically renamed; `caddy-source.json` is published last. This
+is not an atomic two-file transaction: interruption between renames leaves a pair that
+`simcluster build` rejects before Docker is invoked. The Dockerfile repeats verification
+on its copied files, and build checks the runnable Caddy version inside the target image.
+A failed or interrupted stage requires re-staging before build; do not hand-edit the receipt.
+
+`drills/lib/caddy.sh` configures the baked real Caddy through the production installer's
+`caddy.service` during initial drill setup. The instance CA is reused; inject trust into
+ctl/agents before those processes start. `/sub/*` routes to 8090; the remaining HTTPS/WSS
+traffic routes to NATS WebSocket 8222. `caddy_probe_wss` requires an authenticated request
+through `wss://<broker>:443/nats`; merely active systemd state is insufficient. Control WSS
+and tunnel TLS (`<broker>:7000`) are independent addresses: pass the latter as argument six
+to `agent_provision_yaml`. The helper refuses to replace an existing Python ingress sidecar.
+Fresh nodes use the installer's public `--no-enable`: the broker start command enables
+NATS/broker, while `caddy_start` enables Caddy for the explicit profile. This keeps Caddy
+disabled across reboot in plain/Python-ingress profiles. Existing provisioned nodes are
+not retroactively changed; use fresh isolated containers for these profile checks.
+These helpers do not by themselves constitute an H0 continuity drill: it must keep one
+original external SSH/TCP stream and audit all discovered endpoints before declaring READY.
 
 ## Quickstart
 
@@ -385,6 +427,11 @@ from gotcha ordinals — 12/20/21 off gotcha ids, 13 a run-on).
 | `78-proxy-dial-backoff` | **INCOMPLETE** (g75-g78, N=1 broker + 1 agent + ctl): the **gotcha #78** deploy-tier regression — proxy first-dial exponential backoff + broker read-REGISTER WARN damping + `proxy.participate` opt-out. **Arm A** (GREEN): under a REJECTing tunnel port (`fault_reject_on`), total dial attempts (via the **netfilter packet counter**, not product logs) must fall well below the no-backoff ~39 baseline (≤20) AND show a decreasing per-bucket trend — fault-speed-decoupled (an absolute count would couple to REJECT's fast-fail vs a slow half-open timeout). **Arm B** (GREEN): an operator `proxy off`/`on` mints a new epoch and establishes within 60s — no backoff hangover. **Arm C** (`not_covered` gap): the broker WARN-damping face is NOT deploy-tier-constructable — the `read REGISTER` WARN site is post-TLS (`tls.NewListener`), so a raw junk-TCP storm fails at the handshake and hits the `accept` site, never reaching it (measured WARN delta 0); the half-open TLS-completed-then-EOF shape needs a real TLS middlebox this sim doesn't front. Hermetically covered by `internal/tunnel/register_log_damping_test.go` (per-class damping under interleave, no-recovery-on-unauthorized-line, per-Cap reaffirmation). **Arm D** (GREEN, strongest #78 evidence): `proxy.participate: false` → zero dials across a live repair loop + the __proxy__ allocation freed + `proxy status` shows `opted-out`, then flip back re-enters the pool and serves. Mandate-honest: arm C exposes the constructability limit rather than faking it with a raw-TCP storm that would false-GREEN or false-RED. |
 | `31-node-upgrade-fleet` | **INCOMPLETE** (G-A/S5, N=1 cluster + 2 agents): **#28-FIXED** — configured agent `upgrade.url_allow` is proven to admit the self-hosted artifact, while the negative local-allowlist discriminator remains non-vacuous. The drill covers broker negatives plus the fleet CONTROL surface: ONLINE enumeration, OFFLINE exclusion, dispatch/config-abort, and `--timeout 0` under the upgrade-safety CANARY contract (a canary transient failure aborts with the rest untouched). Single-node success/rollback/`--wait` is owned by drill 33; the remaining nc_gap is only the fleet-wide `--all` fan-out after a committed canary. |
 | `33-node-upgrade-success` | **INCOMPLETE** (S5 follow-up, N=1 cluster + 1 agent container with TWO agent units + ctl, ≈9 min incl. one rigid 120s watchdog window): the REAL `node upgrade` success/rollback/upgrade-domain paths — B: a healthy tether-next artifact under a SYN-only egress block (`fault_synblock_on`, the weak-NAT shape of broker-ops §8.7: established registration lives, the re-exec'd process can never register) → staged line → pending whole-conjunction (marker `boot_count>=1` ∧ dst flip ∧ same MainPID ∧ `/proc/exe`==next) → 120s watchdog rollback whole-conjunction (Detail phrase-pinned to the watchdog leg, `.prev` consumed, running image back to OLD) → heal: product-only re-register at OLD + broker `agent-reported upgrade outcome rolled_back` + delivered marker removed; C (nested in B's window): shared-binary sibling `agt1b` refused `upgrade_in_progress` at the MARKER-gate phrase; A: real success — same PID through THREE execs (`ExecMainStartTimestamp` unchanged) + running-image sha==next + `node ls` RELEASE flip + ctl COMMITTED + marker committed interlock; C2: domain release — the sibling's own upgrade commits (⚠ wholesale-replaces the shared marker; nothing reads agt1's marker after it). nc_gap: gotcha **#73** (a non-tether artifact past the smoke gate has no boot shim — deliberately not staged; it would wedge the node). Plan: `docs/reviews/upgrade-success-drill-plan.md`. |
+| `34-hot-update-process` | **S3 acceptance: GREEN ×7 arms** (observed 2026-10-02, image `4fe3646b…`, `run-drills.sh` -j4: A 63 / G 77 / U 68 / N 72 / P 102 / W 217 / F 81 s, 220 s wall, NO DEVIATIONS; receipts in `docs/reviews/hot-update-evidence.md §14`). N1 per arm: A one same-PID image switch and original ctl rc23; G one producer across tether → tether-next → tether; U product `agentUserUnitBody` rendered with `User=sim` as a SYSTEM unit (does **not** prove `systemctl --user`; 82 U3 owns that gap); N setsid/nohup, nonce pidfile and stable fd2 inode; P calibrated mixed traffic at 10 requests/s, a start handshake and observed cut/activation marks, continuing through activation plus 10 seconds (180-second maximum); successful read/write/short work, ≥9 requests/s and a successful write overlapping the switch are required; refusals outside the cut, refusal side effects and unrequested ledger tokens fail; reliable/legacy exec counts are recorded; W SYN blackhole and watchdog redispatch to the previous image, LOST→RUNNING and EXITED(23); F healthy hangfs mounted before the final setup restart and before business work, then a wedged probe proven by refusal, retained census and agent slog; disk untouched, then healed retry. Child identity, exact output, final process state, image generations, audit counts and FD ownership are independent oracles. Freeze and request latency distributions are recorded calibration. The historical S1 PRODUCT-RED receipt is preserved in expected-verdicts-log §34. No PTY/SSH/transfer/full-stack continuity claim. |
+| `35-hot-update-exec-carrier` | **GREEN ×3 arms** (observed 2026-09-21, first real run, image `ea43e478…`, `run-drills.sh` -j3: A 90 s / B 51 s / C 84 s, pass 29/21/40, NO DEVIATIONS; receipts in `docs/reviews/hot-update-evidence.md §12.2`) (hot-update S1, `docs/reviews/hot-update-reliable-exec-plan.md` §5.2; N=1 + agent + ctl per arm, no upgrade, no artifact server): a reliable `tether exec` survives its CARRIER being replaced under it — **A** nats-server restart then a 25 s nats-server outage (> `redialAfter` 20 s: the agent rebuilds its whole NATS session, asserted from its slog); **B** tether-broker restart (auth_callout black window included; `B-new` records a new exec's rc/path/wall, never judged); **C** the N-1 window against the REAL previous release `vendor/tether-prev` behind a die-gate — C1 the old ctl vs today's agent under the A2 fault (claim: legacy path taken, executed once, discontinuity recorded honestly in `legacy-outcome.json`; a fully continuous old ctl REFUSES the judge; C1 is also the old-binary NEGATIVE control of the A/B oracle), C2 today's ctl vs the old agent (probe reaches it — `unknown forwarded verb` — ctl falls back to legacy after the 2 s tax, run complete). GREEN conjunction (probe.py `carrier`): original child alive under the same PID triple/parent, agent MainPID + ExecMainStartTimestamp unchanged, both transcripts == source, no pipe_error, ctl rc 23 on its own, exactly one `agent: exec … reliable=true` for the nonce, exactly one `ps -a` row EXITED(23), ≥ 20 source records inside every fault window (`carrier.json`). Non-vacuity: `_stream_advancing` gates every injection; the shell gates are proved two-sided in `tests/r9d-nonvacuity.sh`, the judges in the probe selftest. Every log read via `drills/lib/logs.sh`. |
+| `36-hot-update-pty` | **S4：NOT_RUN**，验收目标 36.A/W/C/L 及父 36 全 GREEN（非已跑结果）。每臂 fresh N1、原 ctl 真实 controlling tty + 独立远端 PTY；A 不同 SHA 升级、原长前台双工/resize、strict mixed 10/s（≥9/s）、新 run≤5s、业务停顿≤5s；W 新 KA 收据后 SYN 黑洞、真实 120s watchdog 回 prev，原 handle 与当前 A/Q/output 继续，KA 绝对期限不重授；C server restart+25s outage/session rebuild，并覆盖 leader 退出后 >200ms 尾流和 FIN/canonical/raw；L 真实旧 ctl 的 legacy 会话使升级 legacy_session_busy、盘面不变，新 ctl 对旧端仅 create 前 fallback。逐字 bytes、原 master/fg/child identity、同 agent PID 与 running SHA、marker generation、唯一 spawn/courier exit、原 ctl waitpid rc23、最终 FD/zombie 均独立断言。四日志流经 logs.sh 新鲜完整 cursor；500ms 全冻结窗只校准、保留最大值/超标。Σ declared worst=1380s、串行 ceiling=2760s 是预算算术，actual 成本 NOT_RUN；34 七臂、33 A/C/C2、35 全回归另存同 SHA 收据。 |
+| `39-hot-update-legacy-n1` | **S3 N-1 boundary: X GREEN / Y PRODUCT-RED (owner S8), parent PRODUCT-RED** (observed 2026-10-02, image `4fe3646b…`, -j2: X 64 s / Y 117 s, NO DEVIATIONS; the predicted `idle_timeout_rc70` signature matched verbatim, no re-pin). X GREEN: live reliable task refuses the real previous-release target with `image_abi_unsupported` (64), disk untouched and original ctl rc23. Y PRODUCT-RED: running `vendor/tether-prev` exports via bare exec; dev ctl falls back to legacy, both original pipes EPIPE and ps EXITED(-1). `idle_timeout_rc70` was predicted from the ctl code before the first real run and measured verbatim on it. Parent is the PRODUCT-RED join. Real previous tag/source/SHA/absent ABI die-gate; no fake executable. |
+| `39.P`（`39-hot-update-legacy-n1` 的 S4 新臂） | **S4：NOT_RUN**，目标原生 PRODUCT-RED，不能写 GREEN。真正 `vendor/tether-prev` old exporter + old ctl，有 source/version/SHA die-gate，与 36.A 相同 HUP 敏感原 PTY fixture、升级故障及 continuity judge；故障后 child 可已死，不能用存活 setup 门掩盖缺陷。先证有效供给/故障/可读日志，再以真实产品单一精确签名重钉，不猜 rc70。三层分存：continuity oracle rc=1；native DRILL-VERDICT PRODUCT-RED rc=3、assert_fail=setup_red=not_covered=nc_gap=0；sweep 无 waiver 阻塞，--allow-product-red 只放行 sweep、绝不改 native。39 父按 X/Y/P join 仍 PRODUCT-RED；保留 H0 owner 子串并追加 H1 legacy PTY exporter / S8 legacy-to-capable first migration。三向 selftest 必须证正输入过、旧输入失败、删检查后旧输入错误通过；坏 setup/空窗口/缺 waitpid 不算 PRODUCT-RED。estimate 150s / declared worst 300s，actual NOT_RUN；证据见 hot-update-evidence §15。 |
 | `32-install-lifecycle` | GREEN (G-A/S5, fresh un-provisioned container): install.sh lifecycle — `--dry-run` zero-write (3 roles, md5-stable tree) + never-start invariant (`! pgrep tether`) + `--uninstall` → units gone + reinstall idempotent + ownership (/etc/tether root, nats.d tether) + agent `BIN_DIR=~/.local/bin` (S0-layout, node-upgrade atomic-replace target). + external-review M5: the zero-write oracle is a CONTENT+METADATA manifest (per-file type/mode/**numeric uid/gid**/size/sha256/link-target + symlink own-mode/owner + an other-type catch-all, not just path names — a self-test proves mutating one byte MOVES the digest) + ctl/agent dry-runs run as the SIM user (not root). **round-4 R4-M4 (GREEN, 17 assertions)**: manifest hardened to numeric `%u|%g` + `while IFS= read -r` (embedded-newline paths a noted residual — dash `read` has no `-d ''`) + **fail-CLOSED** (an empty / stat-error / hash-error manifest can no longer certify zero-write — it returns a sentinel that never matches a valid snap) + a **byte-exact self-test restore** (cp -a backup/restore, not a sed line-delete). **REAL agent binary install NOW-COVERED**: a real S0-artifact https tarball → install.sh downloads + verifies the sha + place_binary EXTRACTS + atomic-places the binary at ~/.local/bin/tether; it RUNS + never-starts + uninstall removes it (NOT --skip-download, which skips place_binary). **R5-M4 NOW-COVERED**: (1) the manifest FAILS CLOSED on a partial/permission-failed `find` traversal (MANIFEST-FIND-ERR — the old `find|grep|sort` lost find's rc); (2) ONE combined EXIT trap (the two traps overwrote each other, leaking the artifact container on early failure); (3) REAL **ctl** binary boundary — its OWN place_binary/run/never-start/uninstall (not "same as agent"); (4) **§8.4 single-broker manual upgrade IMPLEMENTED** — a live N=1 broker: stop tether-broker → swap the binary (privileged step) → `sqlite3 PRAGMA integrity_check == ok` (sqlite3 added to the image) → start → G.2 business convergence (the original expose serves the sentinel AGAIN + a NEW post-upgrade expose serves — real read-write) with version-flip ∧ MainPID-changed guards. §8.4 is the OPERATOR manual path (systemctl+install), NOT the #31/#28-blocked `cluster upgrade`/`node upgrade` verbs |
 | `30-rolling-upgrade` | **GREEN-on-mechanism (G-A/S5, N=3 cluster + ctl; G5 #8)** — REWRITTEN R9-D, after the 2026-07-18 full-suite review found this drill's G5 coverage was NET ZERO (H1: a version oracle querying a schema the product never emitted ⇒ permanently empty; H3: a discarded roll rc and a roll.log that never reached the operator). R4 fixed the oracle; R9-D added the mechanism. **OQ-6 supply (`drills/lib/colocated.sh`)**: the sim now provisions a tether AGENT co-located on a broker host, which had never existed, so the whole-host leg was structurally uncoverable and stood as a permanent `not_covered`. All THREE P3 presence states are built in ONE cluster: **(a) DECLARED** (broker.yaml `colocated_agent_nid=colo-<host>`, nid != node_id so `assumed:false` proves the declaration — not the convention — was consumed), **(b) OBSERVED** (nid == node_id, undeclared ⇒ `assumed:true`), **(c) ABSENT** (the leader runs no agent ⇒ its plan step must read `[broker-only]`). **The (b)-state HALT**: the declared agent is STOPPED and the roll must HALT loudly on it (P3: a declared agent stays PRESENT while down) — reproducing `HALTED at <host>: agent re-exec refused: agent_no_responders` verbatim. A roll that SUCCEEDS there is an ASSERT-FAIL: silently skipping a declared-but-down agent is the P3 bug. Because the HALT is aimed at the FIRST hop, the partial state is exactly checkable — **per-hop advance** (only that host's broker moved; the other two untouched; leader-last held on the failure path) and **skew=true** on the half-upgraded host, then skew CLEARED after the repair. **The way out**: a HALT deliberately leaves the roll lock held, so `tether cluster unlock` (R7b; drill-coverage owner R9) is exercised for real — the default clear REFUSES a lease still in the future, `--force` clears AND confirms, and the TERMINAL proof is that the NEXT roll gets past acquire-lock (not the unlock command's own success message). **Mechanism, not just end state**: the roll's own log must show it re-exec'd the OBSERVED host's agent and declared that host `(broker+agent) at <target>`, and must show the repaired host SKIPPED as `already at target` (idempotent resume) — an end-state-only drill would credit `cluster upgrade` for an advance the operator's daemon restart performed. #31 is now PROBED directly (`cluster unlock --grow --dry-run`, zero mutation) BEFORE the roll instead of being inferred from a roll that trips over it: a held marker is a PRODUCT-RED plus tether's own `cluster unlock --grow --force` remedy asserted to confirm the clear; a clean marker is asserted as the KEPT R7a invariant. Retained: privileged staging (labeled, NOT automatic) + `--expect-sha256` anchor + broker-local ctl login + `--account-seed`/`--backup-taken` refuses + ordered-roll dry-run + PID-preserving re-exec + a raft write probe run over BOTH the failed and the completing roll. **Harness bug fixed in the same batch**: the write probe used to run under the ctl's own `$HOME`, and `session create` rewrites that HOME's active-session pointer (session.go:69) — so every session-scoped read after the probe started was answered for an empty throwaway session (`node ls` printed "(no nodes)", the AGENT half of `node ls --brokers` read `?`/skew=false on a genuinely skewed host). The probe now runs in an isolated HOME and the ctl's session pointer is asserted intact. Remaining stated-reason gaps: (b) the 30-C N=2 write-fence NEGATIVE control, (c) a LEADER-hop HALT/resume |
 
@@ -480,6 +527,305 @@ DEGRADED look like #22).
 
 ## NON-GOALS
 
-Single host (cross-process, not cross-host WAN raft); no ACME/Caddy/real domains (plain `nats://` on the
-trusted bridge, route mTLS is real); v2/`main` only; not a load/perf/fuzz tool; Linux/amd64 only; not a
+Single host (cross-process, not cross-host WAN raft); no public ACME/real domains. Existing drills use
+plain `nats://` on the trusted bridge (route mTLS is real); the explicit Caddy profile uses
+real Caddy TLS/WSS with the instance test CA. v2/`main` only; not a load/perf/fuzz tool; Linux/amd64 only; not a
 CI gate and not a substitute for the real multi-host staging drill.
+
+## S5 flow/SS validation contract (historical contract; final receipts linked below)
+
+The [binding S5 plan](../../docs/reviews/hot-update-flow-carrier-plan.md) §9 defines the following
+validation contract; [raw receipt index](../../docs/reviews/hot-update-evidence.md#16-s5-flow-carrier-ss-receipt-index)
+also links the [S5 final receipts](../../docs/reviews/hot-update-evidence.md#17-s5-flow-carrier-ss-最终收尾收据2026-10-11). The following records the original contract, not a new receipt. P24/P25/P27 own probes, scripts,
+supply and verdict/cost registries. Keep this contract distinct from historical drill rows above.
+
+`75-hot-update-flows.sh` has exactly five manifest headers and one top-level ARM dispatch:
+
+```sh
+# arms: A C R B W L
+# fixture: A=N1 C=N3-live R=N1 B=N1 W=N1 L=N1
+# grows: A=0 C=2 R=0 B=0 W=0 L=0
+# worst: A=420 C=600 R=420 B=540 W=660 L=420
+# forgoes: A=- C=- R=- B=- W=- L=-
+```
+
+| Unit | Required native verdict | Nonempty evidence |
+|---|---|---|
+|75.A|GREEN/rc0, nc_gap0|Same original SSH, four duplex TCP, actual EINPROGRESS OPEN, half-close and bob/alice SS cohort through upgrade, in-window alice revoke and forced carrier rebuild;≥20 samples each stage plus10/s new flows.|
+|75.C|GREEN/rc0, nc_gap0|N3-live,32active and declared slow flow; healthy home/epoch/port unchanged, reaper running and SQL/event evidence.|
+|75.R|GREEN/rc0, nc_gap0|PREPARE/final cut/RESUME revoke windows; silent alice terminated by product with originals/dup/public FD/replay retirement, bob survives, fresh AppliedRevision grant.|
+|75.B|GREEN/rc0, nc_gap0|Two real communicable artifacts A→B→A, both commits; B advances offsets/nonces/retirement, two current cuts.|
+|75.W|GREEN/rc0, nc_gap0|First real commit marker filesystem write fails after ready; restore filesystem access, keep NATS and default reaper alive, product120s watchdog takes second current cut.|
+|75.L|GREEN/rc0, nc_gap0|True v0.6.0 broker runs before first business, old /proc exe SHA and empty ALPN/raw first byte; new agent raw interoperability, safe legacy_session_busy75 preserves original business; no continuity claim.|
+|75 parent|GREEN/rc0, nc_gap0|All six children joined natively; never aggregate cohorts from separate phases into75.A.|
+|early-close / wrong-offset|ASSERT-FAIL/rc1 each|Same independent continuity judge; actual early socket close and product A+1 or removed dedupe mutant; A−1 correct overlap is a positive control.|
+|39.F|PRODUCT-RED/rc3|Real v0.6.0 exporter/old business before bare-exec fault, valid_fault1, shared continuity judge rc1, earlyEOF/RST signature, then assert_bug native3; dispatch before common exec-only setup. Safe busy is an ability gap, not this receipt.|
+
+75.W fault setup holds first-register response until candidate boot_count advances, chmods the non-root
+agent binary directory0555 only for the first CreateTemp/rename attempt, observes real commit failure with
+pending/ready/watchdog armed, then restores mode. An ineffective root permission fault or second full-register
+commit is SETUP-RED and must rebuild the fixture. Do not disconnect NATS for120s, pause reaper, or let the
+fixture call resume/rollback on the product's behalf. B and W are separate receipts.
+
+Use independent directional seq/hash ledgers, original kernel/application identities and predeclared final
+sequence/deadline. Judge trailing silence, sticky EOF/RST, original half-close reverse tail and genuine
+short Write0<n<attemptLen; no application reconnect. Normal max stall/new request≤5s is hard, p95 alone
+is insufficient; full required-domain freeze500ms is calibration with all samples/max/excesses retained.
+Source/artifact/running SHA must prove actual exec. Every negative product mutant is restaged with source
+and running SHA; restore and revalidate the final candidate. Legacy fixed v0.6.0/a3431a1 supply and dynamic
+adjacent-release N-1 are separate: record peeled tag commit, flags, checksum and actual broker ExecStart/SHA.
+An old ctl against a new broker cannot sign the old-broker quadrant; TLS/pins remain enforced.
+
+`expected-verdicts.tsv` is exactly six columns: drill, expected, expected_nc_gap, bands, owner, note-ref.
+75/its six children use GREEN,0,-,- and full unit note-ref.39.F uses PRODUCT-RED,0,- and owner
+`hot-update-plan H2 legacy flow exporter; S8 legacy-to-capable first migration`, note-ref
+`39-hot-update-legacy-n1.F`; append that full owner to39's existing parent owner preserving H0/S4 H1.
+Parent verdict=child join, gap=sum, child owner is parent substring. Priority ASSERT-FAIL>SETUP-RED>
+PRODUCT-RED>INCOMPLETE>GREEN; the inherited harness uses native rc1/2/3/4/0. S5 plan §9.4's
+INCOMPLETE75 differs from `lib/assert.sh` and the validator/runner, which plan L15 preserves.
+S6 lead L4 confirms native INCOMPLETE4; safe-busy command75 remains a separate business result.
+Waivers never rewrite native results;
+save subshell rc before pipes/cleanup. Native drill INCOMPLETE4 and a business command's safe-busy75
+are separate fields. Headers/worst/expected are declarations, not actual wall receipts.
+
+On the same final candidate preserve36.A/W/C/L GREEN and39.P PRODUCT-RED,34 seven arms,35 three arms,
+33 A/C/C2 plus its INCOMPLETE boundary;70/72 full verdicts.70 verifies rm immediate reuse separately
+from Stop≤15s refused/restart.72 verifies wrong PSK zero SINKBYTES on allow-private sink, growing and
+silent alice revoke/bob continuity, off OS-listener+allocation retirement and same-port reuse.
+A fixture closing the victim cannot prove product cleanup. Four log streams still use only logs.sh.
+
+Estimates (not measured):75 A/C/R/B/W/L=180/240/180/240/300/150s, total1290s; declared worst3060s.
+Per-arm2×worst ceilings840/1200/840/1080/1320/840s within runner global ceiling.
+39.F estimate180–300s, worst420s; mutants5–10min, S4/exec regression25–40min,70/72≈6min;
+reserve60–90min for serial deploy, failure reconstruction extra. S5 rows in `drill-costs.tsv`
+are explicit estimate / declared / NOT_RUN placeholders for launch ordering; the lead replaces each
+with COMPLETE actual wall/source/date/concurrency/regime; avoid counting parent+arm wall twice. Each raw receipt stores
+source_head/dirty_patch_sha(actual content, including untracked inputs)/build_flags/artifact_sha/running_sha/
+role/command/native_rc/verdict/wall_s/oracle_inputs_sha/evidence_path/status and raw byte/crypto/SQL/FD/budget logs.
+P28 does not edit mechanical verdict/cost ledgers or claim any of these drills ran.
+
+Current deploy prerequisite: `drills/lib/flow.sh` loads the live `flow_fixture` and independent judge.
+The fixture owns original SSH/TCP/SS workloads, sealed client custody, actual barrier observations
+and raw collection. Product Seal attempts/short writes, private flow bindings, domain reservations
+and legacy ALPN/raw-prefix observations still need product owner interfaces. Missing priors return
+native SETUP-RED2; hermetic passes cannot certify deployment continuity.
+The former `tests/flow-fixture-report.md` process report is absent from this tree (NOT_RECORDED);
+use the reviewed [S5 evidence](../../docs/reviews/hot-update-evidence.md#17-s5-flow-carrier-ss-最终收尾收据2026-10-11)
+for scoped final receipts rather than a dead process-file link.
+39.F also requires `FLOW_LEGACY_EXPECTED_LOSS=early_eof` or `reset`, selected only after the
+lead reviews its actual raw historical loss. An unpinned run retains the oracle observation and
+returns SETUP-RED; it cannot manufacture a PRODUCT-RED receipt from an EOF/RST alternation.
+The former `DRILL-PREP-REPORT.md` process report is absent (NOT_RECORDED); current executable
+fixture/driver declarations and their independent NOT_RUN status are documented below.
+
+## S6 broker-image deploy contract (NOT_RUN pending P29/P35)
+
+Use the [frozen plan](../../docs/reviews/hot-update-broker-image-plan.md) §10 and
+[unchecked claim index](../../docs/reviews/hot-update-tasklist.md#s6-broker-image-receipt-boundary).
+The mechanical `hot-update-broker-ledger.tsv` currently records NOT_RUN for every S6 claim; P33 owns its
+updates. Existing fixture scripts and manifest declarations do not prove a product run. P29 owns real live
+fixture/collector and its selftests; do not invent a fixture command until its entry is landed and verified.
+P30 owns deploy arm wiring/native verdict controls. P35 archives final native runs, legacy pin and measured costs.
+
+| Unit | Required native verdict | Independent evidence |
+|---|---|---|
+|37.A|GREEN0|Default single, same broker PID/new running SHA, original SSH/TCP/SS and reliable child; current SQLite ACK prefix/flock/listener continuity.|
+|37.A1|GREEN0|Real sole-voter configuration and production timers; first new write ≤5s, no CodeIsLeader.|
+|37.B|GREEN0|N3 fresh leadership transfer before each cut; explicit broker-only scope leaves real co-located agent PID/SHA unchanged; home/epoch/port/pins and dwell stable.|
+|37.T|GREEN0|S7 capable live transfers migrate in single and N3 lanes, both legs before default reaper; nonempty original ID/version/PID/OFD, postcut progress and exact history. Independent legacy/unknown responsibility still safely defers.|
+|37.R|GREEN0|Valid candidate reaches partial Take with complete salvage, then separate ACTIVE new ACK/offset state takes generation+1 current cut to previous reader.|
+|37 parent|GREEN0|All five native child receipts on one candidate/run; no translated expected-red success.|
+|39.BR|PRODUCT-RED3|Genuine previous-release N3 broker Run-unwind; peeled tag/source/binary/running SHA, capability and valid original cohort; independent first-run loss signature signed by lead.|
+
+Originals must survive without application reconnect, target Accept=1 and exact directional bytes/EOF;
+include real pending OPEN, slow/half-close tail and independent SS nonce oracle. Every10/s scheduled request
+slot and attempt, CONNECT versus request failure, true PID start/effects and trailing silence is retained.
+Measure actual auth-callout blackout from usable-to-usable, not Flush/log timestamps. Retain unchanged external
+JS object/chunk/config/consumer/audit witnesses. Do not pause reaper, pre-authenticate away the window,
+reset JS or start a second NATS server. A capable T preflight refusal leaves S7 coverage incomplete. R refusal at preflight does not sign its downstream branches.
+
+Normal flow/control/write max≤5s is hard; full required-domain freeze500ms is calibration with all
+samples/max/excesses. INCOMPLETE4, ASSERT-FAIL1, SETUP-RED2, PRODUCT-RED3 and GREEN0 remain native;
+retryable business refusal75 is separate. Preserve39 X/Y/P/F owners and verdicts when appending BR.
+Declared worst/estimate values are not measured wall; S6 package/lead gate history is in evidence §18, while S6 deploy drills remain NOT_RUN. S7/S8/S9/S10
+final evidence and ENDPOINT-RESUME carry reconciliation remain unsigned until reviewed. Historical red
+receipts are preserved; administrative stage closure is not a deployment pass.
+
+## S7 transfer-continuation driver (NOT_RUN)
+
+The frozen [S7 plan](../../docs/reviews/hot-update-transfer-continuation-plan.md)
+§10 owns the acceptance profile. `63-hot-update-transfer` has exactly eleven
+positive arms: A A1 B C1 C2 C3 R1 R2 X W1 W2. R1 is pristine and R2 is ACTIVE
+current-state rollback. `64-hot-update-transfer-controls` has23 independent arms:
+M01 M02 M03 M04 M05 M06 M07 M08A M08B M08C M09 M10A M10B M11A M11B M11C
+M12A M12B M12C M13A M13B M13C M14. Each arm is a fresh launch unit. Existing
+`run-drills.sh` arm splitting and missing-child checks own the parents; the driver
+never serializes all arms into one2700s launch. The positive parent requires every
+child GREEN0; the control parent preserves the children's native ASSERT-FAIL1.
+
+| Unit | Frozen coverage | Estimate / declared worst / runner ceiling |
+|---|---|---|
+|63.A / A1 / B|Four independent sessions/buckets/installations; both legs, agent A→B, broker A→B, agent and broker current-state B→A; N3 has three individually witnessed hops.|600 /650 /750s estimates;1200s worst each;2400s ceiling|
+|63.C1 / C2 / C3|Distinct carrier replacement / transfer data connection rebuild / same-binary same-store JS restart; all four cohorts both legs have pending Publish/Get.|570s each estimate;1000s worst;2000s ceiling|
+|63.R1 / R2|Tier A/B × push/pull × agent/broker NewStore/broker NewControl import failures; ACTIVE requires new progress before current cut.|650s each estimate;1200s worst;2400s ceiling|
+|63.X|Independent Ctrl-C/session-rm victims before reserve; four successful survivors have separate sessions/buckets. No-force-existing refusal is independent.|580s estimate;1100s worst;2200s ceiling|
+|63.W1 / W2|One real120s outage per original call: W1 leg1 pull sender, W2 leg2 push receiver; actual byte attachment stalled, original budget and automatic current cut.|450s each estimate;1100s worst;2200s ceiling|
+|64,23 children|Exact SHA-bound production predicate patches; M08=3, M10=2, M11/M12/M13=3 each; original native judge kills each independently.|About5000s total estimate;900s worst per child;1800s ceiling|
+|61 /37.T /39.BR|All41 transfer edge assertions, unlimited baseline and TTL List; T single/N3 capable live cut with legacy/unknown safe defer; independent reviewed old N3 native PRODUCT-RED3.|Original budgets;37.T now1200s worst;2400s ceiling|
+
+All durations above are ESTIMATE / NOT_MEASURED. About13170s serial marginal
+cost, two lanes and grow concurrency1, with shared builds/install serialized;
+allow2–3h plus original regressions/gates. P37 records actual per-launch wall,
+direct poll wait, baseline versus marginal, peak FD/RSS/JSbytes. A runner timeout
+without drill_end is INFRA-ABORT. It cannot be renamed INCOMPLETE by cleanup.
+
+The four labels are `small-push`, `small-pull`, `large-push`, `large-pull`.
+Small is66,549,440B at256KiB/s; large is1GiB at4MiB/s. W predeclares1MiB/s and
+8MiB/s respectively, with only one120s outage per invocation. Production budgets
+remain568s small /1084s large in the baseline and300s small /1084s large for W.
+The large4MiB/s profile does not change the product budget's2MiB/s effective-rate
+cap. Each leg cuts agent by30s, broker by110s, rollback by190s relative to its first
+durable receipt. Sender needs0<acked bytes<size; receiver needs0<Sync bytes<size.
+Prepared/courier responsibility is counted separately. Healthy progress is10s,
+control slots10/s with5s logical budget, maintenance8s, watchdog120s, default
+reaper. Rate/IDs/deadlines never change after the manifest is sealed.
+
+Driver prerequisites and handoff to P29/P32 (currently NOT_RUN):
+
+- `TRANSFER_DEPLOYMENT_MANIFEST` is a read-only JSON deployment description.
+  `cohorts` are ordered by the four labels, with `sid,bucket,nid,agent_node`,
+  isolated absolute `binary_path,home,source,destination`, `verb,size,sha256`,
+  `rate_limit_bps,force`. SID/bucket/NID and agent installation pairs are unique.
+  Force/no-force both occur in each direction. `transport` is `caddy-wss`.
+  `artifacts.A/B` carry absolute prebuilt `binary`, HTTPS `url`, `sha256`, `version`;
+  both are real capable images with distinct SHA and `transfer_version=transfer-v1`. `brokers` carry `node,socket`.
+  R artifacts are additionally keyed by the exact schedule cell ID; P32 provides
+  actual import-barrier builds, including separate NewStore and NewControl cells.
+  X has separate `victims` with `kind,sid,bucket`. T also requires separate
+  `refusal_lanes` ordered legacy/unknown, each with `kind,node,socket,artifact_key,reason`;
+  P29/P32 supplies real retained legacy and unknown-census windows. The driver
+  issues reload itself, requires native75, and the fixture checks unchanged
+  running identity and zero cut effects before those original responsibilities retire. P29 must check live isolation,
+  source hashes, original images and zero business side effects before start.
+  `fixture` contains the observation owner's schema=1 live manifest: `processes`,
+  `transfers`, `cuts`, `nats`, and `control.logical_ids`. Each transfer supplies
+  its original transfer ID/nonce/object version, canonical start/terminal bytes,
+  streams/subjects, custody producer/receipt and required OFD schedule. Its
+  session, bucket, target, size, hash and rate must match its driver cohort.
+  Agent home/binary pairs must match the four installations. These inputs are
+  required; the driver cannot infer canonical product identities from node IDs.
+  Existing flat deployment manifests may supply these fixture fields at the
+  top level with `mode=live`; the projection removes driver-only fields and
+  restores schema=1 after the planning manifest replaces its schema.
+- `TRANSFER_PROCESS_SUPERVISOR` is FIX-ORPHAN's absolute shared executable,
+  called as `--log PATH --receipt PATH -- ARGV...`. It preserves native status
+  and owns descendants through timeout/panic/SIGKILL. Missing helper is SETUP2;
+  this driver has no private Pdeathsig implementation.
+  The in-repo Go launcher now implements these flags: it tees inherited stdout
+  and stderr to the log and writes the final decimal status after descendant
+  cleanup. `SIM_UPGRADE_SUPERVISOR` is also accepted as the shared launcher.
+- The fixture's frozen CLI remains `transfer_fixture.py
+  start|sample|drain|judge|stop --manifest PATH --evidence DIR`. It launches the
+  keeper in the foreground and returns a flushed startup custody receipt while
+  serving its control socket. The driver retains its supervisor until stop and
+  joins it on failure too. Product custody/launch integration supplies original
+  CLI push/pull using existing positional arguments plus the predeclared
+  `--rate-limit`; every original PID/ID must be retained. The driver only
+  invokes node upgrade, broker reload and cluster broker-only upgrade itself.
+  The fixture cannot issue upgrades, change product ledgers or resume for ctl.
+- `manifest.json` is the generated `transfer-driver-v1` profile. P29 sample writes
+  `sample.json`, bound by `manifest_sha=SHA256(sorted-key JSON without newline)`,
+  with positive `sequence` and `windows[requested-step]` (the step ID is in the
+  evidence file `requested-step`). Each ordered window records label, leg,
+  ready, elapsed_s, role, complete=false and durable_bytes/size or positive
+  pending_responsibilities. Expired windows set `window_expired=true`. Sample
+  remains read-only. Connection fault mapping is `connections.carrier/data`
+  arrays of node/peer/port; the native judge independently verifies all affected
+  attachments, connection/server/stream identities and postfault progress.
+  W records watchdog current_cut_observed/elapsed_s/pending_data before release;
+  X records original cancel ctl_pid. P29 owns schema/events/poison/OFD and all
+  target completeness, history, resource and end-of-run oracles.
+  `drills/lib/transfer_fixture_manifest.py` projects `fixture-manifest.json`
+  using the frozen schema=1 reader after control artifact binding. Only this
+  manifest is passed to all five fixture verbs. The driver planning manifest
+  remains the scheduler's input. Hermetic real-start controls are part of
+  `tests/transfer-fixture-selftest.sh`; they exercise the actual keeper and Go
+  launcher against loopback protocol peers, without product/deploy claims.
+- Drain joins every courier/finalizer/watchdog and retirement/consumer owner,
+  gets fresh ACK plus JS scan, waits predeclared quiet>=2s, repeats fresh ACK/scan.
+  The original judge log and rc are saved before stop or EXIT cleanup. Missing
+  custody/ACK/channel tail is SETUP2; early finish/missed matrix is INCOMPLETE4.
+
+Production patch handoff: `TRANSFER_MUTATION_PATCHES/<arm>.json` uses schema
+`transfer-production-patch-v1`, exact `mutation_id`, catalog `defect,roles`, and
+nonempty `changes` with production `path,source_sha256,function,before,after`.
+The path must belong to that mutation's data owner; tests, contracts, stubs,
+source drift, ambiguous needles and comment-only patches are rejected. Exact
+owner patches are required after those implementations land. Missing patches
+never build a synthetic "mutant". Existing GOFLAGS overlays are merged without
+collisions and the new overlay is exported to all nested builds before business.
+Each control builds two real capable images from the same production patch:
+A with trimpath and B with trimpath=false, retaining distinct artifact SHA.
+The deployment predeclares `mutation_artifact_urls.A/B` HTTPS URLs; before start
+the driver binds the built binaries and hashes into the manifest. P29 stages
+these URLs and launches the affected original roles from the patched artifacts.
+This keeps ctl mutations on the original invocation and import mutations in the
+candidate across cuts. No build runs while business is active.
+P29 archives `mutation-runtime.json` with build_selector and actual role PID/
+process_start/boot_id/artifact_sha/running_sha, plus `mutation-witness.json` with
+mutation_id, exercised criterion, native_rc, raw_path/raw_sha,
+oracle_input_path/oracle_input_sha and reader_digest. M02/M12B additionally
+record default_dedup_ns=120000000000 and actual elapsed_s>=125. These bind the real source
+patch to actual running bytes and the original judge inputs. Only exercised
+native1 emits `control-receipt.json`; setup/compile/incomplete red never kills.
+The runner marks a 64 control as DEVIATION when setup_red is nonzero or its
+receipt is missing/invalid. A matching ASSERT-FAIL enum alone is insufficient:
+the receipt must reconstruct the source/build/runtime/witness chain in this
+invocation's announced evidence directory. Expected red still remains a blocker.
+
+Hermetic driver validation uses the source-only T43/T44 architecture tests and
+`python3 -I -B drills/lib/transfer_mutations.py selftest`. These prove contract
+and parser controls; they provide no live acceptance receipt. Live exits await
+P29/P32/P33 product/fixture integration, P34/P35 inventories and P37's same-candidate
+native runs. No receipt or cost in this section is claimed measured.
+
+| Ledger scope | Registered arms and source | Evidence and cost status |
+|---|---|---|
+| S8 transaction / rollback | `38-hot-update-rollback-compat`: 71 child IDs from `drills/lib/upgrade_tx_arms.tsv`; 50 positive cases and 21 independent mutation arms. `tests/drill38-contract-test.sh` is in the hermetic runner. | Declared / NOT_RUN; shell `ASSERT-FAIL` and S8 receipt `ASSERT-RED` both mean native rc1. Per-child declared worst is a conservative launch estimate, NOT_MEASURED; no parent launch cost. |
+| S8 compatibility / historical boundaries | `39-hot-update-legacy-n1`: X/Y/P/F/BR retained, all 56 landed S8 additions plus NI/CI; `tests/drill39-contract-test.sh`. 31/33 V1 retains every historical assertion; V2 uses `tests/upgrade-regression-test.sh`. | New cells declared / NOT_RUN. Existing 39 Y/P/F/BR PRODUCT-RED and parent ownership retained. Historical V1 costs retain their original measured samples; new cells use estimates only. |
+| S9 infrastructure | `85-hot-update-nats`: A/A1/B/D/Q/L/S/J/F; `86-hot-update-caddy`: R/B/I/H/C/K/F/U; independent 39 NI/CI capability refusals. Source: both drivers and `hot-update-infra-ledger.tsv`. | 21 declared claims / NOT_RUN; native rc, candidate/artifact/running SHA, raw oracle and marginal wall remain unset. Child costs are launch estimates from actual worst headers, never measured marginal costs. |
+| S10 positive acceptance | `99-hot-update-fullstack`: C1/C3 calibration; A/B full rollout; S1/S3/F1/F3 prefix; K fixed-survivor soak. Sources: `drills/lib/fullstack_manifest.json`, `drills/lib/fullstack_fixture.py`, `test/fullstackharness/fixture.go`. | Nine children declared / NOT_RUN. C1/C3 estimates 2200s, A/B 4800s, S1/S3/F1/F3 2000s, K 1500s; exact frozen worst/ceiling map remains in the manifest. Same-candidate quiet/default/live-grow regimes, no retry or attribution, original cohorts and native child Join required. |
+| S10 independent controls | `100-hot-update-fullstack-controls`: M01A/M01B; M02E/M02P/M02F/M02X; M03E/M03P/M03F/M03X; M04A/M04B/M04P; M05E/M05P/M05X/M05R; M06A/M06B/M06R/M06F; M07A/M07B/M07N/M07C; M08E/M08P/M08A/M08B/M08D/M08X/M08C/M08O; M09A/M09B; M10S/M10C; M11W/M11I/M11O/M11P/M11Q/M11F/M11S/M11X/M11D/M11C/M11L/M11U/M11K. Source: `drills/lib/fullstack_mutations.json` and `hot-update-fullstack-ledger.tsv`. | 50 exact keys / 77 topology cells / NOT_RUN. Independent baseline0→mutant1→restore0 archives, exact nonempty hit windows and P05 original supervised waiter required. Estimated worst600s/ceiling1200s per child; controls stay outside 99. |
+| S10 supply / provisioning intake | P10 `lib/fullstack-artifacts-test.py`: `FullstackArtifactSupplyTest` (19 hermetic tests in its package receipt); P11 `drills/lib/fullstack_provision_test.py`: `FullstackProvisionTest`; four runtimes a0/a1/a2/a3 retain s10-small-push/s10-small-pull/s10-large-push/s10-large-pull. Both selftests are registered in the fullstack wrapper. | Package selftest receipts are hermetic-only. Full source→COPY→product-stage→executing evidence, real provisioning and live acceptance remain NOT_RUN; these rows certify no deployed generation. |
+
+Documentation status is separate from live execution: the integrated tree contains S8 transaction and
+S9 infra CLI/routes plus S10 fixture/observer declarations; 38/39/85/86/99/100 live runs, three hard gates
+on the final candidate and Darwin native remain NOT_RUN/PENDING. S9 P39 supplies final infra receipts;
+S10 P34/P35 supplies leaf coverage, carry closure and final candidate validation. No S10 A–H total is
+signed here. S9 hot support remains linux/amd64 + systemd/pidfd/cgroup/nft, with explicit before-effect
+unsupported/defer boundaries. Package workers use bounded hermetic/source checks; lead reports cost
+before full default/live-grow runs and never overlaps deploy drills with go test.
+
+The S10 declaration crosscheck runs through `tests/ledger-crosscheck.sh` and
+`test/architecture/fullstack_drill_ledger_test.go`. The launch catalog in
+`hot-update-fullstack-ledger.tsv` enumerates every on-disk launch unit for
+`default` and `live-grow`, plus nine quiet 99 arms and fifty control 100 arms.
+Parents only join children and have no launch cost. Each control row names its
+exact applicable topology set; all 77 per-topology native chains remain separate
+in the preceding mutation table. Neither this catalog nor a matching expected
+verdict certifies a live run. Upstream artifact/cell provenance remains pending
+its manifest owner and S10/P27; S10/P19/P20/P26/P32/P35 own the final S10 launch
+profile, assembly and execution receipts.
+
+`drill-costs.tsv` is functional input. The frozen S10 plan section 9.2 estimates
+180s per control child, worst 600s and ceiling 1200s; this replaces the earlier
+conservative 600s launch estimate before candidate sealing. Nine positive arms
+sum to 23500s and fifty controls to 9000s. These are estimates, NOT_MEASURED and
+NOT_RUN, and do not include builds, gates, platform checks or fuzz overhead.
+Changing costs, expected verdicts, topology sets, schedules or ceilings requires
+a candidate re-seal and scheduling review. Such edits are outside the receipt
+whitelist. S10/P35 may populate independent measured results only after retaining
+the original candidate, native rc, raw evidence and resource peaks; missing live
+evidence stays NOT_RUN. Full-directory totals await that intake, and historical
+samples never sign the current candidate. No deployment run is launched by this
+crosscheck.

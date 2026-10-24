@@ -17,6 +17,7 @@ import (
 	"database/sql"
 	"github.com/LinZiyang666/tether/internal/session"
 	"log/slog"
+	"sync"
 	"testing"
 	"time"
 
@@ -69,7 +70,9 @@ type brokerOpts func(*broker.Config)
 // Use startJSBroker when JetStream is required.
 func startBroker(t *testing.T, url string, db *sql.DB, opts ...brokerOpts) func() {
 	t.Helper()
+	ready := make(chan struct{})
 	cfg := broker.Config{
+		ReadyCh:                  ready,
 		NATSURL:                  url,
 		DB:                       db,
 		Logger:                   silentLog(),
@@ -90,24 +93,35 @@ func startBroker(t *testing.T, url string, db *sql.DB, opts ...brokerOpts) func(
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
-	go func() { done <- b.Run(ctx) }()
+	go func() { done <- b.Run(ctx); close(done) }()
 	testharness.WaitConnect(t, url, 3*time.Second)
 	// Subscriptions install synchronously inside Run() before the
 	// connect loop returns, but the audit/reconciler tickers race
 	// the first probe. A 50ms slack lets the goroutines settle —
 	// shorter than the per-phase suites' 150ms because we don't
 	// run JS by default.
-	time.Sleep(50 * time.Millisecond)
-	return func() {
+	// A connected NATS server and that historical slack do not prove the
+	// broker's own subscriptions finished. Join the actual readiness barrier.
+	// origin: S7 internal review MAKETEST-TRANSFER F5; S7 plan §6.1 / S8 §4.2
+	stop := sync.OnceFunc(func() {
 		cancel()
 		select {
 		case <-done:
 		case <-time.After(2 * time.Second):
 			t.Fatal("broker did not exit")
 		}
+	})
+	t.Cleanup(stop)
+	select {
+	case <-ready:
+	case err := <-done:
+		t.Fatalf("broker startup failed: %v", err)
+	case <-time.After(3 * time.Second):
+		t.Fatal("broker did not become ready")
 	}
+	return stop
 }
 
 // startAgent boots an in-process agent for (sid, nid) and waits for
