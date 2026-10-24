@@ -57,6 +57,201 @@
 落地当天就已经不对）。每次给某条装上门，来这里改一行——一条"已有闸门"的规范如果表里写着靠人读，读者会以为它没人守；
 反过来，2026-09-01 内审发现 T3 与 T6 的门都已落地而这张表还写着「靠人读」（L5-F3 / L6-F6），是同一个错误的另一面。
 
+### 0.4 真二进制层（`test/cli_e2e/realstack_harness_test.go`，hot-update S1/S3/S4）
+
+**Release-mode timing budgets (S10 lead decision D-A, 2026-10-22).** The 500 ms agent freeze,
+≤5 s sole-voter reload/first durable write, 30 s Tier-A transfer and 10 s T46 durable-progress
+budgets are production SLOs. Build both measured images with the shared cached
+`testharness.BuildReleaseCandidate`: `CGO_ENABLED=0`, `-trimpath`, release `-s -w -X ...ReleaseVersion=...`
+flags and no `-race`; retain inherited mutation/observer overlays. The harness may run under
+`-race`. Run the same functional assertions against race candidates separately, without an SLO
+verdict. Budget receipts identify the measured executable SHA, toolchain, race/CGO settings,
+duration and unchanged limit. `CheckReleaseBudget` must reject an actual race-built candidate,
+even with an in-budget duration. Go omits linker flags from build info with `-trimpath`; the
+shared builder fixes those flags and the receipt records the executable's available metadata.
+A release-mode miss requires a product fix and regression/mutation evidence. T46 push
+prepare-accepted remains `not_covered` only when its release receipt proves the 10 s miss is
+upload-bound; eventual success cannot replace the cut-anchored durable Sync deadline.
+
+
+L3 里有一个子形态，谓词是「**被测的 ctl 与 agent 是编译出的 `tether` 二进制的真进程**」，而不是同进程里的
+`agent.New`/CLI helper。它守的是进程内集成结构上看不见的东西：真 ctl 的退出码与 stderr 文案、真 agent 子进程的
+5 s 心跳与 broker 默认 `StaleAfter`/`OfflineAfter` 的交互、NATS 连接被掀掉时两个真客户端各自的重连与续接。
+写它有五条不能违反的纪律，每条都来自 S1 落地时踩到的一次假绿/假红：
+
+1. **匿名模式必须 `opts.AlwaysEnableNonce = true`**（嵌入 nats-server）。否则带 nkey 的真 ctl 得到 `nkeys not
+   supported`；而**用 `TETHER_DEV_NO_AUTH` 绕过**会让 `tether exec` 的可靠路径静默退化成 legacy——整个套件仍然全绿，
+   守的却是另一条路径。这是本 harness 最重要的一行。callout 模式照抄 `test/p3` 的 Nkeys+AuthCallout 形状。
+2. **broker 保留产品默认 `StaleAfter`/`OfflineAfter`（5 s / 60 s）**。进程内套件常用 300 ms / 900 ms 让测试快，
+   但真 agent 子进程 5 s 一次心跳，任何 > 0.9 s 的 bounce 都会被判 OFFLINE——那是 harness 制造的 `node_offline`，
+   不是产品的。
+3. **故障注入只切 TCP，不伪造字节**。匹配请求的 PUB/HPUB 帧转发前，relay（`natsrelay_test.go`）先封住
+   对应 server→client 回包方向并给出已封闭收据，再完整转发请求、断链。必须另观察首次副作用已经发生，
+   同时证明该 reply 未交付；仅「forward 后立刻 close」有竞态，不能推出回复必丢。重试用原 handle/操作序号，
+   create/input/resize/signal/KA/hangup/terminal-ack 各自有外部收据。要模拟 server/broker 重启就真重启，不能伪造回复。
+4. **每条用例自带非空性断言**：agent 日志 `agent: exec … reliable=true` 恰 1 行（走了可靠路径且只执行一次），
+   或观察订阅计数 `process-resume` create ≥ 1 且 `exec.req.forwarded` == 0。一条在 legacy 上跑绿的「续接」测试
+   什么都没证明。
+5. **Linux-only（`//go:build linux`）**，且进 `-race` 矩阵（`TestReliableExecMatrix`），不进 `make test` 之外的任何
+   串行路径。Darwin 上它不编译、不计数——`test/README.md` 的表里写明。
+
+前一发布的真二进制（N-1 象限里旧 ctl / 旧 agent 那两格）**不在** `go test` 里构建：hermetic 用旧方的**订阅面**代替旧方
+本身——旧 agent 是 `legacyAgentSim`（只答 `exec`、对 `process-resume` 静默），旧 broker 是 server 端 deny 掉今天 broker 的
+`process-resume.req` 订阅（`newRealStackLegacyBroker`：v0.6.0 broker 本就没有这条订阅，ctl 得到的是 server 自己的 503；
+注入自证读 server 的连接表，不读假设）；真 v(N-1) 二进制由 `test/simcluster/lib/stage.sh` 的 `vendor/tether-prev`
+供给（从前一 `v*` tag 的源码在 detached worktree 里构建，`tether-prev-source.json` 为收据，构建失败 fail-closed；
+`tests/prev-supply-test.sh` 守它），只被 deploy-tier drill 使用。
+
+S3 在 `test/cli_e2e/node_upgrade_image_test.go` 沿用 realStack（Linux-only，真 ctl/agent；当前进程统一经共享
+subreaper/CLOEXEC lease/pidfd supervisor，Setpgid 只作补充），验证 `node upgrade` 真实替换运行映像。以下四条是
+[S3 plan §7 T16](reviews/hot-update-agent-bootstrap-plan.md) 明列、由 **S3 交付**的测试承诺，
+不是本段声称当前候选已跑绿的收据；S3 历史 deploy-tier 结果见 evidence §14：
+
+| 测试 | 必须观察的结果 |
+|---|---|
+| `TestNodeUpgradeCarriesLiveExecAcrossExec` | agent 同 PID、`/proc/<pid>/exe` SHA 改变；原 child 身份不变、producer 字节连续、原 ctl rc 23；marker committed/generation/resource_phase=active/imported_resources=1/freeze_window_ms>0；`image activated` 恰一行；无残留 handoff memfd、稳态 fd≥3 全 CLOEXEC |
+| `TestNodeUpgradeGenerationChainKeepsLiveExec` | gen1→gen2→gen1 的真实运行 SHA 序列、generation 1→2；同一 child 跨两跳，流与终态仍精确；每代一个冻结窗样本 |
+| `TestNodeUpgradeDefersOnBusyResource` | 开 legacy PTY 时 rc 75，文本含 `upgrade_deferred` 与 `legacy_session_busy`；无 marker、磁盘不变、业务继续；可靠 PTY 则由 S4 的 image/升级用例证明可交接 |
+| `TestNodeUpgradeRefusesLegacyCandidateWithLiveTasks` | fake candidate 的 `version` 没有 ABI 行，活任务在场时 rc 64 `image_abi_unsupported`；无 marker、磁盘不变、child 继续；这个 fixture 只证明 ABI 拒绝，不冒充真 N-1 binary |
+
+候选由 `httptest` 明文 loopback 提供，agent 显式传 `--upgrade-url-allow http://127.0.0.1:` 前缀；
+gen2 用同源码 `-ldflags` 变体或尾部附加字节的副本，**SHA 必须不同**，`version` 末行仍为 `image-abi v1`。
+不能用 fake execFn 或直接调用 `agent.New` 代替这层。真 binary 由 harness 嵌套 `go build` 产出：
+生产变异用 `GOFLAGS=-overlay=<json>` 传到整棵构建图，单独给外层 `go test -overlay` 不会自动改变内层构建。
+至少注入 New 忽略携带映像而初始化空 runtime、Run 在 Thaw 前 register、删除 ABI 门三种缺陷，确认各自红；
+冻结窗保留 `freeze_window_ms/shim_ms/import_ms` 原始样本；D-A 规定 release candidate 超过 500 ms 必须失败，race candidate 只记录功能样本，不提高 `upgradebudget.LocalFreezeWindow`。
+
+**激活日志的跨语言契约**（origin: hot-update S3 plan §3.2 / §8.2；DR-1）：
+`cmd/tether/agent_log_format_test.go` 的 `TestAgentLogFormatMatchesActivationRecords` 使用真实 `newLoggerTo`，
+以固定时钟分别渲染 text/JSON **完整 slog record**，与
+`test/simcluster/tests/testdata/agent-activation-records.txt` 的两行 golden 逐字比较，并钉住生产 activation emitter。
+Python 的 `test/simcluster/tests/hot-update-process-probe-test.py` 消费同一 golden，经真实 CLI judge 验证。
+改 emitter、logger 格式或解析器时须核对两侧；不能拿去掉 record 包装的裸 message 证明解析成功，
+也不能修改 golden 掩盖回归。缺字段、重复字段/record、非整数/非正数及裸 message 的负控制都须拒绝。
+
+**混合探针按观测窗判定**（origin: hot-update S3 plan §8.1 / §8.2；DR-4/DR-5/DRILLS-V1）：
+升级窗口使用新日志 cursor 后**实际观察到的** `agent: image cut` 与 `agent: image activated`，
+由探针自己的单调时钟记 `cut` / `activated` marks；不是用启动 upgrade 命令或预计下载耗时安排 marks。
+先拿 `started.json` 握手再升级，持续发请求直到观察到 activated 加 tail；到 max-duration 仍缺 mark 必须失败。
+日志轮询到达时刻是观测端点，不冒称它与进程内部 Freeze/Thaw 时间戳完全重合。
+P0 校准不能替 P1 证明负载：P1 本身须达到配置速率的 90%，read/write/short 各有成功样本，
+并至少有一个 **rc 0 且 ledger 确有副作用的 write，其请求区间与 `[cut, activated]` 相交**。
+`agent_upgrading` 只允许请求开始于该窗内且无副作用；重复副作用、rc 0 无副作用、非零 rc 有副作用、
+ledger 中无对应已发 write token 的副作用都拒绝。样本必须完整、已 reap，skipped 不能算请求；
+保留 reliable/legacy 路径计数。缺少实际窗口内成功写、全部 exec 被拒、升级发生在流量结束后等反例必须变红。
+这些是 hermetic oracle 与 S3 drill 的编写规则；S3 历史实跑见 evidence §14，当前候选仍须独立回归。
+
+**S4 双 PTY 与真实 syscall 收据**（origin: hot-update S4 plan §8 / §9，lead L5/L6）：
+`test/cli_e2e/run_reliable_test.go` 使用两个独立 PTY：本地 ctl 自己 setsid 并成功取得真实 controlling tty，
+远端业务使用原 kernel PTY。TIOCSCTTY 失败是 setup failure，不能忽略；本地允许测试 slave keeper，
+远端禁止额外 slave keeper。ctl 的退出必须由**原进程 waitpid**证明，不能等本地 master EOF 或开一个新 run 顶替。
+原 foreground/job 的 boot/PID/ticks/nonce、master index/mount、agent 同 PID 与 running SHA 是各自独立的身份收据。
+raw 双向 bytes 比较保留原顺序、次数及首尾，不过滤 CR/LF、不用源 ledger 拼回收到的输出。
+T35 的 upgrade/rollback、T36 丢回复和 T37 settlement 均须证明 reliable 路径及唯一 spawn；
+resize 去重测试在首次 resize 后由对端主动改变尺寸，signal 先获处理 handshake，不能用天然幂等掩盖重复副作用。
+
+T04 的 blocked raw slave 必须实际不读；记录一次真实 master.Write 的 attemptLen、n、error、调用序，
+断言 `0<n<attemptLen`，冻结 Applied 恰为 n，跨**同 PID exec**后 suffix 无重无丢。
+只有 `0<A<Q`、构造短写返回值或检查 SetDeadline 返回 nil 都不是短 syscall 非空收据。
+T03 要在 resize 前后实际堵塞读/写并证 deadline 唤醒；T02 要证明 leader 为 zombie、ReapHeld，
+后代超过旧 200 ms 再写尾流；不能用 leader 活着的用例代替尾流窗口。
+真 binary 内层 build 沿用 GOFLAGS overlay 传播与 race 插桩收据，外层 `go test -overlay` 不能代表生产变异已加载。
+
+可靠 stdio 的测试按 lead L5 覆盖 TTY/FIFO 独立 OFD、regular file 与 `/dev/null` 成功，socket 在 create 前提示回落，
+不以 64 拒绝文件重定向。EOF/实际 0x04/raw 0x03/外部 SIGINT/SIGTERM/显式 signal 分开，取消后 join、恢复 termios/原 FD flags。
+Darwin `TestLegacyRunDarwinTerminalLifecycle` 为 darwin-tag 真 legacy 测试；cross-build/vet-tags/unsupported twin 可编译
+与实际 Darwin run/resize/cancel 分列，无 runner 写 NOT_RUN「未在 Darwin 实跑」，不阻塞 S4 出口。
+
+**五轮资源锚点**：ptysession、terminalio 和直接 import pty 的新宿主，在 Test body **直接**调用
+`testharness.AssertNoGoroutineLeak/AssertNoFDLeak`，每个 assertion site 登记 `leakExerciseAnchors`，
+实际 exercise≥5 轮且每轮有 spawn/I/O/cut/import/失败回收等所声明活动。空循环、死 helper 或循环外唯一 spawn 不算五轮。
+T18/T34/T43 的泄漏变异须分别留下 master dup、pump 或 replay/pidfd 责任并击红；不能靠 trap kill 做出产品清场。
+在 owner 仍活时按 FD 类别与 identity 验保留/释放阶段，settle 后本 task 归零；总 FD 相等不能掩盖提前关闭业务。
+ptysession 整包 `-race -count=3`，其它风险包按整包 race 矩阵覆盖；命名筛选不冒称整包 race。
+
+### 0.5 同 PID exec harness（`internal/execsession/runtime_image_exec_test.go`、`internal/agentimage/bundle_exec_test.go`，hot-update S2）
+
+谓词是「**同一个 PID 把自己 exec 成新映像，原 child / pipe / memfd 由内核原样持有**」。一个测试函数扮三个角色
+（父进程 / helper 的 before 半 / helper 的 after 半），形状固定，每条都是一次假绿或死锁换来的：
+
+1. **一个测试函数 + mode env + 精确 `-test.run=^Name$ -test.count=1`**；helper 内**只** `handoff.Prepared.Exec`，不二次
+   fork（`spawnexec` 的 init 分派与本 harness 的 mode 键不冲突——它们各自的键集专属，且 helper 是 `os.Args[0]` 同一二进制）。
+2. **环境双向剥离**：helper 环境 = `handoff.CleanEnvironment(os.Environ())` 剥掉本 harness 的全部键再加本 mode 的键；
+   业务 child 的 `cmd.Env` 同样剥（`runtimeChildEnvironment`），并由 child 打印 `${MODE}${_TETHER_HANDOFF}` 为空自证。
+   after 半二次 `handoff.Restore()` 必须是 `(nil, nil)`（dispatch 只消费一次）。
+3. **oracle 在 exec 之前捕获，after 半只读 receipt**：能证明连续性的量（PID / start ticks / pipe dev:ino / ACK 偏移 /
+   InputBase / 预算 / 在途请求数）在 before 半写进 `handoff.State.Data` 的 fixture，after 半与内核和导入结果比对后写
+   receipt JSON，父进程逐项断言。fixture **可以**带 Image（因而带 registry secret）——它只在 sealed memfd 里走；绝不能带
+   它的是 stdout/stderr/日志：两处 harness 的父进程都断言 helper 输出不含 `"secret"`（execsession 的还断言不含 `[redacted]`）。
+   **after 半的资源收据必须按类别计数**（`/proc/self/fd` 链接名：`pipe:[…]`、`/memfd:tether-replay`、`anon_inode:[pidfd]`、
+   `/memfd:tether-handoff`），Close 后各类归零、总数低于导入前——「总数没涨」的 oracle 在 closeTask 变成 no-op 时照样绿
+   （内审 R1/M28）；预算收据取导入后的 `ReplayBudgetUsed()`，不是导出方的数字。
+4. **后代与 child 的推进用控制管道（fd 3）或 marker 文件门控，不用 sleep 计时**；所有进程走共享 subreaper/CLOEXEC lease/pidfd supervisor 并 join；`Setpgid + cmd.Cancel` 杀组只作补充。
+   跨 exec 的 ctl oracle 是**真 `execclient.Run`** 对嵌入 NATS——它的 500 ms attempt 重发就是「旧映像的在途请求丢失、
+   新映像回答重发」的机制本身，所以「冻结期至少一个请求在途」是必须断言的非空性（否则测试只证明了一次普通 exec）。
+5. **负控制用 mutation env 改导出对象**（`drop-stderr-replay`：after 半必须 `IMAGE_ORACLE_REJECT` 并非零退出、ctl 拿不到结果），
+   **生产变异用 `go test -overlay`** 且每个变异副本在入口打 `IMAGE_MUTATION=<name>` 自证——overlay 是整个构建图的输入，
+   被 exec 的 helper 就是同一二进制，所以 before/after 两半都带变异。
+6. **memfd/pipe 计数法**：`/proc/self/fd` 的链接名（`/memfd:tether-handoff (deleted)` 必须为 0、每条业务 pipe 恰 1 引用），
+   跳过 fd 0–2（父进程把 helper 的 stdout/stderr 捕获在同一条 pipe 上）。带 NATS 的 exec 测试**只跑一次**做字面收据
+   （嵌入 server 的 accepted socket 异步回收让父侧 FD 容差 0 flake）；五轮资源门另用无 NATS 的 bundle exec 测试与
+   进程内往返（共享冻结 Manager，`imageDupSource` 用 `F_DUPFD_CLOEXEC` 扮演 handoff 的复制）。
+7. **Linux-only、进 `TestLeakRiskMatrix`**；三处 exec 测试在 `-race` 下各 +2–3 s。
+8. **S3 进程内注入用 `agentboot.FromCut` + `handofftest.DupSource`**，经 `Config.BootImage` 进入生产 New/Run，
+   不另造一套导入路径。A 完成 Freeze/导出后，用 `internal/handoff/handofftest.DupResources` 对资源逐文件
+   `F_DUPFD_CLOEXEC`，再把 bundle、rows、DupSource 与其 Borrow 资源传给 FromCut。`TakeFile` 转移副本所有权，
+   `Borrow` 只借未取项、`Remaining` 计数、`Swap/Drop` 制造同形错位/缺文件，`Close` 只关未取项；
+   **不把 A 的原 `*os.File` 直接交给 B**。拒绝后验证 salvage 可与 Borrow 余项按 ID 合并再派发，
+   不用 Close 销毁导入冻结态（Manager 仍冻结时返回 `workload.ErrFrozen`，此时应用 Detach）。
+   dup 仍共享 open-file-description，A 已导出的旧 runtime 在 B 接管成功后只 Discard、不 Thaw；
+   这是调用纪律，不能假设 API 会拒绝旧 runtime 的 Thaw（exec 失败回滚恰恰需要允许它）。
+   共享 child 的 cleanup 次序必须是 **kill child → 等 B 记终态 → `A.workloads.Thaw()`**，再完成其余释放，
+   避免 A 的 reaper 抢走 B 的终态。带并发/泄漏风险的用例用共享 leak helper，≥5 轮 exercise；
+   这些是 plan §7 T3–T5/T8/T9/T14 由 S3 交付的进程内测试形状，不能替代同 PID 真 exec 的收据。
+9. **未取文件的释放要在活进程中观察**（origin: hot-update S3 plan §1.3 / §1.6；RS-1）：
+   held/refused/imported 可保留 handoff 余项供 Repack；Activate 成功 Thaw 后，真实 Restored 的未 TakeFile 文件应立即关闭，
+   已取业务文件继续由 runtime 持有。进程内 FromCut 的借用资源由 fixture owner 回收，不能把它当成 Restored 的释放证明；
+   不能等 receiver 退出后才验 EPIPE/fd 消失，否则内核退出清场会让漏 Close 也通过。
+
+### 0.6 三角色真二进制 harness（hot-update S3）
+
+谓词是「**dispatcher test binary → real tether → receiver test binary（作为 `.prev`）**，三者用同一 PID
+连续 exec」。父进程仍是 go test，负责构建、起 dispatcher、收 receipt；被测中间一跳必须是真
+`go build ./cmd/tether` 产物，才能观察 main/boot shim/Cobra/FinishBoot 的真实顺序。
+位置与测试承诺来自 [S3 plan §7](reviews/hot-update-agent-bootstrap-plan.md)：
+`internal/agentboot/boot_exec_test.go`，由 **S3 交付**；本规范不代签部署；S3 历史收据见 evidence §14，当前候选需重新验证。
+
+1. **三角色边界固定**：父进程在 sandbox 准备真 tether、marker 和 `.prev`（test binary 的副本）；
+   dispatcher 起真实 child，Freeze → Prepare → `Prepared.Exec(<sandbox>/tether, ["tether","agent",…], env)`；
+   tether 经生产回滚路径 exec `.prev`；receiver 才 `handoff.Restore` → `agentimage.Restore(Target{fresh Manager})`，
+   按需要 Thaw 并验 oracle，写 receipt、释放资源后退出。不能用测试 shim 代替中间的 main，也不能用 fork 伪装再派发。
+2. **receiver 必须在 `init()` 按专用 mode env 分派，早于 testing 解析 flag**：它继承的是 tether argv，
+   不是 `-test.*` argv；等测试函数运行才分派会先被 flag parser 拒绝。环境清理沿用 §0.5 的双向剥离，
+   父→dispatcher 用精确 test selector；mode 只给对应角色，业务 child 不继承 handoff/mode 密钥。
+3. **marker fixture 镜像生产字段，不手造另一份协议**：父按 `upgradeMarker` 写 JSON，fixture 源旁带
+   `// drill-pin: mirrors internal/agent/upgrade_state.go upgradeMarker`，测试/守卫旁带
+   `// origin: hot-update S3 plan §7`。receipt 与 marker/dst SHA 必须由父断言，不能只以 helper rc 0 判成功。
+4. **跨中间映像失败仍须证明同一资源**：dispatch 前记 State 字节 SHA、文件 dev/ino、child PID/start ticks、lineage；
+   receiver 核对同一 bundle 与文件，原 child 仍活且能读到 exec 后的新字节；再派发 env 含原 `TETHER_INSTANCE_ID`。
+   manifest nonce 每次重建，不要求相等；receiver 二次 `handoff.Restore()` 为 nil、handoff memfd 为 0，
+   输出不含 `"secret"`，不把 bundle 或其 raw Data 写进 stdout/stderr/receipt。
+5. **用真实早失败触发路径**：`TestAgentBootstrapRunsBootCheckBeforeRestore` 以未知 Cobra flag 证明
+   boot_count 先增加、尚无 `image restored`、FinishBoot 把资源送到 prev；
+   `TestBundlePresentAndBudgetExhaustedRedispatchesToPrev` 令预算已耗尽，证明 boot rollback 携资源、marker 与 dst SHA 收敛。
+   `TestBeginCrashWindowClosesForeignDescriptorsAndContinues` 用坏 nonce 证明 W1 关闭非 CLOEXEC 外来 fd 后继续，
+   另以真实 `version` argv 证明 Begin 无条件运行、W1b 放弃资源而 version 照常输出。
+   W1b 的 EPIPE/fd 断言须发生在接收进程仍活着时，不能由命令退出代替 Abandon 清场；
+   W1 还须覆盖 `/proc` 普查失败后的 fcntl 回退与关闭前 dev/ino 复核（origin: hot-update S3 plan §1.5 / §7 T13；RS-2、RESOURCES-V1、RB-5）。
+   `TestFinishBootRedispatchTable` 按 plan 的 proof/TargetInstance/拒绝与 salvage 半取表覆盖所有权分支；
+   不把这些 hermetic 结果写成 deploy-tier 覆盖。
+6. **变异要命中被测角色**：test binary 的 helper 变异可用 `go test -overlay`；中间真 tether 的生产变异必须
+   经 `GOFLAGS=-overlay=<json>` 传入嵌套 build，并由构建/运行收据证明加载了变异。
+   必测删除 FinishBoot、预算记账移到 Restore 后、去掉 Begin lineage 快照、boot rollback 改裸 exec、
+   W1 不关外来 fd、Begin 移到 daemon 条件内；每种记录红灯及恢复后结果，不能用「看起来会红」作收据。
+7. **隔离与资源纪律**：Linux-only，父用 `Setpgid` 与有界取消/kill-group 清理，所有路径用临时 sandbox/Home；
+   不运行 PATH 上已安装的 tether，不触碰生产 Home。fd 按 pipe/replay/pidfd/handoff 分类别计数，业务推进用门控而非 sleep。
+   并发/泄漏敏感覆盖用共享 helper ≥5 轮；进程内重复资源门与三角色字面收据各守其范围，不能以总 fd 数相等掩盖类别错漏。
+
 ---
 
 ## 一、时间、并发与分布式前提
@@ -446,3 +641,138 @@ if host == "" { return false }
 | 日志流单映射 | `test/simcluster/drills/lib/logs.sh` + `test/architecture/simcluster_log_oracle_test.go` | 十几份内联映射曾把健康产品报失败 |
 | 唯一全矩阵闸 | `make e2e-parallel`（串行 target 已删除） | 存在的 target 就会有人跑 |
 | 全部注释 | `cmd/` + `internal/` 29–33% 的行 | `.golangci.yml` 故意不开行数 linter |
+
+## S6 broker-image validation
+
+The [frozen S6 plan](reviews/hot-update-broker-image-plan.md) §11 fixes T01–T58 and mandatory mutations;
+§12 fixes each owner. [Architecture §22.9](distributed-broker-architecture.md#229-s6-broker-image-binding-contract-final-receipts-pending)
+is the living contract; landed tests are not final exit receipts. Follow §0.4–§0.6: sandbox-built real
+artifacts, same-PID init dispatch, original socket/child identity, exact helper selectors, nested-build
+GOFLAGS overlay propagation, and independent byte/effect oracles. Never exercise installed tether or
+production state. No test process starts another go test. Preflight/Bolt second-open negatives require
+bounded helper kill+wait; an old DB restore must be detected before replay can conceal missing ACKs.
+
+Every concurrency/leak test directly uses both shared goroutine/FD assertions and directly calls its
+exercise across ≥5 rounds. Partial constructor/close/Take, timer callback, accepted RPC, current-stop and
+ACTIVE rollback paths must be exercised while original owners live; fixture exit cannot stand in for cleanup.
+Inject each mandatory defect independently, preserve patch digest/native rc/failing assertion, restore,
+then rerun positive control. Source scanners require on-disk mutants. P31/P32/P33 own exact caps, all-OS
+lifetime/layering/build-tag/ctx, closed enum/error/wire/private inventory, matrix and leak anchors; workers
+report rows instead of editing mechanical ledgers. The unfiltered gate/matrix controls must kill omissions.
+
+P35 runs one final candidate's three hard gates (`make test`, `make e2e-parallel`, `make lint`) and separate
+`make gates`, whole race matrix, Linux/Darwin builds, native Darwin resource regression,37/39.BR and preserved
+S3/S4/S5 regressions. These are lead commands, not package-worker commands. Parallel matrix GREEN needs
+no serial rerun. Source/artifact/running SHA, exact command/native rc, all scheduled slots/attempts,
+nonempty originals/ACKs/true-started effects and measured marginal wall costs belong in receipts.
+Normal max5s is hard; freeze500ms is complete required-domain calibration. Linux/cross-build does not sign
+Darwin native; absent native runner is NOT_RUN and cannot close S6 exit6. P34 signs only linked verified
+P35 receipts. [The documentation audit](../test/hotupdate/README.md#s6-documentation-audit) is read-only and
+has independent missing-source/command/dead-test/premature-tick controls; it never signs product behavior.
+
+
+## S7 transfer-continuation validation (PENDING receipts)
+
+The [frozen S7 plan](reviews/hot-update-transfer-continuation-plan.md) §10–§12 and lead LQ1–LQ3/L15–L18
+bind validation. These are required checks, not completed receipts. P36 runs only bounded documentation
+checks; P34 owns T54 and its central controls, P35 the inventories/leak/race/matrix rows, P37 final evidence.
+The [README audit](../test/hotupdate/README.md#s7-documentation-audit) is separately runnable and does not
+certify product behavior. Missing dependent real implementations remain NOT_RUN, never fake successes.
+
+- Use shared `test/transferharness` and the FIX-ORPHAN process supervisor for every process, including
+  fixture/same-PID dispatcher/native child. Verify zero surviving descendants after panic/timeout/SIGKILL
+  by PID+start ticks. Setpgid cleanup or Pdeathsig alone is insufficient. Sandbox HOME/state and workspace
+  binaries only; installed tether and production state are prohibited.
+- Cover both tiers, push/pull and prepare/write/Sync/preprimitive/postprimitive/courier windows using real
+  A→B→A artifacts at the original PID, original source/tmp/parent OFDs and original ID/NUID. dev/ino/offset
+  equality cannot substitute for kernel OFD comparison. Independent target observation at each boundary
+  rejects transient in-place partial writes even if final SHA is correct. ACTIVE failures export current
+  progress at generation+1; pristine imports cannot Seek/Truncate/repair shared flags.
+- Default 120s chunk/history dedupe crossings use actual wall time. Both competitors are already sent:
+  absent scan→original accepted with ACK lost→retry held until 120s+5s→late retry rejected by CAS.
+  Simultaneous first acceptance after a wait is masked by a fresh dedupe window and does not kill M02/M12.
+  Full raw physical records and canonical content/count are required; Apply=1 is not history=1.
+- T30 exercises both actual TTL List edges with bounded ctx/cancel/join and ≤5s pass, followed by a real
+  next pass without fixture metadata writes. T31 covers DELETING/cold restart/orphan sweep protection,
+  ordinary CONNECT denial, receiver-only settlement permissions and terminal-before-deletion. LQ1 controls
+  prove no flag→75/no deletion, explicit abandonment→exact terminal=1/failed/outcome_unknown=true.
+- Every explicit risk package in plan §11.3 has direct Test-body shared goroutine and FD asserts after
+  ≥5 direct exercise calls, with P35 exact anchor and whole-package race tuple. Include filetransfer,
+  transferpath, drillobserve and test/transferharness. Pure codec/contracts remain whole-race with a no-IO
+  declaration; add lifecycle exercises if they begin IO. Do not broaden worker checks to whole broker/
+  agent/tunnel races. Lead/P37 runs the full matrix; per-test partitions keep the 600s unit ceiling, with
+  >70% units split or optimized. Tagged tests and every scanner follow moved definitions immediately.
+- Each M01–M14 subcase mutates the real production predicate independently, builds with inherited
+  GOFLAGS overlay through nested builders and records source patch/artifact/running SHA. Compile/setup
+  failure is not a behavioral kill. Source scanners require on-disk mutations. Restore then rerun baseline;
+  preserve native failure text/rc and do not relax any assertion or inventory to make it pass.
+
+The frozen positive parent 63 requires A/A1/B/C1/C2/C3/R1/R2/X/W1/W2, each independently native GREEN0.
+Four independent buckets carry 66,549,440 B and 1 GiB each push/pull. Every leg/cut has actual active data and
+post-cut progress; prepared sender substitutes and completed short files are INCOMPLETE4. C1 carrier,
+C2 data connection and C3 same-binary/same-store JS restart have separate injection/identity receipts.
+R1 pristine and R2 ACTIVE are separate; W1/W2 are separate real 120s watchdog units. Ctrl-C and session-rm
+victims use separate buckets from each other and from the four survivors. Preserve 61's all 41 assertions,
+37.T capable single/N3 live cuts plus legacy defer,39.BR genuine old Run-unwind PRODUCT-RED3 and the
+S3/S4/S5/S6 regression set. S9 binary upgrades cannot be signed from same-store JS restart.
+
+Controls 64 has 23 independent launch arms (M08/M10/M11/M12/M13 subcases separate), outside parent 63.
+Native verdict grammar/order remains ASSERT-FAIL1→SETUP-RED2→PRODUCT-RED3→INCOMPLETE4→GREEN0;
+expected native red stays red. Business temporary refusal 75 is never drill INCOMPLETE4. Missing fixture
+custody/overflow/drain ACK is SETUP-RED2; expired live window is 4; runner timeout without drill_end remains
+INFRA-ABORT. Ending requires canonical history, joined courier/finalizer/watchdog, consumer delete/writer
+retirement, fresh per-process drain+JS scan, quiet window≥2s after join, second fresh drain+scan, then
+keeper/fixture teardown. Teardown cannot kill late effects to manufacture a unique terminal.
+
+Every product receipt carries source_sha, dirty_digest, artifact_sha, running_sha, test_or_arm, command,
+native_rc, mutation_id, raw_path, oracle_input_sha, reader_digest and wall_s; each cut additionally carries
+pid, process_start, boot_id, image_generation and cut_id. P37 reviews actual raw content/coverage and
+candidate freshness before P36 signs B-3/B-6 transfer portions or E-1/E-2/E-3/E-5/E-6. E-4 remains S6;
+F/G/H totals remain open. Product/config/oracle changes invalidate affected receipts even if a later
+docs-only audit passes. Record launch-unit actual wall/direct poll, baseline/marginal wall and FD/RSS/JS
+peaks separately; plan cost estimates remain ESTIMATE/NOT_MEASURED. Darwin cross-build and test-binary
+compile differ from native lifecycle tests; required missing native receipts leave their exit unsigned.
+
+## S8/S9/S10 transaction, infra and final-candidate validation
+
+The frozen [S8](reviews/hot-update-upgrade-orchestration-plan.md),
+[S9](reviews/hot-update-infra-nats-caddy-plan.md) and
+[S10](reviews/hot-update-fullstack-acceptance-plan.md) lead verdicts define the current validation scope.
+Target describe→prepare→root stage→same-TxID Start→fresh wait is the product route; fixtures cannot
+write selectors, `.prev`, markers or journals to complete it. Test status-query rc0 separately from
+wait/rollback completion: historical completed, register and disk-only SHA must fail current proof.
+Exercise three completion receipts with full attempt/revision/direction/scope/nonce/sequence, current
+rollback after ACTIVE, incarnation-guarded G.1, and actual activation/retirement events for two live
+generations. Capability, release N-1 and same-source mechanism binaries retain separate receipts.
+
+S9 integration has real stock version/artifact, privilege, business/auth and process/socket/storage
+oracles. Auth-first tests need signed ordinary CONNECT plus normal-queue probe after SUB/PONG; a static
+credential or S6 local handler probe cannot sign it. Read ACK prefixes before product recovery gates
+release writer/replay/reconcile/GC. N1 original-store restart, N3 pre-LDM cohort movement, N2/quorum/
+replica refusals and healthy N2 Caddy are independent. Caddy canonical fresh TLS, WSS migrate/return,
+current ACME final sync, permissions and exact old/temporary retirement cannot be inferred from a URL
+or HTTP200. A serving shadow may survive an action timeout but the transaction stays pending/halted.
+
+Use installed per-test race partitions with a 600s unit ceiling; >420s requires decomposition or lower
+cost. Whole-package race is an exact discovery union, including all suite tags and newly moved leaf
+owners. Every source scanner/tag-gated test follows moved symbols immediately. Every subprocess, even
+a fixture, nested build, native child or init dispatcher, uses shared internal/testharness supervision
+(S6 FIX-ORPHAN; S9 L22/S10 L15), not a second Pdeathsig-only supervisor. Verify PID+start ticks, join/reap
+on panic/timeout/SIGKILL and preserve cleanup-found leak failures. Direct shared goroutine/FD assertions
+and ≥5 direct exercise calls are required for each risk package, with retirement observed while the
+receiver remains alive. Parent runtime.NumGoroutine does not measure agent resources across exec.
+
+S10 99 calibration/full rollout/prefix/soak and 100's 50 independent controls need all original cohorts,
+all scheduled 10/s slots/attempts and raw bytes/effects/current identity; no completed short transfer
+substitutes for a live window. Baseline→mutant→restore records exact source/dirty/artifact/running/oracle
+identities, native rc and assertion. Compilation/setup/timeout/refusal is not a continuity mutant kill.
+Use on-disk mutations for scanners and GOFLAGS overlay propagation through nested real builds. Record
+launch wall/direct poll, baseline and marginal cost, FD/RSS/JS peaks; estimates remain NOT_MEASURED.
+
+38/39/85/86/99/100 live runs, final same-candidate three hard gates plus separate gates/whole-race and
+Darwin native are NOT_RUN/PENDING. S8/S10 normal full-profile freeze500ms is a hard gate; S3–S7
+calibration samples do not sign it. S9 hot support is linux/amd64 + systemd/pidfd/cgroup/nft; cross-build
+never signs a native platform. `lint-install` validates only its actual extracted heredoc templates;
+live units/permissions/ACME/kernel behavior require S9 receipts. Workers run authorized targeted checks;
+lead runs global gates/matrices and deploy drills serially on the sealed candidate after reporting cost.
+P34/P35 (S10) and P39 (S9) retain unsigned product/coverage claims until reviewed raw receipts exist.

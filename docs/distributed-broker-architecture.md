@@ -4,7 +4,10 @@
 >
 > **流程状态**：Stage B 定稿 → **已过 Stage C 全部三轮对抗性审查并三次改稿**（报告见 `docs/reviews/dist-broker-arch-review.md`、`-round2.md`、`-round3.md`）→ **外审 round-1（FAIL）已处置**：6 条 finding（F1–F3 High：apply.* 鉴权双契约 / force-single runbook / cluster status 直连 Raft 矛盾；F4–F6 Medium：per-expose 地址粒度 / alert ack 集群级 / §18.4 架构契约升正文）已逐条回写正文、§18 降为审计轨迹、§16 补偏离登记（报告与回复见 `docs/reviews/dist-broker-arch-external-review.md`）。**外审 round-2（FAIL）已处置**：3 条契约欠定义（RF1 apply.* 发布者身份=broker nkey AuthUsers/`PermissionsForBroker`，§6.2；RF2 membership 门控=入群密码学 join PoP + remove/upsert 的 leader-local admission，FSM 不假称校验不可复制的 origin proof，§8.1；RF3 稳定 tunnel 证书的存储/Raft 写/轮换契约，§15/§7.7）+ 2 非阻塞已修。**外审 round-3（FAIL）已处置**：R3F1（membership 拆**两阶段**——roster `ClusterNodeUpsert`+join PoP 由 follower 在 `Apply` 复算，`raft.AddVoter` 仅在其 committed 后发起、非 FSM 校验点；半成功 phase + 顺序 + 幂等 + §13.11 门，§8.1/§5）、R3F2（tunnel cert 轮换定 **wire-list `cert_pins{current,previous,valid_until}`** 无状态 agent 契约，§15/§7.7/§2/§13.7）、R3F3（§8.3 create/add 分发 `broker.nk`+稳定 tunnel cert、§6.2 generated nats config 同含 auth_users 与 static nkey permissions）。架构级结论收敛自洽；**纯实现精度长尾见 §18.4(B)，留 plan 阶段必解**。→ **外审 round-4 PASS / 放行（2026-06）**：4 轮外审（F1–F6 / RF1–RF3 / R3F1–R3F3 全部回写正文）后，本文档**作为下一大版本实现基线进入 plan/implementation**（报告见 `docs/reviews/dist-broker-arch-external-review.md`）。**开发 phase 分解（依赖分明的 D0–D9，体例同主项目 P0–P11）见 §19。**
 >
-> 语言：中文叙述；代码 / 标识符 / subject / 表名 / 配置键英文。所有结论**已逐条对齐真实代码树**（migrations 到 0007；`SetMaxOpenConns(1)`+rollback-journal；auth_callout 用普通 `Subscribe`、CONNECT 时一次、`JWTTTL=24h`；`go.mod` **只有 `hashicorp/yamux`，无 raft**；8 处 `CURRENT_TIMESTAMP`；`tunnel.denyIsTransient` 默认 **terminal**、agent 端 `InsecureSkipVerify`；**≥71** 处内联 `pubAudit*/pubSysEvent`（实现期 lint 点清，非"约 15/63"）；存储助手均 `*sql.DB` 自开事务；`disk_pressure` 仅 `disk.go` 的 fire-and-forget `pubSysEvent`（无存储/ack/banner）；`tunnel` server 每次 Start 自签**临时**证书、agent `InsecureSkipVerify`；`port_allocations` row_id 是 AUTOINCREMENT；`PermissionsForBroker` 给每台 broker `s.*.audit.>`/`$JS.API.>` 通配 pub；`adminsock` 仅 0600 文件权限、无签名密钥；P13 仅 **CONDITIONAL PASS**）。
+> 语言：中文叙述；代码 / 标识符 / subject / 表名 / 配置键英文。当前依赖由 `go.mod` / `go.sum`
+> 固定（Go1.26.0、toolchain go1.26.8、Raft/SQLite/NATS/yamux 均已使用）。早期“只有 yamux、临时 tunnel
+> 证书、agent 跳过验证”等快照是历史输入，不是当前实现。运行契约见本文章节；热更新 owner、
+> reader/authority/事务/infra 与未签收边界见 §21/§22，历史阶段回执见 `docs/reviews/`。
 
 ---
 
@@ -61,7 +64,7 @@ cmd/tether/
 ## 3. 状态层（Raft + 本地 SQLite）
 
 ### 3.1 选库（Stage-B/合并前置门）
-`hashicorp/raft` + `raft-boltdb/v2` + `FileSnapshotStore`。**raft 是全新依赖（go.mod 现只有 yamux）**：pin 版本、`CGO_ENABLED=0`+Go1.25 编译、**确认 `Config.PreVoteDisabled` 字段在**（hashicorp/raft v1.7.x **无 `Config.PreVote`**；真实字段是 `PreVoteDisabled bool`，`DefaultConfig()` 不设它 → 零值 false → pre-vote **缺省启用**。另：raft 在 transport 未实现 `WithPreVote` 接口时**静默关闭** pre-vote，故"字段在"不足证"行为生效"，见 §18.2.14）（§8.4/§9.4 正确性前提）——升为合并前置门。
+`hashicorp/raft` + `raft-boltdb/v2` + `FileSnapshotStore`。当前已使用 Raft（版本见 go.mod）；保持 pin、`CGO_ENABLED=0` 和 go.mod 指定 toolchain，**确认 `Config.PreVoteDisabled` 字段在**（hashicorp/raft v1.7.x **无 `Config.PreVote`**；真实字段是 `PreVoteDisabled bool`，`DefaultConfig()` 不设它 → 零值 false → pre-vote **缺省启用**。另：raft 在 transport 未实现 `WithPreVote` 接口时**静默关闭** pre-vote，故"字段在"不足证"行为生效"，见 §18.2.14）（§8.4/§9.4 正确性前提）——升为合并前置门。
 > **D1 注（快照/恢复 API 按 driver 实际）**：SQLite 侧用 **modernc.org/sqlite v1.50.0**（非 mattn/go-sqlite3）——online-backup/restore 走 modernc 的 `NewBackup`/`NewRestore`（非 mattn `Backup()` 或 `VACUUM INTO`），机制与 raft v1.7.3 的快照 meta.Index 真相见 **§3.8 D1 实现修正**。
 
 ### 3.2 写入模型 + 读一致性
@@ -247,6 +250,15 @@ NATS 种子 + `connect_urls` 发现 + 无限退避；`ClientAdvertise`=公网:44
 > - **REGISTER 第 6 字段（DA-6/R-11，§7.2(b) 升实现）**：`REGISTER <sid> <nid> <port> <token> <epoch>`；`parseRegisterLine` 收**正好 6**、`strconv.ParseInt(_,10,64)`（非 `Atoi`），负/溢出/非整 → `malformed_register`；wire **不带 barrier**。N=1 epoch 恒 `0`。`home_catching_up` 经**共享 `const proto.ReasonHomeCatchingUp`**（broker 发 + agent `denyIsTransient` 双引同一符号，杜绝字面漂移 brick 车队）。
 > - **初始 home 交付 = C1 致命缺口修（DA-12）**：实测初始 expose 路径 `handleExposeReq → port.Allocate → ExposeForwardedReq{Name,Port,LocalPort,Token,ActorFP}`（5 字段、**无 home**）→ agent，**根本不经 `NodeRegisterResp`**。故 `ExposeForwardedReq` 加 `Home *HomeDirective`（omitempty → N=1 字节等价）；`handleExposeReq` 据 agent 持久 server_name 绑定解析 home（DA-1/R-26）；`handleExposeForwarded` 持久进 `PortToken` 并据之 Open。rehome 经 §7.4。
 
+### 7.2a S5 carrier continuity boundary
+
+Linux peers that both select `tether-flow/1` retain original public and target TCP sockets across
+carrier loss and agent image replacement. `Endpoint` owns the listener, accepted sockets and logical flows;
+TLS/yamux sessions own attachments. Legacy raw reconnect restores new connections only.
+Home/epoch changes remain allocation cutovers: S5 does not migrate an original TCP socket to another host.
+See [§22.8](#228-s5-flow-and-ss-domains-binding-contract) for ACK, authority and handoff rules;
+validation remains [scoped S5 closure/carry receipts](reviews/hot-update-evidence.md#17-s5-flow-carrier-ss-最终收尾收据2026-10-11).
+
 ### 7.3 选址与 happy path
 `--on-broker <host>`（校验 ONLINE）/默认=§6.5 所连 broker/`--remote-port <P>`（P12）；`tether expose --rebuild/--no-rebuild`（默认 ON，Plan 写列）。happy path：Plan 选 port+token+home → Raft 提交 → leader 发 `ExposeForwardedReq{tunnel_addr,home_broker,cert_pins,epoch}` → agent 按 `cert_pins`(current/未过期 previous，§15 RF3) 钉证拨 home:7000 → home 绑口并 **ACK 绑定** → leader 才回 `ExposeResp`（无死 URL）。raw token：leader Plan 铸、只复制 hash、经 NATS authed 通道一次性给 agent、agent 在 home 出示、home 按本地行 hash 比对。
 
@@ -343,12 +355,16 @@ create=装二进制 + **生成/分发本机全套 secrets：`account.nk`(共享�
 
 ## 9. 文件传输（分布式，补全为真 §9）
 
+**S7 contract boundary (PENDING receipts):** §22.10 governs negotiated `transfer-v1` continuation,
+receiver commit authority, exact history and GC. The D8 rules below describe legacy/cap0 transfers;
+their best-effort loss and dedupe claims do not describe v1. No S7 acceptance is inferred from this contract.
+
 > **裁定（R2-blocker：transfer 不是 stub）**：
 > - **终结于 agent 的 home broker**（与方案 B 一致）。**数据面 push/pull 经 broadcast-SUB + home-keyed gate**（D8 实现修正）：`push.req`/`pull.req`/`push-commit.req`/`ev.transfer.*`/`finalize.req` 是 plain `nc.Subscribe`（`broker.go:532` 订阅表），集群下每 broker 都收每份。**START 路径**（`push.req`/`pull.req`）经 `transferHomeGate(sid,nid)` 门住：`home==self` 才处理、否则**静默不应答**（home 处理）；home 未解析/不合格亦静默（ctl 超时 backoff 重试，绑定收敛后命中真 home）。**continuation/terminal 路径**（`push-commit.req`/`ev.transfer.*`/`finalize.req`）按 **tracker 持有**路由——只有持该 transfer_id tracker entry 的源 broker（START 时的 home）应答（`transfers.get`/`claimFinalize`，余静默）。**无需 home-epoch 围栏**：每次 push/pull 调用铸新 transfer_id、对象按 transfer_id 键、tracker entry 只在单个源 broker，故并发 rehome 不产生跨 broker 双绑（旧 home 只 finalize/删自己 tid 的对象=正确；rehome 后是新 tid 走新 home）——与 §16(f) 一致。**不经 §4.1 转发数据面**（broadcast SUB 已送达 home、多一跳浪费）；**仅 transfer audit 行经 §4.1 leader Apply**。
 > - **transfer audit 可重导**（D8 实现修正，与 §4.4/§6.3 一致）：start/complete/failed 经新 op `OpTransferAudit`（纯-Aux 空-Body、每事件一 committed entry、publisher 从 Aux 重导同 `OpReconcileBatch`）；**跨重试幂等 = 派生 `reqID=hex(sha256("xferaudit:"||transfer_id||":"||kind))` 经 0011 ledger**（JS `Duplicates` 窗口有限、不可作跨选举主锚）、去重 id `q<reqID>:xfer`。**start/complete/failed 全经 leader Apply、但 start 异步不阻塞 agent-forward**（保 audit-pair 完整、不给数据面加 raft 延迟）。**矛盾终态由 `claimFinalize` 单-broker 终态原子认领 + home-gate 单写 + per-invocation transfer_id 化解**（无需 terminal-state guard/新表）。
 > - **tier-B ObjectStore：`ensureXferBucket` 的 `Replicas` 从字面 1 改 `replicasFor(nVoters)`**；`OBJ_xfer-<sid>` 与 audit 流同样在扩容/retire 时重配、计入 `cluster status` actual/target、受 `replication_degraded` 与"未重配完不 retire"约束。完成对象 N≥3 下 home 死可存活。**retire 门 xfer 副本枚举读 JetStream 实际 `OBJ_xfer-*` 流列表（`js.ListStreams`），非 DB `ListSIDs`**（D8 修正：bucket 可活过 session 行 → purged-session 孤儿不可见 → false-green 丢数据）；retire readiness 用**只读 `ObserveReplicas()`**、非升配副作用的 `ReconcileOnce()`。
 > - **D5 实现裁定**：`ensureXferBucket(…, targetReplicas)` 经 `UpdateObjectStore` 只升不降、计入 §6.4 的 `AllAtTarget` 全集（否则 retire 门对未冗余 tier-B false-green）。**no-audit-loss-under-kill 证明锁定 `history-<sid>`**（审计承载流）；OBJ_xfer 在 D5 只证"扩到 target"（E-B8）+ 预测语纳入（E-B4），tier-B no-loss-under-kill 出 D5（OQ-6）。
-> - **in-flight tracker + watchdog 在 home broker、best-effort**：home 死则在途丢失、客户端重启；**rehome 不保在途传输**（重启）。**boot orphan reaper（`reconcileXferObjectsOnBoot` 调 `store.Delete`）在 clustered 模式按 home-ownership 过滤**（D8 修正：共享复制 bucket 里别 broker 的 live 在途对象不是孤儿；仅收 home==self 且 committed `OpTransferAudit` 终态的 session 对象，永死 home 孤儿由新 home 接管后收）。生产 `selfID==""` 字节等价。
+> - **Legacy/cap0 in-flight tracker and watchdog remain best-effort at the original home.** A lost owner can leave the result unknown; a new invocation is a new transfer, not continuation. Negotiated v1 retains original-origin responsibility across planned cuts and rehome under §22.10 (PENDING receipts). **boot orphan reaper（`reconcileXferObjectsOnBoot` 调 `store.Delete`）在 clustered 模式按 home-ownership 过滤**（D8 修正：共享复制 bucket 里别 broker 的 live 在途对象不是孤儿；仅收 home==self 且 committed `OpTransferAudit` 终态的 session 对象，永死 home 孤儿由新 home 接管后收）。生产 `selfID==""` 字节等价。
 > - 无 multipath / 最快链路（需求 §1.3 推后）。
 > - 门：tier-B 对象在 N≥3 杀 home 后存活；home 死时在途重启。
 
@@ -471,7 +487,8 @@ NATS=C；快照=WAL+online-backup(独立只读 handle)；applied_index 权威=SQ
 | 控制状态(session/port/proc/member) | 无冗余 | 双副本掉一即只读 | **已提交 0 丢失**容 1 故障 | 同 |
 | 审计 history-<sid> / OBJ_xfer | R1 | R2 | R3 | **仍 R1/部分——未达 HA**（status actual<target + `replication_degraded`，禁 retire 原节点）|
 | 审计 0 丢失 | — | — | **近似**（leader 提交后/JS 发布前崩有窗口，可重导 sweep 兜底；D5：仅 `OpReconcileBatch` 可重导、以快照节律+dedup 窗口为界；leader-local-only 审计 best-effort） | 同 |
-| ev/PTY/transfer 在途 | best-effort | best-effort | best-effort（重连/重试） | 同 |
+| Legacy ev/PTY/transfer in flight | best-effort | best-effort | best-effort | Same |
+| Negotiated transfer-v1 planned continuation | PENDING S7 single receipt | No new N=2 guarantee | PENDING S7 N3 receipt (§22.10) | Requires admission/replica proof |
 | **proxy(/sub) 故障切换** | — | — | **非 v1 HA 保证**（P13 移出，§0）| 同 |
 | 撤销延迟 | 即时 | — | **max(副本应用滞后, 残留 JWT TTL, 强制断连耗时)**——靠主动断连非 TTL | 同 |
 
@@ -870,73 +887,1132 @@ N-1 纪元的端发布在 `tether.v(N-1).*` 主题树上——在双订阅（§2
   审查纪律覆盖——写明这条边界，不假称机械闸门管到了它没扫的地方。
 - "零值合法"的判据：旧端发来的报文**没有**这个字段时，新端解出零值后的行为必须与增量前一致。
 
-### 21.3 agent 升级状态机（`node upgrade` 安全化）
+### 21.2.1 S4 PTY 的 N-1 窗口
 
-安装序：下载 → sha256 → **冒烟门** → **prev 槽** → marker=pending → 单次 `rename(tmp, dst)` → 回执 → exec。
+`ProtoVersion`、`ProcessResumeVersion` 与 `ImageABIVersion` 均不 bump；PTY 的 18 个字段 additive/omitempty，
+`Kind=""` 保持 exec，旧端缺 `PTYVersion` 是合法旧 capability。新 ctl 在同一 2 s 总预算内先
+`probe Kind=pty`，再 `pty-probe`；旧 agent 在第一步回旧 capability，旧 process-resume broker 在第二步拒新 op，
+无 verb 的旧 broker 则按兼容探测回落。只有 **create 之前**允许 legacy fallback，权限、身份、busy/容量拒绝不回落。
+旧 ctl × 新 agent 仍走 legacy subjects；升级准入拒绝使用旧 ctl 已知的 `try_again`（75），`agent_upgrading` 保留在 detail，不要求旧端识别新码。活 legacy PTY 以 `legacy_session_busy` 阻止升级；不将可用性写成连续性。
+create 发出后，即使 broker 回到不认识新 op 的版本，也只能续接原 handle 或明确报 74，绝不另建 legacy child。
 
-- **冒烟门**：rename 前对 tmp 二进制跑 `<tmp> version`（5s 超时，stdout 有 64KiB 上限 +
-  `WaitDelay` 防子进程占管道）；exec 失败或首行不符冻结格式 → `smoke_failed`；首行报告的
-  **proto 纪元 ≠ 本 agent 纪元** → `proto_bump_requires_reinstall`（外审 F5：请求里的
-  ProtoVersion 只证明 ctl/broker/本 agent 同纪元，不证明**下载的字节**属于该纪元——跨纪元
-  产物必须走重装，不许被 upgrade 偷运）。两者磁盘零变更。首行严格解析冻结格式
-  `tether <release> (proto v<N>)`，提取的 release 与 register 上报的 `ReleaseVersion`
-  **同一格式**（ctl `--wait` 的判据依赖该等式）。
-- **prev 槽**：`os.Remove(prev)` → `os.Link(dst, prev)`（硬链接，同 fs 零拷贝；link 失败降级 copy）→
-  单次 rename 进位。**dst 在任意断点都在位**——这是对"双 rename 断电后 ExecStart ENOENT 永久失联"
-  的结构性排除。prev 路径 = `dst + ".prev"`。
-- **marker**：`<dst 同目录>/.tether-upgrade.json`，tmp+rename 原子写。字段：
-  `state`（`pending|committed|rolled_back|rollback_failed`）、`prev_sha`、`new_sha`、`prev_version`、
-  `new_version`、`deadline`（绝对墙钟）、`boot_count`、`boot_budget`（=3）。JSON 损坏视为 idle 并告警。
-- **入口门**：marker=pending 时再来 upgrade → `upgrade_in_progress` 拒绝（防二次升级把唯一好二进制
-  clobber 成 prev）。
-- **exec 失败就地恢复**：`syscall.Exec` 失败时旧进程映像是**唯一存活的旧代码**——
-  `rename(prev, dst)` 恢复、写 `rolled_back`、旧进程继续跑**不退出**（同时闭合 setsid-nohup 路径）。
-- **启动检查**：`decideBoot(marker, selfSHA, now)` 纯函数，挂在 **`main()` 里 Cobra 解析之前**
-  的 boot shim 上（按 argv 形状识别 `tether agent` 守护调用；`version`/help/install 子命令
-  绝不碰 marker）。**必须早于一切可失败的启动步骤**（外审 F2）：新二进制若在 flag 解析、
-  strict YAML、logger 初始化上回归，进程在到达 RunE 前就退出——boot 检查若在这些步骤之后，
-  预算永不消耗、回退永不触发。黑盒钉子：`cmd/tether/agent_boot_shim_test.go` 用真实构建的
-  二进制 + 必被 Cobra 拒绝的 flag 连续启动，断言预算逐次消耗并在耗尽时回退。分支：
-  pending ∧ self==new_sha ∧ 预算内 ∧ 未过期 → boot_count++、继续、武装 watchdog；
-  pending ∧（boot_count≥budget ∨ 过 deadline）→ 校验 prev_sha、恢复 prev、写 `rolled_back`、exec dst；
-  pending ∧ self==prev_sha → 收敛写 `rolled_back`；prev 缺失/sha 不符 → `rollback_failed` 终态、
-  响亮日志、以现状继续（不制造新循环）。
-- **健康签到**：register 成功 = 提交点 → marker 写 `committed`。提交证明是**三件套**（外审 F1）：
-  ① marker 的 `target_sid/target_nid` == 本实例（`node upgrade <nid>` 点名谁就只有谁能提交/上报）；
-  ② `boot_count > 0`（staged 映像至少经过一次 decideBoot——install 时恒写 0，堵 flip→exec 窗口）；
-  ③ **运行映像 sha == new_sha**——取自 `/proc/self/exe`（读的是本进程正在执行的字节，即使路径
-  已被 rename 顶替），而非磁盘路径：flip 之后磁盘路径对宿主上**所有**进程都是 NewSHA，
-  只有真正 re-exec 过的那个进程运行着它，故该证明不可被共享二进制的兄弟进程借用。
-  pending 期武装 register-deadline watchdog（120s 常量；**只有 target 实例武装**——兄弟进程
-  重启不代管别人的升级，target 死亡场景由其 supervisor 下次拉起时的 boot 检查收敛）：
-  到期未 commit → 恢复 prev、`rolled_back`、exec dst。commit 与回退**互斥**：进程内靠
-  upgradeMu，跨进程靠二进制目录下 `.tether-upgrade.lock` 的 **flock**（install 全段非阻塞持有，
-  boot/commit/watchdog/exec-failure 四个短临界区阻塞持有）——**同宿主共享二进制 = 一个升级域**。
-- **有序持久化协议**（外审 F6；rename 只给崩溃原子性，不给断电持久性）：候选文件在**同一 fd 上**
-  chmod 0755 → fsync → close；prev 槽建立后 fsync 目录；marker tmp fsync → rename → fsync 目录；
-  dst flip rename → fsync 目录；rollback 的恢复 rename 与终态 marker 同样补目录 fsync。
-  install 路径上任何 sync 失败 → `install_failed` 收场（marker 尚未存在，盘面回到起点）。
-  顺序由 `upgradeSyncObserver` 注入点钉住（`upgrade_durability_test.go`：顺序断言 + 注入
-  sync 失败断言 fail-closed）。
-- **boot 预算 = 宿主上 staged 映像的启动次数**：boot shim 早于配置解析、无从得知 sid/nid，
-  而 flip 之后宿主上任何进程启动跑的都是 staged 字节——任何一次即崩都是对该映像的证据。
-  代价是共享二进制的兄弟实例在 120s 窗口内的正常重启也计入预算（罕见、方向安全，如实记录）。
-- **boot_budget 论证**：本仓两个 unit 是 `Restart=always RestartSec=2`（`scripts/install.sh`）与
-  `Restart=on-failure RestartSec=5`（user 单元）；按 systemd 默认
-  `StartLimitIntervalSec=10s / StartLimitBurst=5`，2s/5s 间隔**不会烧穿 start-limit**——
-  起来即崩的二进制会无限循环。boot_budget=3 是"起来即崩"的真正闭合者（~15s 收敛），deadline 是后备。
-- **已知 GAP（如实标注，不弥补）**：setsid-nohup 无监督路径下"起来即崩"无人拉起（与增量前同险）；
-  "崩得早于启动检查"的窗口 = boot shim 之前的 Go 运行时初始化（外审 F2 订正：在 shim 前置到
-  Cobra 解析之前**以前**，这个窗口其实覆盖 flag/YAML/logger 整个启动面，旧论断"极窄"不成立；
-  前置后才真正只剩运行时初始化，静态二进制已过真实 exec 冒烟，接受）——⚠ 该接受以**产物是 tether
-  二进制**为前提：一个格式全对的**非 tether 产物**骗过冒烟后没有 shim，预算/watchdog/marker 三层
-  收敛器全旁路、节点永久失联，这不在接受窗口内，见 deploy-tier-gotchas **#73**（OPEN）；
-  register 成功但行为异常不在承诺边界内——运维手段是金丝雀 + 手动指旧版本 URL 再升一次。
-- co-located agent 的 `ReExecOnly` 路径**不进状态机**（bin 目录 root-owned，`cluster upgrade`
-  已有 staging + sha + quorum 保护）。
+image 兼容另有域门（§22.7）：ABI 1 不代表能读 PTY；无 domain 行的 S3 reader 只有 `exec-v1`。
+纯 exec image 的所有 S4 新字段为零并省略，保留 S3 回滚；任意 retained PTY 状态或 `ClockUnknown` 非零要求 `pty-v1`。
+S4→S3 有 PTY 时在盘面变更前拒绝；S3→S4 首次 pending 期间若 prev 不支持 PTY，仍广告完整 capability，
+新 reliable create 返回 busy、legacy run 返回 75，commit 真正落盘后才开放。目标与 prev 均按实际 SHA 绑定 reader 能力；
+共享 binary sibling 仍允许 prev ∈ {running image, candidate}，不恢复 running==disk 门。
+四象限、真实旧二进制来源及 image 窗口的实际 S4 收据见 [S4 evidence](reviews/hot-update-evidence.md#15-s4-pty-terminal-证据骨架)；其日期/SHA 不代签 S5 候选。
+
+### 21.2.2 S5 flow/SS compatibility
+
+S5 keeps ProtoVersion/ImageABIVersion unchanged and adds flow-v1/ss-v1 capability domains; NATS fields,
+subjects/ACL and six-field REGISTER/exact OK stay unchanged. The binary flow frame has its own version1
+and private sealed codec has its own inventory, separate from the existing NATS wire ledger.
+New/new TLS peers select tether-flow/1; new/old, old/new and old/old use legacy raw on empty ALPN.
+No intersection clears server ALPN with original certificate/pin configuration; only the exact remote ALPN
+alert can cause one pre-REGISTER client retry without ALPN and without retained v1 flows.
+Selected v1, pin/certificate failure, authorization or capacity errors never downgrade.
+Legacy raw has no frame header and offers interoperability, with legacy_session_busy for active or idle
+retained responsibilities. Fixed v0.6.0/a3431a1 old-broker/exporter receipts and dynamic adjacent-release
+N-1 supply are recorded separately, with peeled source, flags, artifact and actual running SHA.
+
+All retained listener/retirement/salt/timer/cleanup domains must be readable by SHA-bound candidate and
+actual prev, checked before disk mutation, on the frozen bundle and after final re-export. ABI1 alone
+cannot certify this. Pending rollback to a reader lacking these domains blocks their new admission until
+durable commit, including pushed directives; MarkReady cannot release it. Shared binary sibling keeps
+prev ∈ {running image, candidate}; a third SHA fails. Details are §22.8 and the
+[binding plan](reviews/hot-update-flow-carrier-plan.md); scoped closure/carry receipts are in evidence §17/§18; historical §16 rows remain unsigned.
+
+### 21.3 agent 升级事务与首次迁入（S8 当前路径）
+
+当前代码保留两条入口，不能混用完成语义。`node upgrade <nid> --url … --sha256 …`
+及 `--all` 默认仍发送旧 upgrade wire；新 broker 在 `internal/broker/upgrade.go` 应用共同的
+legacy policy。事务入口由 `--prepare-only` 或 `--tx-id` 选择，实际实现是
+`internal/upgradecli` → `upgradewire` → `agentupgradeport` / `upgradestore`。
+
+1. **describe → prepare → stage → start → wait。** describe 从当前目标取得注册 Key、运行 SHA、release
+   和全部保留资源的 Scope；不存在描述路由就在下载前 defer，不猜 UID、路径或空资源集合。
+   prepare 校验下载 archive SHA、解压后的 binary SHA、实际 reader 声明，目标签发 inert Grant。
+   `tether upgrade stage` 是显式本地产品入口：验证 grant，发布 source/candidate 两份 immutable SHA
+   工件并给出 artifact receipt；installer 只做 retrofit，不启动 tether、不写 daemon journal。
+   原 ctl 用同一 TxID 和 receipt 发 Start；丢回复后 query/wait 原 ID，不能重新 prepare/start 猜测结果。
+2. **唯一 writer 与锁。** daemon 独占 durable journal；grant 缓存只是 ctl 已持证据，不是执行权。
+   同 canonical binary parent inode 的共享安装属于一个域；component/host/cluster 域长锁与 journal
+   RMW 短锁是不同 inode。长锁跨整个 cut、exec、恢复和退休，不沿用 S3 安装回调返回即解锁的形状。
+   canonical 冷启动解析 component 的 effective selector，盘面目标不等于运行映像。
+3. **三个完成点。** `control_ready` 要求订阅集合、Flush、重协调及真实请求 proof；register 单独不签 ready。
+   `resources_migrated` 证明原资源和 cut 后接纳责任归当前代；`old_generation_released` 证明原范围内旧 owner
+   全部退休。`upgradetx.Completed` 逐项核对 TxID/Key/revision/CutID/generation/direction/scope、producer、
+   nonce/sequence/time、三 receipt、实际 running/effective SHA 和 fresh census。历史 completed 或磁盘 SHA
+   不能回答当前 query。status 可 rc0 返回未知 owner；wait 对未知/超时返回 `upgrade_unsettled`（74）。
+4. **回滚与冷恢复。** forward/reverse 是独立 attempt。pristine 输入只读校验并可携原 FD 再派发；任一 ACTIVE
+   副作用后，显式或 watchdog reverse 都从当前状态导出 generation+1，保留新 ACK、offset、撤权和 transfer Grant。
+   不恢复旧 DB/WAL/backup。不可得安全点时 `rollback_blocked` 保留原业务和责任，不为期限杀业务。
+   损坏 journal fail-closed；v1 marker 只保留兼容投影，不再以“JSON 损坏视为 idle”授权新事务。
+   pending 永不 GC；历史保留最近 128 笔或 30 天（取较多），下一次 Start 关闭上一回滚窗口。
+5. **reader / authority / 两代门。** proto epoch、release、image ABI、ReadEpochs、required domains、schema
+   各自验证；ABI1 不证明全域可读。`upgrade-cut-v1` 独立 sealed adjunct 保留事务与锁的 custody，
+   不扩写 broker 九种 private kind。session incarnation 来自创建身份；register/G.1 与清理在实际写边界复核，
+   防止同 SID 删除重建后旧 PTY/flow 恢复权限。完整 managed fleet 最多两 release，资源链最多两 live generations。
+6. **legacy 边界。** 默认旧 envelope 对 busy 返回 `bad_request` + detail `legacy_busy`（64），无法证明 idle/quiescence 返回
+   `try_again` + detail `legacy_quiescence_unproved`（75）；事务 adapter 对应投影为 `upgrade_rejected` / `upgrade_deferred`。
+   混合或未知 delivery consumer 不能授权首次迁入。
+   `--interrupting` 是明确标记的 `legacy_interrupting non_hot`，不能签热成功；当前 CLI 在 dispatch 后无法证明
+   因果时返回 74。旧版本可能已有 smoke/prev/rollback，缺的是全域交接、授权与可关联 proof。
+   capable→legacy 热回滚拒绝；整机重启、业务程序自身升级和无监督启动即崩仍属独立边界。
+
+可执行顺序见 [usage §5.19](usage.md#519-tether-node-upgrade) 与
+[broker operations](broker-ops.md#s8-transaction-operations)。S3/S4/S5 历史候选收据见
+[evidence §14–§17](reviews/hot-update-evidence.md)；S8 38/39、A-6、最终候选门禁与 Darwin native
+仍为 NOT_RUN/PENDING，源码落地不签出口。§22.11 绑定当前事务 owner 和观测合同。
 
 ### 21.4 对未来 ProtoVersion bump 者的义务
 
 bump = 纪元更替，必须整体交付：新 broker 同时订阅 `tether.v(N)` 与 `tether.v(N-1)` 两棵 subject 树、
 在请求方的前缀上应答、并保持双订阅至少一个 release 窗口；agent/ctl 端重装（不得 `node upgrade` 跨纪元）。
 `internal/proto` 的钉子测试失败信息会把 bump 者引到本节。
+
+### 控制连接与恢复补充（2026-09-20）
+
+对应 `reviews/control-connection-recovery-plan.md`：tier-B 的 agent/ctl 对象读取使用普通 pull consumer，同一 NATS connection 的所有 reader 共享最多四个 chunk 的批次窗口，完整消费后再请求，保持长度/摘要/序列校验和取消清理。此约束防止 ordered push 积压合并成超出客户端上限的 WSS 帧；对象 wire 格式、发布路径和权限域不变。
+
+同一 desired configuration 的 expose 重放在拨 REGISTER 前保留已有 session/supervisor；不同身份、token、home/epoch 仍受原有守卫约束。成功重拨须有明确日志。silence 逃离依赖当前接入 broker 的已确认身份、未过期 roster 和不同合法 voter；register 的 optional `connected_broker_id` 从请求 ServerID 查集群映射，N-1 缺失只用明确 host/route 证据。未知 alias、nil/过期 roster 不作为重建依据。
+
+上述批次还必须使用真实 pull request 的字节限制 `min(5×MaxPayload,32MiB)`，不能只信对象 metadata 的 ChunkSize。取消/失败时退订后经同连接 PONG 确认排空，未确认的 reader window 不能用于发送下一批；读入完整批次且消费完毕才可直接释放。consumer inactive 覆盖本次 transfer 整体预算，Close 正常主动删除。隧道 pin 升级以真实 transport 的证书为证据，不能由可变 desired pins 推断；在途无 pin 握手若被 pin 升级超过，安装前重验 peer，失败继续恢复而不终止 supervisor。
+
+启动时未通过账户 pin、签名、schema 或有效期验证的 roster cache 只保留持久 pin/generation 高水位，不进入当前决策镜像。runtime route 首次推导身份/aliases 时也须检查 roster 当前有效期，避免已过期缓存经一次合法新回复固化为错误的接入身份。
+
+同 epoch 的 ApplyHome 也遵守上述 pin 升级校验，并保存显式 home 身份；从单节点迁入集群且保留 epoch0 的旧连接不能在未验证 peer 时被报告已应用，也不能被后续空 pin 更新降回无验证模式。
+
+N-1的host/route推导只有在匹配唯一NodeID时才可成为跨刷新保留的接入身份；多个节点共享hostname时保持未知，显式connected_broker_id不受此限制。
+
+传输reader以新API在caller ctx内创建consumer后，用legacy公开Bind+SkipConsumerLookup+AckNone建立本地pull subscription，避免固定SDK中未继承ctx的冗余ConsumerInfo；Bind指定已有consumer，不能隐式创建第二个。
+
+首次从无名fallback迁入named home是同epoch地址规则的例外：cluster init --from-existing 的operator-provided TunnelAddr可能与旧fallback不同。升级校验实际peer后保存advertised地址，保留活transport；supervisor在mu/generation守卫内同时读取当前地址和pins供下一次重拨。已named home的同epoch地址变化仍拒绝，必须用新epoch重建。
+
+## 22. 热更新基础设施与运行层接线（S0–S10）
+
+需求见requirements §6.8，完整范围、验收和当前进度分别见
+[plan](reviews/hot-update-plan.md)、[tasklist](reviews/hot-update-tasklist.md)与[证据索引](reviews/hot-update-evidence.md)。
+升级入口已接普通 exec image（§22.6）与可靠 PTY 域（§22.7）；完整全栈连续性仍以各 stage 的真实收据为准。
+S3 的普通进程部署收据见 evidence §14，S4 的实际收据见 §15；S5 的绑定合同见 §22.8，历史未签行见 evidence §16，实际 S5 收尾与 carry 见 §17/§18；不代签当前全栈候选。
+
+已新增的`internal/handoff`负责Linux同PID替换映像时的显式资源包：
+
+- `Prepare`校验owner/state/resource，将调用者已具CLOEXEC的白名单FD复制成独立CLOEXEC描述符，
+  把有版本的元数据写入sealed memfd。原FD的status flags和所有权不变；open-file description仍共享。
+- `Exec`只在Go ForkLock保护的exec窗口允许这些副本和manifest继承；系统调用返回失败时恢复保护。
+  不改变其他FD的既有继承策略，完整资源清单与安全点由上层运行层负责。
+- `Restore`消耗私有环境参数，验证sealed状态、schema、同PID/EUID、包身份、资源FD指纹和flags；
+  导入FD全部恢复CLOEXEC后才交给调用者。`TakeFile`逐项转移所有权，`Close`只关闭未领取资源。
+- 使用`SyscallConn.Control`复制FD，避免`File/Fd`转换改变共享socket的阻塞状态。
+  deadline、bufio/泵缓存、TLS/yamux、Wait/退出日志、传输与权限状态仍须各自adapter显式处理。
+- metadata总量上限64MiB、资源和FD各最多16384；未知或不完整输入拒绝。
+  匿名snapshot只服务计划内exec，不是断电journal或跨进程认证。非Linux明确不支持该交接能力。
+
+底层已有真实子进程exec、原child/pipe/TCP与失败恢复、≥5轮资源门和解析fuzz。
+这些证据只对应资源包；agent/broker/ctl接线、可靠流、基础服务滚动和完整热更新出口仍以tasklist为准。
+
+### 22.2 进程所有权接线进度
+
+`internal/workload.Manager`现接管成功启动的普通exec与PTY child的wait/signal；仅对登记PID执行WNOHANG，reap与信号共享屏障，保存真实status/退出码/rusage后释放os.Process句柄。普通exec的输出EOF前设置ReapHeld，保留leader的PID占用与子树信号责任；两路输出完成后才AllowReap，避免后台后代仍持pipe而已无法安全清场。普通exec使用显式三组pipe，避免os/exec隐式copy/Wait清理。可靠PTY的master、输入/resize与KA由ptysession actor持有（§22.7）；legacy仍经Session/agent队列，启动失败和abandoned helper仍由原隔离路径回收。
+
+G.1快照包含普通exec、PTY和courier待交付exit；终态转交发生在任务退休前，按PID合并且exit优先，避免暂时缺席被误判-1。kill和G.1 DropProcesses也可向普通exec原进程组发信号，后者仍按SIGTERM、5s后SIGKILL且ctx取消停止升级信号。进程表freeze本身仅是wait/signal子屏障；完整运行层cut另组合runtime双向I/O/registry与进程表屏障，普通exec见§22.5/§22.6，可靠PTY见§22.7，不能把单独冻表当完整安全点。
+
+进程域新增版本化ProcessState：只在冻结状态导出，绑定本机boot ID及原owner PID/start ticks；所有未reap child需匹配原parent、group、start ticks，包含仍被ReapHeld保留的zombie。导入验证全表后才安装，失败不reap/kill；终态只恢复保留结果，不碰可能复用的PID。恢复Manager保持frozen，Thaw启动唯一reaper。该进程域的同PID exec和错误导入/资源测试守住单域身份；agent完整导入由§22.5–§22.7的bundle/activation边界组合，收据仍逐层分列。
+
+注册回包的courier结算现在绑定每次请求的事件身份和实际快照；重试重新取快照，迟到回复不删除后到或被替换的退出事件。此修正不替代联合任务准入屏障。
+
+### 22.3 字节资源与运行层屏障
+
+`workload.Replay`使用匿名固定大小memfd保存连续未确认字节及FIN，base/end为逻辑累计offset，物理环绕不改变顺序。容量预留计入每节点预算；默认每流上限8MiB、节点256MiB，容量耗尽向源背压。grow/shrink seal固定文件长度，唯一owner的freeze屏障排除append/ACK；FD与精简元数据经handoff传递，恢复保持frozen。
+
+`workload.Output/Input`分别持有可轮询的原读/写端；暂停以自身的临时deadline唤醒I/O，n>0先记账再进入安全点。输出已读但日志写入失败的有限suffix仍保留在状态，不因错误丢弃。输入仅在实际写入后推进applied offset，接受FIN且此前所有字节写完后才关闭writer。actor不绑定NATS生命周期。普通exec的actor已接可靠协议、agent/ctl与image升级（§22.4–§22.6）；PTY使用§22.7的专用owner和finalizer。TCP/SSH/SS 已有 §22.8 owner，transfer 已有 §22.10 owner，事务与 infra 接线见 §22.11/§22.12；本层结果不签全栈验收。
+
+可靠 exec 输出流的**异常终结**（S0 定稿，见 `reviews/hot-update-stages-plan.md §-1 OQ5`）：`ProcessOutput.Error` 与 `FIN` 同位（都作用于 `Offset+len(Data)`）、只出现在到达 End 的那一批、二者互斥。aborted 流已读字节全部保留、`FIN` 保持 false、不调用 `Replay.Finish`；request 侧 `StdoutFIN/StderrFIN` 只回显真 EOF，agent 拒绝对非 FIN 日志的 FIN 声明；terminal-ack 逐流接受 `(FIN && ack==End) || (aborted && ack==End)`；`execclient.Run` 在 settle **之后**把 terminal error / 流 abort 作为 `*SettledError` 返回，`Result` 保留真实 exit/signal；`tether exec` 进程本身在 S0 仍把任何 `SettledError` 归到未分类 exit 70（不透传真实 exit/signal）——退出码 taxonomy 与 usage §9.13「真跑起来即透传」的张力在 S1 先改文档再改码。aborted 只有两个来源：泵未建立（child 已存在后 setup 失败，`task.abort`）与泵自记 `ReadError`（EIO / 存储失败）；后续 PTY 域的非 started EIO 与逻辑流错误复用后者，不需要新 API。setup 失败后 child 被 SIGKILL、终态先记录，已建的泵把内核 pipe 缓冲 drain 到真 EOF（terminal-draining）——不 Abort 泵、不丢字节。已关闭 Runtime 下迟到 Start 的唯一最终清场 owner 是 startup goroutine 自身（`conclude`），`Close` 对已发布的 task 不等 ctx 立即回收，永远不需要第二次 `Close`。
+
+（S1 订正：`tether exec` 进程自 S1 起不再把 `SettledError` 归到 70——真跑起来的任务透传真实 exit/signal，create 送达后一切未结清失败归 **74**（`EX_IOERR`，终态、仅表现层），权限类保持 77；完整 taxonomy 见 §22.4 第 9 条与 usage §9.13。OQ4 边界：ctl **进程**退出/重启后按同一 handle 恢复不是本需求目标——handle 只在 ctl 进程生命周期内保留（requirements §6.8）。）
+
+### 22.4 可靠进程请求协议与准入（S1 定稿，活契约）
+
+本节把 `reviews/hot-update-handoff-protocol.md` §2–§4 的裁决与 `reviews/hot-update-reliable-exec-plan.md` 的实现搬成**绑定契约**；实现在 `internal/proto/process_resume.go`、`internal/procrequest`、`internal/execsession`、`internal/execclient`、`internal/procforward`、`internal/broker/{exec,admit,reconcile}.go`、`internal/agent/exec.go`、`cmd/tether/{exec,ctl_connect,exitcode}.go`。改本节先于改码。
+
+1. **verb 与 op。** `process-resume` 是独立 verb（旧 exec broker 会 decode→re-marshal 丢掉新幂等字段，所以不能复用 `exec`）；subject `SubjCmdBy(sid, actorPublicKey, nid, "process-resume")`，broker 转发到 `SubjCmdForwarded(sid, nid, "process-resume")`。五种 op：`probe`（无创建副作用，返回绑定原 runtime 的 capability + lease）、`create`、`resume`、`ack`、`terminal-ack`。handle = 原始 lease + 稳定 RequestID；registry key 绑 scope（SID/NID/ActorFP/ClientLineage）+ LeaseID + RequestID，intent hash 覆盖整个 `ExecReq`——同身份换 argv/env/cwd 是冲突（`process_conflict`），不是新任务。lease 只限制**未见过请求的首次创建窗口**（默认 30 s、上限 5 min、容量 4096/16384）；已保留记录按原 handle 查找，settled 且创建 lease 已过期才可回收，回收后的晚重试得 `process_expired`，永不重建任务。**异实例 lease**（`TargetInstance`/`BootID` 不等于本 runtime）在整体校验之前先判 `process_instance_lost`——它无法验 MAC，也不泄露任何东西（instance 本就在 capability 回复里）；drill 34 的 ctl 半靠它在数秒内退 74。AttachEpoch 在 S1 恒为 1：断链续接不换 epoch（`TestRunKeepsAttachEpochAcrossReconnect`）。
+
+2. **broker 转发顺序**（`handleProcessResumeReq`，每步的位置都是裁决）：① subject/reply 守卫（reply 必须是 `auth.InboxPrefixFor(actorPublicKey)+"."` 私有前缀、≤512、token 只许 ASCII 字母数字下划线连字符）与 leader 检查——**先于任何错误回复**，否则合法 publisher 可借错误响应让 broker 向任意 subject 注入；② 体积 ≤ `procforward.MaxRequestBytes`（1 MiB），超限 `process_request_too_large`、`CallID=0`；③ `procforward.Parse` 只读 `version/call_id/op`（`call_id` 必须是裸数字 token——引号包住的 `"7"` 是 bad_request），malformed → `bad_request`、`CallID=0`（malformed/oversize 无可靠可解析关联，是明文边界；**路由键**（`version/call_id/op/exec`）任何大小写变体拼写也是 `bad_request`——agent 的 struct 解码折叠大小写，一份 `"Exec":{…}` 会让 broker 按无 exec 准入、agent 按有 exec 执行，`actor_fp` 例外：它由 stamp 拥有，变体被剥离而非拒绝）；**CallID=0 的这两种拒绝由 client 认领**：它同一时刻只有一个在飞的 call，`unparseableRefusal` 直接呈现为 typed refusal 而不是当作「不是我的」丢弃——否则一条确定性拒绝会变成 500 ms 一次的重发循环直到 `--timeout` 再报 74；且 client 在**首次发布前**按同一常量 `proto.ProcessRequestMaxBytes` 自检，超限 create 根本不出门（S1 内审 ctl-V1）；④ **按 op 选 spec**（attach 类 op 用 `processResumeAttachSpec`）但**不在此拒绝**未知 op；⑤ `admitACL` 每 op 重读当前 SID membership——ACL 拒绝**先于**协议/op 错误，reason 文本一字不改（`not_a_member`、`node_offline: status=…`）；⑥ version ≠ `ProcessResumeVersion` → `unsupported_process_protocol`；未知 op → `unsupported_process_operation`；⑦ `Stamp(actorFP)`：raw overlay——**只**改写顶层与 `exec` 内的 `actor_fp`（大小写折叠删除所有变体后写入一份），其余字节原样转发，lease/TargetInstance/意图/ACK 一律不碰；⑧ `PublishMsg` 到 forwarded subject，Reply 透传；⑨ `create` 才写 audit `call`，且**天然可多条**（回复丢失 → client 同 CallID 重发 → 每次转发都记）——「无重复执行」的 oracle 一律取 agent 侧证据（`agent: exec` 日志恰 1 行、`ps` 恰 1 行、marker 恰 1），audit 只记录。合法 JSON 的拒绝必须带原 CallID；client 丢弃 CallID 不匹配的迟回复后才看 version/status。
+
+3. **agent 侧身份。** agent 用 broker 盖章的 `actor_fp` 与本地 SID/NID 构造 scope，绝不信 payload 自称的身份；`ActorFP` 是原始 key 字节的指纹，不能拿它算私有 inbox。`msg.Reply==""` 的转发直接丢弃（无法回复也不能执行）。
+
+4. **准入极性。** `probe` 与未知 op 走严格 spec（节点必须 ONLINE）；`create/resume/ack/terminal-ack` 走 `allowStaleNode`：STALE（心跳空窗 > StaleAfter=5 s，agent 大概率活着）放行，OFFLINE 仍拒绝（gotcha #90）。代价：真死 agent 在 STALE 窗（5–60 s）内的 attach 请求被转发到无人订阅的 subject，ctl **收不到** 503（no-responders 只发给自己持有 reply 订阅的发布者），按 500 ms attempt 超时重发直到 OFFLINE → `node_offline: status=OFFLINE` → 74。
+
+5. **Code 词表**（`ProcessResumeReply.Code`，additive/omitempty；旧 client 只看 `Error` 文本）：`bad_request` / `process_request_too_large` / `unsupported_process_protocol` / `unsupported_process_operation` / `process_identity` / `process_instance_lost` / `process_expired` / `process_conflict` / `process_capacity` / `process_stale` / `process_busy` / `process_recovering` / `process_revoked` / `process_output_discarded` / `process_runtime_closed`，外加 admit 的八个拒绝码与 broker 转发失败的 `forward_failed`（→ 75）。`process_recovering` 只表示有界准入等待已到期、恢复及原任务责任仍保留，不能据此重建任务；新 exec 重发同 CallID/handle 直到原 ctx 到期，PTY 使用原固定恢复窗，真正 `process_busy` 不重试。N-1 reliable exec/PTY client 将未知 code 作为 typed final refusal 呈现（create 后 74；更早的 exec 可为旧 default 70），既不 fallback 也不另建 child；更旧的 prose-only client 同样呈现 Error，不将其认作 unsupported。新增 code 不改字段、版本或旧端零值语义，CLI refusal table 归 temp-failure 75；已 create 的任务仍受 item 9 的 74 规则约束。client 的 `ErrUnsupported`（→ legacy fallback）**只**由创建前的 `unsupported_*`、无 responder / probe 2 s 超时、拿不到私有 inbox 产生；权限错误保留原错误、不降级。`process_expired` 只在 client 已持有双流 FIN 与 terminal 时可解释为「已结清」。
+
+6. **单一 started 站点与 G.1（C-5）。** `proc.started` 由 `startExecPipes` 在 `AdoptDraining` **之前**入队（reliable 与 legacy 同一站点，带真实 `boot_id/start_time_ticks/started_at`）；`initProcessRuntime` 的 `Started` 钩子只留审计行 `agent: exec … reliable=true`。`LocalProcess.StartedUnacked`（additive）标记「已 adopt、courier 仍欠 started」的行，broker reconcile 的**两处** orphan 循环（纯分类器 + live）对它 `continue`——既不 accept 也不 drop，等 courier 自己 settle。N-1 四象限：旧 broker 忽略字段（今天的窗口行为）、旧 agent 不发字段（今天）、新 agent × 新 broker 关掉 false-orphan 窗、零 Raft op / 零 schema。
+
+7. **撤权（C-10 的 exec 半）。** 产品没有 member 移除动词；member 撤销只在 broker 每 op 的 `admitACL` 以 77 拒绝 ctl，agent 上的任务照跑到自己退出。`session_destroyed`（sys.events，只有 broker 可发）由 agent 处理：`Runtime.Revoke` SIGKILL 每个任务的进程组 + 标记 revoked + 记录撤权时刻（用 runtime 自己的钟——签发 lease 的那一个；钟失败要报错、不能静默当「无可撤」），`reapManagedChildren` 收 legacy exec 与 PTY；**daemon 不退出**（systemd cgroup 随 daemon 退出杀光 unit 内全部负载）。标记本身覆盖不到的两个形状（S1 内审 P1/P2）：**startup owner 仍在 `Start` 里的任务**没有已 adopt 的 child，Revoke 的 Signal 落空——`start()` 在 adopt 之后重读 `t.revoked` 补杀（标记落在 spawn 之前则直接拒绝 spawn，终态 `revoked: …`）；**输出日志已满的任务**的泵在等一个永远不会来的 ACK，dead child 的 EOF 永远读不到——`observe` 对 revoked 任务把**停滞**的流 `Abort`（在当前 End 结束、字节保留、绝不伪造 FIN），还在 drain 的流照旧到真 EOF，于是 child 被 reap、`finish` 记下 `revoked:` 终态、Exited 发出。撤权后 `Handle`：命中 revoked 任务或 `IssuedBootNS` 早于撤权时刻的 create → `process_revoked`；同 handle 的 create 经 `Reserve` 回到原记录同样命中——不复活。**freeze 与删除竞争**：撤权是权威事件永远赢——(a) 未冻结 → 立即 kill + tombstone；(b) **已冻结（S2 已实现）** → `Revoke` 只登记（`t.revoked` + `revocations[sid]`，返回的 killed 计数仍是被标记数），kill 推迟到 `Runtime.Thaw`，哪个映像 thaw 就由它执行——所以 `Thaw` 在进程表仍冻结时**先判后改**、返回 `workload.ErrFrozen` 而不改任何状态（否则那次补杀会静默丢失）；(c) 事件落在 exec 窗内丢失 → 新映像首次 register 得 `session_not_found_or_deleting` 时按 `session_destroyed` 处理（S3）。tombstone 与 revocations 随 image 导出（§22.5），导入后 `handleDiscarded` 与撤权前 lease 的 create 拒绝原样成立。
+
+8. **abandoned-terminal 有界保留。** 终态任务在 `now ≥ max(lease.ExpiresBootNS, lastTouch+2 min, terminalAt+2 min)` 后由 `Sweep` 释放三份 replay 预算并留 tombstone（TerminalID/exit/signal/error/FinalEnd/FinalFIN）；tombstone 15 min 后 `Settle`+`Collect`，晚重试得 `process_expired`。tombstone 期间：`terminal-ack` 且 TerminalID/acks/fins 全等 → 仍可结清；其它 op → 回复带终态 + `process_output_discarded`。触发点是 create 分支与 agent heartbeat tick（空闲节点也受 lease+grace 封顶，不新增 goroutine）。**running-abandoned（S2 实现，D11）**：无人 ACK 的 running 任务在输出累积 8 MiB 后对原 pipe 背压；`Sweep` 在 `now ≥ lease.ExpiresBootNS` 且 `now ≥ lastTouch + AbandonedRunningGrace(15 min)` 时对**已满**的输出流调 `workload.Output.Discard`——该流对消费者在当前 End 以 aborted 结束（`Error` 以 `abandoned:` 开头，绝不伪造 FIN，已保留的 8 MiB 仍可读、仍按 aborted 合同结清），泵改为读而丢弃，**child 继续运行**到自己退出；不 kill、不伪造 ACK（kill 是用户可见倒退，伪造 ACK 让回来的 ctl 永远 `process_conflict`）。`OutputState.Discarding` 随 image 导出，导入后的泵继续丢弃。未满的流、有 touch 的任务不动（`TestSweepDiscardsAbandonedRunningOutput`）。
+
+9. **ctl 退出码 taxonomy**（usage §9.13）：阶段规则——create 送达前的 unsupported → legacy；ctx 取消 → 75；权限 → 77；`nats: maximum payload exceeded` → 64（确定性）。create 送达后**除 77 外一律 74**（`exitUnsettled`，EX_IOERR，终态、仅表现层，永不进 `brokerCodeExitClasses`），**唯二例外**是构造上证明「什么都没被接纳」的拒绝（`createNeverAdmitted`）：`process_capacity`（`Reserve` 先返回既有记录、再查容量，所以它只可能是「此 handle 无记录」的 create 回复）→ 75，`process_request_too_large`（broker 从未转发）→ 64。typed refusal 的类只由 **Code** 决定（其 message 是散文，前缀键不到任何类）；无 Code 的旧 peer 才用 message 前缀查类，且 `ExitError.Code` 留空。`SettledError` 且任务真跑起来 → 透传 exit/signal（信号 → 128+sig）；未执行且无流 abort → 用 terminal error 文本；`--timeout` 到期与 Ctrl-C/SIGTERM 都是 **放弃**（74，各自的文案：`gave up waiting after --timeout …` / `interrupted (Ctrl-C/SIGTERM)`，任务在 agent 上继续）。**没有 per-task 的 kill 动词**：放弃后的指引只说存在的东西——任务自己结束、`tether session rm <sid>`（该会话所有节点的全部任务）、到节点上停进程（`TestExecFailureGuidanceNamesExistingCommands` 对命令树核对每条指引）。重试规则：69/70/75 可重试（退避），64/74/77 终态。
+
+10. **连接级有界重试**（callout 黑窗）。受益前提「本身份此前认证成功」的载体是收据文件 `<home>/auth_receipts/<sid>`（首行 = 指纹，换 key 不继承），任何一次以已激活名成功的 CONNECT 都写它（存量 home 升级后第一条成功命令即自愈）。谓词 `transientConnectErr` = `nats.ErrNoServers | nats.ErrTimeout | net.Error.Timeout() | nats.ErrAuthorization | "Authorization Violation"`；其它（TLS、`ErrNkeysNotSupported`、其它 `-ERR`）不重试。预算 5 s（新尝试只在预算内**开始**，最坏墙钟 = 预算 + **一次 connect 尝试**：单 URL 路径为一个端点的 2 s Timeout，扩展拨号路径一次尝试走遍池内 N 个端点、可达 N × 3 s），退避 250 ms→500 ms→1 s 封顶；`!eligible` 短路成单次尝试——这是负控制的机械保证，其谓词是纯函数 `connectRetryEligible(verb, home, sid, activated, fp)`：**任何 `login` 动词**（含 `--pin` 激活时传的 `"login: activation for session <sid>"`——S1 第一版只比对字面量 `"login"`，激活动词漏网，错 PIN 在持有收据的 home 上会重试满预算、每次都是真实的 Argon2 拒绝并扣减 per-IP PIN 配额；内审 C3）、未激活名、无收据或收据属于别的 key/别的 session，都不重试。收据按 (home, sid, key) 键控，不含 broker：同名 session 在另一台 broker 上被当作「认证过」，代价是 ≤ 5 s 的误导性重试行、仍以 77 收口（已知宽松面，记录不修）。`nats.IgnoreAuthErrorAbort()` 进 ctl 的连接选项：代价是被撤权的 ctl 在 `exec`/`run` 中途会重连到 `--timeout`/Ctrl-C 而不是两次 auth 错误后断开，撤权由 broker 每 op 77 收口。
+
+11. **S1 historical boundary, superseded for S6 admission by §22.9 item5:** the earlier2s probe treated timeout/no responders as legacy. `internal/execclient/admission.go` now retries within one absolute budget; only explicit unsupported or authenticated legacy capability permits fallback. Blackout must never start a duplicate legacy task. Production command integration and ≤5s acceptance receipts remain pending P23/P29/P35; record reliable/legacy path separately.
+
+12. **N-1 四象限的证据分工**：Q1 新 ctl × 旧 broker（真二进制 harness 里用 server 端 deny 掉今天 broker 的 `process-resume.req` 订阅——v0.6.0 broker 本就没有这条订阅，ctl 得到的是 server 自己的 503，`TestExecReliableLegacyFallbackOnOldBroker`）、Q3 新 ctl × 旧 agent（`legacyAgentSim` 只答 `exec`、对 `process-resume` 静默）、Q4 旧 broker × 新 agent 由 hermetic 守；Q2 旧 ctl × 新 broker 与真 v0.6.0 二进制的 Q3 由 drill 35 臂 C 用 `vendor/tether-prev`（前一发布 tag 源码构建，tether-next 只证机制）守——2026-09-21 实跑三臂 GREEN（`test/simcluster/expected-verdicts-log.md §35`、evidence §12.2）：C1 的 v0.6.0 ctl 走 legacy、丢 450/522 记录、exit 仍送达；C2 的 v0.6.0 agent 收到 4 条 probe 后 ctl 退回 legacy、跑完。旧 agent 对每次可靠 probe 记 ~4 条 `unknown forwarded verb` warn（probe 每 500 ms 重发都被转发）——这是 N-1 窗口的已知噪声，不是缺陷。
+
+### 22.5 agent 运行层 image ABI v1（S2 定稿，活契约）
+
+> S4 的 kind-aware PTY 资源、deadline-aware 屏障与撤权优先激活扩展见 §22.7；S5 flow/SS 与共享预算见 §22.8。本节保留 S2 基线，扩展域冲突处以对应后节为准。
+> S2 交付的是**可交接的运行层**，不接产品路径（bootstrap / `node upgrade` / marker / G.1 联合快照 / `session_destroyed` 导入半 = S3）。本节是 `internal/execsession` fence + `internal/agentimage` bundle 的绑定契约；plan：`docs/reviews/hot-update-agent-image-abi-plan.md`。
+
+1. **组成与归属。** `agentimage.Bundle{Version=1, Instance, Lineage{Generation, BootID, ProtoVersion, InstanceID?, RoutingNID?, ExporterRelease?}, Processes workload.ProcessState, Runtime execsession.Image, Courier CourierState, SpawnSafe *spawnsafe.State}`。每域自带 version；bundle 是**元数据**——每个 replay 环（memfd）与 pipe 端都作为描述符经 `internal/handoff` 走（每 task 一个 `Resource{ID:"exec-task.<pid>", Kind:"exec-task"}`，文件名 ⊆ {`stdin-replay`,`stdin-target`,`stdout-replay`,`stdout-source`,`stderr-replay`,`stderr-source`}）。**进程表（`workload.Manager`）归 agentimage 冻结，不归 execsession**：它是 legacy exec / PTY 共享的一张表，冻结顺序 runtime → Manager、解冻顺序 Manager → runtime（见 3）。
+2. **`execsession.Image`**：`{version, instance, frozen_at_boot_ns, replay_capacity, budget_limit?, budget_used, registry procrequest.State（含 HMAC secret）, tasks[], tombstones[], revocations[]}`；`TaskImage{pid, handle, abort[2]?, revoked?, lost_terminal?, terminal_at?, last_touch, stdin?/stdout?/stderr? StreamImage, files{name→{dev,ino}}}`；`StreamImage{replay ReplayState, output? OutputState, input? InputState}`。**phase 不导出**——导入时由 registry record 派生（running/terminal），这关掉了 `finish`（record 已 terminal）与 `conclude`（done 关闭）之间的无锁窗口。字段全表由 `test/architecture/testdata/image_field_inventory.txt`（只增账本）钉住。
+3. **fence（六段屏障，来源 × 状态）。** `Runtime.Freeze(deadline)`：先 `registry.Freeze()`（任一 record `starting` → `ErrBusy`，**这是「无在飞 spawn」的唯一判据**，绝不等 `t.done`）——等待期间（quiescing）create 阻塞、attach 类 op 照常，每 5 ms 重试到 deadline；再按 pid 序冻每个 task 的 Input/Output/裸 log（持 `r.mu`，泵 goroutine 从不取 `r.mu`）。冻结后：`Handle` 的每个 op（含入口锁竞争）在同一个 `upgradebudget.RequestLatency`（5 s）截止内透明排队；旧映像的 waiter 随 exec 消失，新映像 Thaw 后回答客户端的 500 ms attempt 重发。到期返回 `process_recovering`（内部同时匹配 `ErrBusy` 与 `ErrRollbackPending`），保留封闭准入、恢复 owner 与全部资源；exec 在原 ctx 预算内用同 CallID/handle 重发，PTY 在原 180 s absolute recovery window 内重试，错误不续期。真正的容量/legacy 准入忙仍为 `process_busy`，两种客户端均立即呈现；`observe` 整段 gate（不 abort、不 AllowReap、不 finish；frozen 且 closed = 已 Discard，直接退出**不**走 closed 分支的 SIGKILL）；`Revoke` 只登记；`Sweep` 不动；`Close` 对已 export 的冻结 runtime 等价 `Discard`；对**未导出**的冻结 runtime（含导入未 thaw 的）`Close` 先**thaw 本地状态**（泵 + registry，降 fence 位）再走 S0 的关闭分支（SIGKILL、closeTask、AllowReap、finish → Exited + Forget），且在进程表仍冻结时**拒绝**并返回 `workload.ErrFrozen`、不改任何状态（先 thaw 表——回滚序——或对导入映像用 `Detach`）；第一版直接走 frozen+closed 门、吞掉 Signal 的 ErrFrozen，留下已杀未收的 ReapHeld 僵尸且不发 Exited（内审 F4/V1/R3/P6）。**冻结期 child 退出**：runtime 先冻、Manager 后冻的微秒窗内退出的 child 被 reaper 记成 Exit 行（非 ReapHeld）或保持僵尸（ReapHeld / Manager 已冻），随 `ProcessState` 导出，由新映像的 observe 记账**恰一次**；`finish` 的 ErrFrozen 臂保留为 belt。
+4. **Thaw 顺序**（load-bearing）：本地泵先（首个 Handle 读到的流已清临时 deadline）→ registry → 补发冻结期登记的撤权 kill（Manager 必须已 thaw，否则先判后拒）→ 导入的 live 任务起 observer（`defer conclude`，与 `start()` 同形）→ `cond.Broadcast`。网络（courier 投递、register）在 agentimage/S3 层，永远在 `Runtime.Thaw` 之后。
+5. **导入三段式，无部分安装。** ① 纯校验（`procrequest.RestoreWithClock` 全表 + §2 的每条规则：版本/instance/boot ID/handle 一致/phase 与流形态一致/预算 Σcapacity==budget_used≤limit/文件名集合==期望集合/tombstone 有 terminal record/每条非 settled record 恰有一个 owner/rows 与任务表互相覆盖、外来行 → `ErrForeignProcess`）；② 逐名 `TakeFile` + 只读谓词（fstat dev/ino == 导出指纹、`CheckReplayFile`(seal/size/RDWR/CLOEXEC)、`CheckStreamFile`(方向/FIFO)）——任一失败把已取文件**原样**（不 Close）作 `[]handoff.Resource` 返回（Salvage）；③ 构造（RestoreReplay/RestoreOutput/RestoreInput，全部 paused、无 goroutine、registry frozen）——失败经 `Detach` 回收进同一 Salvage。`Import` 全程只读 `cfg.Manager`；`RestoreProcesses` 由 agentimage 在 `Import` 成功**之后**调用（它自身失败无副作用），是最后一个可失败步骤。`Imported.Detach()` 在 Thaw 前把一切交回（runtime 描述符 + 本次 restore 的表 `Manager.Discard()` 释放 pidfd 不 reap）——S3 的「保 FD 再派发回 prev」用它。**`Salvage` 自带 bundle**（解码成功则为解码后的 `Bundle`，Decode 失败则为原样字节）：`Salvage.Prepare(extra...)` 用 `Role` 重新打包同一 bundle + 已取回的描述符，这才是「保 FD 再派发」真正可执行的形状（内审 I1：第一版为了卫生把 `State.Data` 清零后 Salvage 无 bundle 可派发）；`Salvage` 在任何 fmt 动词下只打摘要，`State.Data` 恒为 nil。**`RestoreProcesses` 是最后一个做内核检查的步骤**；其后 courier 与 spawnsafe 的安装各自只可能因调用方竞争失败，而它们从数据可判的拒绝（courier payload 对账 `CourierImporter.Check`、policy 是否新鲜 `Policy.ImportReady`）**在取任何描述符之前**已问过（内审 I5）；安装顺序 courier → spawn 判词，失败即 `discardTable` + `Runtime.Detach` 进同一 Salvage。 **Export 对导入未 thaw 的 runtime 可用**（导入的任务带着与导出方相同的冻结态，回滚可重导当前态，内审 F2/P7）；**`Detach` 只对 imported ∧ frozen ∧ 未 thaw ∧ 未 export 的 runtime 可用**（thaw 过的 observer 已跑、offset 已动；export 过的原件已有第二持有者——`Prepared` 的 dup，内审 F3/R2）。
+6. **预算守恒。** `usedBefore == Σ(导出 log Capacity) == Image.BudgetUsed == 导入后 ReplayBudgetUsed()`；导入只经 `RestoreReplay` 预留一次；`Detach`/`Discard`/`Close` 经 `Replay.Detach`/`Close` 释放。**上限是导入方二进制的**（`execsession.Config.ReplayBudget`，0 = 256 MiB），`Image.budget_limit` 只记录不采用——采用它等于让旧映像的元数据决定新映像的内存上限（内审 I2/R6）。
+7. **agentimage.Freeze 顺序**：Busy 钩子（`homeReadInFlight`、legacy_session_busy 等；S4 可靠 PTY 不再单列 busy）→ spawnsafe `Census`（**已遗弃**的 spawn >0 → `spawn_in_flight`；`probesInFlight>0` → `remote_fs_probe_in_flight`。S4 drill-run3 订正：`wedged` 曾把每个**正常在飞**的 spawn slot 也计入，持续请求下的节点因此几乎每次升级都被当场推迟；现在 `Census` 区分已遗弃与按时在飞，按时在飞的 spawn 不再推迟升级，而是在 cut 内排空，见下一步）→ 外来行**只读预检**（legacy exec / PTY 子进程共享表 → `foreign_process_rows`，在冻任何域之前——否则冻结窗内到达的 legacy `AdoptDraining` 撞 `ErrFrozen` 杀掉刚 spawn 的 child）→ `Runtime.Freeze`（quiescing：新 create 在 fence 前等待，已准入的 create join 完）→ spawnsafe 关闭 spawn 准入并在**同一绝对 cut 期限**内排空按时在飞的 spawn slot（slot 获取、probe 启动与 cut/排空共用 `Policy.mu` 串行化，排空后不可能再起新 spawn；期限到仍有在飞或变成已遗弃 → 逆序回滚并 `spawn_in_flight`；准入保持关闭直到 `Frozen.Thaw` 或旧 Runtime `Discard`）→ `Manager.Freeze`（`ErrFrozen` 视为错误）→ 复核外来行 → 导出 ProcessState → Image → spawnsafe 判词 → **courier outbox 最后**（fence 之后：无 starting ⇒ 无在飞 enqueueStarted、observe gated ⇒ 无 enqueueExit）→ 组装 + `Validate` + 编码 ≤16 MiB。每步失败逆序回滚，返回 `*DeferredError{Reason, Detail}`。deferred 原因码首版：`spawn_in_flight`、`remote_fs_probe_in_flight`、`foreign_process_rows`、`image_too_large`、`runtime_closed`、`platform_unsupported`。
+8. **spawnsafe。** 跨 exec 的是**判词**（healthy/dead + 决定时刻 + mountinfo 行签名），不是任何带 goroutine 的东西：`probesInFlight` 是**与 health map 无关**的计数（launch++ / 返回--）——`applyMounts` 丢掉签名变化的条目、sticky-dead 保留超时探测的 result，都会让 map 走查看不见一个活线程；`Export` 在 `wedged>0 ∨ probesInFlight>0` 时拒绝（**fail-closed**：超时后 sticky-dead 保留的那个探测也算，直到它返回或 daemon 重启——一台已知死挂载的机器不能热更新，S8 的 `--interrupting` 是出口；`Census.ProbesRetained` 把这一形状单独计数并写进 deferral Detail，运维能看出「这条不会自己清」）。「D-state 线程会阻塞 execve（de_thread）」在本阶段是**假设**，未观测，S3 remote-fs 臂（hangfs）实测后再决定是否放宽为只对 pending defer。`Import` **按 mount 逐条**装判词：同 mountpoint、同 mountinfo 行签名、仍是 `kindRemoteProbe` 才装（与 `applyMounts` 的 carry-over 规则同一条），返回装入数；导出的 `Gen`（整张 mountinfo 的哈希）只作信息**不作门**——忙机器上任何一条无关 bind/容器挂载都会让它变化，整表门等于每次热更新都静默丢光判词、每个死挂载再起一个永久探测（F4 回归形；内审 I3 把第一版的整表门改掉）。`decidedAt` 原值（TTL 从真实决定继续）、无 probe（INV-2 成立）。
+9. **courier outbox。** `agent.CourierImage` 导出全字段（payload 原字节 + fails/silent/parked/next/rc/endedAt/startedAt/ticks），`Check` 是纯的一半（payload 重解码与派生字段逐项对账：rc/endedAt/pid/ticks 不一致即拒；`CourierState.Validate` 另要求 pid 是 token、`Silent ≤ MaxCourierSilent(3)=courierParkAfter`），`ImportOutbox` 要求 courier 为空，`next` 重置为 now（首轮全部重试一次），fails/silent/parked 原值（旧 broker 签名与 per-pid 顺序不丢）。courier **不冻结投递**：export→exec 之间已送达被删的条目由新映像重发一次，broker 幂等（§22.4-2⑨ 同口径）。P9（exit 先于 started 落地的 register 结算）归 S3 的「首个 register 前恢复 courier」重写。
+10. **秘密与文本纪律。** registry HMAC secret 只存在于内存与 handoff 的 sealed memfd；`procrequest.Secret` 让 `%v/%+v/%s/%x/%q` 一律打印 `[redacted]`（JSON 仍 base64 往返）；`Bundle.String()` 与 `Salvage.String()/Format()` 只打摘要（Decode 失败的 Salvage 内部保留原样字节以便再派发，但任何 fmt 动词都渲染不出它）；`Restore` 进入即把 `Restored.State.Data` 清零；导入错误文本只由静态串 + 标识符构成，永不 `%v` 任何 State（`TestRuntimeImportErrorsNeverCarryRegistrySecret`）。S3 任何 `Logger.*(bundle)` 都是泄密——无完整机械门。
+11. **schema 的 N-1 规则。** 同 Version 内只增字段、`omitempty`、零值合法；`DisallowUnknownFields`（新导出方多出的字段绝不半读半用地激活）；Version 不等即拒。回滚（gen N+1 导出 → gen N 导入）只在新字段为零时可读，非零即拒 → 保 FD 再派发 / 保留新代（S8 裁定）。账本：`test/architecture/testdata/image_field_inventory.txt`。
+12. **已知限制。** `lostTerminal && Phase=="starting"`（Complete 被拒的 failStart，我们的 bug 态）让 Freeze 永远 `ErrBusy`（`registry.Freeze` 的错误串点名 starting 的 pid 与数量，`Runtime.Freeze` 到期时经 `cfg.Warn` 报出，agentimage 的 deferral Detail 带同一串）；**撤权时刻晚于 `frozen_at_boot_ns` 是合法的**（撤权是唯一在 fence 下落地的决定，导入以导入方的钟为上界而不以 cut 为上界——内审 protocol-V1：第一版拒绝它，把 §22.4 item 7(b) 变成了 exec 后的导入拒绝）；handoff `restoreDescriptor` 在 `validateResources` 失败时既不关也不加 CLOEXEC 导入 fd → S3 定义为崩溃窗；`Restored` 不能枚举文件名，多余文件由 `Restored.Close` 关闭；Handle 最多排队 `RequestLatency`；到期的 `process_recovering` 只结束该请求，不取消恢复责任或释放资源，Freeze/Thaw 的 acknowledged recovery owner 继续负责恢复，调用方仍须完成 Thaw/Exec/Close/Discard；进程内往返（测试）把同一 open-file-description 交给两组 actor：**已导出的旧 runtime 允许 Thaw**——那正是 exec 失败的回滚（`Frozen.Thaw` 在 Export/Prepare 之后调用 `Runtime.Thaw`），所以「导入成功后只 Discard、绝不 Thaw 旧 runtime」是进程内路径的**调用纪律**（`Frozen.Discard`），不是 API 拒绝（内审 F6/P2/V2 订正了第一版「`exported` 标志拒绝 Thaw」的说法）。
+13. **证据。** 真实同 PID exec：`internal/execsession/runtime_image_exec_test.go`（父进程嵌入 NATS + 真 `execclient.Run` 作 oracle：stdout 部分 ACK(Base=10,End=16)/stderr 未 ACK/stdin 未写完/后代持 pipe/ReapHeld 僵尸/冻结期 raw SIGKILL 僵尸，跨 exec 后字节/顺序/rc 23 精确，PID/start ticks/pipe 引用/TargetInstance 不变，冻结期在途请求 ≥1 经重发续接）与 `internal/agentimage/bundle_exec_test.go`（四域）；进程内：`runtime_image_test.go`（fence 表、拒绝表 40 行、tombstone/revocation、撤权在 fence 下跨映像、五轮资源门）、`agentimage/{bundle,freeze}_test.go`（deferral 五形、回滚五轮、预算守恒、bundle 拒绝表）；`-race -count=3` 五包全绿；Darwin `go build ./...` 绿。
+
+
+> **S3 additive 接线补注**：P4 `Salvage.Prepare(extra...)` 按 resource ID 合并已取回资源与未取余项；P5 `Frozen.Prepare` 在编码前重新导出 Runtime（携带 Freeze 后登记的撤权），重新 Validate/检查大小，courier 不重读；`Lineage.InstanceID/RoutingNID` 由 S3 填入。held/refused/imported 阶段保留未取文件供再派发；`Image.Activate` 成功 Thaw 后立即 `Restored.Close` 释放所有未取余项，已被导入域 `TakeFile` 的文件不受影响。无 image schema 变更；完整规则见 §22.6 第 3、5 条。
+
+### 22.6 agent bootstrap 与 node upgrade 接线（S3，活契约）
+
+> S4 的 PTY 域、撤权优先激活及历史十码 deferred 合同见 §22.7；S5 的恢复顺序、域三门与九码 deferred 合同见 §22.8。本节记录 S3 基线，冲突处以对应扩展为准；日期/SHA 属于各自历史收据。
+
+本节依据 [S3 定稿计划](reviews/hot-update-agent-bootstrap-plan.md) 的「定稿裁决」与 §1–§13，
+是 agent bootstrap、`node upgrade`、回滚与观测字段的绑定契约；§22 开头、§22.2/§22.3 的未接线路径描述是前序阶段记录，S3 以本节为准。
+本节描述 S3 交付契约；deploy-tier 收据另记于 [evidence §14](reviews/hot-update-evidence.md)：2026-10-02 实跑
+34（A G U N P W F）七臂 GREEN、39 X GREEN / Y PRODUCT-RED（owner S8，预测签名逐字命中）、33 INCOMPLETE（#73，不劣化）、
+35 GREEN。它证的只是**普通进程/exec 域**跨 agent 映像切换与一次 watchdog 回滚；PTY（S4）、SSH/TCP/SS（S5）、
+broker（S6）、传输（S7）不在其内，不得据此声称这些域的业务连续性。
+
+1. **启动顺序（plan §1.2）。** `main` 第一条语句无条件调用 `agentboot.Begin`，在任何消费前快照
+   `TETHER_INSTANCE_ID` / `TETHER_ROUTING_NID`，并接收 handoff；随后仅 daemon 调用 `BootUpgradeCheck`，
+   再进入 Cobra/YAML/logger/identity。`agent.New` 在 mint instance 后立即记录 exec lineage，
+   **最后一步**从 `Config.BootImage` 或 `agentboot.Claim()` 取 image 并 Restore（courier 此时新建且为空，spawn policy 已就绪）；
+   有 image 而 Restore 失败则 New 失败，**绝不回落 fresh runtime、绝不空表 register**；无 image 才初始化 runtime。
+   `Run` **第一条语句** Activate/Thaw（Manager → Runtime），早于任何 defer、Home 读取、courier loop 与网络。
+   第一次 register 的 G.1 快照包含已导入进程行与 outbox；当前 `finishAgentControlReady` 在订阅/重协调后
+   Flush，并为 carried cut/pending marker 执行 fresh nonce 外部请求 probe，再提交 Boot/legacy report。
+   普通无 cut/无 pending marker 的旧 broker 会话只 Flush，不能据此签 S8 completion。
+   **ready 不证明 committed 已持久化**，未证实的 cut 继续服务并保留 reservation 供 recovery，不退出破坏业务。
+   `ExecuteContext` 返回后 `FinishBoot` 是唯一退出收口：held/refused/imported 按所有权尝试再派发；active 已由 Run 处理，ready/lost 不再派发。
+
+2. **phase 与状态表（plan §1.6）。** `held` = handoff 已接收、尚未取文件；`refused` = Restore 拒绝或 Activate 失败后保留 salvage；
+   `imported` = 已导入但仍冻结；`active` = 已 Thaw；`ready` = 完成所需 control proof（普通旧会话可仅 Flush）；`lost` = 已放弃携带资源。
+   `PhaseNone` 表示没有 image；phase 是进程内所有权状态，与 marker 的 `state/resource_phase` 不同。
+
+   | # | bundle / phase | marker / 决议 | watchdog | 动作与去向 | 关键日志 / 不变量 |
+   |---|---|---|---|---|---|
+   | 1 | none | 任意 | 既有行为 | 普通 New、新 mint | 不新增 image 日志，不写 `resource_phase` |
+   | 2 | held → imported → active | none/终态，proceed（ReExecOnly、到达 prev、install 失败残留） | 不武装 | New Restore → Run Thaw → ready | `bootstrap holds a dispatched image` / `image restored` / `image activated`；首个 register 前已 Thaw |
+   | 3 | held | pending ∧ self==new ∧ 预算内 | Run 内武装 | boot_count++（两次 fsync 计入 `shim_ms`）→ 铸 proof → 同 #2 | `booting a staged upgrade`；proof 只属于本进程 |
+   | 4 | held | pending ∧ 预算/期限耗尽 | 未武装 | Repack → rollback(redispatch) 到 prev；exec 失败关闭 Prepared，保持 held，继续导入新映像 | `boot: budget/deadline exhausted` 原短语不变；`agent: image re-dispatched`；prev 收同一 State、新 nonce manifest、同 dev/ino；Borrow 不转移文件 |
+   | 5 | held | pending ∧ self==prev（converge） | — | 写 rolled_back → 同 #2 | `agent: converged an interrupted upgrade rollback at boot`；无 proof 时后续失败按 TargetInstance 判所有权 |
+   | 6 | held | orphan | — | 写 rollback_failed → 同 #2 | `marker orphaned`；同 #5 |
+   | 7 | held | Cobra/YAML/logger/identity/New 失败 | 未武装 | FinishBoot：有所有权则 Repack → prev，否则 Abandon → W2 | `bootstrap failed before control-ready; re-dispatching`；未导入、未 register，env 快照保 lineage |
+   | 8 | refused / imported 未激活 | Restore 拒绝 / Thaw 失败后 Detach | 未武装 | 同 #7；Repack 使用 `salvage.Prepare(restored.Borrow()...)` | 只 Detach，不以 Close 清冻结的导入 runtime；salvage 保留 bundle |
+   | 9 | active | pending ∧ targets | 已武装 | Thaw 后写 active/资源数/冻结窗 → courier → session/register → ready | `image activated`；网络晚于 Thaw，G.1 含导入行 |
+   | 10 | active | Run 因权威拒绝早退、尚未 control-ready | 已武装 | Freeze 当前态（gen+1）→ Prepare → prev；失败则 Thaw → return err | `run failed before control-ready`；W3 退出清理可能杀任务 |
+   | 11 | active / ready | pending 到期未持久化 commit（包括 register 已成功但 commit 写盘失败） | 触发 | Freeze 当前态；deferred → rollback_blocked + 5s 重试；成功 → Prepare → prev；exec 失败则关闭 Prepared + Thaw，写 thawed 后继续运行 | `register deadline exceeded` 原短语不变；`agent: image cut` / `agent: image re-dispatched`；marker 先记录本次 cut 的 generation；第二次 install 拒 `upgrade_in_progress` |
+   | 12 | ready | committed | 已停 | 此后 Run 失败是普通失败 | `upgrade COMMITTED`；detail 追加 image 摘要，marker 保留 resource_phase |
+   | 13 | W1 → lost | 任意；pending ∧ targets 才武装 | 条件武装 | 关外来 fd → 普通启动 → 写 lost | `dispatched image unreadable`；空表 register 是携带任务丢失的 H0 结局，不冒称恢复成功 |
+
+3. **再派发 API 与代数上界（plan §1.4 P1–P5）。** `Restored.Borrow()` 按 ID 返回尚未 `TakeFile` 的文件，
+   只借用、绝不转移所有权，Close 后返回 nil；`Restored.Repack()` = 用原 State 与 Borrow 的资源重新 Prepare，
+   Prepare 只 dup，因此 exec 失败后原 Restored 仍可导入。`MergeResources(groups...)` 按 ID 合并，Kind 必须一致，
+   同 ID 同名文件出现两次即双 owner，必须拒绝；**每个文件恰一个 owner**。
+   `Salvage.Prepare(extra...)` 经 MergeResources 合并已取资源与 Restored 余项；refused 态不能用 `restored.Repack()`，
+   因为 Restore 已清空 `State.Data`，同一 bundle（Decode 失败时为原字节）由 salvage 保存。
+   `Frozen.Prepare` 编码前重新 `Runtime.Export()`，只刷新 Runtime 与 resources，再 Validate 与检查大小：
+   Freeze 后登记的 Revoke/tombstone 随之带走；**courier 不重读**，它已在 Freeze 最后导出，继续投递的旧事件由新映像幂等重投。
+   `Imported.Detach` 只在未 Thaw、未 export 的导入冻结 runtime 上合法；active 必须 Freeze 当前态再导出。
+   `Image.Activate` 在 `Imported.Thaw` 成功后立即关闭 Restored 中**所有未 TakeFile 的余项**并释放该持有者，
+   不等到 MarkReady 或进程退出；已取文件仍归导入域。held/refused/imported 未激活时保留余项，供失败回滚按 ID 合并。
+   自动再派发链**最多 2 跳**：单一 `.prev` 被 rename 消耗，marker 离开 pending，boot proof 只在 continue-pending 铸造；
+   prev 再拒绝导入则 W2。此上界不限制各次已提交升级令 `Lineage.Generation` 继续递增，也不等同于 S8 的 `MaxGenerations` 共存预算。
+
+4. **崩溃窗（plan §1.5，S8 注入点；均未实跑）。** W1 按 Q2 继续普通启动，不能把 unreadable bundle 当作成功交接。
+
+   | 窗 | 触发 | 行为 | 日志签名 | S8 注入点 |
+   |---|---|---|---|---|
+   | W1 | `handoff.Restore` 的 seal/nonce/PID/UID/version/resource 校验失败；导入 fd 尚未恢复 CLOEXEC | Restore 前快照 fd≥3 且非 CLOEXEC 的集合与 dev/ino，失败后关闭身份仍匹配的文件（保留 0–2）；记录 lost 后继续普通启动，New 后 marker 标 lost，原 child 可能 EPIPE | `agent: dispatched image unreadable — tasks of the previous image are lost`，字段 `crash_window=handoff_restore`、`closed_fds`、`reason=handoff_rejected`、`fd_cleanup_error` | 非 sealed memfd、错误 nonce、manifest 尾部多字节、fd 指纹篡改 |
+   | W1b | handoff env 在场，但 argv 不是 agent daemon | Abandon 关资源，原命令照常执行 | `agent: image abandoned … crash_window=non_daemon_invocation` | `Prepared.Exec` 到 `tether version` |
+   | W2 | bootstrap 失败后无再派发目标：ReExecOnly 无 marker、prev 槽已消耗、所有权失败、Repack 失败、prev 第二跳仍导入失败 | Abandon 关闭 salvage/restored → child EPIPE，非零退出；有 supervisor 才能拉起干净 prev，nohup 可能停机；Repack 失败也须先关资源才可裸回退 | `agent: image abandoned … crash_window=bootstrap_no_rollback_target` | prevstub 拒绝导入 |
+   | W3 | Thaw 后、control-ready 前 register 权威拒绝 | 尝试重导出当前态再派发；exec 失败则 Thaw 后返回错误，Run deferred Close 杀任务；Run 父 ctx 取消、错误为 context.Canceled 或 session gone 时不再派发 | `agent: run failed before control-ready; re-dispatching current state`，派发前另记 `agent: image re-dispatched` | 假 broker 回 `proto_mismatch` |
+   | W4 | Restore 与 Thaw 之间 panic | 内核关 fd → EPIPE（H0） | Go panic 进入 boot.err 流 | plan 未指定具体注入点 |
+
+   W1 依赖**启动独占**：main 最早入口尚未启动业务 goroutine/child，继承的 fd≥3 且非 CLOEXEC 只属于 dispatch，
+   Go 自有 fd 带 CLOEXEC；**不支持 socket activation**，CLOEXEC 筛选不是来源证明。
+   Linux 优先读 `/proc/self/fd`；普查失败（例如 EMFILE）回退到无需新 fd 的 `fcntl(F_GETFD)` 扫描，
+   范围为 `[3, max(RLIMIT_NOFILE.Cur, RLIMIT_NOFILE.Max))`，避免漏掉降低 soft limit 前已继承的 fd。
+   limit 无法取得/不可用或逐项普查出错时由 `fd_cleanup_error` 暴露，不能把失败冒充空集合；仍按 Q2 继续 lost 启动。
+   关闭前重新 fstat 比较 dev/ino，跳过被复用为其它文件的号码；不按当前 CLOEXEC 再筛，
+   因为 Restore 可能先保护 manifest 再拒绝。该身份复核仍依赖启动独占，不承诺抵御并发 fd 替换；非 Linux 不支持 handoff。
+
+5. **所有权证明与 lineage 裁决（plan §1.7）。** FinishBoot 再派发须满足
+   `pending ∧ (UpgradeID == currentUpgradeBootProof() ∨ (TargetInstance != "" ∧ TargetInstance == Begin 快照的 InstanceID))`。
+   后一臂覆盖 shim 因 executable/flock 失败而未铸 proof；不能只检查 pending 就回滚共享 binary 上别人的升级。
+   boot 再派发用 `execEnvFor(img.Env().InstanceID, img.Env().RoutingNID)`；New 已完成的路径用已记录的 `execEnv()`。
+   bundle 的 `Lineage.InstanceID/RoutingNID` 形状合法（26 位 lowerBase32 / `acceptableLeaseName`）时以 bundle 为准，
+   env 缺失则填入、相等则不动作、相异则覆盖 env 并 Warn；bundle 值畸形则保留 env 并 Warn。
+   `Lineage.Matches` 只决定 Warn，**绝不是拒绝理由**；覆盖 instance 后重新 `setExecLineage`。
+
+6. **`node upgrade` 安装序（plan §2.1；TD-7(a/b)、CC-V1）。** install 与 ReExecOnly 先争同一
+   `upgradeInstallMu.TryLock`，关着的 gate 或 `rollbackInFlight` 也拒 `upgrade_in_progress`。
+   install 在 host flock 内另检查 `pending ∧ (now.Before(deadline) ∨ rollbackInFlight ∨ ownsPendingUpgrade(a, m))`。
+   `ownsPendingUpgrade` 精确为 `markerTargetsThisAgent(m) ∧ ((UpgradeID 非空且等于 a.upgradeBootProofID) ∨ ownsUpgradeImage(a))`，
+   其中 ownsUpgradeImage 只认 active/ready。markerTargetsThisAgent 要求 target SID/NID 匹配；有 TargetInstance 时还要求
+   instance 相同或持该事务的非空 boot proof，旧 marker 无 TargetInstance 则只比 SID/NID。
+   因而 **pending 过期只是触发恢复，不会释放活 owner 的 prev 槽**；只有过期、无 rollbackInFlight、且本进程不满足上述所有权的
+   pending 才不再阻塞此门，不是扫描全宿主 PID 判活。损坏 marker Warn 后按 idle；其它入口门仍适用。
+
+   allowlist 后只要求 `runningImageSHA()` 可算（不可算即 `install_failed` `cannot hash the running image: …`，未下载）。
+   **prev 槽可接纳性**在下载/sha/extract 之后、smoke 之前判定：`dst == 运行映像 ∨ dst == 候选`（逐字节 sha），
+   否则 `install_failed`，错误串 `running image differs from the on-disk binary; restart the agent before upgrading`，
+   prev/marker/dst 都不动。这两个二进制恰好是**能接住任何回滚映像**的全部：boot 回滚再派发的 bundle 候选已按
+   `checkCandidateABI` 收过，watchdog 回滚的 bundle 由候选自己重导出。第二支就是共享二进制 sibling——同宿主另一
+   agent 已装好**同一个**制品（dst == 候选 ≠ 运行映像）。plan 原文只认第一支并在下载前判定，drill 33 C2 首次实跑
+   （2026-10-02）证明它把 sibling 永久拒在旧映像上（每次重试看到的都是同一张盘），只剩重启一条路。
+   **下载前 preflight** 只读并汇总 busyChecks 的全部命中（hangable Home 另做 ≤RequestLatency 的有界读探测），
+   命中即 `upgrade_deferred`，无下载、无新 marker、无 prev 变更；它不是候选 ABI 检查。
+   下载/sha/extract 后 `smokeVersionImageABI` 只调用一次 `smokeVersion`：首个非空行严格解析 release/proto，
+   后续逐行 TrimSpace，遇精确前缀 `image-abi v` 才以 `strconv.Atoi` 解析剩余部分；值必须 >0。
+   **多个合法 ABI 行以最后一个匹配值覆盖前值**，其它后续行忽略，无匹配为 0；任一匹配前缀后解析失败或非正数
+   立即报 `invalid candidate image ABI line …`，不能被后续合法行覆盖。输出末行可以是其它内容；
+   本产品 emitter 仍须把 ABI 行放最后（第 12 条），reader 不要求该位置。
+   Linux 探针经 `agentboot.RunVersionProbe` 的隔离 subreaper helper：候选单独成组，正常退出、执行失败和取消路径
+   都清理候选组并 reap；格式/ABI 拒绝发生在 helper 完成之后。agent 本身不启 subreaper、不用 wait4 抢业务 child 的终态。
+   探针保留 5 s deadline、64 KiB stdout 上限与 2 s WaitDelay；非 Linux 只做进程组清理，孤儿回收归 OS。
+
+   **两次 ABI 检查**：① smoke 后、建立 prev/marker/flip 前，`checkCandidateABI` 拒绝高于
+   `proto.ImageABIVersion` 的 ABI（即使空映像）；无 ABI 行则以 courier pending 与临时 runtime fence/export 检查
+   tasks/tombstones/revocations，不能证明为空也拒绝 `image_abi_unsupported`（64）。此处拒绝不改 dst/prev、无新 marker。
+   初检为空只 Warn；② install 建 prev、写 pending（generation+1、staged）、fsync、flip 后关 gate，
+   复用 `heartbeatPayload` 发布前置心跳并 `FlushTimeout(ReplyDrain)`，在 `SafePointWait` 内 Freeze，
+   对 ABI=0 从**冻结 bundle**再查 Runtime 的三域与 Courier.Events。下载/初检后新增状态被此门捕获；
+   非空先 abandon/Thaw，再回滚磁盘，回 `image_abi_unsupported`；两次都为空才标记 legacy，保持空 cut 冻结至裸 exec，
+   防止最终检查后又接纳 reliable create。ReExecOnly 也有这两次检查，但没有本腿的 install marker/un-flip。
+
+   **Freeze 及复核必须早于 OK reply**。post-flip 失败统一开 gate 并调用 executeRollback：
+   成功恢复时 prev 被消耗、dst 回到旧 SHA，留下 `state=rolled_back/resource_phase=deferred` 的收据，不能称作「无 marker」。
+   `*DeferredError` 的 detail 为 `deferred(<reason>)`、回 `upgrade_deferred`；其它错误为 `freeze failed: <class>`，
+   class 闭合集合为 `frozen_table`（workload.ErrFrozen）、`abi_late`（errImageABIUnsupported）、
+   `bundle`（agentimage.ErrBundle）、`image_cut`（其余）。`abi_late` 回 `image_abi_unsupported`，其它 class 回 `install_failed`；
+   marker 不写任意底层错误文本。恢复失败仍按 executeRollback 的 `rollback_failed` 契约记录，不能声称已成功 un-flip。
+   成功才回 `{BinaryReplaced, NewVersion}`、记 `agent: image cut`、进入 reExecInPlace。
+
+7. **reExecInPlace 与 cut latch（plan §2.2/§2.5，Q3）。** `cutMu` 从 Freeze 前持有到 exec 成功（不返回）或 abandon 完成，
+   `Run` 的 deferred `stopProcessRuntime` 必须先取同一锁：**exported 的冻结 runtime 被 Close = discard**，
+   若它抢在 exec 失败之前清理，随后 Thaw 只会得到 ErrClosed。另一条不可混淆的 S2 规则是未 export 的冻结 runtime
+   （含导入未 Thaw）在 Manager 仍冻结时 Close 拒绝 `workload.ErrFrozen`，不改状态，应按条件 Detach。
+   reply 用 `ReplyDrain` 有界 flush；Prepare 重导出紧贴 Exec。Prepare/exec 失败后关闭 Prepared 副本，
+   `cut.abandon` 调 `Frozen.Thaw`（**Manager 先、Runtime 后**）再开 gate，最后才做磁盘 rollback、marker 标 thawed。
+   进程内 `UpgradeNoExit` 且无 execFn 时同样 abandon，不可留下冻结表。
+   `ReExecOnly` 不写 install marker、没有自己的 prev 回滚目标，但同样经 TryLock（并发拒 `upgrade_in_progress`）、
+   SHA/ABI/preflight/gate/心跳/cut，Freeze 早于 reply；exec 失败**Thaw 后保活**，记录
+   `re-exec failed with no pending marker; staying alive on the thawed image`，不 exit 1；`cluster upgrade` driver 用运行 SHA 判断该腿。
+   **升级准入与业务 gate 分开持有**：install/ReExecOnly 的 `upgradeInstallMu` 经 `cut.releaseAdmission` 交给异步 exec，
+   handler 返回不解锁；exec 成功由进程替换结束，失败则经过 abandon 与 tracked 磁盘恢复才释放。
+   因此开业务 gate/Thaw 不意味着可开始下一次 install，不能在恢复前改掉已选中的 executable 或 prev（CC-5）。
+
+8. **watchdog 与 control-ready 前失败（plan §2.6/§3.5；RB-1–4、CC-1/2/6）。** 有 active **或 ready** image 的 pending marker 到期，必须 Freeze 并重导出
+   **当前态**（含导入后推进的 offset、退出、撤权，generation+1），Prepare 后携映像 rollback；不可重用旧 cut 或裸 exec。
+   deferral 时开门、保持 pending、写 `resource_phase=rollback_blocked` 与 reason，置 `rollbackInFlight`，
+   每 `RollbackCutRetry`（5 s）重试；`agent: upgrade rollback blocked` **为 Error 级**，首次立即记、后续至少隔一分钟，字段 `reason`。
+   该分支 cut 的非 DeferredError 原因仍为 `freeze failed`；这是 watchdog 的阻塞诊断，不是第 6 条安装失败的 class 词表。
+   不为期限 kill 业务、不关业务 fd、不裸回滚；期间第二次 install 被拒。Prepare 失败也先 Thaw、保留回滚准入并重试。
+   原因消除后自动重试；Prepare 成功后先将 `m.Generation=cut.generation` 与 `resource_phase=redispatched` 交给
+   executeRollback 持久化，并记 `agent: image cut generation=… tasks=… courier_events=…`；
+   最终 exec 前记 `agent: image re-dispatched`（image 摘要与 generation），不能沿用导入代数。
+   exec 返回失败时关闭 Prepared、Thaw 并开 gate，再在同一 upgradeMu/flock 下写 `resource_phase=thawed`，保留回滚 reason，watchdog 路径继续运行。
+   持久化 commit、回滚处理完成、已上报的终态清理，以及 watchdog 重试发现无本进程的 pending 事务时均清除 `rollbackInFlight`，
+   避免已解决事务永久占住准入。commit 写盘失败即使 register 已成功且 phase=ready，watchdog 仍须携 runtime；legacy 无 image 才裸回滚。
+   W3 与 watchdog 共享 upgradeMu/flock 串行：仅 active ∧ pending ∧ targets 且 Run 因权威拒绝早退才尝试当前态 cut；
+   **判断 Run 的父 ctx**，不读取 session 返回时已取消的子 ctx；等待 upgradeMu/flock 后再复核父 ctx。
+   父 ctx 已取消、错误为 `context.Canceled` 或 `errSessionGone` 都不再派发；普通 session teardown 不能屏蔽权威拒绝的恢复。
+   deferred 返回原错误，exec 失败 Thaw 后返回原错误，退出清理仍可能杀任务。
+   首次 register 的 `session_not_found` / `session_not_found_or_deleting` 两码都先撤权 workloads，再以 session gone 收口，覆盖 exec 窗中丢失的 `session_destroyed`。
+
+9. **deferred 集合与准入（S5/S7 当前集合）。** `agentimage.DeferredReasons` 是有序九码单源；
+   preflight 汇总已知 busy，Freeze 再复核实际所有权、registry、reader 和编码大小。
+
+   | code | 当前判据 |
+   |---|---|
+   | `spawn_in_flight` | 已遗弃 spawn、无法在 cut 原期限排空的在飞 spawn/starting |
+   | `remote_fs_probe_in_flight` | Home/remote-FS probe 仍有未结责任 |
+   | `foreign_process_rows` | Manager 行不在完整 runtime task 所有权集合 |
+   | `image_too_large` | bundle/FD/resource 或实际共享预算超额 |
+   | `runtime_closed` | 所需 runtime 已关或缺失 |
+   | `platform_unsupported` | 当前平台不支持所需 handoff/replay |
+   | `transfers_in_flight` | legacy/未知 transfer 责任；typed capable transfer-v1 以完整 census 交接 |
+   | `legacy_session_busy` | legacy exec/run/raw tunnel、idle listener、retained slot、未知 adapter/owner |
+   | `ss_state_unrepresentable` | 已知 SS 状态无法完整表达/交接 |
+
+   `flow_busy/ss_busy` 属已移除的历史 S3 原因，不再进入公共集合。typed v1 expose 不重复算 transfer；
+   current capable flow/SS/transfer 依完整 reader/custody/容量检查交接。legacy/未知责任仍安全拒绝。
+   gate 在 cut 前关闭，legacy exec/run/push/pull/expose 用旧 ctl 已知 `try_again`（75），detail 为
+   `agent_upgrading`；可靠请求按原身份/绝对期限 fence 与续接，不能由拒绝推出正常 profile 已通过。
+
+10. **marker 与提交 detail（plan §2.4，唯一字段词表）。** additive/omitempty，不写 bundle 或 secret；committed 时保留这些面包屑，旧 reader 忽略未知字段。
+
+    | 字段 | 值 / writer |
+    |---|---|
+    | `generation` | installNewBinary 随 pending 写 `a.imageGeneration+1`；当前态回滚 cut 在 executeRollback 持久化前写 `cut.generation`，与发出的 bundle 同代 |
+    | `resource_phase` | 闭合集合：`staged`、`active`、`redispatched`、`thawed`、`deferred`、`lost`、`rollback_blocked` |
+    | `imported_resources` | 新映像 Thaw 后由 stampMarkerPhase 写携带 task 数，与日志 tasks 对齐，不是 fd 数 |
+    | `freeze_window_ms` | 新映像 Thaw 后写 Imported.FreezeWindow 的毫秒值 |
+
+    staged 与 generation 随安装时 pending 同次写入（已持 flock）；active/资源数/冻结窗在 Run Thaw **之后**短持 flock，
+    仅 pending ∧ markerTargetsThisAgent 才写，因此这次 fsync 不在冻结窗内；redispatched/thawed/deferred/lost/rollback_blocked
+    各由对应 boot/executeRollback/watchdog 分支写；当前态回滚 exec 返回后先 Thaw 再补写 thawed，不能继续声称 redispatched。
+    held boot 回滚 exec 失败仍 held，不能标成 thawed。upgradeRegisterReport 的 committed detail 精确追加
+    `; image gen G: N tasks carried, freeze window Xms`（格式串 `; image gen %d: %d tasks carried, freeze window %dms`），永不追加 bundle。
+
+11. **日志短语（唯一命名源，drill grep 以此为准）。** 省略号表示摘要或实际字段值，不是另起同义短语；不得打印 bundle/State.Data。
+
+    | 时点 | 日志签名 |
+    |---|---|
+    | Begin 持有 image | `agent: bootstrap holds a dispatched image` |
+    | Restore 成功 | `agent: image restored generation=… tasks=… courier_events=… spawn_verdicts=…` |
+    | Activate/Thaw 成功 | `agent: image activated generation=… tasks=… freeze_window_ms=… shim_ms=… import_ms=…` |
+    | cut 成功 | `agent: image cut generation=… tasks=… courier_events=…` |
+    | 携映像再派发（boot 预算、watchdog、Run control-ready 前失败、早期 bootstrap 失败） | `agent: image re-dispatched`，附 image 摘要；当前态 cut 与 FinishBoot 路径另带 generation 字段 |
+    | boot 收敛中断回滚 | `agent: converged an interrupted upgrade rollback at boot` |
+    | 升级 deferred | `agent: upgrade deferred reasons=[…]` |
+    | 放弃 image | `agent: image abandoned … crash_window=…` |
+    | W1 无法读取 | `agent: dispatched image unreadable … crash_window=handoff_restore` |
+    | watchdog 无法 cut | `agent: upgrade rollback blocked reason=…`（Error，首次立即记，此后至少间隔一分钟） |
+
+    `image re-dispatched` 是派发尝试收据，不单独证明 exec 成功；boot-budget 路径在 Repack 成功后记，
+    watchdog/Run/FinishBoot 在 executeRollback 调最终 exec 时记。当前态回滚另有 cut 行，held Repack 不产生新 cut。
+    `image activated` **每 generation 恰一行**，是冻结窗校准的唯一读点；不是每次重连/register 都记。
+    `freeze_window_ms` 是旧泵 Freeze 到新泵可用的全程，含 ReplyDrain、exec/Go init、shim 的 SHA 与两次 fsync、
+    Cobra/YAML/identity、Restore/Import/Thaw；`shim_ms/import_ms` 用于归因，不拿删掉某段后的数冒充全窗。
+
+12. **wire 与版本（plan §4.2）。** **零新 wire 字段，ProtoVersion 不变**；升级拒绝走已有 Code/Error，broker 的 `agent_rejected:` 前缀透传。业务准入采用 v0.6.0 已知的 `try_again`：run Reason / exec Error 为 `try_again: agent_upgrading: image switch in progress; retry`；expose / push prepare/commit / pull 的 Code 为 `try_again`，Error 为 `agent_upgrading: image switch in progress; retry`。旧端按 Reason/Error 冒号前缀或 Code 查表得 75；当前 ctl 按 detail 选升级 hint，保留 machine-visible reason；S3 裸 `agent_upgrading` 仍识别为 75。
+
+    | code | ctl exit | hint / 呈现 |
+    |---|---|---|
+    | `upgrade_deferred` | 75（transient） | **不登记 hint**，保留 `deferred: <reason> (<detail>); …`；`--all` 跳过，canary 仍中止 |
+    | `image_abi_unsupported` | 64（config / usage） | 保留 agent 的具体 Error 再追加 hint：ABI 高于支持范围须换兼容版本；无 ABI 行且状态非空才可选热更新版本或先 drain；空节点也拒绝过高 ABI |
+    | `try_again`（detail: `agent_upgrading`） | 75（transient，含 v0.6.0 ctl） | 依据 detail 选升级 hint，`image switch in progress; retry`；保留原因，不误提示 broker storage hiccup |
+
+    `image_abi_unsupported` 的初检诊断格式为 `upgrade: candidate image ABI is unsupported: candidate image-abi v%d, agent supports v%d`，
+    冻结复核晚拒绝为 `upgrade: candidate image ABI is unsupported`；裸码与 `agent_rejected:` 包装码都保留原诊断再追加 hint，
+    不把过高 ABI 误说成「没有 ABI 行」，也不把 drain 当成其解决办法。
+
+    `tether version` 首行保留 release/proto 冻结格式，后续声明 domains/read epochs/features；
+    **最后一行**为 `image-abi v1`；append-only，值由
+    `proto.ImageABIVersion` / `ImageABILine()` 单源生成，`agentimage.BundleVersion = proto.ImageABIVersion`。
+    旧 smoke 只读首行，保持兼容。结构化事务 View 与 S8 adjunct 见 §22.11，S3 历史 marker 仍是兼容投影。
+
+13. **courier P9 结算（plan §3.4；CC-3）。** `registerReceipt` 在构造 register 请求快照前捕获 pending 事件身份。
+    **该请求的 receipt** 若含同 pid 的 started，则即使回包时 started 已被后来 ACK 删除，也保留 exit：
+    broker 处理旧请求时可能还不知道该 pid，Accepted 中缺席不是终态收据，后到的 start ACK 不能追授旧 reply 结算权。
+    需下一次不带该 pending start 的 register 或独立 exit ACK 结清；仍核对事件指针与实际 wire 行的 state/rc/endedAt，
+    迟到回包不删后到或替换事件。N-1 broker 若一直不 ACK started，
+    exit 最多滞留到 `courierMaxLifetime`；每次 register 可携同一 exited 行，broker 幂等。
+    New 导入 outbox → Run Thaw → courier.run → 首次 register 的顺序不可倒置。
+
+14. **已知限制（plan §13）。** 冻结窗与 gate 关闭窗目标 **≤500 ms**，不是已达成保证；S3 的首批样本可能超标，
+    只记录 `freeze_window_ms/shim_ms/import_ms`，**不抬预算**，优化归 S8。W3 再派发 exec 失败仍会经 Close 杀携带任务后退出。
+    `agent join --start` 经 New Claim 接线，但 re-exec 会重跑 join，invite 可能单次，manifest 预取也在冻结窗内；
+    新旧映像都可能失败后落 W2，S3 drill 不覆盖此形态。S3 的异常 Thaw 曾存在 best-effort Detach 的责任窗口；
+    S4 已将 active 责任标记提前到 Manager.Thaw 之前，部分激活失败保留当前 owner、禁止 Detach 初始映像，见 §22.7 第 6 条。
+    SIGTERM 落在 cut latch 内，exec 仍可能进行，新映像不知道旧 ctx 取消，systemd TimeoutStopSec 后可 SIGKILL；
+    plan 估计为 ≤1s 竞态窗，尚非实测上界。N-1 legacy ctl 在 gate 关闭窗得到可分类的 75，不承诺该请求连续。
+    S5 前 expose/proxy 的严格 deferral 已由 typed v1 owner 替代；legacy 首次迁入现在受 §21.3 policy 约束。
+    drill 34.U 的 S3 形状仅是 `agentUserUnitBody` 逐字渲染加 `User=sim` 的 body-等价系统单元，
+    不证明 `systemctl --user`、dbus/logind/linger，真 user manager 归 S8；S3 34/39 历史实跑见 evidence §14，S8 新臂仍为 NOT_RUN。
+
+15. **预算单源（plan §6）。** Go 单源 `internal/upgradebudget` ↔ shell 单源
+    `test/simcluster/drills/lib/hot_update_budget.sh`，由 S3 交付的
+    `test/architecture/upgrade_budget_pin_test.go` 对账；业务、ctl、探针都引用，不另造可漂移数字。
+
+    | 常量 | 值 / 用途 |
+    |---|---|
+    | `LocalFreezeWindow` / `RequestLatency` / `ProbeRatePerSecond` | 500 ms / 5 s / 10 次每秒；S3 冻结窗仅采样 |
+    | `ComponentHandover` / `FullStackRollout` | 120 s / 15 min；ctl wait = ComponentHandover + 30 s |
+    | `SafePointWait` / `ReplyDrain` / `RollbackCutRetry` / `BootBudget` | 5 s / 100 ms / 5 s / 3 次启动 |
+    | `StreamReplayBytes` / `NodeReplayBytes` | 8 MiB / 256 MiB；workload 默认值引用本单源 |
+    | `LiveFlowStall` / `TransferProgress` / `MaxGenerations` | 5 s / 10 s / 2；分别供 S5/S7/S8，不是 S3 验收收据 |
+
+    保持 `SafePointWait < ComponentHandover`、`ReplyDrain < LocalFreezeWindow`；该包只依赖标准库 time，不能反向 import internal。
+
+
+### 22.7 S4 PTY 域（绑定契约）
+
+本节依据 [S4 定稿 plan](reviews/hot-update-pty-terminal-plan.md) §2–§7 及顶部 lead L1–L6 裁决；
+是修改协议、owner 与升级接线时的活契约。实现已接入可靠 run；验收状态独立记录于
+[evidence §15](reviews/hot-update-evidence.md#15-s4-pty-terminal-证据骨架)，本节不代签测试或部署通过。
+
+**Observability records (plan §9.1).** The agent's existing slog handler emits one `agent: pty image state`
+per retained PTY task after the final Prepare re-export (`phase=cut`) and after imported-owner activation
+(`phase=activated`): `phase`, `generation`, `pid`, `input_applied` (A), `input_accepted` (Q), `input_fin`,
+`input_ended`, `output_base`, `output_end`, `output_fin`, `control_seq`, `ka_seq`, `ka_deadline_boot_ns`,
+`revoked` (boolean), `master_closed`. The same fields appear at completed NATS session teardown
+(`phase=carrier-lost`) and the first successful register/lease acceptance of its successor
+(`phase=carrier-restored`), once per outstanding loss/restoration pair. Failed connect/register attempts
+and ordinary reconnect callbacks do not emit pairs; no PTY tasks means no records. Carrier receipts
+observe current owners without changing identity, byte responsibility or KA authority. Activation reads
+current owners; import/reconnect never renews the deadline.
+`agent: pty control committed` carries `pid`, `seq`, `op`, `outcome` (`ok`, `ioctl_error`, `signal_error`,
+`close_error`, `authority_expired`, or `error`); only a newly committed resize/signal/hangup emits, including
+committed failures. Retries, rejected guards and individual keepalives emit no control record.
+`agent: run reliable=true started` carries `pid`, `request_id_hash` (SHA-256), `os_pid`, `start_time_ticks`;
+`agent: run reliable=true exited` carries `pid`, `code`, `signal`, `input_applied`, `input_accepted`,
+`input_fin`, `input_ended`, `output_base`, `output_end`, `output_fin`. These lifecycle records describe original
+child start and terminal completion, not import. `agent: run reliable=true settled` carries `pid`, `code`,
+`signal`, `input_applied`, `input_accepted`, `output_base`, `output_end`, once after a successful
+terminal-ack registry commit and before replay retirement. `output_base` is the actual acknowledged
+Base (or a tombstone's validated final ACK), equal to End; retries emit no second receipt. Sweeper GC
+is not a terminal ACK and emits no settlement record. No record contains argv, env, nonce, byte payloads, secrets,
+or free-form errors. Text and JSON layouts are pinned by `cmd/tether/agent_log_format_test.go` and its
+`testdata/agent-pty-records.text` / `.json` samples; these passive records do not replace deployment receipts.
+
+1. **wire 与能力。** 沿用 `process-resume` verb/版本、私有 inbox、Scope/MAC/boot/instance/RequestID/AttachEpoch，
+   reply `Kind` 仍为 capability/status/error；task kind 另用 `TaskKind`。新增字段恰 **8 request + 10 reply**，全部 `omitempty`：
+
+   | 类型 | Go 字段 / JSON tag / 类型 |
+   |---|---|
+   | `ProcessResumeReq` | `Kind / kind / string`；`Run / run / *RunReq`；`Input / input / []byte`；`InputSeq / input_seq / uint64`；`InputFIN / input_fin / bool`；`Resize / resize / *PtyResizeEvent`；`Signal / signal / int`；`ControlSeq / control_seq / uint64` |
+   | `ProcessResumeReply` | `TaskKind / task_kind / string`；`PTYVersion / pty_version / int`；`InputACK / input_ack / uint64`；`InputAccepted / input_accepted / uint64`；`InputWindow / input_window / uint64`；`InputFIN / input_fin / bool`；`InputEnded / input_ended / bool`；`InputError / input_error / string`；`ControlACK / control_ack / uint64`；`ControlError / control_error / string` |
+
+   `Kind=""` 是原 exec，`Kind="pty"` 是 PTY，不接受另一个 exec 别名。PTY 的所有回复含 tombstone/settled 均保留
+   `TaskKind=pty`；exec 默认不输出新字段。`probe Kind=pty` 与 `pty-probe` 共用一个绝对 2 s 预算；
+   只有第二步的完整 `PTYVersion=1` capability 与新 lease 可用于 create。合法旧 capability 缺版本、旧 op/verb
+   unsupported 或旧端无响应仅在 create 前允许回落；`process_identity`、权限、busy、容量都不当成旧版本。
+
+   | op | PTY payload 与作用 |
+   |---|---|
+   | `probe` / `pty-probe` | 无 Handle/Run/Exec/变更；后者带 Kind=pty 与 ClientLineage，验证 broker 全路径，不预留 child |
+   | `create` | Run 非空、Exec 空；Handle/AttachEpoch；输入、输出 ACK、control、TerminalID 全零 |
+   | `resume/ack/terminal-ack` | 原 Handle/AttachEpoch；变更 payload 空；terminal-ack 匹配 TerminalID 与最终收据 |
+   | `input` | 字节 InputSeq、Input、InputFIN；最多 32 KiB，可携输出 ACK |
+   | `resize/signal/keepalive/hangup` | 独立 ControlSeq≥1，仅各自 payload，可携输出 ACK |
+
+   每个 op 先做互斥、溢出、scope/epoch 与当前 ACL 检查，拒绝前没有 queue/kernel/KA 副作用。
+   probe 严格 ONLINE，attach 类含五个变更 op 可走 STALE，OFFLINE 仍拒；broker raw overlay 不解析 Run，
+   agent 在异步使用前深拷贝 Argv/Env，用顶层 Scope.ActorFP 覆盖 Run.ActorFP。create audit 可多条，
+   唯一执行证据取 agent 的 `agent: run … reliable=true`、真实 child 与 ps 行。
+
+2. **owner、image 与域声明。** `agent → execsession → ptysession → pty/workload`；Manager 唯一 wait/signal owner，
+   PTY actor 唯一 master close/两向 deadline owner，两泵借用一个活动 wrapper。一个 public PID、一个 handle、
+   一个 registry record、一个 `pty-task.<pid>` resource，共享 Manager、registry、节点 replay 预算与 courier；
+   reliable PTY 不登记 legacy procs、不取 gateRun。成功 Start、ready、adoption 与 master 身份成立才可 TakeMaster 一次，
+   旧 Session 转交后失去 close/input/resize 权限。
+
+   Bundle ABI 仍为 1；追加 Record/TaskImage/TombstoneImage 的 `Kind`、task 的 `PTY *ptysession.Image`、
+   tombstone 的 `PTY *ptysession.Tombstone`、RevocationImage 的 `ClockUnknown`，外层新增字段零值省略。
+   PTY Image version 1 保存身份与终端观察、输入/输出 replay、FIN/Ended/Error、Pending/Discarding/SourceEnded/MasterClosed、
+   控制 seq/digest/error、KA 与 authority 绝对期限、Revoked/CleanupPending/CleanupMembers；不序列化连接 proof、函数、锁或 FD 整数。
+   Tombstone 保留最终 A/Q、输入 FIN/Ended/Error 与控制收据，外层保留真实 terminal 和输出终点；settled record 保留 Kind 到原 lease 可回收。
+
+   | 状态 | kind / 文件集合 |
+   |---|---|
+   | running/draining/frozen，含逻辑输入 FIN | `pty-task-v1`：`master,input-replay,output-replay`，每名恰一份 |
+   | master 已关闭，child 可仍 RUNNING；terminal 未 ACK | `pty-task-v1`：`input-replay,output-replay` |
+   | discarded tombstone / settled record | 无 resource、FD 或 replay 预算，metadata 的 kind/责任仍参与域检查 |
+   | spawn 失败 | 同 handle 的真实失败 terminal；无假 started master，可保留已分配 replay，不能重新 spawn |
+
+   exec 的原六文件集合不变；MergeResources/Import/FD 总量按 kind 和实际文件表检查，不能统一假设六 FD。
+   master 用 RawConn 只读验证 CLOEXEC/NONBLOCK/RDWR、字符设备、PTY index、devpts mount ID、fstat tuple；
+   不用 File.Fd、不重开 slave、不修共享 OFD flags，不加 slave keeper。termios/winsize/当前 SID/foreground 只作观察，
+   zombie leader + 持 slave 后代的 draining image 依赖原 master 与 Manager 的 boot/PID/ticks/ReapHeld，不能靠 TCSETS/tcsetpgrp 修复身份。
+   两 replay 在 Start 前预留，duplicate 先回已有记录；metadata≤16 MiB、FD≤16384，Pending 总量另检。
+
+   `proto.ImageDomainsLine()` 单源输出 `image-domains exec-v1 pty-v1`，位于最后一行 `image-abi v1` 之前。
+   无 domain 的 ABI1 reader 仅 exec-v1，无 ABI 仅完全空 image 可 bare exec；更高 ABI 拒绝，重复/畸形声明 smoke_failed。
+   未知 domain token 可忽略为 reader 的其它能力，不能声称本地支持未知域。
+   `RequiredDomains` 检查所有 retained Records（含 settled）、Tasks、Tombstones、Revocations、control/cleanup/resource kind；
+   仅扫描活 PID 会漏掉回滚不可读状态。检查在临时候选 smoke 后且盘面变更前、Freeze 后实际 bundle、
+   final Prepare 重 Export 后且 Exec 前各做一次；target/prev capability 均绑定被 probe 的实际 SHA，回滚前再验 pinned prev。
+
+3. **输入、EIO 与尾流。** `A=InputACK` 是 master.Write 实际返回的 n，`Q=InputAccepted` 是保存量；
+   `0≤A≤Q`，replay `[A,Q)`≤256 KiB，单包≤32 KiB，Window/A/Q 同锁快照。容量不足整包不接纳且不提交 FIN；
+   retained overlap 逐字比对、已 ACK 前缀裁掉，gap/不同 overlap/溢出拒绝。write(n,err) 总是先记 n，再处理 error，
+   自然短写续 suffix；freeze deadline 只是暂停。ACK 不代表 slave 程序已 read/处理，ctl 不能凭 Q 释放责任。
+   存储写前缀后失败仅增加真实 Q，保留稳定错误，不把未存 suffix 算成功。
+
+   InputFIN 锁定接纳终点 F=Q，A==F 才 InputEnded；只停输入，**不关 master、不发 HUP、不注入 0x04**。
+   Ctrl-D 是实际字节，由远端 canonical/raw/custom VEOF 解释。write EIO、Hangup、撤权等是输入 abort，
+   最终 A<Q 可合法，ctl 继续交付尾输出与真实 exit、结清后报 74，rc0 不掩盖未应用输入。
+   PTY 输出只用 Stdout 承载合并有序流，Stderr 无 FD/预算，固定 Offset=0、FIN=true，非零 stderr ACK 拒绝。
+   输出 replay 8 MiB，满则背压；本地 stdout 写入 n 后才 ACK n。
+
+   仅成功 started 且身份验证的 master **Read** last-slave EIO 可成为真 FIN，先保存 n>0；pipe、未 Start/失败 Start、
+   Write EIO、人工 Close、deadline 均不能借此伪造 EOF。leader exit、SourceEnded、逻辑输出结束、discard-drain 分开：
+   真 source end→AllowReap→Manager.Wait→真实 terminal/courier→terminal-ack→释放，不用 200 ms 截尾。
+   replay Append 失败须唤醒/join 在飞 read，再固定可保留前缀 End 与 OutputError；Pending≤32 KiB 仅记录责任，
+   错误发布后不能追加到 End。discard-drain 继续到真 source end；显式关闭/管理清场完成前保留 reap hold。
+
+4. **control 与 Hangup 事务。** ControlSeq 从 1 起只收 last+1；重复 last 且 digest 相同回原成功/失败 receipt，
+   同 seq 不同内容 conflict、更旧 stale、gap conflict。CallID 仅关联回复，先过滤迟回复再读 ACK；不能代替副作用去重。
+   signal v1 仅 SIGINT/SIGTERM/SIGHUP，作用于 Manager 持有的原 PGID；raw 0x03 则由 line discipline 送当前前台组。
+   resize 作用于原 terminal 并触发 SIGWINCH，不能改写未确认 resize 的重试 payload。
+   Hangup 占 control token→暂停/join 两泵→Manager.WithControl，在同一 guard 内 Signal→Close→提交 receipt；
+   Freeze 不可导出 Signal 后 Close 前状态。唯一嵌套顺序 token→Manager guard→actor state→Replay；
+   I/O、join、census、网络 probe 不持 Runtime/Manager/state mutex。
+   frozen/unknown/身份拒绝不 Close、不消费 seq；同保留行已 exit/ESRCH 可 Close；其它 Signal 错误不 Close，
+   失败 receipt 消费 seq；Close 错误保实际状态及 cleanup 责任、不重复 Signal。只保留 SIGHUP 语义，不补 SIGCONT/SIGKILL，
+   HUP-immune/stopped child 不伪造 terminal。管理撤权是第 6 条的另一条清场路径。
+
+5. **绝对 KA 与恢复机会。** KAIntervalMS=0 不武装，正值规范到 1–60 s，grace=max(6×interval,180 s)。
+   create 唯一初始 grant，只有新 ControlSeq keepalive 首次提交才置 `KADeadlineBootNS=BootNow+grace`；
+   重复 KA、poll/ACK、Import、NATS reconnect、本地 pumps 恢复不续期。到期判定需要当前连接 generation 的
+   两个新独立 round-trip proof，期间 deadline/LastKASeq 不变，锁外 probe、token 内复核身份/期限/revoke。
+   首次发现过期固定一次 `RecoveryNotBefore=max(KADeadline,首次过期时刻)+5 s`，
+   ExpiredSince/RecoveryNotBefore/NextJudge 跨代保存，旧 proof 废弃；NextJudge 已到即判定，不另给启动周期。
+   持续健康且无新 KA 时机会后两个 reaper tick 内 Hangup；持续不健康保责任，健康恢复不再给新 grace。
+   `AuthorityDeadlineBootNS=0` 表示无独立授权期限；若非零，到期在恢复输入前撤权，不等双 proof。
+   create lease 默认 30 s 仅限制首次 Reserve，不能冒充 session 授权 TTL。
+
+6. **撤权优先激活与清场边界。** Revoke 先不可逆登记 SID/task 责任、关闭 input/control/KA 入口，再读 BootNow；
+   钟失败保留 `ClockUnknown=true`，拒新 create/KA/GC，不写 now0、不回收责任。已在飞 Write 返回的 n 仍须记账；
+   零新增输入的断言从入口封闭完成或 frozen 导入开始算。starting 在 allocation/start/adopt 分界重查，冻结期只记责任，
+   Prepare 最后重 Export。Import 三段式为全量只读校验→取得全部 FD 但仍冻结→PreActivate 后激活；
+   **Manager.Thaw 前**先标 active 资源责任，随后清已撤权/authority 到期任务，再启 output cleanup/drain，最后只启合法 input/control。
+   Manager 或任一 actor 激活后失败不准 Detach/重派初始 bundle，保当前 owner、有限重试；回滚只 cut 当前态、generation+1。
+   安全点不可得则 rollback_blocked 保持 cleanup 责任，不用 Close 凑截止。只有全部应启方向就绪才发 image activated/ready。
+
+   管理清场先杀原 PGID，再 census 原 leader 的同 OS session 成员，包含多 PGID 和 stopped foreground；
+   每 PID 取 pidfd 并复核 boot/ticks/SID，循环至两次稳定 census 无匹配成员。扫描/kill 锁外、批间可 freeze，
+   CleanupPending/CleanupMembers 跨 image；不可读、身份冲突、持续 fork 不报清完，metadata 超界 defer cut。
+   **主动 setsid 脱离原 session 的后代不覆盖**（lead L2），不以 UID/PID 范围猜杀，不承诺任意子树 containment。
+   session_destroyed 事件路径清场但 daemon 不主动退出；首次 register 的 gone 两码则撤权后权威退出。
+   S4 覆盖 Freeze 前、Freeze 后/Prepare 前、Take 后/Activate 前、active 四窗口及 finalPrepare 后丢事件且持续 gone。
+   **finalPrepare 后丢事件且同 SID 已硬删重建不可判别**：当前 DB/wire/lease 无 authority incarnation，
+   由 S8 的权威连续性专项闭合（lead L1）；C-10 PTY 在 S4 不勾，不能用再次 Export 证明该窗口已覆盖。
+
+7. **准入与十个 deferred。** reliable PTY 可参与 cut，活跃 deferred 集合删除 pty_busy；legacy run/exec 的 admission→owner
+   交接取 gateRun/gateExec、procs、Manager 非 Runtime task 行的并集，任何分配/未 attach/spawn/draining legacy 均 busy。
+
+   | reason（与 DeferredReasons 同序） | 拒绝边界 |
+   |---|---|
+   | `spawn_in_flight` | starting/wedged spawn 未到安全点 |
+   | `remote_fs_probe_in_flight` | probe/home read 未收敛 |
+   | `foreign_process_rows` | Manager 有无法交接的外来行 |
+   | `image_too_large` | metadata、FD、Pending 或 cleanup 状态越界 |
+   | `runtime_closed` | 运行层关闭/未初始化 |
+   | `platform_unsupported` | 平台无 image 支持 |
+   | `flow_busy` | 任意 expose/rehome/在飞拨号；S5 前保留 |
+   | `ss_busy` | proxy serving，即使无流量；S5 前保留 |
+   | `transfers_in_flight` | push/pull/expose 或未到期 commit cache；S7 接管 |
+   | `legacy_session_busy` | legacy run/exec gate、procs 或非 Runtime Manager 行；永久文档化成员 |
+
+   下载前预检只读，下载后 cut 重检；安装/pending/共享 marker/flock 规则沿 §22.6。
+   prev 无 pty-v1 时 pending 不产生新的 PTY 扩展状态，但 probe 不藏能力、不诱导 fallback；commit 持久化失败仍关门。
+
+8. **本地 stdio、信号与平台。** Linux TTY/FIFO 经 `/proc/self/fd` 重开独立 OFD，CLOEXEC/NONBLOCK/NOCTTY 并验身份，
+   自有 wake/poller 支持 Cancel+join，只关自有 FD，恢复原 flags/termios；不能 dup 后修改原 OFD。
+   regular file 与 `/dev/null` 支持可靠路径，在有界读写之间查取消（lead L5）。socket 及其它无法安全重开/唤醒的类型
+   在 create 前回落 legacy，stderr 一行 `tether: <stdin|stdout> is a <kind>; using legacy run (no hot-update continuity)`，不报 64。
+   非 TTY 外部 SIGINT/SIGTERM 沿 main 根 NotifyContext 作本地取消，停止输入/KA、join/Restore 后返回；
+   不装第二个 signal handler、不承诺远端收到 Signal。raw 0x03 和显式 signal op 是远端语义。
+   已发 create 的 ctl 从首次失联启固定 **180 s** 恢复窗，timeout/no responders/reconnecting/node_offline/agent_upgrading/process_recovering
+   重试原 handle，失败不续期；同实例合法 status 才结束本次失联。窗口耗尽 74、任务可能已执行；权限 77、坏身份/instance lost/revoked
+   立即结束；真正 process_busy 也是终态拒绝，无 create 后 fallback。准入等待最多 5 s，到期 process_recovering 不释放原资源或恢复责任。KA 绝对截止不因这 180 s 改变。
+   Darwin 仅 legacy run，不广告 PTYVersion1；cross-build/vet-tags 与真实终端实跑分列。
+   无 Darwin runner 时真实 run/resize/cancel 记 NOT_RUN、未在 Darwin 实跑，不阻塞 S4 出口（lead L6）。
+   正常新请求/业务停顿 5 s 为硬判；500 ms 全冻结窗在 S4 仍是校准，完整报告最大值与超标，S8 定性能 profile（lead L4）。
+
+### 22.8 S5 flow and SS domains (binding contract)
+
+This live contract follows the [frozen S5 plan](reviews/hot-update-flow-carrier-plan.md)
+§2–§7; its lead verdicts Q1–Q3 and M override earlier recommendations and planning status.
+The implementation includes the S5 fix-round contracts below; the six exits remain
+[scoped S5 closure/carry receipts](reviews/hot-update-evidence.md#17-s5-flow-carrier-ss-最终收尾收据2026-10-11).
+S4 remains §22.7, including its three domain gates, 500 ms calibration and Darwin rule.
+The frozen plan's request for a new §22.7 maps here without renumbering S4.
+Deployment hazards and implementation guards are recorded in
+[deploy-tier-gotchas.md](deploy-tier-gotchas.md#2026-10-03--s5-flowss-carrier-and-original-socket-continuity).
+
+1. **Ownership and negotiation.** `flow` owns ordered logical bytes; `rawsocket` owns original kernel
+   sockets; broker `Endpoint` owns listener/public connections/journal/fences; TLS/yamux owns only the
+   replaceable carrier. Each flow has one data stream per attachment, bound before DATA.
+   TLS selects `tether-flow/1` only with complete Linux v1 ownership and bounded authority.
+   No common ALPN selects legacy raw; the server clears ALPN on no intersection while preserving certificate
+   and pin checks. A new client may retry an exact remote no-application-protocol alert once, before REGISTER
+   and with no retained v1 flow, preserving all TLS checks. Certificate/pin failure cannot trigger fallback.
+   Selected v1 never downgrades. REGISTER remains `REGISTER sid nid port token epoch\n` (six fields);
+   server emits exactly `OK\n`. Buffered bytes after REGISTER/OK must reach yamux through the original reader.
+   A fresh v1 Open retries only typed `home_catching_up`/`try_again` refusals inside one existing
+   two-second RESUME attempt and the caller's earlier deadline, with a fresh REGISTER each time.
+   A freshly allocated proxy token uses the ordinary expose path's bounded remote-home command-cursor wait before its first push. The wait uses the existing three-second budget and never compares Raft's all-entry cursor with the command-domain cursor. An unavailable home retains the ordinary expose best-effort fallback; the wait neither remints the token nor caches authority across a revoke.
+   A previous agent cannot retry a transient legacy REGISTER denial. The broker retains that one REGISTER within the existing one-second lookup budget, retrying only failed known-lag snapshots with a fresh transaction and one absolute deadline. Known lag never authorizes; a committed revoke or store fault keeps its native classification. No positive grant is cached across attempts.
+   Terminal refusals and legacy initial Opens retain their single-attempt behavior; installed sessions
+   remain anchored to Start rather than the temporary handshake budget.
+
+2. **Frame and byte responsibility.** Version 1 uses a big-endian 40-byte header:
+   Version:u8, Kind:u8, Flags:u16, BodyLen:u32, FlowID:16 bytes, CarrierGen:u64, Offset:u64;
+   BodyLen≤32768. Kinds 1–9 are OPEN, OPEN_ACK, RESUME, RESUME_OK, REJECT, DATA, ACK, FIN, CLOSE.
+   Direction is flag bit0, FIN receipt bit1 only on ACK, CLOSE receipt bit2 only on CLOSE; reject all other
+   bits, unknown kinds/modes, overflow and trailing bytes. Endpoint control uses zero FlowID/Offset;
+   only DATA/ACK/FIN use Offset. Bodies and phases remain exactly plan §2.2.
+   TxBase B≤peer Applied A≤TxEnd E; current CarrierSent is not an ACK bound.
+   Received R and Applied A are distinct: retain `[A,R)` and advance A by the actual raw Write n,
+   even with an error. Dedupe and overlap validation precede raw Write. Preserve RawReadPending and
+   partial replay-Append suffixes across cuts. A−1 correct overlap is a positive control; A+1 or missing
+   dedupe must fail the independent byte oracle.
+
+3. **OPEN, FIN and retirement.** FlowID is random 128-bit, OpenSeq starts at 1 and never reuses.
+   Journal before target connect; lost OPEN resends the same ID/seq/intent, lost OPEN_ACK returns the original
+   pending/connected/failed receipt. Unknown RESUME never dials. The original connector alone consumes
+   SO_ERROR and records it; descriptor validation reads identity/flags without consuming SO_ERROR or
+   repairing shared OFD flags. Connecting sockets and original BOOTTIME deadline migrate without redial.
+   Receipt GC retains RetiredThrough and holes (≤1024/allocation); terminal metadata≤4096/node.
+   Active flows and retained terminal receipts have separate bounds: 32 and 4096 respectively.
+   Settled records leave the live RESUME set but remain in the frozen journal. Full retirement capacity
+   refuses new OPEN, never evicts proof that would permit a second Dial.
+   Source EOF seals FIN End; n+EOF saves n first. CloseWrite occurs exactly once after A reaches End,
+   then FIN receipt. Read EOF does not close the reverse direction: reverse tail may exceed 8 MiB and cross exec.
+   Normal CLOSE proves both directions' final End/Applied/FIN; abort records actual prefixes and drain/discard
+   outcome. Abort CLOSE keeps the data stream until its tail is receipted or explicitly discarded and
+   settlement is terminal. Rejected OPEN closes its accepted yamux stream and releases its binding.
+   If a cut loses revoke CLOSE, a repeated OPEN matching a retained terminal journal returns its
+   irreversible refusal on that stream. Endpoint/sequence/intent/target conflicts still fail closed;
+   the refusal preserves its reason and cannot interrupt another flow's shared carrier.
+   A lost final FIN receipt is reconciled from retained terminal controls on carrier rebuild, without a
+   replacement business socket or replay reservation. Hard revoke intentionally discards unauthorized
+   tail and is evaluated separately from survivors.
+
+4. **Endpoint and fresh authority.** Attached/Detached/Prepared/Binding owners retain port and fence refs;
+   session teardown keeps listeners/public sockets. First detach starts an absolute 8 s grace, never renewed
+   by failed retries (below the shortest 10 s reaper dwell phase). CloseProxy/CloseSession/ForgetSession/Close
+   cover detached owners, pending accepts, permits, receipts and timers. Check killGen/forgotten/allocation
+   fences before lookup and again before attach CAS; prune only with every owner/inflight/timer ref zero.
+   PREPARE occurs while the old carrier runs; activation consumes a purpose-bound 120 s permit once.
+   Current-owner tickets have no short idle TTL. A lost reply retries the same ResumeID, retrieving the same
+   receipt with fresh authority and fences. A current owner may replace a consumed predecessor permit
+   to prepare the next handoff; retries retain the same pending permit. New generation alone cannot steal
+   ownership. Planned freeze preserves previously real proxy readiness through the original absolute
+   detached-grace deadline, carried in sealed state; it emits no false unready edge. Restore/retry never
+   renews grace. Expiry, fresh revocation and teardown clear readiness.
+   Each REGISTER/RESUME/bind/cached-receipt authorization attempt reads one bounded SQLite transaction containing session/node
+   activity, allocation/token/home/epoch, Enabled, complete Keys, proxy Generation/Epoch and AppliedRevision.
+   System-proxy grants also require node proxy participation in that snapshot; ordinary expose does not.
+   Both authority paths disable the SQLite busy handler for the read and restore it before pool reuse.
+   Expiry yields a retryable refusal, including an expired positive result. v1 REGISTER preserves
+   try_again/home_catching_up as transient refusals; neither is collapsed into terminal revocation.
+   Known lag, failed reads, invalid values or scope mismatch refuse the whole grant. Lookup's ≤1 s deadline
+   includes pool/lock wait; Stop cancels and joins the operation before releasing refs.
+   AppliedRevision belongs to the SQLite command domain. This is local-applied authorization;
+   **leader commit does not imply immediate global linearizable revocation** (Q1). Barrier(timeout) is no proof.
+
+5. **Capacity and images.** Exec, PTY and flow share the same `*workload.ReplayBudget`, fixed 256 MiB/node.
+   Each flow has one 8 MiB send replay per host, including an empty log; ACK frees retained space,
+   Close/Detach releases its capacity reservation. Domain ReservedBytes/DomainUsed count only that domain;
+   compare their sum with shared Used, never copy the budget or import an old Limit.
+   Image validation/encoding/import bound 32 active flows and 4096 retained terminal receipts separately;
+   terminal history consumes no live RESUME slot or replay reservation. The current OPEN admission guard
+   still counts all journal records toward its 4096 ceiling, conservatively refusing before the separate
+   terminal quota is full when active records coexist; this remaining admission mismatch must be corrected.
+   Idle listeners reserve zero replay. Accepted pending FD≤32/node, active flows≤32, idle Endpoint≤128;
+   use a bounded fair reservation queue and pause accepts at capacity, preserving established flows.
+   TxPending/RxPending/writer staging each≤32 KiB/flow; control≤64 KiB/Endpoint and 4 MiB/node;
+   RESUME pages≤2 MiB/node; one pending permit/allocation; yamux window=256 KiB/stream.
+   Non-replay persistent data≤64 MiB/process, private sealed state≤32 MiB/cut; count codec/Prepared transient
+   peaks separately. FD preflight counts live, sealed, Prepared dup and salvage against real RLIMIT and 16384.
+   A normal drill reserves≤224 MiB replay; saturation is a separate profile.
+   ABI remains 1, with `image-domains exec-v1 pty-v1 flow-v1 ss-v1` before final `image-abi v1`.
+   Public Bundle refs are additive/omitempty; private flow/endpoint/SS/authority/timer/permit/receipt state
+   travels only in sealed memfd. Resource IDs use legal dot-separated typed names; originals and Prepared
+   dup have separate owners. Re-export each domain at final Prepare; replacement closes the previous owned
+   sealed FD only after success. Failed export closes only its new resources.
+   RequiredDomains scans all retained listeners, salts, retirement/timers/receipts/cleanup, not just active flows.
+   Check candidate and actual prev SHA-bound capabilities before disk mutation, after Freeze, and after final
+   re-export before Prepare/Exec. At the final cut, prepareImageCut unconditionally checks every retained
+   domain against every reader, including flow-v1/ss-v1 admitted after preflight and auxiliary SS state;
+   an optional caller callback cannot bypass this check. Preserve `prev ∈ {running image, candidate}`, rejecting any third SHA.
+   An old reader lacks flow-v1/ss-v1 even at ABI1; pending denies creation of unreadable domains through every
+   admission path until commit is durable. MarkReady does not open this gate.
+
+   **Private release observation (drill 75).** `internal/drillobserve` is a leaf compiled into the
+   release artifact. Its hook is nil unless startup supplies both `TETHER_TEST_DRILL_OBSERVER=v1`
+   and `TETHER_TEST_DRILL_CUSTODY_FD` naming a valid fully sealed configuration memfd containing an
+   inherited connected UNIX seqpacket descriptor. Startup consumes and unsets both variables;
+   spawnexec/spawnsafe strip explicit workload overrides. Same-PID image exec preserves only this
+   private custody channel after the image gate drains. The observer opens no ordinary files,
+   sockets, listeners, CLI or control-plane interfaces. Inert hooks perform only a nil check.
+   Active hooks copy bounded records to a nonblocking queue; a separate writer seals bounded batches
+   and passes their memfds to an external keeper with SCM_RIGHTS. Overflow, write failure, missing
+   sequence or missing fresh product acknowledgement poisons custody and forces SETUP-RED2 while
+   product IO continues. No observer write holds a product owner lock.
+   Private records include every actual Seal attempt before the primitive (actual subkey SHA256 and
+   nonce), actual socket write results/suffixes, original FlowID/EndpointID/OFD fingerprints, committed
+   offsets/Base/retirement, per-domain live reservations and files, applied grant/revoke, final cut,
+   PREPARE/RESUME, default reaper decisions and watchdog barriers. Carrier identity is derived from
+   the actual negotiated TLS exporter; legacy records retain empty ALPN and original decrypted first
+   carrier bytes. These values remain in keeper memory or sealed memfds across judge subprocesses.
+   Public receipts contain only IDs, generations, counts and decisions. Independent kernel socket
+   identities use one-way tuple hashes; raw private tuples and crypto state never enter ordinary
+   capture files. Custody frames and archives are bounded; the keeper compares actual original-flow
+   carrier sessions before creating a public continuity receipt. Hermetic controls exercise the real
+   observer and collector; they do not constitute deployment evidence.
+
+6. **SS actor and secrets.** Retain salt/length/payload/target parser cursors, cross-chunk ATYP/host/port,
+   approved DNS results/policy/index, original connecting FD/SO_ERROR, BOOTTIME deadlines, rx/tx nonce12 and
+   exhaustion, already Opened plaintext and already Sealed ciphertext plus actual write cursor, RawReadPending,
+   EOF/CloseWrite, key-material version, ConnID→FlowID, revoked/fired/cleanup/authority state.
+   The upstream tuple records the connector’s actual bound source address/port after Connect, rather than
+   the pre-connect wildcard. Import accepts a consumed Failed connect receipt without a peer (ENOTCONN),
+   retaining its original errno; it does not redial or consume SO_ERROR again.
+   Preserve chacha20-ietf-poly1305/HKDF `ss-subkey`, salt32, tag16 and max chunk 0x3fff.
+   Open/Seal/result/nonce advance are one guarded decision; never re-Seal a partial ciphertext suffix or wrap nonce.
+   Salt history follows actual master material, so aliases share FIFO8192 plus live-salt protection across
+   deletion/re-add/rotation/exec. Response salt is atomically reserved against inbound/history/live salts.
+   The 8192 FIFO is a bounded replay window, not permanent memory of all salts.
+   Material history≤64/node (Q3), keys≤256/node, actors≤128/node. At capacity, remove revoked authority first,
+   refuse new material/authentication with failure/retry feedback and preserve histories/survivors.
+   A fresh complete grant at quota reauthorizes surviving bound actors after Thaw even when new-material
+   admission fails; it neither suspends live survivors nor advances/ACKs the failed apply watermark.
+   An authorized existing actor retains its original subkey on same-ID rotation; new trials recheck current
+   material at bind. Same Generation/Epoch requires the same complete keyset digest; failed apply does not ACK
+   or advance lastApplied. One comparator orders authority by generation, then epoch, then revision.
+   Stale grants are rejected before disabled/oversized processing, without revocation, suspension or
+   admission side effects. Higher-generation recovery accepts a lower epoch/revision. Fresh RESUME
+   updates the serialized agent watermark/digest; delayed pushes use the same comparator’s pair
+   projection and versioned Authorize path, so they cannot undo fresher authority.
+   Restore dispatch/applied pairs and Fired/CleanupPending before callbacks.
+   Revoke is irreversible: close authorization entry first, SHUT_RDWR original loopback/upstream OFDs so dup
+   also fails, and explicitly revoke bound FlowID/public replay even for a silent victim. Join/close outside locks;
+   callbacks submit cleanup to another owner, never join themselves.
+   Unknown fresh authority holds SS in AuthorityPending with zero target plaintext Write, including exec-failure
+   Thaw of the old server. Freeze pauses ownership; revoke terminates authorization.
+   PSK/subkeys, key IDs, salts/nonces, target addresses, grants/tickets and payloads remain private sealed state.
+   No raw/hex/base64 secret in logs, fmt/errors, JSON/Resource.Data, marker, argv/env or ordinary files.
+
+7. **Restore, cancellation and rollback.** New validates/takes every FD into frozen owners without workers.
+   Run installs exit cleanup and pending watchdog before activation, marks responsibility active at the first
+   active resource, then Manager/revoke → raw pumps (SS AuthorityPending) → TLS/yamux REGISTER → fresh RESUME
+   → SS.Authorize/data bind → NATS/register. Active Endpoints restore first with parallelism32; each attempt's
+   TLS/REGISTER/RESUME budget is 2 s, lookup≤1 s. NATS session replacement does not destroy data-plane owners.
+   Fence submission/attachment before cancellation, close underlying TLS outside locks, then yamux, then join
+   workers; stream Close or ctx cancel alone cannot wake the shared writer/window-update graph.
+   PREPARE precedes Freeze. Exec failure closes Prepared copies, Thaws originals and obtains fresh SS authority;
+   asynchronous ABORT cannot block local Thaw. Before activation Detach/salvage may redispatch the original;
+   Flow Manager/Client and SS Server expose ctx-free Detach for pristine frozen imports, transferring
+   the exact sealed/business descriptor closure without socket shutdown; Flow Detach releases its replay
+   reservations. Activation or mutation ends pristine eligibility and releases retained import metadata.
+   Once any domain activates, rollback must Freeze/re-export current offsets/nonces/revoke/retirement at generation+1.
+   A ready image with pending commit-write failure keeps its real 120 s watchdog armed.
+   Normal business/new-request maximum stall≤5 s is hard. The 500 ms full freeze window is calibration,
+   ending only when the last required raw/carrier/bind/SS domain is usable; record max and excesses plus
+   raw_activation_ms/carrier_resume_ms/ss_authority_ms/NATS_register_ms separately.
+   Runtime.FrozenAtBootNS retains the S2/S3 accounting-cut meaning: a task admitted before the
+   outer fence may still advance before Runtime freezes. The earlier admission BOOTTIME is optional
+   handoff calibration metadata (`image-freeze-calibration`, kind `image-freeze-calibration-v1`,
+   canonical positive decimal Resource.Data), bounded by that accounting cut. Its one empty sealed
+   `state` memfd retains resource custody through the previous reader's Borrow/Repack; it carries no
+   business state or secrets. New readers measure the complete window from admission; absent metadata
+   keeps the previous accounting-cut calibration. Invalid present metadata refuses before business
+   descriptors are taken. No new strict Bundle/Runtime JSON field or required domain is introduced:
+   the real S3 reader must continue to read pure-exec images under all three existing domain gates.
+
+8. **Admission and remaining stages.** Replace historical flow_busy/ss_busy only with closed ownership census
+   and admission. agentimage.DeferredReasons is the shared ordered S5 nine-code source:
+   spawn_in_flight, remote_fs_probe_in_flight, foreign_process_rows,
+   image_too_large, runtime_closed, platform_unsupported, transfers_in_flight, legacy_session_busy,
+   ss_state_unrepresentable. Legacy idle listeners/retained slots and unknown adapters refuse with
+   legacy_session_busy (Q2); known unrepresentable SS state uses ss_state_unrepresentable; byte/FD excess
+   uses image_too_large. Typed owned v1 expose no longer double-counts as transfer. The S5 transfer
+   refusal is the legacy baseline; §22.10 defines the S7 capable-transfer census and retained-domain gate.
+   The integrated census admits representable typed v1 owners; historical flow_busy/ss_busy are absent
+   from the current public deferred set and upgrade consumer. Legacy/unknown responsibility still refuses.
+   Darwin retains actual legacy expose/SS and explicit unsupported image behavior; cross-build is separate
+   from native tests, NOT_RUN without a Darwin runner and nonblocking under S4 L6.
+   S6 owns broker same-PID exec/Endpoint/listener/fence export; S8 owns authority incarnation, legacy first
+   migration and broader transactions; S9 owns NATS/Caddy switching; S10 owns final mixed rollout/retirement.
+   S4 C-4/C-8/C-10/C-11/B-2 and failures §4's six responsibilities require same-S5-candidate regression receipts;
+   PTY lost-event plus same-SID recreation remains S8 and does not become complete through SS fresh grants.
+
+### 22.9 S6 broker image (binding contract; final receipts pending)
+
+The [frozen plan](reviews/hot-update-broker-image-plan.md) lead verdicts L1–L7 govern this section.
+This is a contract, not an acceptance receipt. The S6 candidate contains real single/sole-voter/N3
+same-PID cut paths with scoped receipts in the [S6 review](reviews/hot-update-broker-image-review.md);
+final gates/drills remain pending in the combined S7-close window ([evidence §18](reviews/hot-update-evidence.md#18-s6-broker-image-interim-receipts-2026-10-12)). The
+[unchecked claim index](reviews/hot-update-tasklist.md#s6-broker-image-receipt-boundary) records final evidence dependencies.
+
+1. **Current runtime and cut.** `brokerimage.RuntimeSlot` is the unique current store/control/server owner.
+   The production cut stays inside `Broker.Run`: fence admission/transfers, join store users,
+   stop carrier TLS and join yamux/workers/monitors before freezing flows; pause listener Accept views,
+   retain keeper LISTEN OFDs and UNIX pathname; shut down Raft/transport/Bolt and all actual SQLite
+   writer/RO/backup connections, checkpoint, seal, then `Prepared.Exec`. A successful exec never unwinds
+   Run's defers. Normal stop reads the current slot. `internal/broker/reexec.go:runBrokerImageReloadUsing`
+   delegates to `brokerimage.ReloadCurrentStore`; `brokerupgrade/brokerruntime` binds role guards and current owners. The cold Run-unwind path remains a separate historical baseline;
+   source presence does not certify final production continuity.
+2. **Store and schema.** `internal/storage/current.go` owns `OpenCurrent`: exact canonical DB identity,
+   filename/content migration set and schema objects, original journal mode and FULL synchronous mode,
+   actual registered driver exclusivity. Hot reopen never migrates. Single/cluster/offline use one canonical
+   DB lock domain and inherit the original flock OFD without unlock/re-flock. Closed receipts require actual
+   driver counts zero and every close phase known closed; an error/unknown phase blocks reopen.
+   `internal/storage` and `internal/brokerimage` own the shutdown/lock integration. SQL applied cursor and Raft last/config index/digest are
+   separate facts. `internal/cluster/snapshot.go` keeps startup snapshot restore disabled and rejects runtime
+   snapshots below the current durable floor; replay must not repair loss before the ACK-prefix oracle reads.
+3. **Image ownership and rollback.** `broker-image-v1` has role broker and a16MiB bundle ceiling.
+   `internal/brokerimage/boot.go`, `preflight.go`, `import.go` and `codec.go` implement role dispatch,
+   pure candidate/previous reader probes and strict public/private validation. Probe neither opens store nor
+   runs migrations. Partial Take includes nonnil files returned with errors in salvage. Before any possible
+   store/transport side effect, import marks ACTIVE. Pristine detach/repack preserves all taken original
+   resources without shutdown; ACTIVE failure needs a fresh generation+1 current cut, including new ACKs,
+   flow offsets/nonces and revocations. The runtime slot and `internal/brokerimage` own current rollback; final deployment receipts remain pending. Never restore an old DB/WAL
+   or backup for hot rollback. Broker private kinds stay outside the global S5 sealedstate vocabulary;
+   SS keys/salts/AEAD state stay exclusively in sealed memfd.
+   Public `BrokerImageStatus` is exactly running_sha256/generation/phase/cut_id/mode (additive omitempty);
+   local admin RuntimeReport and remote health share that shape. `ClusterHealthSchemaVersion=8` records
+   the remote shape and is not a compatibility gate; local admin schema version is unchanged.
+4. **Topology and maintenance.** Single is the primary lane, sole voter uses fresh configuration/term/role
+   evidence, and N≥3 transfers leadership before every step. Planned cut requires installed agent route-hold
+   capability and signed ACK from every required observer. Signed nonce/issuer proofs map cross-machine
+   expiry to local boot time with RTT consumed; fixed expiry ≤8s is never extended by late reply/new leader.
+   Holder acquire/renew/release uses exact CAS. Every automatic/manual home mutation validates maintenance
+   and full allocation identity under writer serialization; only commit/readback permits event emission.
+   Preserve historical dwell and let genuine expiry/crash recovery proceed. `--broker-only` is PlanScope,
+   independent of the older Step.BrokerOnly agent-absence fact; co-located agent PID/SHA stays unchanged.
+5. **Auth and admission.** Rebuild auth_callout first, checked subscription flush then genuine signed JWT
+   response/CONNECT before business subscriptions. Auth-usable and full-ready are separate events; unchanged
+   external JetStream identities are witnesses, never reset/recreated. `internal/brokercontrol` and `internal/infraattach` bind production auth/control admission; §22.12 describes ordinary reconnect proof. Each eligible RunE admission uses one absolute5s budget through
+   banner/health/discovery/DNS/proxy/TLS/WSS/inbox/probe/create/request/backoff. Long tasks continue on their
+   original context after true start. Stable IDs/payloads retain exactly one effect; unsafe sent mutations
+   query a receipt or report `control_result_unknown`. Only S1 historical receipt identity permits auth
+   blackout retry; first login/PIN/ACL/revoke errors remain terminal. Probe timeout/no responders do not
+   establish unsupported capability or permit legacy fallback. `internal/controlbudget` and ctl retry/admission adapters carry the absolute budget; final blackout receipts remain pending.
+6. **Acceptance boundary.** `37.A/A1/B/T/R` and parent37 require native GREEN0; genuine previous-release
+   N3 Run-unwind is separate `39.BR`, native PRODUCT-RED3 with independently established lead-signed loss
+   signature. INCOMPLETE4, ASSERT-FAIL1 and SETUP-RED2 retain native meaning. The S6 T baseline
+   requires transfer defer; §22.10 replaces it for S7 capable live transfers with an actual cut in
+   single/N3, keeping a separate legacy/unknown defer case. R requires valid post-Take salvage and ACTIVE
+   current rollback, not a preflight refusal. The live supply/collector is present; final P35 deployment receipts are pending. Same original
+   SSH/TCP/SS sockets, running reliable child PID/startticks, listener identities, ACK prefix, home history,
+   all10/s scheduled slots/attempts and unchanged JS objects must independently prove continuity.
+   Normal maximum flow/control/write stall ≤5s is hard; complete required-domain freeze500ms is calibration,
+   with all maxima/excesses retained. S7 tracker/GC, S8 first migration/two generations, S9 NATS/Caddy and
+   S10 mixed rollout remain outside these claims.
+
+
+### 22.10 S7 transfer continuation (binding contract; receipts pending)
+
+The [frozen S7 plan](reviews/hot-update-transfer-continuation-plan.md) governs this contract;
+lead LQ1–LQ3 and L15–L18 override the candidate verdict table and body. All S7 product exits are
+**PENDING / NOT_RUN** in the [claim register](reviews/hot-update-tasklist.md#s7-transfer-continuation-receipt-boundary).
+P00's `internal/xfercontract/{contracts,state,ports}.go` and leaf contract files supply frozen declarations.
+Compile stubs and a documentation audit provide no runtime, deployment or GREEN receipt.
+`internal/xferclient`, `internal/xferworker`, `internal/xferbroker` and `internal/xferbridge` now supply
+the client/worker/tracker and image adapters. Tier-A inline data and tier-B object IO use separate paths;
+source presence is not evidence that both sender/receiver legs passed the final live-cut matrix.
+
+1. **Identity, creation and routing.** One ctl invocation mints one `transfer_id` and one intent.
+   Tier B fixes one object NUID; tier A has no OBJ, empty ObjectVersion and Chunks=0. Tier A retains
+   capacity-reserved copied inline bytes/offset/hash and original tmp/parent, Grant/outcome in the worker
+   image; duplicate inline input returns original state without a second target write. `transfer-probe` is read-only; `transfer-permit` creates authority bound to
+   SID/NID/actor/agent instance/intent and original broker instance/boot/generation. The usual 30s,
+   maximum 5min permit limits first creation only. Existing matching entries continue after expiry;
+   expired permits cannot recreate retired workers. Sent-unknown never obtains a new-home permit.
+   Permit/prepare creation requires ONLINE; admitted continuation allows ONLINE/STALE with current
+   authorization. Plain broadcast subscriptions route continuation to the original origin, which
+   installs its imported tracker before subscriptions, watchdog or either reaper disposition runs.
+   N3 admission proves every eligible broker's version/history/config guard, including a follower
+   origin reached through another ingress. Cold/hot registration share one descriptor; nonowners
+   are silent. `transfer-bucket-config` forwards to the leader; census is broker-only.
+2. **Budgets and admission.** Size ceilings stay 8 MiB tier A and 2 GiB tier B; bucket single-flight and
+   tracker 1024 slots stay unchanged. `--rate-limit` is bytes/s, sealed before side effects; zero keeps
+   the original rate formula. Tier A has 30s. Tier B uses `rate=min(2 MiB/s, requested_rate)` (zero=2 MiB/s)
+   and `max(300s, 2*ceil(size/rate)*1s+60s)`, refusing values above 2108s before creation/first chunk.
+   Pull may start with a 2108s provisional ceiling, then source pin/hash/size seals the actual budget
+   from the original start. Local BOOTTIME is boot-bound; cross-host remaining time consumes request
+   elapsed/queue time and never resets the deadline. Healthy durable progress is 10s, control attempts
+   ≤5s, maintenance ≤8s. Result cache lasts at least 10min and beyond permit expiry; unresolved Grant,
+   START/TERMINAL or cleanup responsibilities have no TTL retirement and still consume capacity.
+   Recovery horizon H=2108s+120s=2228s. OBJ requires `Duplicates>=H`, `MaxAge=0` or `MaxAge>=H`,
+   a compatible server ceiling and a full-version storage reservation. Existing 48h TTL is valid.
+   `transfer_storage_horizon` reports required Duplicates/MaxAge before the first chunk; no automatic
+   TTL changes or legacy downgrade. Config owner patches only its fields, preserving operator limits.
+3. **Fixed-version writer and reader.** The writer has one pending logical chunk and retains exact
+   idx/offset/bytes/digest/headers and attachment generation. Subject CAS plus stream CAS survives
+   late original/retry HPUB beyond the default 120s dedupe window. Raw readback verifies physical seq,
+   header and content before advancing; global LastSeq is never byte progress. Complete continuous
+   receipts and source seal precede exact SDK-compatible metadata publication. Source uses the original
+   FD; changed inode content fails without metadata. Capable recovery cannot reach SDK Put/rewind/new ID;
+   explicit pre-create cap0 selects a separate once-only legacy path. Reader fetch and sink durability
+   are separate: actual WriteAt n plus successful whole-chunk Sync atomically advances offset/index/
+   stream seq/hash prefix. Healthy drops, slow consumer, consumer deletion, short batch and last-chunk
+   timeout retire the old fetch with cancel/join, UNSUB/PONG and consumer deletion before rebuilding
+   at synced seq+1. Four-message and bytes windows are bounded by 32 MiB/connection; refs=0 cannot clear
+   an unconfirmed dirty window. Each dirty connection keeps its bounded cleanup owner.
+4. **Atomic receiver and truthful outcome.** Source/tmp/parent transfer the original OFDs. Freeze joins
+   IO, truncates partial suffix to the synced prefix in the original owner and Syncs before export;
+   pristine Import only validates and never repairs size/offset/flags. Broker durably reserves one Grant
+   before force Renameat or no-force Linkat. Cancellation closes a gate irreversibly; watchdog cannot
+   decide failed after a Grant may have escaped. Primitive entry/outcome recording is an uncuttable
+   local section. Linkat success remains landed after tmp unlink failure; parent Sync failure retains
+   landed with durability unknown and never repeats the primitive. Only confirmed directory durability
+   can decide complete. Kill-9 inside primitive/outcome registration is honestly unknown.
+5. **Decision, history and cleanup.** Open → CommitReserved → Decided → HistoryConfirmed → CleanupPending
+   → Settled are distinct responsibilities. Revision-CAS ledger stores original start/budget, Grant,
+   immutable canonical START/TERMINAL, delivery and cleanup in primary/outbox. File Sync→rename→dir Sync
+   preserves staging; conflicting disk/image/history records never ACK, overwrite or discard evidence.
+   History requires full canonical equality and exactly one physical START and TERMINAL. Transfer-subject
+   scan/CAS/readback is the sole v1 writer for single and N3; Raft commit, NATS Flush, boolean terminal or
+   publisher checkpoint is insufficient. Aux truncation keeps origin outbox responsibility. History uses
+   MaxAge=0, DiscardNew and no eviction limits; capacity-full stays pending. Exact receipts alone permit
+   courier ACK and old-ctl compatibility events. Writer retirement stop/join plus acknowledged metadata/
+   stream fence, all reader retirement, then exact original-NUID purge precede ledger consume (primary
+   durable unlink before outbox). GC cannot bypass this finalizer. Live imported responsibility protects
+   both dispositions, while finalizers still run; cross-home GC needs original-origin retirement proof.
+   Unreachable origin retains evidence; proven legacy orphans must actually be reaped. Both TTL List
+   calls have bounded contexts, cancel/join and ≤5s passes, so the next reconcile pass can enter.
+6. **Status and retries.** The only status states are unknown/live/terminal. Phase expresses pending
+   detail; complete/failed is terminal kind. Unknown requires a ready, complete original-origin census;
+   missing/foreign/corrupt/unavailable authority yields owner-recovering/result-unknown error. A fresh
+   read-only origin resolver may locate retained responsibility, but cannot mint permits or recreate work.
+   Terminal status requires exact history receipt and can still expose cleanup_pending. A status query
+   with affirmative unknown exits 0 without claiming completion; an unresolved main invocation exits 74.
+   Sent-unknown immediately leaves generic retry for status/ResolvePending; only proven-safe replay uses
+   the original CallID, Grant and outcome. Finalize failure cannot print OK. User timeout stops UI/new-byte
+   admission, not settlement ownership. The [usage exit table](usage.md#9134-s7-transfer-exit-codes-pending-receipts)
+   distinguishes 64/74/75/77; `transfer_reconcile_required` remains an internal engine control.
+7. **Session deletion (LQ1).** MarkDeleting immediately revokes ordinary business and new bytes. The
+   ≤5s settlement barrier retains DELETING and returns 75 with pending transfer IDs/reasons until exact
+   START/TERMINAL and writer/receiver/consumer/late-attempt retirement proofs permit history→OBJ→SQL
+   deletion. Cold/periodic orphan sweeps protect unsettled DELETING streams; no empty history recreation.
+   Repeat the same removal after settlement: the retry that passes the barrier and drives cleanup
+   returns OK (CLI exit 0); an ordinary retry without settlement involvement keeps `already_deleting`
+   (CLI exit 64).
+   Receiver-NKey-bound sealed SettlementCapsule grants only that entry's terminal/status/cancel-settlement
+   and private replies, never CMD/prepare/OBJ IO. Normal register cannot restore revoked business.
+   Without `--abandon-unsettled-transfers`, no unsettled evidence is deleted. Explicit abandonment writes
+   one exact canonical failed terminal per unsettled transfer: reason `settlement_abandoned`,
+   `outcome_unknown=true`; it never claims complete/no-effect. History/status must retain this distinction
+   while available. The observer records terminals and drains before normal deletion removes the streams.
+8. **One cut and current rollback.** `transfer-v1` is the capability/image domain; `xfer-state-v1` is the
+   private sealed codec. Global proto epoch/ImageABIVersion remain unchanged. Public agent/broker Bundle
+   contains only additive `Transfers *ImageRef`; private state and `xfer-source-v1/xfer-tmp-v1/xfer-parent-v1`
+   resources join the actual FD/ownership union. Prepared-only, courier-only, cancellation, Grant, deadline,
+   cleanup and result responsibility require the retained domain. Candidate and actual prev must read it
+   at all three domain gates. Missing-prev domain blocks new creation until durable upgrade commit while
+   capability remains advertised. Sleeping tracker is installed as the broker slot's fourth owner before
+   store/control side effects; partial Take/error resources stay in salvage. Exec failure rebinds originals
+   to the current backend before Thaw. Any ACTIVE partial failure or explicit/watchdog rollback takes a
+   fresh generation+1 current cut, never old checkpoint/DB/WAL. SafePoint timeout preserves the original
+   owner and Thaws; timer.Stop alone does not join callbacks. Capable live transfers can cut without drain;
+   legacy/unknown, unrepresentable syscall, missing reader or capacity excess safely defer (PENDING receipts).
+   Keep public 16 MiB, sealed 32 MiB/cut, non-replay 64 MiB/process, shared replay 256 MiB and 16384 FD/resource caps;
+   count original/dup/witness/salvage and codec peaks, with no private 128 MiB transfer pool. Secrets/capsules
+   stay sealed and never enter public JSON, logs, argv or env.
+9. **Receipt and scope boundary.** E1–E6 are AND exits, not checkboxes derived from source presence.
+   Linux real A→B→A same PID proves each tier/direction/window and both legs. Four independent buckets
+   carry 66,549,440 B and 1 GiB push/pull; every agent/broker/rollback hop must be live and advance afterward.
+   `63` requires A/A1/B/C1/C2/C3/R1/R2/X/W1/W2 native GREEN0; `64` has 23 independent production controls,
+   native ASSERT-FAIL1 expectations, outside the positive parent. `61` retains all 41 assertions;
+   `37.T` capable single/N3 cuts and legacy defer stay separate. Genuine old Run-unwind `39.BR` remains
+   native PRODUCT-RED3, never translated to success. Carrier replacement, data connection rebuild and
+   same-binary/same-store JS restart each have independent evidence. Two fresh drains/JS scan seals and
+   joined owners precede keeper teardown; poison/missing custody is SETUP-RED2, missed live window is
+   INCOMPLETE4. Platform, full gates/race and measured costs await P37. S8 owns transaction-handle query/wait after ctl loss,
+   authority incarnation/two generations/first legacy migration; it does not persist a dead ctl's transfer output handle; S9 owns NATS/Caddy binary changes;
+   S10 owns final mixed rollout. S7 promises no arbitrary-offset or rename exactly-once power-loss recovery.
+
+### 22.11 S8 transaction ownership and completion (receipts pending)
+
+§21.3 is the operational contract. `internal/upgradetx` owns the neutral vocabulary and pure completion
+predicate; `upgradestore` owns the durable action journal and recovery engine; `upgradeobserve` owns
+admission/receipt barriers; `upgradeartifact` and `upgradelock` own publication/selection and the registered
+domain lease. `agentupgradeport`, `brokerupgrade` and `brokerupgrade/brokerruntime` bind actual owners.
+Broker handler slim moves do not move authority into the CLI or change the wire contract.
+
+The actor/admin-only `View` keeps `Historical`, `Observation` and `Metadata` separate. Each fresh query
+has its own nonce and current revision/census. Three completion receipts bind the same immutable scope,
+original identities, target SHA and attempt, including direction; old-owner retirement also covers late
+admissions. `control_ready` alone never closes component, host or cluster scope. The ordered cluster plan
+and stable child handles are durable; resume observes that plan rather than recomputing from releases.
+Release compatibility and reader/config/schema compatibility remain separate checks. Domain locks include
+co-located/shared-bin participants, and a pending reverse cannot admit a third live resource generation.
+
+Authority incarnation is checked under register/leader-planner/write serialization and carried into G.1
+cleanup. A recreated SID cannot revive an old PTY or proxy grant. Revocation and current-state rollback
+preserve cleanup ownership even when the import was only partly activated. The independent
+`upgrade-cut-v1` adjunct follows sealed custody; public state contains no secret material or FD integers.
+
+The [S8 frozen plan](reviews/hot-update-upgrade-orchestration-plan.md) defines the full eight-quadrant
+release/wire/ABI matrix and R0/R1/R2 reverse windows. Drill 38/39 and the A-6 normal-profile 500ms hard
+freeze gate remain NOT_RUN/PENDING here. Historical S3/S4/S5 calibration cannot sign that stronger gate.
+Current source, a safe refusal and a historical expected-red match each have their own meaning; none
+substitutes for a same-candidate native success receipt.
+
+### 22.12 S9 NATS/Caddy infrastructure (receipts pending)
+
+`internal/infraupgrade` coordinates registered NATS/Caddy component transactions in the same host domain
+as image upgrades. `infraattach` binds broker/agent/ctl lifecycle, `infraauth` supplies ordinary-auth proof,
+`infrarepair` gates pre-repair ACK verification, and `infraroot`/`infraunit` implement the restricted root
+and launcher edges. Missing ports/capabilities refuse before effects; no compile stub signs a cut.
+The separate strict infra wire/admin operations cannot fall back to a broker reexec after a timeout.
+
+- **Support and supply.** Hot cuts support linux/amd64 with systemd, pidfd, cgroup and nft capabilities.
+  Other platforms keep build/install/cold paths, without a hot-cut claim. The catalog pins stock NATS
+  2.14.5↔2.14.6 and Caddy 2.7.5↔2.7.6, with independent archive and executable hashes. Default pins remain
+  NATS 2.14.6 and Caddy 2.7.6. Helper/launcher have their own artifacts, running identities and retirement
+  responsibilities. Local bootstrap is explicit; installation alone is not enablement or a run receipt.
+- **NATS topology.** Broker voters, NATS servers and actual JetStream groups are separate censuses.
+  Default single and tether sole-voter with standalone JS both stop/restart the original store, without
+  LDM or a shadow opening the same store. N3 prepares successor/cohort migration before LDM closes
+  listeners/JS. N2 NATS, insufficient surviving quorum/replicas/current state, lag or unknown assets defer;
+  readiness never silently raises replica counts. A same-binary JS restart does not prove a binary cut.
+- **Authentication and recovery.** Ordinary reconnect creates an auth-only generation, subscribes and
+  confirms PONG before signed ordinary member/agent CONNECT and normal-queue probe proof. Business
+  subscriptions/admission wait for auth_usable and the pre-repair ACK-prefix read; writer, replay,
+  reconcile/rederive and GC share the recovery gate. Business owners outlive NC generations. Cancellation
+  reaches DNS/TCP/TLS/WSS and joins old workers. Migration binds actual raw socket incarnation, cid,
+  serverID and accepted ingress PID/exe. The signed old→new route proof keeps the original ≤8s expiry;
+  it does not relax S6's exact-route proof or renew grace on reconnect.
+- **Caddy.** Config reload stays in the same process; binary upgrade uses an alt-port transient and
+  managed nft canonical redirect, covering fresh canonical TLS connections as well as migrated WSS.
+  Original external business sockets retain identity. Stock filesystem ACME and managed HTTP/WSS/TCP
+  routes plus verifiable finite HTTP are in scope. Active QUIC, unknown third-party long connections,
+  custom modules or external storage defer before cut. Admin uses a protected per-invocation Unix socket;
+  a loopback port, Origin or token is not a UID boundary. Retrofit retires the old root process by exact
+  incarnation, with a successor running as tether/Restart=always/bind capability. Warm ACME copy is
+  read-only; after the old writer exits, final current-state sync/fsync/ownership/selector commit releases
+  the startup fence. Root-only old certificate keys require the managed permission/storage transition.
+- **Privilege and settlement.** The thin root helper accepts closed verbs and registered, policy-bound
+  identities under journal CAS; it does not accept an arbitrary caller command/config/path. A component's
+  normal completion budget is 120s; expiry halts and retains a healthy serving shadow, rather than killing
+  its business. Recover continues the same durable transaction. Completion requires current running-image
+  proof and zero old/temporary owners. Credential rotation invalidates old policy tickets; current
+  `admin infra rotate-policy` explicitly refuses unsupported until its root protocol binding exists.
+
+The CLI and JSON/exit contracts are in [usage](usage.md#infrastructure-commands-s9) and
+[operations](broker-ops.md#s9-infrastructure-operations). [S9 P39](reviews/hot-update-infra-nats-caddy-plan.md#p39--最终候选收据与关闭--hard)
+owns final candidate receipts. Drills 85/86, helper/launcher live updates, privilege/storage/cohort cuts
+and native platform evidence remain NOT_RUN/PENDING; scope and source availability do not sign them.
+
+### 22.13 S10 full-stack acceptance boundary (NOT_RUN)
+
+The [frozen S10 plan](reviews/hot-update-fullstack-acceptance-plan.md) L15–L17 and §3–§9 bind the final
+profile: four independently installed agent runtimes across two hosts/four SID buckets; original TCP/SSH,
+PTY, exec and both transfer legs, independent SS/reverse-forward lanes, every 10/s request slot/attempt,
+per-generation resource settlement and fixed-SHA soak. Each required agent/broker executes five novel
+successor SHAs on T0→T1→T0→T2→T3→T4→T5; ABA mechanism variants do not prove release N-1 compatibility.
+NATS/Caddy use actual adjacent catalog versions in both directions. Four original finite transfer IDs
+cross the complete sequence within their sealed deadlines; later cohorts cannot replace their evidence.
+
+Internal NC/TLS/yamux/WSS rebuilding, planned agent/broker same-PID exec and planned NATS/Caddy process
+replacement are recorded separately from original application sockets/PIDs/ctl. Hardware failure,
+business application upgrades, unsupported legacy/platform/infra responsibility and dead-ctl output
+reacquisition remain explicit boundaries. Normal successes require no deferred/rejected/unknown result
+for any action/attempt/runtime; independent safety-negative arms keep their original business codes.
+
+Drill 99's calibration/rollout/prefix/soak and drill 100's 50 independent mutation subcases require raw
+identity/window/oracle/native-rc evidence, with baseline0→assertion-red1→restore0 for each control.
+Required quiet/default/live-grow regimes and final same-candidate three hard gates, separate gates,
+whole race, carry closure and Darwin native are NOT_RUN/PENDING. P34 owns leaf coverage/tasklist closure;
+P35 owns final receipts and fixed internal review. This documentation signs no A–H total or full-stack exit.

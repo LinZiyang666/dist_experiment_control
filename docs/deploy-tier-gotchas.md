@@ -1484,6 +1484,36 @@ drill 在面 A 全绿之后**无条件**记一条 `not_covered[gap]` 声明面 B
   原本就在），本机 server 一回来就重连上；加 `DisconnectErrHandler` / `ReconnectHandler` 日志（`broker: NATS reconnected
   url=… server=…`），漫游从此不可能静默。broker 的 server 就是客户端能到达它的那台，连到别处不是韧性，是离岗。
 - **N-1**：无 wire 变更；旧 broker 继续可能漫游，直到升级。
+- **族补注（hot-update S1，2026-09-21）**：同一黑窗打的是 **ctl**：nats-server 重启后 ctl 重连撞 auth_callout 黑窗
+  （broker 还没把 callout 应答者挂回来），nats.go 默认**两次同一 auth 错误即永久 CLOSED**（`ErrAuthorization` 连续两次），
+  于是 `exec`/`history --follow` 这类长命令在 broker 重启窗内直接死，而不是等 broker 回来续接。S1 把
+  `nats.IgnoreAuthErrorAbort()` 加进 ctl 的连接选项（`internal/cli/natsconn.go ctlConnOptions`，与 agent 同一理由），
+  钉住：`TestCtlConnOptionsIgnoreAuthErrorAbort` + 真二进制 `TestExecReliableCalloutBlackWindowMidStream`。代价写在
+  usage §5.12：被撤权的 ctl 在命令中途会重连到 `--timeout`/Ctrl-C 才退，撤权由 broker 每 op 以 77 拒绝收口。
+
+### #90 — broker 把 STALE（心跳空窗 5 s）当作 `node_offline`，一次 NATS/broker 重启就把**在途** exec 的续接请求拒成 74（已修复，hot-update S1）
+
+- **状态：✅ FIXED（2026-09-21，hot-update S1，`docs/reviews/hot-update-reliable-exec-plan.md §2.4`；
+  `internal/broker/admit.go` `verbSpec.allowStaleNode` + `processResumeAttachSpec`）。** 钉住：`TestConvertedVerbSpecsMatchTheirHandlers`
+  （极性表：只有 attach spec 为 true，probe spec 与其它所有 verb 仍严格）、`TestProcessResumeAttachOpsTolerateStaleNodeButNotOffline`
+  （STALE 放行 attach、拒 probe；OFFLINE 两者都拒）；真二进制 `TestExecReliableBrokerRestartMidStream` 断言节点在 broker 重启后
+  被观测到 STALE 且续接成功；deploy tier：drill 35 臂 A2（25 s 停机 > StaleAfter 5 s）确定性穿过 STALE 窗，A1/B（秒级）是否
+  穿过取决于心跳相位——drill 不采样 node 状态、只判续接结果，所以那两臂对 #90 只是可能的见证（内审 D10）；2026-09-21 实跑
+  三臂 GREEN（A2 `rebuild_lines=1`、25 s 停机内源推进 167→626，续接 rc 23）。
+- **机理**：broker 的节点状态是心跳推的：`StaleAfter` 5 s 没心跳 → STALE，60 s → OFFLINE。`admitACL` 对所有 verb 一律
+  `status != ONLINE → node_offline: status=<STALE|OFFLINE>`。可靠 exec 的续接（`resume/ack/terminal-ack`）恰恰发生在
+  NATS 或 broker 刚回来的那几秒——agent 还没来得及重发心跳，节点在表里是 STALE——于是 ctl 在 create 送达之后收到
+  `node_offline: status=STALE`，按 §22.4 第 9 条归 74「结果未知」并退出；任务在 agent 上照跑，输出无人 ACK。
+  hermetic 里看不见：`harness_test.go` 的 broker 用 300 ms/900 ms 的 Stale/Offline，agent 与 broker 又在同一进程里，
+  心跳从不真的晚。
+- **修**：`verbSpec` 加 `allowStaleNode`（零值 = 严格，遵守该文件的极性规则）；只有 `process-resume` 的 **attach 类 op**
+  （`create/resume/ack/terminal-ack`）置 true——任务已经在 agent 上，5 s 心跳空窗不该把它判死；`probe`（要挑一个活节点
+  创建新任务）与其它所有 verb 仍严格。OFFLINE 照拒。
+- **放宽的代价**（如实写进 usage §9.13.2）：真死的 agent 在 STALE 窗（5–60 s）内的 attach 请求会被转发到无人订阅的
+  subject——ctl **收不到** 503（no-responders 只发给自己持有 reply 订阅的发布者，broker 不持 ctl 的 `_TINBOX` 订阅），
+  只能按 500 ms attempt 超时重发，直到节点 OFFLINE（≤ 60 s）拿到 `node_offline: status=OFFLINE` → 74。即：真死 agent
+  的 ctl 最多多等 55 s 才知道结果未知——换来的是一次普通重启不再把活着的任务判死。
+- **N-1**：无 wire 变更；旧 broker 继续对 STALE 拒绝，新 ctl 对旧 broker 本就只走 legacy。
 
 ## 已了结条目索引（全文见 `docs/reviews/deploy-tier-gotchas-closed.md`）
 
@@ -1519,3 +1549,427 @@ drill 在面 A 全绿之后**无条件**记一条 `not_covered[gap]` 声明面 B
 | #75 | FIXED | broker.yaml 静默失效（serveconf 非严格解析）+ log-sink 无可见性；g75-g78 严格化 + inert TLS stub + config-check + breadcrumb（外审 F1 整合） |
 | #76 | FIXED | install.sh broker unit 不 enable → 开机不自启；g75-g78 默认 enable + --no-enable + 三分支 banner（外审 F2/M4 整合） |
 | #77 | FIXED | journald 无默认 SystemMaxUse；g75-g78 条件写三档 drop-in + ownership marker（外审 F3 整合） |
+
+
+## 2026-09-20 现场巡检补充
+
+本轮另外处理了大文件WSS断连、活expose重放、单broker别名误判、恢复观测及history整数显示五项现场反馈。
+详 [现场证据与处置](reviews/control-connection-recovery-evidence.md) 和 [内审回复](reviews/control-connection-recovery-review.md)。
+这些记录来自现网巡检并由本机真实组件/集成测试验证；尚无对应deploy drill，故未分配本台账的simcluster编号，
+不伪造expected-verdicts owner，也不将组件绿收据冒称systemd/Caddy部署覆盖。#48的silence启发式边界与#80附近的恢复观测须结合该补充读取。
+
+### 2026-09-28 · 流撞到**自身** `MaxBytes` 没有任何监控；H.4 盯的是文件系统百分比，在小盘 broker 上结构性地不会先响
+
+**同样不分配 `#NN`**（理由同上：来自现网巡检、无 drill 可钉，编号会让 `ledger-crosscheck` 找不到 owner 而红。
+真要编号，先给它一个 deploy-tier 断言——见下面「怎么自动化」）。
+
+- **现象（LIVE-MEASURED，racknerd 2026-09-28，单 broker v0.6.0）**：每条 JetStream 流都有自己的 `MaxBytes`，
+  撞顶行为由 `Discard` 决定，而**没有任何东西观测"某条流用到自己上限的百分之多少"**：
+
+  | 流 | 已用 / 自身上限 | 占比 | `Discard` | `MaxAge` | 撞顶后果 |
+  |---|---|---|---|---|---|
+  | `OBJ_xfer-lab` | 1622 / 2112 MiB | **76.8%** | `new` | 0（永不过期） | tier-B push 被 `insufficient storage` 拒 |
+  | `history-lab` | 160 / 1024 MiB | 15.6% | `new` | 0（永不过期） | **新审计被拒写** |
+  | `events` | 0 / 1024 MiB | 0% | `old` | 30 d | 正常轮转（对照组，唯一配置正确的一条） |
+
+  同一时刻**文件系统只用了 35%**（19 GB 盘、12 GB 可用）——H.4 的 80% 阈值不但没到，而且**永远到不了**：
+  单会话 history 上限 1 GiB、xfer 桶 2.06 GiB，加起来远小于盘，流必然先撞自己的顶。
+- **机理**：`internal/jsstream/jsstream.go:145-166` 的 `EnsureHistoryStream` 设 `MaxAge:0` + `MaxBytes:1 GiB` +
+  `Discard:DiscardNew`，其注释写着「**the 80%-disk advisory monitor (H.4) still warns long before this cap matters
+  in practice**」——这句前提**在真实部署上不成立**。H.4 的实现 `internal/broker/disk.go:1-25` 是
+  `syscall.Statfs(Config.StoreDir)` 取**文件系统** used/total 与 0.80 比较（`defaultDiskPressureThreshold`），
+  它对"某条流用满了自己的配额"一无所知。全仓 `MaxBytes` 只出现在建流与 `xferReserveFor`
+  （`internal/broker/transfer.go:155-170`）的容量算术里，**没有任何读取点把它和 `state.bytes` 相比**。
+  于是 `DiscardNew` 这个"在悬崖边拒新、保住旧审计"的设计选择，失去了它唯一被声称的预警。
+- **两条现网后果，一条已在逼近**：
+  1. `OBJ_xfer-lab` 的 76.8% **不是正常业务占用**，是 **#85** 的孤儿 chunk 组（最老 2026-08-11，`MaxAge=0` 永不过期，
+     对象级 reaper 看不见）。#85 条目自己预言过终局——「计入 bucket 的 `MaxBytes`，直到 push 被 `insufficient storage`
+     拒掉」——现在只剩 **490 MiB 余量**，而 tier-B 桶按"一次最大传输 + 分块余量"定尺，**一次大传输就能吃掉它**。
+     #85 的修复（`reapOrphanChunks`）在 main `cab90d1`，**尚未发版**；部署后这 1.6 GiB 会被自动回收（孤儿远早于任何 floor）。
+  2. `history-lab` 5 天从 211,719 条 / 70 MiB 涨到 365,400 条 / 160 MiB（≈18 MiB/天，源头是 timan107 的 openpi_trace
+     自动化：每次 exec 写 CALL + PROC start + PROC exit 三行，而 **PROC start 行带完整脚本体**，常 ~800 B）。
+     按此速率 **≈48 天后撞 1 GiB**，然后审计静默拒写——而磁盘那时仍在 40% 上下，H.4 一声不吭。
+- **怎么修 / 怎么自动化**：
+  - **产品**：给容量监控加一维——除 statfs 外，按 `STREAM.INFO` 的 `state.bytes / config.max_bytes` 对每条自有流
+    出 `disk_pressure` 同族的 advisory（阈值同样 80%）。这维正是 `DiscardNew` 的设计前提，缺了它那句注释就是假的。
+    顺带订正 `EnsureHistoryStream` 的注释：H.4 不覆盖本流。
+  - **运维（在修复发版前）**：发 v0.6.1 把 #85 的 `reapOrphanChunks` 推上去，`OBJ_xfer-lab` 自清；
+    `history-lab` 另需裁定（要么给 `MaxAge`，要么接受撞顶拒写并靠上面的 advisory 提前介入）。
+  - **钉住它的 drill（尚不存在，这是本条没有编号的原因）**：可行形状 = 在 67 或一条新 N1 drill 里把桶灌到
+    `max_bytes` 的 ~85%，断言 ① 有 advisory 事件、② 下一次 tier-B push 的拒绝文案点名"流配额"而非泛化的磁盘。
+    今天两条都不成立：没有 ①，② 只会回 `insufficient storage`。
+- **为什么巡检前没人看见**：`jsz` 不带 `config=1` 时**不返回 `max_bytes`**（返回的 config 是残缺的），
+  用默认查询看这三条流会读成"没有任何上限、只是在慢慢长"——我自己在本轮前半程就是这么误判的，
+  纠正它的唯一办法是显式 `?acc=$G&streams=1&config=1` 再把 `state.bytes` 除以 `config.max_bytes`。
+
+### 2026-09-28 · tier-B 传输：全集群同时只能有一个（脸 A），且每一单都会压断收方的控制连接（脸 B）
+
+**同样不分配 `#NN`**（无 drill 可钉）。用户 2026-09-28 报告"整个集群 push/pull 不能有多个，同时做容易失败"，
+归因后是**两条机理不同的缺陷**，运维侧的完整证据与复现建议在 `~/tether-ops/defects/concurrent-transfer.md`。
+
+- **脸 A —— 并发键是 per-session 的桶，而正常部署只有一个 session**。
+  `internal/broker/transfer.go:333-348` `putWithBlocker`：`e.bucket != ""` 时扫描在飞 entry，
+  同桶即拒 `too_many_in_flight`。桶是 `xfer-<sid>`（**每 session 一个**，不是每节点），
+  而 `usage.md` 教的标准部署就是全车队一个 session ⇒ **9 台机的 tier-B 传输被串成一条**。
+  push 与 pull 占同一个槽位（pull 的 entry 同样带 bucket），三种组合全互斥；tier A（`bucket==""`）不受影响。
+  **放大器**：传输未正常 finalize 时槽位要等 watchdog 预算才释放——`XferTimeoutTierBFloor` **5 min** 下限，
+  pull 恒取下限（`PullPrepareReq` 无 size），大文件按 `2×size/最低吞吐+60s` 可达数十分钟。
+  drill 67 的 CONTROL(after) 就录到过**一次被遗弃的上传导致连续 12 次 `too_many_in_flight`**。
+  注意这与 §「2026-09-28 流撞 MaxBytes」那条叠加：桶已 76.8% 满，撞顶后会换成 `insufficient storage`，
+  运维看到的同样是"push 又失败了"，但根因不同。
+  *候选修法*：并发键从"桶"换成"桶内容量预约"（按声明 size 准入，小传输可并发），或按节点分桶
+  （代价是 JetStream 预留乘节点数，小盘 broker 吃不消，须与 `xferReserveFor` 一起重算）。
+- **脸 B —— 数据面与控制面共用同一条 NATS 连接**（`internal/agent/transfer.go:263` 的
+  `jetstream.New(nc)` 用的就是控制面那条 `nc`）。**LIVE 取证 2026-09-20 17:32:53–17:33:42Z**，
+  一次 66,549,440 B 的 push 串行推给 4 个节点，`connz?state=closed` 显示**每个收方在自己那一单期间都被关过连接**：
+  h100 两次（`Write Error`，pending 12.59 MB / 11.02 MB）、weilandserver（`Read Error`，8.00 MB）、
+  timan107（`Write Error`，12.86 MB）、timan108 两次（8.92 MB / 11.94 MB）。
+  nats-server 侧 `max_pending=64 MiB`、`write_deadline=10s`：积压顶到十几 MB、写超死线即关连接，
+  **控制面跟着一起断**，agent 重连重注册（broker.log 在同一单里能看到 `node registered` 夹在
+  `push.req forwarded` 与 `ev.transfer complete` 之间）。传输本身靠重连续传仍 complete，但代价是车队在
+  传输期间看起来在抖，且与 **#48** 的 silence 启发式、**#90** 的 STALE 判定相互作用。
+  *候选修法*：agent 为 tier-B 另开一条 NATS 连接（首选，改动面小），或给 chunk 发布加应用层 pacing；
+  调大 `write_deadline`/`max_pending` 只是把断连推后，不是修。
+
+### 2026-09-30 · xfer reaper 在**没有截止时间的 ctx** 上调 `store.List`；桶一旦带 TTL，它会卡住，并且串行冻结**全部** reconcile pass
+
+**同样不分配 `#NN`**（无 drill 可钉）。运维侧完整证据与复现程序在 `~/tether-ops/defects/xfer-reap-ttl-wedge.md`。
+背景：2026-09-28 运维给 `OBJ_xfer-lab` 设了 `MaxAge=48h`，用来回收上一条记录里 #85 的 1.6 GiB 孤儿（已回收到 0.4 MiB）；
+产品支持这种配置——`objectStoreConfigFromStream` 会把已有的 `MaxAge` 当作 `TTL` 带过 converge。
+
+- **现象（LIVE，racknerd v0.6.0）**：9/30 05:05:35Z 和 18:50:35Z 两次
+  `reconcile pass failed pass=xfer-orphan-reap err="context deadline exceeded" consecutive_failures=1`，每次 ≈5.4s，下一轮自愈。
+  broker.log 从 9/04 开始，设 TTL 之前一次都没出现过；设 TTL 之后约 565 轮里出现 2 次。
+- **机理（读源码确认）**：
+  1. pass 本身没有截止时间——`broker.go:1510` 把 Run ctx 交给 `runDue`。deadline 来自 nats.go v1.52.0 的
+     `ListStreams`：它给**整个遍历过程**套了 5s 默认超时（`jetstream.go:1075`），而 `OBJ_xfer-lab` 按名字排第一，
+     所以循环体里对它的 `reapBucketObjects` 超过 5s，下一次发送就会撞上超时。**慢的是 reap，不是 STREAM.LIST。**
+  2. `store.List` → `obs.Watch`（`object.go:1278-1389`）：只有"`GetLastMsgForSubject` 返回 not-found"或者
+     "投递到一条 `NumPending==0` 的消息"时才会发出初始化标记；`List` 只等调用方的 ctx，**内部没有超时**。
+     TTL 桶里，如果第一步看到的 meta 在投递前过期了，初始化标记永远不来，`List` 就一直阻塞到下一次写入 meta
+     （也就是下一次 tier-B 传输）。`MaxAge=0` 时 meta 走 rollup、不会凭空消失，所以没有这条路径。
+  3. `runDue`（`reconcile_registry.go:356-392`）持有 `runMu`，在一个 goroutine 里串行跑所有 pass ⇒
+     **reap 卡住，node-states / ports / tunnel-sessions / proc-gc / home-delivery 等 12 个 pass 全部停摆**。
+- **本地复现（嵌入式 nats-server v2.14.6 + nats.go v1.52.0，与现网一致）**：持续写入 + TTL 1.5s，30,139 次 List
+  出现 2 次 ≈1.85s 卡顿；对照组 TTL=0，6,331 次 List 最大 59ms；**桶闲置、跨越最后一条 meta 过期时连续 List：
+  30 轮里 23 轮卡满 20s 上限**。
+- **现网风险**：需要"连续 48h 没有 tier-B 写入导致桶排空"加上"reap 恰好撞上最后一条过期"（窗口约为一次 List 的耗时），
+  每次排空约 1e-5。运维侧已在巡检里加了 registry 活性检查（任何 pass 的 `last_tick` 超过 max(3×interval, 90s) 即报警），
+  恢复办法是 push 一个 >8 MiB 的文件。权衡后保留了 TTL。
+- **main `cab90d1` 同样存在**：`reapBucketObjects:253`（`ListObjectsShowDeleted`，同一个 watcher）、
+  `xferBucketHasAgedObjects:401`（只在集群模式）都没有截止时间；新的 `reapOrphanChunks` 用的是 `GetLastMsgForSubject`，有 5s 超时，不受影响。
+- **S7 frozen remedy (PENDING receipts)**: both `store.List` sites require bounded cancellable contexts, cancel/join and a pass deadline ≤5s (LQ3 / P17 T30). This supersedes the earlier 30s candidate suggestion. The budget cancels the actual List operation:
+  `List` 会响应 ctx.Done——和 registry B7 注释里否掉的那种"装饰性预算"不是一回事。
+  更一般的规则：串行 registry 里任何会调 JetStream watcher 的 pass 都必须有界，否则一个 pass 卡住就是全体停摆。
+
+
+### 2026-10-02 · handoff 校验失败 = 崩溃窗 W1（hot-update S3）
+
+**同样不分配 `#NN`**（本条登记 S3 定稿契约，尚无 deploy-tier 实跑收据；S8 注入矩阵待交付，状态 `NOT_RUN`）。
+
+- **现象**：收到 handoff 的新映像若无法校验 sealed manifest/nonce/PID/UID/version/资源指纹，
+  会丢失上一映像携带的任务；S3 按 Q2 **继续普通启动**，不是立即退出，也不是任务恢复成功。
+  后续可出现空表 register，marker `resource_phase=lost`。
+- **机理**：`internal/handoff/image_linux.go` 的 `restoreDescriptor` 在资源校验失败时尚未给导入 fd 恢复 CLOEXEC；
+  `internal/agentboot` 的 Begin 在 main 第一条语句无条件运行，先快照 fd≥3 且非 CLOEXEC 的集合与 dev/ino，
+  再 Restore；拒绝后只关闭身份仍匹配的文件，保留 0–2。不能在 Restore 之后才按 CLOEXEC 筛选，
+  因为 manifest 可能先加保护再拒绝。`/proc/self/fd` 普查失败（如 EMFILE）时回退到无需新 fd 的
+  `fcntl(F_GETFD)` 扫描，上界取 soft/hard RLIMIT_NOFILE 的较大值；普查仍失败由 `fd_cleanup_error` 报出。
+  关闭前复核 dev/ino 防号码被其它文件复用；这仍依赖启动独占，**不支持 socket activation**，
+  非 CLOEXEC 不是来源证明。原 child 可因 EPIPE 失去输出；详见架构 §22.6 第 4 条。
+- **怎么自动化或处置**：保留失败日志、marker 与运行映像身份，把携带任务视为丢失并核对实际业务结果，
+  不以 agent 又 ONLINE 推断旧任务已恢复。S8 应注入非 sealed memfd、错误 nonce、manifest 尾部字节、fd 指纹篡改；
+  hermetic 的 `TestBeginCrashWindowClosesForeignDescriptorsAndContinues` 由 S3 plan §7 T13 交付，验证 fd 清理、EPIPE 与继续启动。
+- **钉住它的 drill + 签名**：S8 注入点，`NOT_RUN`；日志固定为
+  `agent: dispatched image unreadable — tasks of the previous image are lost`，附 `crash_window=handoff_restore`、`closed_fds=N` 与 `fd_cleanup_error`。
+  `agent: image abandoned … crash_window=non_daemon_invocation` 是 W1b，不与 W1 混算。
+  成功激活则不属于 W1：`Image.Activate` 在 Thaw 成功后立即释放未被 TakeFile 的 handoff 余项，
+  不能让这些辅助 fd 等到进程退出才回收；held/refused/imported 阶段仍保留它们用于再派发。
+
+### 2026-10-02 · rollback_blocked 的运维出口（hot-update S3）
+
+**同样不分配 `#NN`**（S3 契约记录，无本分支的 deploy-tier 收据，状态 `NOT_RUN`）。
+
+- **现象**：新映像已 Thaw 却未在 register deadline 前提交，watchdog 想回 prev，但当前资源无法安全 cut；
+  marker 仍为 pending，`resource_phase=rollback_blocked`，进程和业务保持运行；再次 install 得 `upgrade_in_progress`。
+- **机理**：`internal/agent/upgrade_state.go` 的 watchdog 必须重导出当前状态，不能拿过期 bundle 或裸 exec 回滚。
+  active **或 ready** 都携带 runtime；register 成功但 commit 写盘失败仍可 pending，不能把 ready 当成提交持久化。
+  cut 命中 deferral 时记录 reason、置 `rollbackInFlight`，每 `upgradebudget.RollbackCutRetry`（5 s）重试，
+  `agent: upgrade rollback blocked reason=…` 是 **Error 级**，首次立即记、之后至少隔一分钟；
+  即使 watchdog 尚未置该 flag，过期 pending 只要仍满足本进程的所有权判据也拒绝新 install，保护唯一 `.prev`。
+  install/ReExecOnly 的准入延续到异步 exec 或 abandon 后恢复完成；持久化提交、回滚处理完成或 watchdog 重试发现
+  原事务不再归本进程处理时清除 `rollbackInFlight`。详见架构 §22.6 第 6–8 条。
+- **怎么自动化或处置**：同时读 marker 的 **`resource_phase` + detail** 与日志 **reason**，按架构 §22.6 的 deferred 表
+  消除阻塞原因（如结束 PTY/在飞传输、恢复仍未返回的 remote-fs probe）；条件消失后 watchdog **自动重试**。
+  **不要手工删 marker**，也不要再次覆盖 `.prev`：这会丢掉所有权与恢复依据，不能帮助安全 cut。
+  expose/proxy 的严格限制见末尾同主题记录；尚未返回的 retained probe 不会因等待超过 deadline 自动变安全。
+- **钉住它的 drill + 签名**：`agent: upgrade rollback blocked reason=…`；
+  成功形成当前态回滚 cut 时另记 `agent: image cut`，marker 在回滚持久化前写本次 generation，
+  exec 前记 `agent: image re-dispatched`。exec 失败返回后先 Thaw 再写 `resource_phase=thawed`，保留原回滚 detail。
+  plan §7 T11 的 `TestWatchdogRollbackReexportsCurrentStateOrDefers` 由 S3 交付，覆盖 deferred 重试与二次 install 拒绝。
+  drill 34.W 计划验证有业务的 watchdog 当前态再派发，**不等于已验证 rollback_blocked 分支**；两者均无本轮实跑收据，`NOT_RUN`。
+
+### 2026-10-02 · 升级到无 bootstrap 的旧 binary 被 image_abi_unsupported 拒绝（hot-update S3）
+
+**同样不分配 `#NN`**（这是兼容性拒绝契约；计划由 drill 39.X 验证，当前 `NOT_RUN`，不登记已修复/已验证）。
+
+- **现象**：本节点仍带 task/tombstone/revocation/courier pending 任一状态时，候选 `version` 无 `image-abi v<N>` 行，
+  `node upgrade` 返回 `image_abi_unsupported`（ctl exit 64）。初检拒绝不改 dst/prev、无新 marker；
+  初检后出现状态则在 post-flip 冻结复核中拒绝，恢复旧二进制并留下
+  `state=rolled_back/resource_phase=deferred/detail="freeze failed: abi_late"`（恢复失败另见 rollback_failed）。
+  映像两次检查都为空才允许 legacy 裸 exec；候选 ABI 高于当前支持值即使空节点也拒绝。
+- **机理**：`internal/agent/upgrade.go` / `upgrade_image.go` 在 smoke 后、安装 flip 前检查 ABI，再对 ABI=0 候选的冻结 bundle 复核（S3 plan Q1、§2.1）。
+  smoke 解析首个非空 release/proto 行后扫描其余行，多个合法 `image-abi v<N>` 取最后匹配值，
+  任一匹配前缀却非法的值立即拒绝；不是只认输出末行。本产品 emitter 仍把 ABI 行放最后。
+  Linux version probe 由隔离 subreaper helper 托管候选进程组，成功、失败、取消均 kill/reap；
+  不在 agent 内启 subreaper，避免抢走业务 child 的退出状态。
+  不认识 bootstrap 的旧 binary 无法接管 bundle，携带 exec 会让非 CLOEXEC 业务 fd 与 registry secret memfd 进入无 owner 的旧映像。
+  这不是可由重试绕过的临时忙；详见架构 §22.6 第 6、12 条。
+- **怎么自动化或处置**：ctl 保留具体诊断并追加覆盖两种原因的 hint；无 ABI 行时选择热更新版本，或先 drain 到 task/tombstone/revocation/courier pending 都为空；
+  ABI 高于支持值时须改兼容候选，drain 无法解决。
+  仅结束活进程不足以保证 image 为空。不要用手工覆盖 binary 绕过 ABI 门；运行映像与磁盘不一致还会被另一道 `install_failed` 门拒绝。
+  plan §7 T16 的 `TestNodeUpgradeRefusesLegacyCandidateWithLiveTasks` 由 S3 交付，以无 ABI 行 fixture 验拒绝。
+- **钉住它的 drill + 签名**：drill `39-hot-update-legacy-n1` 的 **39.X 将验证**真实旧候选，预期
+  `agent_rejected:image_abi_unsupported` + 磁盘 SHA 不变 + producer 连续；状态 **`NOT_RUN`**。
+  39.Y 的 legacy exporter 首次迁移是另一边界，不能拿 39.X 的拒绝覆盖它。
+
+### 2026-10-02 · 带 expose/proxy 的节点在 S5 前 node upgrade 恒 deferred（hot-update S3）
+
+**同样不分配 `#NN`**（阶段性能力边界，无此分支的 deploy-tier 收据，状态 `NOT_RUN`）。
+
+- **现象**：**所有带 expose/proxy 的节点在 S5 前 `node upgrade` 恒 deferred**，即使此刻没有活流量；
+  ctl exit 75，保留 `upgrade_deferred` 的原因文本 `flow_busy` / `ss_busy`，下载前预检拒绝时盘面零变更。
+- **机理**：`internal/agent/upgrade_image.go` 的 busy 判据严格覆盖任一 expose SessionCount>0 或 rehomeRunning，
+  以及有 ExposeAdapter 时已准入但尚未装入 session 的 expose dial、proxy 锁下 `servingLocked()`；
+  flow 判据先读 admission 计数再读 session，避免漏掉两者的交接。exec 会关闭尚未被 S5 接管的 TLS/yamux/代理资源，不能把公网端口等待重拨的黑窗冒充热交接。
+  expose replay 在 AddProxy 前取 `gateExpose`，home directive 在启动 worker 前取同一 admission，
+  持有至拨号结束并贯穿 retries/successors；关门时跳过，新映像重放 expose、broker 重推指令，proxy start 同样受门保护。
+  无 adapter 的 expose 仍计入 `transfers_in_flight`；详见架构 §22.6 第 9 条。
+- **怎么自动化或处置**：需要保持 expose/proxy 连续时等待 S5；若业务允许，先通过已有管理流程停止相关服务、
+  等会话/rehome/在飞拨号/serving 状态确实清空后再升级。不要以「空闲连接」或「零流量」替代这些状态判据。
+  若在 watchdog 回滚时命中，按上一条 rollback_blocked 运维出口处理，不删 marker。
+- **钉住它的 drill + 签名**：日志 `agent: upgrade deferred reasons=[…]` 中的 `flow_busy` / `ss_busy`；
+  plan §7 T6 的 `TestPreflightDefersOnEachReasonCode` 由 S3 交付两码的 hermetic 覆盖，不能声称已有对应部署 drill；`NOT_RUN`。
+
+
+### 2026-10-02 · PTY image 域与可靠 run 的升级边界（hot-update S4）
+
+**不分配 #NN**：这是 [S4 定稿 plan](reviews/hot-update-pty-terminal-plan.md) 已裁决的能力边界，
+不是本包新发现的部署缺陷；36/39.P 及本节相关新收据均为 **NOT_RUN**。
+
+- **ABI 1 不等于 PTY 可回滚**：候选与 actual prev 都须按 SHA 证明 `pty-v1`；无 domain 行的 S3 只有 exec-v1。
+  retained task/terminal/tombstone/settled Kind 或 ClockUnknown 扩展都可能使旧 reader 拒绝，不能清空 metadata 凑兼容。
+  S4→S3 纯 exec 可按旧 reader 合同交接，有 PTY 则盘面变更前拒绝；S3→S4 首次 pending 若 prev 不支持 PTY，
+  capability 保持完整，新 reliable create busy、legacy run75，commit 持久化后开放。共享 sibling 的 prev 仍可等于 candidate。
+- **legacy 不参与可靠交接**：legacy run 的未 attach/分配/spawn/draining 与 gateRun/gateExec、procs、非 Runtime Manager 行
+  取并集归 legacy_session_busy；可靠 PTY 不误计此项。删除活跃 pty_busy 后 deferred 共十码，flow_busy/ss_busy 原拒绝保留。
+  180s 是原 ctl 的固定失联等待窗，重复错误不延长，不是重授 KA 或授权；create 后绝不 fallback 重建。
+- **清场有明确范围**：管理撤权覆盖原 session 的多 PGID/stopped foreground，主动 setsid 脱离后代不覆盖。
+  finalPrepare 后丢 session_destroyed 且同 SID 硬删重建，当前缺 authority incarnation 无法判别，归 S8；
+  C-10 PTY 在 S4 不勾。事件路径 daemon 不主动退，register-gone 则撤权后退出，两者不能用同一个在线断言。
+- **平台/stdio**：Darwin 只 legacy；cross-build 不代表 run/resize/cancel 实跑，无 runner 如实 NOT_RUN且不阻塞 S4 出口。
+  regular file、/dev/null 支持可靠 run；socket 在 create 前 stderr 提示 legacy fallback，不以64拒绝文件重定向。
+  外部非TTY SIGINT/SIGTERM 是本地取消，远端中断由 raw 0x03/显式 signal 负责，不并存第二个 handler。
+- **验收不能混写**：36.A/W/C/L 的目标 GREEN 与 39.P 的目标原生 PRODUCT-RED 分列。
+  39.P continuity oracle rc1、native rc3、sweep 放行各存原值，waiver 不改 native；setup 坏不能算产品负控。
+  500ms 全冻结窗仍校准，最大值和超标全留；正常新请求及业务停顿5s是硬判。实际成本、运行 SHA、
+  原 ctl waitpid、四日志 cursor 与 FD/进程身份需 lead 实跑后填 [evidence §15](reviews/hot-update-evidence.md#15-s4-pty-terminal-证据骨架)。
+
+### 2026-10-03 · S5 flow/SS carrier and original socket continuity
+
+**No #NN is assigned**: these are S5 hazards and implemented guards, not newly observed deployment
+incidents. Tests/mutations and drill 75 receipts remain
+[scoped S5 closure/carry receipts](reviews/hot-update-evidence.md#17-s5-flow-carrier-ss-最终收尾收据2026-10-11).
+The [single frozen plan](reviews/hot-update-flow-carrier-plan.md) §8 supplies exact test names and mutations;
+the binding contracts are [architecture §22.8](distributed-broker-architecture.md#228-s5-flow-and-ss-domains-binding-contract).
+
+- **Symptoms**: a slow raw sink stalls unrelated flows or prevents freeze from joining; REGISTER succeeds
+  but yamux loses its first header; recovery opens a second target socket or truncates a reverse half-close tail.
+- **Mechanisms (owner paths)**: `internal/tunnel/flow_carrier.go` shares the TLS writer and yamux's 64 send
+  slots even with a separate control stream. `internal/tunnel/tunnel.go` may buffer yamux bytes while reading
+  REGISTER/OK. `internal/rawsocket/connect_linux.go` owns the original connect result; a validator consuming
+  SO_ERROR destroys that receipt. `internal/flow/retirement.go` must retain old OPEN retirement proof after
+  receipt GC, and `internal/flow/pump.go` must distinguish read EOF from a full close. See architecture §22.8
+  items 1–3 and 7 for the guards and ownership order.
+- **Automation or handling**: keep original listener/socket identity, target Accept=1 and independent
+  bidirectional final byte ledgers. T11 fills all 64 send slots with a real blocked TLS writer and a fast
+  survivor; T16 coalesces OK+yamux in real TLS and checks exact server OK/legacy client acceptance.
+  T09 cuts original EINPROGRESS/failed connects without redial; T05 resends the real old OPEN after receipt
+  deletion. T06/T41 retain the original reverse tail beyond 8 MiB across same-PID exec. A successful REGISTER
+  or a replacement application connection cannot sign continuity.
+- **Fix-round handling**: settled receipts stay in the image journal and leave the live RESUME set;
+  image bounds are separately 32 active flows and 4096 terminal receipts. Abort CLOSE retains its data
+  stream until terminal tail/discard settlement. Rejected OPEN closes the accepted yamux stream.
+  Carrier rebuild replays lost final FIN receipts without redial; consumed predecessor permits can
+  be replaced by the current owner for successive handoffs. OPEN admission still conservatively counts
+  active records toward the terminal ceiling; see architecture §22.8 item 5 for the remaining mismatch.
+- **Drill + signature**: planned 75.A/C/R/L and T05/T06/T09/T11/T16/T41; no native result is claimed.
+  The independent oracle requires unchanged application/socket identity, exact final seq/hash/EOF and
+  `nc_gap=0`; early-close and wrong-offset controls must fail natively. Legacy interoperability is separate
+  from v1 continuity, as specified in plan §9.
+
+### 2026-10-03 · S5 SS authority, ciphertext and cleanup across a cut
+
+**No #NN is assigned**: this records required guards, with deployment and mutation receipts **NOT_RUN
+pending P29**; it does not close an existing incident.
+
+- **Symptoms**: a revoked silent connection survives, target plaintext is written before a fresh grant,
+  a partial ciphertext suffix is encrypted again, alias keys reuse a salt/subkey, or Stop/freeze cannot join.
+- **Mechanisms (owner paths)**: `internal/tunnel/flow_endpoint.go` must reauthorize cached receipts and check
+  attachment fences; a positive local row cannot prove global leader-commit revocation. In
+  `internal/agent/ssproxy/{actor,crypto,salt,keys,fence}.go`, already-Sealed bytes and actual write cursors,
+  material-shared FIFO8192/live salts and atomic response-salt reservation survive rotation and exec.
+  Freeze/exec-failure Thaw does not restore old keyset authority. `internal/agent/proxy.go` and SS callbacks
+  must extract cleanup owners under locks and shutdown/close/join outside them; callbacks cannot join themselves.
+  Contracts, including irreversible original/dup shutdown and bound FlowID revoke, are architecture §22.8 items 4 and 6.
+- **Automation or handling**: T13/T29 and lost-reply tests repeat fresh authorization for the same ResumeID.
+  T18/T42 use an independent actual-subkey+nonce ledger and a real `0<n<attemptLen` ciphertext Write;
+  T19 covers aliases, remove/re-add, exec and controlled response collision. T21/T43 keep alice silent
+  while bob continues, verify original/dup/public-flow cleanup, and require zero target Write before grant.
+  T22 exercises concurrent apply/freeze/revoke and asynchronous cleanup ownership. Keys, salts and AEAD
+  state remain sealed; collect typed reasons and counts rather than secret values.
+- **Fix-round handling**: one comparator orders generation, epoch, then revision; stale grants have no
+  revocation/admission/survivor side effects. Fresh RESUME advances the serialized agent watermark/digest
+  and dominates delayed pushes. A higher generation accepts a lower epoch/revision after broker recovery.
+  Both broker authority reads use one bounded SQLite snapshot with the busy handler disabled during
+  lookup and restored for pool reuse; expiry refuses retryably. System-proxy fresh grants apply node
+  participation, while ordinary expose remains independent. v1 REGISTER preserves try_again and
+  home_catching_up as transient. Planned freeze retains previously real readiness until the original
+  detached-grace deadline, including restore; expiry/revocation/teardown clear it.
+  SS exports the connector’s actual bound source tuple and imports consumed failed-connect receipts
+  without requiring a connected peer. Material-quota refusal reauthorizes live survivors after Thaw,
+  preserves history and refuses new authentication without advancing the failed apply watermark.
+- **Drill + signature**: planned 75.A/C/R/B/W and T13/T18/T19/T21/T22/T29/T42/T43; evidence must separate
+  the hard-revoked victim from surviving flows. Q1 authorization is a bounded local-applied snapshot with
+  known lag refused, not a global linearizability receipt. The lost-event plus same-SID PTY recreation
+  boundary still requires S8 authority incarnation and cannot be signed by an SS grant.
+
+### 2026-10-03 · S5 rollback domains, capacity and ready-pending watchdog
+
+**No #NN is assigned**: these are compatibility/capacity boundaries and implemented rollback guards;
+deployment receipts must be read with the scoped S5 closure/carry in evidence §17/§18; historical §16 rows remain unsigned.
+
+- **Symptoms**: an ABI1 reader cannot restore idle listener/salt/retirement state; rollback uses stale
+  offsets/nonces; MarkReady suppresses recovery after commit marker write failure; accounting reports the
+  shared replay Used as each domain's own reservation or silently forgets salt history to admit new material.
+- **Mechanisms (owner paths)**: `internal/agent/upgrade{,_image,_state}.go` must check SHA-bound candidate
+  and actual prev against all retained domains at three gates. `internal/agentimage/{freeze,restore}.go` and
+  `internal/agentboot/image.go` must re-export current state after any activation. Ready is not durable commit.
+  `internal/workload/replay.go` reserves capacity independently of retained bytes; per-domain ownership
+  cannot be derived from global Used. SS material history is bounded at 64/node; the full ledger cannot be
+  silently GC'd. Binding contracts and admission reasons are architecture §22.8 items 5–8.
+- **Automation or handling**: T35/T36 test idle retained domains, actual prev and pending admission;
+  T33/T34/T44 require all current domains after activation. T30 checks the identical budget pointer and
+  each domain's owned capacity: ACK frees retained bytes, ownership Close releases reservation. At material
+  capacity, revoke removed authority first, refuse new material/authentication with failure/retry feedback,
+  and preserve survivor/history. Idle legacy listeners/retained slots still yield `legacy_session_busy` (Q2).
+  The unconditional final prepareImageCut check tests every retained domain against every reader,
+  including late-admitted flow-v1/ss-v1 and auxiliary SS state; optional callbacks cannot bypass it.
+  Flow Manager/Client and SS Server provide ctx-free pristine Detach, returning the exact sealed/business
+  closure without shutdown; activation or mutation requires a current-state cut instead. The upgrade
+  consumer and agentimage.DeferredReasons share the ordered S5 nine-code set in architecture §22.8 item 8.
+  Do not delete a pending marker or overwrite prev to bypass these guards.
+- **Drill + signature**: T45/75.W blocks only the first real commit filesystem write, restores access,
+  keeps NATS/reaper alive and observes the product's real 120 s second current-state cut. Ordinary A→B→A
+  is 75.B and cannot sign W. Three-gate and capacity mutations are separate receipts; 500 ms is full-domain
+  calibration with maximum/excesses retained, while normal maximum stall≤5 s is hard. Darwin cross-build
+  proves compilation; native legacy expose/SS lifecycle remains NOT_RUN without a Darwin runner (S4 L6).
+
+### 2026-10-11 · S6 broker-image boundaries (acceptance pending)
+
+No new #NN or deploy-verification claim is assigned. [Architecture §22.9](distributed-broker-architecture.md#229-s6-broker-image-binding-contract-final-receipts-pending)
+records the implemented same-PID cut and pending final receipts.
+Current `Broker.Run` calls `runBrokerImageReloadUsing` → `brokerimage.ReloadCurrentStore` without
+unwinding Run. Broker responsibilities moved into brokercontrol/brokerimage/brokerupgrade/brokerruntime;
+source scanners and tagged tests must follow their actual owners. The genuine old-release Run-unwind
+path remains the 39.BR negative baseline. Same PID alone cannot prove preserved sockets/flock/store. Default single and real sole voter require separate receipts.
+A mixed-release join WARN proves only proto admission, not hot-cut capability; agent route-hold installation
+ACK is required before planned cut. Unsafe transfer/close/expiry conditions must refuse while originals live.
+
+Backup restore remains independent disaster recovery. ACTIVE hot rollback takes a new current-state cut;
+restoring old DB/WAL can erase newly ACKed writes. Preflight opens no store; hot reopen performs no migration.
+Probe no responders/timeouts cannot be interpreted as legacy and trigger duplicate execution. Eligible
+control retries stay inside one5s admission budget and S1 historical-receipt authority boundary.
+
+The carried S5 **ENDPOINT-RESUME** invalid-flow-owner-state failure remains open until same-candidate S6
+regression evidence closes it. New helper implementations or safe defer do not close that claim.
+`37.A/A1/B/T/R` requires GREEN0, while genuine N3 old Run-unwind `39.BR` requires PRODUCT-RED3 with an
+independently pinned loss signature. Native INCOMPLETE4 differs from retryable business refusal75.
+[P34 claim index](reviews/hot-update-tasklist.md#s6-broker-image-receipt-boundary) stays unchecked; P35 alone
+supplies final candidate drill/gate/cost receipts. S7/S8/S9/S10 claims remain with their owners.
+
+
+### 2026-10-12 · S7 transfer continuation and settlement boundary (PENDING receipts)
+
+No new incident number or deployment-verification claim is assigned. The
+[frozen S7 plan](reviews/hot-update-transfer-continuation-plan.md) lead LQ1–LQ3 and
+[architecture §22.10](distributed-broker-architecture.md#2210-s7-transfer-continuation-binding-contract-receipts-pending)
+define the contract. All acceptance is NOT_RUN pending owner receipts and P37 final evidence.
+
+- **Lost upload ACK / duplicate object version:** SDK Put retries generate new NUIDs; v1 must retain
+  one pending chunk, exact raw receipt and subject+stream CAS, even when a sent retry arrives beyond
+  the default 120s dedupe window. Rewind/Put is not continuation. Metadata appears only after all receipts
+  and original-source hash validation. T01–T04/T19 and M01–M03 remain pending.
+- **Fetch progress ahead of disk:** short writes and failed Sync cannot advance the durable cursor/hash.
+  Healthy consumer drops require old fetch join, UNSUB/PONG and consumer retirement before rebuilding
+  from the synced prefix. refs=0 cannot erase an unconfirmed dirty window. T06–T08/M04/M05/M08 pending.
+- **Failed audit followed by actual rename:** a durably reserved Grant keeps receiver decision authority;
+  watchdog/cancel cannot guess failure. Landed+directory Sync unknown preserves the outcome and never
+  repeats the primitive. Raft commit/Flush/boolean terminal cannot ACK a courier. Canonical physical
+  START=1 and TERMINAL=1 are required. T11–T16/T23–T25/M06/M10/M12 pending.
+- **Live objects mistaken for orphans:** imported tracker responsibility is installed before both reaper
+  dispositions and store/control activation. Cross-home GC needs original-origin retirement proof;
+  unreachable origin retains evidence. Positive orphan reclamation still runs. Retirement fence ACK
+  precedes exact-NUID purge so old reconnect HPUB cannot resurrect it. T04/T20/T29/M11/M13 pending.
+- **TTL List freezes the entire registry:** the 2026-09-30 incident remains open. Both List operations must
+  be cancelled/joined within bounded ≤5s passes, then the next pass must execute without a
+  fixture metadata write. T30 must run the real TTL edge and prove its mutation red; source presence
+  or a new timeout label cannot close the incident.
+- **Storage cannot cover recovery:** before any chunk, refuse `transfer_storage_horizon` with required
+  Duplicates/MaxAge for H=2228s. Preserve valid 48h TTL and operator limits. No auto-TTL or fallback.
+  T05/M14 pending; `--rate-limit` seals budget from the original start and refuses above 2108s.
+- **DELETING streams collected too early:** normal session rm returns 75 with pending IDs/reasons and
+  protects history/OBJ/SQL until settlement/retirement. Explicit `--abandon-unsettled-transfers` records
+  failed/settlement_abandoned with outcome_unknown=true before normal deletion; never complete.
+  Auth reconnection is restricted to the original receiver's one settlement entry. T31 and LQ1 controls
+  pending. Capture terminal/drain before stream deletion; an empty post-delete history proves nothing.
+
+S7 capable cuts, current rollback, C1/C2/C3 and actual live-window receipts cannot be inferred from an
+upgrade reply or same SHA. Native missing window=INCOMPLETE4, missing/poison custody=SETUP-RED2,
+old Run-unwind 39.BR=PRODUCT-RED3. Operator guidance is in
+[broker operations](broker-ops.md#s7-transfer-settlement-operations-pending-receipts); command syntax is present and workspace --help-verified, while final live receipts remain pending. Kill-9/power-loss arbitrary-offset recovery, ctl death/reacquisition, infrastructure
+binary replacement and whole-stack acceptance remain outside this claim.
+
+### S8/S9 integrated operational boundaries (live receipts pending)
+
+No incident number or deployment pass is assigned by this documentation change. Legacy upgrade/reload
+envelopes now refuse before dispatch: known busy returns bad_request/legacy_busy (64), unproved
+quiescence try_again/legacy_quiescence_unproved (75). Use the target-issued transaction route; a local
+--interrupting flag cannot manufacture the old wire's missing grant/reservation. Old versions may have
+smoke/prev/rollback; absence of full-domain custody is the actual first-migration boundary.
+
+- **Auth-first is a real reconnect gate.** Auth-only SUB/PONG plus signed ordinary CONNECT and normal
+  queue probe precede business admission. A static broker credential CONNECT or local image handler
+  probe is insufficient. The pre-repair ACK prefix must be read before writer/audit/reconcile/GC can
+  conceal lost data; an unchanged JS name is not its original identity.
+- **NATS topology and lifecycle.** B/S/JS-group counts differ. N1 uses the original store without a
+  second opener; N3 moves clients before LDM closes listener/JS. N2/missing quorum/current/replica/
+  unknown asset census defer. Never use replica changes or a fixture pause to manufacture readiness.
+- **Canonical ingress and permissions.** Caddy alt-port warmup must install the managed nft route for
+  fresh canonical443; changing a client's URL/8443 alone is insufficient. Match accepted raw socket to
+  actual PID/exe. Legacy root Caddy's root-only key cannot simply be handed to User=tether: managed
+  certificate/ACME ownership and startup fencing must precede the successor; final sync follows old
+  writer retirement. Admin Unix socket permissions are the UID boundary, not loopback or Origin.
+- **Retirement is a condition, not a timer.** A halted transaction may retain a serving shadow beyond
+  120s. Recover the same ID, prove current main/old/temporary incarnations, then retire them. Never kill
+  a healthy retained owner to obtain completed. Unknown QUIC/third-party connections, custom modules
+  or external storage defer; hot support is linux/amd64 + systemd/pidfd/cgroup/nft.
+- **Observations must be complete.** Use the shared logs owner for broker/agent slog and panic streams,
+  including prelogger, rotation/truncation, cursor/end fences. Empty tail/grep cannot establish silence.
+  Original business socket EOF/reconnect differs from planned internal carrier replacement.
+
+Historical #73, #89 and 39 Y/P/F/BR native losses are not closed by source changes or docs audits.
+38/39/85/86/99/100 live runs, final candidate gates and Darwin native remain NOT_RUN/PENDING.
+[S9 P39](reviews/hot-update-infra-nats-caddy-plan.md#p39--最终候选收据与关闭--hard) signs infra evidence;
+S10 P34/P35 own aggregate carry/coverage/receipts. Cold restore remains disaster recovery with possible
+loss of later ACKs, not a hot rollback.

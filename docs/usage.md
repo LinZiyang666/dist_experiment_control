@@ -218,7 +218,7 @@ ctl 几乎不需要常驻配置；活动会话用 `~/.tether/current_session` �
 - `TETHER_HOME`    — 覆盖 `~/.tether`（用于多账号隔离 / 测试）
 - `TETHER_NATS_URL` — 覆盖 broker URL（优先级：显式 `--nats-url` / `--broker` flag > 此 env > `~/.tether/broker_url` > cobra 默认）
 - `TETHER_RUN_READY_TIMEOUT` — `tether run` 等待 agent PTY ready 的超时，默认 `20s`（需 ≥ agent attach deadline 15s + 网络 RTT）
-- `TETHER_RUN_LIVENESS_TIMEOUT` — `tether run` 心跳看门狗超时，默认 `15s`（= 3 × 心跳间隔 5s）；设为 `0` 关闭看门狗
+- `TETHER_RUN_LIVENESS_TIMEOUT` — `tether run` 心跳看门狗超时，默认 `15s`（= 3 × 心跳间隔 5s）；仅 legacy 路径，设为 `0` 关闭看门狗；可靠路径恢复窗固定 180s
 - `TETHER_DEV_NO_AUTH=1` — **仅本地开发**：跳过 nkey 生成与签名，匿名连接
 
 ### 3.2 `~/.tether/agent/<sid>/agent.yaml`（agent）
@@ -391,8 +391,14 @@ tether version
 ```
 tether v0.0.0-dev (proto v2)
 linux/amd64
-go1.25.0
+go1.26.8
+image-domains exec-v1 pty-v1 flow-v1 ss-v1
+image-abi v1
 ```
+
+The domain line declares reader capabilities; ABI1 alone does not prove every retained domain is readable.
+The final ABI line remains last. Candidate and actual prev must pass the three SHA-bound domain checks;
+these version strings do not sign S5 product validation.
 
 ### 5.3 `tether completion`
 
@@ -596,8 +602,8 @@ tether session rm <sid> [--ack-alerts]      # tombstone：ACTIVE → DELETING（
 （owner / member）、活动标记（`*` 表示当前激活）、创建时间。
 
 **`session rm` 是什么**：owner-only，把 session 标 `DELETING` 并触发三
-阶段回收（见下）。**不可逆**：tombstone 后无法 undo，全部 history、port
-分配、agent 注册都会被清理。
+阶段回收（见下）。**不可逆**：tombstone 后无法 undo。S7 adds a settlement barrier before
+history/OBJ/SQL cleanup; unsettled transfer evidence remains protected (PENDING receipts).
 
 `session rm` 是三阶段删除（P7 architecture H.5）：
 1. broker SQLite 把 state 设为 DELETING；
@@ -605,6 +611,22 @@ tether session rm <sid> [--ack-alerts]      # tombstone：ACTIVE → DELETING（
    主动断开 sid 范围内的 NATS subject；
 3. 等待静默期后回收 JetStream stream（`history-<sid>`）+ port_allocations + 全部
    agent_provisioning 行。
+
+**S7 session-removal contract — PENDING final receipts; CLI wiring present:**
+ordinary business is revoked immediately. If receiver commit authority or START/TERMINAL delivery is
+unsettled, the command returns 75 within its 5s control budget, leaves the session DELETING, and lists
+pending transfer IDs and reasons. Settlement continues before history→OBJ→SQL deletion. Repeat the
+same removal after settlement: the retry that passes the barrier and drives cleanup returns OK (exit 0).
+An ordinary retry without settlement involvement keeps `already_deleting` (exit 64).
+A pending result does not mean the streams have been deleted.
+
+When the original receiver cannot be recovered, the frozen operator escape is
+`tether session rm <sid> --abandon-unsettled-transfers` (CLI help verified; live settlement receipt pending).
+It records one exact canonical failed terminal per unsettled transfer with reason
+`settlement_abandoned` and `outcome_unknown=true`, then follows normal deletion order. The record does
+not prove the target was unchanged and never claims complete. Collect history/status evidence before
+streams are removed. Without the flag, unsettled evidence must remain. `--ack-alerts` does not abandon
+settlement; the flags serve independent purposes. See [broker operations](broker-ops.md#s7-transfer-settlement-operations-pending-receipts).
 
 `tether session ls` 输出含 `STATE`（ACTIVE / DELETING）+ `ROLE`（owner / member）+
 当前 active 标记 `*`。
@@ -615,6 +637,7 @@ flag：
 |---|---|---|---|
 | `session create` | `--pin` | (必填) | 新 session 的一次性加入 PIN；owner 创建后无法修改 |
 | `session rm` | `--ack-alerts` | false | 分布式集群处于 `quorum_lost` 或 `force_single_active` severe alert 时仍继续删除；只确认本次风险，不会修复或清除告警 |
+| `session rm` (S7 PENDING) | `--abandon-unsettled-transfers` | false | Explicitly records failed/outcome-unknown abandonment before cleanup; CLI present; final live receipts pending |
 | 全部 `session` 子命令 | `--nats-url` | 同 §5.1 全局解析链 | NATS 入口；分布式 HA 可写逗号分隔 seed list |
 | 全部 `session` 子命令 | `--home` | `~/.tether` | 读取 nkey、`current_session`、默认 broker URL 的目录 |
 
@@ -704,8 +727,20 @@ PORTS
   返回），可以 `tether exec gpu -- tail -f log.txt` 看实时日志；
 - **退出码透传**：远端进程的 exit code 即本地 exit code，方便 `&&` /
   `||` 串联；
-- **信号杀变 128**：远端进程被信号杀 ⇒ stderr 打印 "remote process
-  terminated by signal" 然后本地 `exit 128`（当前不传具体信号号）。
+- **信号杀变 `128+sig`**：可靠路径下远端进程被信号 N 杀 ⇒ 本地 `exit 128+N`（如 SIGKILL → 137）；
+  退回 legacy 路径时仍是旧行为（stderr 打印 "remote process terminated by signal"、本地 `exit 128`）。
+- **可靠路径（热更新 S1 起默认）**：每条 exec 先向 agent 取一张创建租约，再以稳定的请求身份创建——
+  同一条命令**只执行一次**，无论 create 的回复丢了几次；输出按流带绝对偏移与 ACK 回传，ctl 与 agent 之间
+  的 NATS 连接、broker、nats-server 任一重启都不会丢字节、重复字节或丢退出码；ctl 的一次 `exec` 期间
+  身份不变（断线重连复用同一收件箱）。agent 或 broker 不支持时自动退回 legacy 路径（probe 最多 2 s）。
+  退出码相位规则见 §9.13.2。
+- **`--stdin`（opt-in）**：把本地 stdin 读到 EOF（上限 512 KiB，超限退 64）一次性交给远端命令作它的
+  stdin；不给时远端 stdin 仍是 /dev/null。opt-in 是为了不让 `while read line; do tether exec …; done`
+  这类脚本被隐式吃掉输入。
+- **spawn 失败不出现在 `ps -a`**：远端根本没起来的命令（`remote_fs_spawn_timeout` 等）只在 ctl 侧报错，
+  不再以 EXITED(-1) 行留在进程列表里（与 `run` 一致）。
+- **`session rm` 会清场**：会话被删除时，各 agent 立即 SIGKILL 该会话托管的全部 exec/PTY 进程及其进程组，
+  并拒绝这些任务被任何晚到的请求复活；agent 守护进程本身不退出。
 
 **何时用**：`ls` / `grep` / `python script.py` / `make test` / 任何
 "输入定死、输出可流" 的命令。
@@ -714,7 +749,7 @@ PORTS
 `tether run`（PTY 模式）。
 
 ```
-tether exec [--cwd DIR] [--timeout 10m] [--safe] <nid> -- <argv...>
+tether exec [--cwd DIR] [--timeout 10m] [--safe] [--stdin] <nid> -- <argv...>
 ```
 
 flag：
@@ -726,6 +761,7 @@ flag：
 | `--cwd`     | (空 = agent 端默认目录) | 远端进程的工作目录 |
 | `--timeout` | `10m`              | 整次命令最长时间（含流式输出），超时返回 `timed out after ...` |
 | `--safe` | false | 在 agent 端**强制作废已缓存的挂载健康判定、立即重探**，再用去掉挂死网络挂载的 PATH 解析 argv[0]，避免 NFS/CIFS 卡死；成本是 per-call（最坏 `probe_timeout` × 被咨询的健康网络挂载数），详见 §7.7；必须写在 `<nid>` 之前 |
+| `--stdin` | false | 把本地 stdin 读到 EOF（≤512 KiB）交给远端命令；必须写在 `<nid>` 之前 |
 
 注：`--` 是可选分隔符（cobra 自动剥离）；`tether exec <nid> ls -la` 与
 `tether exec <nid> -- ls -la` 等价，因为 `SetInterspersed(false)` 已让 `-la`
@@ -749,9 +785,8 @@ PTY，本地终端切 raw 模式后所有键盘字节、箭头序列、Ctrl-C、
   Ctrl-C 中断 ctl 进程），原样发到远端；
 - **SIGWINCH 同步**：本地终端 resize ⇒ remote PTY 同步 resize；vim / less
   会自动刷新；
-- **两阶段 attach 握手**：架构 C.5.1，确保 PTY 的第一个字节不丢；
-- **3 秒 attach deadline**：ctl 没在 3s 内完成订阅 ⇒ agent 主动放弃 PTY，
-  防止 ctl 崩溃导致孤儿 PTY 占用 agent 资源。
+- **可靠 run**：支持时用原任务句柄、字节 ACK 与重放续接，跨 agent 映像切换不重建远端 PTY；
+  首输出订阅先建，保留首字节。旧端回落 legacy 时沿用 ready/attach 握手，默认 attach deadline 15s。
 
 **何时用**：vim / nano / htop / 进入 bash 交互式 shell / 跑带颜色或进度
 条的程序 / 任何需要终端能力的场景。
@@ -773,48 +808,54 @@ flag：
 | `--safe` | false | 与 `exec --safe` 相同：**强制作废已缓存的挂载健康判定并立即重探**，再避开挂死网络挂载解析 argv[0]；必须写在 `<nid>` 之前 |
 | `--ack-alerts` | false | 分布式集群处于 `quorum_lost` 或 `force_single_active` severe alert 时仍继续启动交互进程；只确认本次风险 |
 
-非 tty 调用（如 `tether run nid -- bash <<<EOF ... EOF`）时 SIGINT 转成
-`kill.req{SIGINT}` 发往 agent 的进程组。
+**可靠与 legacy 路径**：新 ctl 先在同一 2 s 总预算内完成能力探测；旧 broker/agent 不支持完整 PTY 协议时，
+只在 create **尚未发出**前回落 legacy。权限、身份、busy/容量拒绝不回落；create 已发出后断链也不另开任务。
+升级 pending 且回滚映像不支持 PTY 时，新 reliable create 报 busy（75），legacy run 同样暂拒；等待原升级真正提交，
+不要为了重试删除 pending marker。正常可靠会话可以参与映像交接，活 legacy 会话使升级返回 `legacy_session_busy`。
+Darwin 仍只提供 legacy run，不承诺热更新连续性。
 
-**ctl 存活契约（h1 D）——关掉终端窗口不再留下永生进程**
+**本地 stdin/stdout**：可靠路径支持 TTY、FIFO/pipe、regular file 与 `/dev/null`，所以 `< file`、`> file` 可用。
+socket 及其它无法安全重开/唤醒的类型在 create 前回落 legacy，并向本地 stderr 打一行：
 
-`run` 期间 ctl 每 5 秒往 `pty.<pid>.ka` 发一个空心跳。agent 端按
-`grace = max(6×间隔, 3 分钟)` 计时：**在 agent 自己的连接被证明健康的前提下**心跳静默超过
-grace，agent 就对该进程组发 `SIGHUP` 并关掉 PTY master——正是真实终端被关掉时会发生的事。
-语义等同 sshd 配了 `ClientAliveInterval`：
+```
+tether: <stdin|stdout> is a <kind>; using legacy run (no hot-update continuity)
+```
 
-- `tmux attach` 会退出（rc=-1，信号死亡），**tmux server 本身照常存活**，重新 attach 即可；
-- 对 `SIGHUP` 免疫的程序会继续跑，`ps` 里也如实继续显示 RUNNING——这不是 kill 升级，只是"终端没了"；
-- **误杀防护有三层**：agent 自身连接不健康的那些 tick 一律不计（静默不能算在 ctl 头上）、
-  动手前先做一次连接往返探测（`nc.Status()` 在静默分区下会撒谎，实测能"CONNECTED"好几分钟）、
-  且必须**连续两个**探测通过的 tick 都静默才动手。
+这是路径提示，不是 exit 64。远端 stdout/stderr 本就接在同一个 slave 上，按原顺序合并到本地 stdout；
+本地 stderr 留给 ctl 诊断，不提供远端 stderr 分流。输出背压时输入/KA/控制仍可调度，缓存有界。
 
-**代价（明确的设计取舍）**：笔记本合盖/挂起**超过 3 分钟**，回来时那条交互会话已经被挂断——
-和 sshd 的行为一致。3 分钟以内不受影响。要跑长命令又不想被这条约束管，用 `tether exec`
-（批处理形态，不参与本契约），或在远端先 `tmux new -d` 再 attach——挂断只会断 attach，
-tmux 里的活照跑。
+**本地 EOF 不等于 Ctrl-D**：stdin 读完只发送逻辑 InputFIN，已接纳字节写入后停止输入；远端 master 仍开，
+不自动发 HUP、不注入 0x04，ctl 继续收尾输出和真实退出码。依赖终端 VEOF 的交互程序可能仍等待，
+需要用其退出命令或实际 Ctrl-D 字节；canonical/raw/自定义 VEOF 对 0x04 的处理不同。
+本地 raw 模式下 Ctrl-C 的 0x03 原样到远端，由远端 line discipline 送当时前台进程组。
+外部 SIGINT/SIGTERM（含非 TTY 调用）沿根 signal context 作**本地取消**：停止输入/KA、join I/O、恢复终端后返回；
+不再转成 `kill.req{SIGINT}`，不承诺远端收到信号，也不等同 EOF 或自动 SIGKILL。
+协议的显式 signal op 则向原进程组发 SIGINT/SIGTERM/SIGHUP。session rm 的管理清场覆盖原 session 中多 PGID 和
+stopped foreground，主动 setsid 脱离的后代不覆盖，不承诺任意后代都被杀。
 
-旧版 ctl（v0.4.7 及更早）不发心跳，agent 对它们**永不**执行挂断（保持老行为）。
+**ctl 存活与恢复窗**：可靠 run 每 5 s 提交新序号 KA；agent 的 grace=max(6×间隔,180 s)，
+只由首次 create 或首次提交的新 KA 更新。重复 KA、重连、导入或普通 ACK 不续期。
+到期后以当前连接 generation 的两个新成功往返证明健康，并给同一次过期一次 5 s 恢复机会，再发 SIGHUP、关 master；
+连接不健康时保留责任，不能把网络故障判成 ctl 已死。HUP-immune 程序可继续 RUNNING，不升级 SIGKILL。
+旧 ctl 未武装 KA 时不自动挂断；tmux 的 attach 可被挂断，主动脱离 session 的 server 不在清场保证内。
 
+create 已发出的可靠 ctl 从**首次失联**起最多等 180 s，timeout、node_offline、升级 busy 等均重试原 handle；
+每次失败不重置窗口，同实例合法回复才结束本次失联。到期 exit 74，提示 task may have executed，
+不要盲目重新 run。这个客户端窗口不延长远端 KA/授权期限；长时间挂起仍可能错过远端 grace。
+权限 77、instance lost、坏身份或 revoked 直接终止。结清的正常任务透传真实 exit/signal；
+未应用输入（A<Q 且 InputError）、截断输出或本地取消等报 74，即使远端 rc0 也保留诊断；详见 §9.13.3。
 
 分布式 HA 影响：`run` 会打开新的交互式远程进程，属于可能扩大损害面的写操作；
 ctl 会先检查 cluster health。看到 `quorum_lost` 或 `force_single_active` 时默认拒绝，
 除非显式加 `--ack-alerts`。这只绕过 ctl 侧提示，不会绕过 broker 端权限、session
 状态或 quorum 能力检查。
 
-调优 env vars（详见 §3.1）：
-- `TETHER_RUN_READY_TIMEOUT` — ctl 等待 agent PTY ready 的总超时，默认 `20s`；
-  慢链路 / 跨大陆链路上 PTY 首字节迟到时调大。
-- `TETHER_RUN_LIVENESS_TIMEOUT` — 心跳看门狗超时，默认 `15s`（agent 心跳间隔
-  5s × 3）；agent 长时间停滞时 ctl 本地会先打印 "agent unreachable" 再退出，
-  避免无限挂起。设为 `0` 关闭看门狗。
+legacy 路径调优 env vars（详见 §3.1）：
+- `TETHER_RUN_READY_TIMEOUT` — ready 等待默认 `20s`；可靠路径 create 已发出后的失败不回落。
+- `TETHER_RUN_LIVENESS_TIMEOUT` — legacy 心跳看门狗默认 `15s`，`0` 关闭；可靠路径使用上述固定 180 s 恢复窗。
 
-**`run` 会话不跨 broker 重启存活**（DOC-28）：ctl 与 agent 的心跳都经由 broker 转发，
-broker 重启 / 换届 / 你用 `--nats-url` 指定的那台 broker 被杀时，心跳中断，看门狗在
-`TETHER_RUN_LIVENESS_TIMEOUT` 后合成 `agent unreachable: no heartbeat` 并**优雅终止**本地会话；
-远端 PTY 进程由 agent 的 ctl-liveness 收割器按上文的 `grace = max(6×间隔, 3 分钟)` 收回。
-这是有意设计，不是故障：重新 `tether run` 即可；需要跨 broker 重启存活的长任务请用
-`tether exec … -- bash -c 'nohup … &'`（§5.12）。
+legacy 会话不承诺跨 broker 重启连续：看门狗可报 `agent unreachable: no heartbeat` 并结束本地会话。
+可靠路径按原 handle 恢复，不能把 legacy 回落的成功执行计作热更新连续性证据。
 
 ### 5.14 `tether expose` / `expose rm`
 
@@ -974,6 +1015,11 @@ agent register 也不会收到 proxy directive；`proxy status` 最多只能读�
 
 ### 5.16 `tether push` / `tether pull`（v0.2.0+）
 
+**S7 implementation present; final product receipts PENDING / NOT_RUN.** The [frozen plan](reviews/hot-update-transfer-continuation-plan.md)
+and [architecture §22.10](distributed-broker-architecture.md#2210-s7-transfer-continuation-binding-contract-receipts-pending)
+define negotiated v1 behavior. P00 declarations do not establish implemented continuation. Existing
+push/pull syntax below is present; new status/rate/abandonment syntax awaits P27 and final P37 receipts.
+
 **这是什么**：在 ctl 与远端 agent 之间搬一个文件。无须 `expose` + `scp` /
 `rsync`，复用 NATS 控制平面 + JetStream Object Store 做传输；单次最大 2 GiB
 （再大请走 `tether expose` + rsync）。
@@ -983,7 +1029,7 @@ agent register 也不会收到 proxy directive；`proxy status` 最多只能读�
 | 大小 | 档位 | 通道 | 是否需 JetStream |
 |---|---|---|---|
 | ≤ `max_payload/2 − 1 KiB`（默认 `max_payload` 1 MiB ⇒ **~511 KiB**；上限封顶 8 MiB） | A | 直接塞进 NATS 消息体 | 否 |
-| 大于上面那条线，至 2 GiB | B | broker 创建 ObjectStore bucket，sender Put → receiver Get | **必须** |
+| 大于上面那条线，至 2 GiB | B | broker 创建 ObjectStore bucket，Fixed-version writer → synced-prefix reader for v1 (PENDING); legacy uses Put/Get | **必须** |
 | > 2 GiB | — | 拒绝（`too_large`）；改走 `tether expose` + rsync | — |
 
 > ⚠️ 这张表以前写「≤ 8 MiB → A」。**默认部署上那是错的**：8 MiB 是设计封顶，实际分界由
@@ -1032,7 +1078,7 @@ tether pull <nid>:<remote-path> <local-path> [--force] [--timeout D] [--ack-aler
 | `<local-path>` | (必填) | ctl 所在机器上的本地文件路径；push 源必须是普通文件，pull 目标可相对/绝对 |
 | `<nid>:<remote-path>` | (必填) | 目标节点 + 该节点上的**绝对**路径；缺省可达任意路径，配了 `allow_roots` 才需落在其前缀内 |
 | `--force` | false | 目标已存在时覆盖；缺省直接拒（`dst_exists` 或本地 path exists） |
-| `--timeout` | 按文件大小推导（上限 `37m08s`） | ctl 等待每个阶段的上限；tier A 一般 < 30s，push tier B 由**文件大小推导**（见下）：不显式给出时取 broker 对**这个大小**的预算再加 2 分钟（12 MB → `7m`，2 GiB → `37m08s`）；显式给出的值原样生效；pull 的 tier-B 阶段在 prepare 拿到大小后同样推导 |
+| `--timeout` | 按文件大小推导（上限 `37m08s`） | Legacy waiting baseline; S7 v1 UI waiting cannot refresh the original sealed deadline (PENDING). ctl 等待每个阶段的上限；tier A 一般 < 30s，push tier B 由**文件大小推导**（见下）：不显式给出时取 broker 对**这个大小**的预算再加 2 分钟（12 MB → `7m`，2 GiB → `37m08s`）；显式给出的值原样生效；pull 的 tier-B 阶段在 prepare 拿到大小后同样推导 |
 | `--ack-alerts` | false | 分布式集群处于 `quorum_lost` 或 `force_single_active` severe alert 时仍继续传输；只确认本次风险 |
 | `--nats-url` | 同 §5.1 全局解析链 | NATS 入口；分布式 HA 可写逗号分隔 seed list |
 | `--home` | `~/.tether` | 读取 nkey、`current_session`、默认 broker URL 的目录 |
@@ -1055,58 +1101,60 @@ tier-B ObjectStore bucket 按 cluster replica 策略创建；传输开始后，�
 - 父目录不存在 → `path_parent_missing`（push）或 `path_not_found`（pull）；
   v0.2.0 不自动 `mkdir -p`，需手动 `tether exec <nid> -- mkdir -p ...`；
 - pull 还会做 dev+inode TOCTOU 校验（`lstat` 与 `open` 之间的换底攻击）；
-- broker 是 ObjectStore bucket 的**唯一所有者**：member/agent JWT 都没有
-  `STREAM.CREATE / DELETE / PURGE` 权限，bucket 由 broker 在 prepare 阶段
-  创建、在 `ev.transfer` / `finalize.req` 收到时删除；超时后 broker watchdog
-  也会兜底删除并写 audit failed。
+- Broker owns bucket configuration and cleanup. Member/agent cannot create/update/delete/purge
+  streams. In S7 v1, terminal delivery is followed by writer/reader retirement, acknowledged deletion
+  fences and exact original-version purge; timeout cannot delete an unsettled Grant or audit obligation.
 
-**push 的 tier-B 超时预算由文件大小推导**（v0.4.8 起）：tier A 固定 30s；**push** 的 tier B 是
-`max(5min, 2 × ⌈size / 2 MiB/s⌉ + 1min)`——`2 MiB/s`（≈16.8 Mbit/s）是本产品承诺覆盖的
-**最慢链路**，`2 ×` 是因为一次 tier-B 传输要**两次穿过 object store**（发送方 Put、
-接收方 Get），额外 1 分钟覆盖 prepare 往返、对象存储打开、校验/fsync、finalize 与事件传播。
-于是 2 GiB push 的 broker 上限预算是 `2 × 1024s + 60s = 2108s = 35m08s`；
-ctl 默认再留 2 分钟，因此 2 GiB 的每阶段上限是 `37m08s`。
-**ctl 的默认值按同一公式对本次文件大小推导**（simcluster-speed 起）：此前 flag 的文案写"由文件大小推导"，
-代码却对任何大小一律取 2 GiB 的 `37m08s`——一个 12 MB 的 push 在 JetStream 退化时会等满 37 分钟才报错
-（deploy-tier drill 67 因此撞 45 分钟超时）。现在 12 MB 取 `5min + 2min = 7m`，显式 `--timeout` 仍原样生效。
+#### S7 same-invocation continuation (PENDING receipts)
 
-**push 中途失败会立刻释放本 session 的 tier-B 槽**（simcluster-speed 起）：同一 session 的 bucket 一次只承载一个
-tier-B 传输（`too_many_in_flight`）。此前 ctl 的 `Put` 失败（例如 JetStream 暂时无 responder）后没有任何途径
-告诉 broker 它已放弃，槽位要等 watchdog 按预算回收（≥6 分钟），期间该 session 的每次 tier-B push 都被拒，且拒绝
-文案建议"换一个 transfer id"——对按 bucket 串行的槽位那是错的建议。现在 ctl 在 commit 之前的任何失败都会发
-`finalize{failed}`（与 pull 一致；commit 之后终态仍只由 agent 的 `ev.transfer` 写），拒绝文案会点名占着 bucket 的
-那个 transfer id。旧 broker 会以 `verb_mismatch` 拒绝这条 push finalize，行为退回旧版（N-1 窗口内可接受）。
+Keep the original ctl process running. Its single transfer ID, original origin and tier-B object NUID remain
+fixed across planned agent/broker cuts, carrier/data-connection recovery and same-store JS restart.
+After an uncertain prepare/chunk/commit/finalize reply, the engine queries the original responsibility
+before safe replay of the same CallID/outcome. It never resumes by rewinding and calling SDK Put again.
+S7 has no cross-process `--resume`: a new push/pull is a new operation with potentially repeated effects.
 
-**push 的 `Put` 阶段带 JetStream 活性看门狗**（simcluster-speed，gotcha #84）：JetStream 失去 quorum（持有 meta/stream
-leader 的 broker 停了）时，`Put` 发出的 chunk 等不到 ack，此前会一直等到整个阶段预算耗尽（12 MB ≈ 7 分钟）才报一句裸
-`Put: nats: timeout`——没有 transient 码、没有重试提示。现在上传期间每 10 s 向该 bucket 的 backing stream 发一次
-`STREAM.INFO`（5 s 超时；只用这一个请求——它在 ctl 自己的 ACL 里，`$JS.API.INFO` 不在），**没有应答、或应答里没有
-stream leader** 都算一次失败，连续 3 次即取消上传、释放槽位，并以 `code=jetstream_not_ready`（exit 75，与 prepare 腿
-的 G67 文案同一套词）告诉你 JetStream 停止应答、稍后重试。这是**第一张脸**（`stopped answering during the upload
-(3 probes over 30s failed …)`）。**第二张脸**是**立刻拒绝**（`no responders` / `no response from stream`——stream 正在选
-leader）：这时 `Put` 会有界重试 3 次（间隔 3 s、6 s），仍不行才以同一个 `jetstream_not_ready` 码拒绝，文案里带尝试次数与
-用时（`refused 3 attempt(s) over 9s`）。**第三张脸**是"应答正常、但一个字节都没收"：探测每次都答、也有 leader，可 stream
-的 `last_seq` 连续 3 次探测（30 s）纹丝不动——那是 chunk 在 leader 选举窗里被静默丢弃（没有 NAK，`Put` 会等 ack 等到预算
-耗尽），stream 对别人已经健康、只对这一次 `Put` 不是；看门狗取消它并在同一次 push 里**重试一次**（新 `Put` 通常几百毫秒
-落地），仍不行才拒绝，文案是 `the stream accepted none of the upload for 30s (3 probes; leader present, last_seq stuck
-at N)`，再包一层 `refused N attempt(s)`。健康的 JetStream 每次探测都应答、序列号随每个 chunk 前进，看门狗不会干预慢速
-大文件。第一张脸不重试（JetStream 对这个 bucket 就是不可用，再等 30 s 也一样）。
-一次被取消的 `Put` 之后你会在 stderr 看到一行 `nats async error: … Permissions Violation for Publish to
-"$JS.API.STREAM.PURGE.OBJ_xfer-<sid>"`：那是 nats.go 试图替你清理上一代 chunk，而 bucket 的清理权在 broker（按设计拒绝）；
-残留的 chunk 由 broker 的定期 reconcile 回收（gotcha #85），不需要你做任何事。两个相关的细节：重试上传**同名对象**时，
-nats.go 在上传完成后还会试一次那个被拒的清理，看门狗要等一个 30 s 探测窗才发现 `Put` 其实已经完成——这是同名重试路径上
-多付的 30 s，不是失败；上传中途本地读盘出错（`input/output error`）会以 `object_put_failed` 上报、不会被当成 JetStream 的
-问题重试三次（round-2 review R2-F1 / R2-F3）。
-改动前这里是固定 5 分钟，而它要覆盖的是 2 GiB × 2 —— 隐含断言了 ~114 Mbit/s 的
-端到端吞吐，超时后还会**删掉正在传的对象**并写 `agent_no_responders`（归因错误：
-agent 可能一直在传，只是不够快）。现在超时写的是 `transfer_budget_exceeded`。
+Command syntax below is present and workspace `--help`-verified; live continuity/settlement receipts remain NOT_RUN/PENDING:
 
-> **pull 不在此列——它仍是固定 5 分钟。**
-> `pull.req` 的 wire 消息**不带文件大小**（大小只有 agent 那侧知道），所以 broker 的看门狗
-> 和 agent 的上传腿都无从推导，两端一致地取固定下限。把 `--timeout` 调大**不会**让一个
-> 又大又慢的 pull 成功：ctl 还在等，agent 和 broker 已经在 5 分钟处结束了。
-> 大文件 / 慢链路的 pull 请改用 `tether expose` + rsync。
-> 给 pull 补 size 需要同时改 `proto.PullPrepareReq` + agent + ctl 三端，属被判缓的中期半。
+```sh
+tether push <local-path> <nid>:<remote-path> --rate-limit <bytes-per-second>
+tether pull <nid>:<remote-path> <local-path> --rate-limit <bytes-per-second>
+tether transfer status <transfer-id> --node <nid> --json
+```
+
+Rate is a nonnegative bytes/s limit fixed before side effects; zero preserves the original behavior.
+Tier A retains 30s. Tier B uses `effective_rate=min(2 MiB/s, requested_rate)` (zero=2 MiB/s), then
+`max(300s, 2*ceil(size/effective_rate)*1s+60s)`; a budget above 2108s is refused before the first chunk,
+rather than clipped. A 2 GiB transfer at the default rate has 2108s=35m08s; lowering the rate enough to
+exceed that budget is a deterministic admission refusal. Push and pull share the sealed original-start
+budget. Pull's unknown source gets only a provisional ceiling; pin/hash/size seal the actual budget
+before the first chunk. Increasing UI `--timeout` cannot refresh that deadline. Healthy progress means
+actual durable JS ACK/receiver Sync within 10s, not a global stream sequence change.
+
+OBJ must retain the original version across H=2228s: `Duplicates>=2228s`, `MaxAge=0` or `MaxAge>=2228s`,
+compatible server limits and sufficient reserved space. The existing 48h TTL is valid.
+`transfer_storage_horizon` returns required Duplicates/MaxAge before any chunk; ask the storage operator
+to reconcile configuration. The command neither changes TTL nor falls back to legacy after refusal.
+History needs non-evicting retention and exact physical START/TERMINAL receipts.
+
+Status is read-only and does not create permits, workers or objects:
+
+| state | Meaning | Query outcome |
+|---|---|---|
+| `unknown` | Complete ready original-origin census proves no retained entry | Query exit 0; no claim of transfer success and no permission to recreate an old invocation |
+| `live` | Prepared/data/commit-reserved/terminal-pending/cleanup responsibility remains | Phase and durable offset describe progress; no success claim |
+| `terminal` | Exact matching history receipt exists | Kind is `complete` or `failed`; cleanup may remain pending |
+| Error (`transfer_owner_recovering` / `transfer_result_unknown`) | Origin unavailable, census incomplete or authority/evidence unverifiable | 75/74 respectively; never fabricated `state=unknown` |
+
+For an unresolved main invocation, exit 74 includes the original ID/phase and read-only status guidance.
+A terminal failed result requires a matching failed receipt. Parent Sync failure retains a landed target
+with durability unknown; it cannot be retried as a second rename. Ctrl-C/cancel closes new byte admission
+and requests settlement; if the primitive already won, report already_committed/pending durability.
+Only exact complete permits a success result. Progress is on stderr, one result on stdout.
+
+Legacy/cap0 is selected explicitly before creation. It retains ordinary interoperability and no S7 hot
+continuation guarantee; its once-only upload must report sent-unknown without an automatic new Put.
+Historical size-only budgets, including fixed 5min pull, describe the pre-S7 legacy baseline. They do not
+limit v1's source-sealed pull contract or justify deleting active v1 objects on watchdog expiry.
 
 **典型用例**：
 
@@ -1141,7 +1189,7 @@ broker 永远是 single audit writer。
 | `path_race` | 校验后父目录或文件 inode 被并发替换，操作已拒绝 |
 | `too_large` | 文件 > 2 GiB |
 | `jetstream_unavailable` | **永久配置态**：该 broker 根本没有 JetStream 客户端（nats.conf 里禁用了，或 broker 启动时那次一次性 JetStream 探测失败——broker 不会重探，重启即重探）。重试无用 |
-| `jetstream_not_ready` | **瞬时态**（G67 / #67）：JetStream 在，但此刻不受理该请求——broker 重启、选主、或 grow 正在进行。broker **已经**有界重试过若干次才回这个码；**稍后重跑同一条命令**即可，退出码 75。持续不消失则 `tether cluster status` |
+| `jetstream_not_ready` | JetStream temporarily unavailable. A 75 pre-admission refusal may be retried later; a sent-unknown v1 invocation must query its original ID before any new mutation (S7 PENDING receipts). |
 | `bucket_create_failed` | **永久态**：tier-B 对象存储无法建立且重试无用（JS store 小于 tier-B 下限、非集群节点上 replicas>1 等）。文案刻意不含任何"重试"字样 |
 | `node_offline` / `not_a_member` | 目标节点离线 / 调用者不是 session 成员 |
 | `not_owner_or_creator` | finalize 阶段 actor 跟 transfer 创建者不一致（防伪造） |
@@ -1265,126 +1313,73 @@ cluster alert 时会把 banner 打到 stderr。cluster 模式下 broker 会记�
 
 ### 5.19 `tether node upgrade`
 
-**这是什么**：owner-only 的"远程升级 agent 二进制"命令。无需登录目标
-机，无需停服务，PID 不变，systemd 不感知 —— agent 内部用 `syscall.Exec`
-原地替换自己的镜像。
+owner-only 的 agent 更新入口。**当前热事务使用 describe→prepare→stage→start→wait**；
+`internal/upgradecli` 从目标取得真实 Key、运行 SHA 和全部资源 Scope，再校验候选 archive/binary/reader。
+事务 prepare 由 ctl 下载并验证 tarball；grant 绑定解压后的 executable SHA/reader，未携 URL。
+URL allowlist 是旧 wire 下载入口的检查，不能据此声称事务 prepare 也经过该检查。
+tarball SHA 与 executable SHA 是两件事；跨 proto 必须重装。
+所有命令都是操作语法，38/39 实跑和最终候选收据仍为 NOT_RUN/PENDING。
 
-**为什么单独存在**：tether 的常见部署是 N 台 NAT 后的实验机，逐台
-SSH 上去 `wget && systemctl restart` 既慢又容易漏。这个命令把"分发新二
-进制 + 校验 + 替换 + 重启 + 状态恢复"打包成一次远程调用。
+```sh
+# 原 ctl HOME 中准备 inert grant；此步不切换目标。
+tether node upgrade <nid> --url <https-release-tarball> --sha256 <archive-sha256> \
+  --prepare-only --grant-out <grant.json> --timeout 120
 
-**安全模型**：
-1. **broker 端白名单前缀强校验**：URL 必须前缀匹配
-   `broker.upgrade.url_allow`（默认仅放本仓库的 GitHub release 前缀，自托管
-   镜像需 yaml 覆盖）；任何前缀外的 URL 都拒；
-2. **owner-only**：必须是 session owner，member 没权限；
-3. **白名单 + SHA256**：URL 必须前缀匹配 broker 配置的白名单，tarball
-   的 SHA256 必须由调用者提供并校验通过；
-4. **文件解压白名单**：tarball 里只允许 `tether` 这一个 entry，路径不
-   允许包含 `..`、symlink；
-5. **size cap**：下载封顶 64 MiB（`io.LimitReader`），防 DoS；
-6. **proto 必须一致**：跨 proto 升级会被拒（必须重装），因为 wire 协议
-   不兼容时升级中途会出现"新 agent 跟旧 broker 谈不拢"的窗口。
+# 在目标主机以有权发布该注册安装域工件的本地 root 执行。
+# source 是当前执行字节，candidate 是与 grant 一致的已校验解压产物。
+tether upgrade stage --grant <grant.json> --source /proc/<agent-pid>/exe \
+  --candidate <candidate-binary> --receipt-out <receipt.json>
 
-**何时用**：发布新 release 后批量推到全部实验机；不能用于跨大版本
-（proto bump）升级。
+# 回到原 ctl HOME，使用 prepare 输出的同一 TxID；不再带 URL/SHA 或新 grant。
+tether node upgrade <nid> --tx-id <tx-id> --artifact-receipt <receipt.json>
+tether node upgrade-status <nid> --tx-id <tx-id> --json
+tether node upgrade-wait <nid> --tx-id <tx-id> --timeout 2m
 
-**何时别用**：跨 proto / 全新部署 / agent 不在线 → 用 `install.sh
---role agent` 现场重装。
-
-```
-tether node upgrade <nid> --url https://... --sha256 <hex64>      # 单台
-tether node upgrade --all  --url https://... --sha256 <hex64>     # session 内全量 ONLINE 的**固定身份设备**
-                                                                  # （克隆凭据族整体拒绝远程升级；重建镜像后重启）
+# reverse 从 fresh query 的当前态导出；保留新请求、ACK、撤权及传输责任。
+tether node upgrade-rollback <nid> --tx-id <tx-id> --timeout 2m
 ```
 
-flag：
+事务命令以单个 NID 为对象，与 `--all` 互斥；status/wait/rollback/cancel/archive 是 `node` 的
+独立 sibling（`upgrade-status` 等），不是 `node upgrade status`。每个命令可用 `--home` / `--nats-url`。
+`node upgrade` 的 `--timeout` 是整数秒，独立 `upgrade-wait` / `upgrade-rollback` 的 timeout 是 duration。
+`--tx-id` 不带 artifact receipt 时只等待原事务；丢 Start 回复先 query/wait，不能新建事务代替。
+`upgrade-cancel` 只取消无激活副作用的事务，`upgrade-archive` 要求目标证明原 owner 已死亡。
+接受前 deferred 先 query 同一 ID：grant 未过期且原作用域未变才可按原 receipt 重试；grant 过期、请求 rejected
+或目标/reader 改变须先确认没有已接受副作用，再重新 describe/prepare。接受后 unknown/recovery_required
+只 query/wait/诊断原事务；不可得安全点时修复可读工件/权限等原因，保业务等 reverse。
+回滚窗口由下一次 Start 明确关闭；当前 CLI 没有独立 close-window 子命令。
 
-| flag | 默认 | 说明 |
-|---|---|---|
-| `--url`     | (必填) | 绝对 `https://` 的 release tarball URL；必须前缀匹配 `broker.upgrade.url_allow` |
-| `--sha256`  | (必填) | tarball 的 SHA256 hex（64 位小写） |
-| `--all`     | false  | 升级全部 ONLINE 节点（与 positional `<nid>` 互斥）；**第一台是金丝雀**，见下 |
-| `--wait`    | 单台默认 `true`；`--all` 下仅金丝雀强制 wait | dispatch 后轮询 `node.list` 直到该节点以新版本重新 register（COMMITTED）或超时（可能已回退）；`--wait=false` 恢复"只等回执"的旧行为 |
-| `--timeout` | `60`（秒） | 单台 upgrade 的总超时；超大 tarball / 慢链路要显式调大 |
-| `--nats-url`| 同 §5.1 全局解析链 | NATS 入口；分布式 HA 可写逗号分隔 seed list |
-| `--home`    | `~/.tether` | 读取 nkey、`current_session`、默认 broker URL 的目录 |
+| 观测 / 退出码 | 含义和处置 |
+|---|---|
+| status rc0 | 成功读取 View；`Historical`、fresh `Observation`、`Metadata` 分列，未知 owner 不等于完成 |
+| wait rc0 | 当前目标、运行/effective SHA、完整 census 和三完成点均通过；不是仅 re-register 新 release |
+| `upgrade_rejected` / `upgrade_grant_unknown` / `upgrade_grant_expired` / `upgrade_window_closed`（64） | 修正请求、grant 或回滚窗口；不能覆盖 selector/prev 绕过 |
+| `upgrade_deferred` / `try_again`（接受前 75） | 缺 reader、资源/安全点/域锁等前置条件，原业务保持；接受后不确定性归 74 |
+| `upgrade_unsettled` / `upgrade_state_corrupt` / `upgrade_not_wired`（74） | 原事务未证实、状态损坏或缺接线；query 同一 ID，保留证据，不重发新的 Start |
+| `session_incarnation_mismatch` / `not_owner`（77） | 当前创建身份或权限不匹配，不能恢复旧授权 |
 
-- broker 校验：owner、URL 在 `broker.upgrade.url_allow`、proto 一致、SHA256 64 位
-  小写 hex；任一不过 ⇒ 拒绝（`url_not_allowed` / `not_owner` / `proto_bump_*` /
-  `sha256_invalid`）。
-- agent 收到后：本地再校验 URL 白名单 → 流式下载（封顶 64 MiB，`io.LimitReader`）
-  → SHA256 校验 → 解 tarball（白名单只允许 `tether` 这一个文件，`O_EXCL|O_NOFOLLOW`）
-  → **冒烟门**（对新二进制跑 `version`：起不来/答不对 ⇒ `smoke_failed`；报告的 **proto 纪元
-  与本 agent 不同** ⇒ `proto_bump_requires_reinstall`——跨纪元产物不许走 upgrade。两者磁盘零变更）
-  → **保留旧二进制**到 `<二进制路径>.prev` → 写升级 marker（pending，记录目标 sid/nid）→ 原子替换自身
-  → `syscall.Exec` 原地重启（PID 不变）。全程持有二进制目录的跨进程 flock——
-  **同宿主共享该二进制的多个 agent 是一个升级域**，同一时刻只有一个在途升级。
-- **克隆凭据族不进入上述升级域**：只要该 family 已产生租约行，broker 同时拒绝 basename
-  与 `<basename>-NN` 的远程升级（`clone_family_upgrade_unsupported`）。共享 home 的克隆可能
-  共用一个二进制和 marker，所谓“只升级其中一个”会改动整个 family，并让 sibling restart
-  消耗目标进程的 boot proof；唯一可靠路径是重建源镜像并重启实例。
-- 新二进制重连后跑 G.1 reconcile（保留进程清单 / 端口分配，OFFLINE → ONLINE）；
-  **register 成功即"提交"**（marker → committed）。
-- **自动回退**：新二进制起不来（启动 3 次仍失败）或 120s 内 register 不成 ⇒ agent 自己把
-  `.prev` 换回来并 re-exec 旧版本（marker → rolled_back）。回退后节点仍以旧版本在线——
-  升级失败**不再**意味着 NAT 后的 agent 永久失联。`.prev` 丢失/被改则记 rollback_failed
-  并以现状继续跑（不制造重启循环）。机制全图见
-  `distributed-broker-architecture.md §21.3`；setsid-nohup 无监督部署下"起来即崩"仍无人拉起（GAP，与旧版同险）。
+`control_ready`、`resources_migrated`、`old_generation_released` 必须各自绑定同一 attempt/scope 的
+完整 receipt，并由新 nonce 的当前 census 复核。盘面 SHA、历史 completed、注册成功或旧 worker
+仍承载业务不能替代它们。共享 canonical binary parent inode 是同一升级域；域长锁跨 exec/recovery，
+journal 短锁与之不同。root stage 只发布 source/candidate 并出具 receipt；daemon 是唯一 journal writer。
+installer 只准备 retrofit，不启动服务。pending 不 GC，历史保留最近 128 笔或 30 天（取较多）。
 
-`--wait` 下的典型输出时序（单台默认开启；与 `cmd/tether` 测试逐字钉住）：
+任何 ACTIVE 副作用后的 reverse 必须重新 cut 当前状态、generation+1；不能重放旧 image/DB/WAL。
+安全点不可得保持 `rollback_blocked`、原业务和清理责任，不删 journal/marker/prev，不为期限 kill。
+三道 reader 检查覆盖候选、actual prev 与所有 retained domains（含 settled/courier/transfer）；
+ABI1 本身不证明 `exec-v1` / `pty-v1` / `flow-v1` / `ss-v1` / `transfer-v1` / `upgrade-cut-v1` 全可读。
+legacy/未知 owner、无安全点 syscall、资源超额仍可 defer；正常验收成功臂不得以 defer 代替。
 
-```
-✔ lab/nid1: staged (→ v0.5.0, smoke ok); agent re-exec in progress
-  waiting for re-register (deadline 120s) …
-✔ nid1: registered as v0.5.0 — upgrade COMMITTED
-```
+**旧入口与首次迁入。** 不带事务 flag 的 `--url … --sha256 …` / `--all` 仍走旧 wire；当前 broker
+在发往下载/exec handler 前拒绝：已知 busy 为 `bad_request` + `legacy_busy`（64），无法证明 quiescence
+为 `try_again` + `legacy_quiescence_unproved`（75）。旧 release 的金丝雀/`--wait` 仅观察 release + ONLINE，
+不能签当前三完成点。`--interrupting` 是显式非热迁入请求；当前 CLI 仍发旧 envelope，broker 不因这个本地
+flag 获得缺失的 durable issuer/grant/reservation。它可被安全拒绝；dispatch 因果无法确认则 74，绝不算热成功。
+旧 agent 可能已有 smoke/prev/rollback，缺的是全域交接与关联 proof。capable→legacy 热回滚硬拒绝。
 
-失败时（超时仍是旧版本）：
-
-```
-✗ nid1: still v0.4.7 after deadline — likely ROLLED BACK (check agent log / broker log)
-```
-
-三条硬语义（外审 F3/F4 收紧）：
-
-- **COMMITTED 是推断不是断言**：判据为 `node.list` 轮询到"新 release + ONLINE"；权威状态查
-  agent/broker 日志（broker 侧 `agent-reported upgrade outcome` 行）。
-- **同 tag 重推 fail-closed**：目标版本 == 节点当前版本时无法用 release 变化确认，`--wait`
-  打印 ⚠ 并以 **UNCONFIRMED** 非零退出；`--all` 的金丝雀遇到它中止扇出。同 tag 修复请逐台跑。
-- **baseline 读不到就不发**：`--wait`/金丝雀需要 dispatch 前的 release 基线；`node.list`
-  查询失败会**拒绝 dispatch**（而不是盲等出假结论）。`--wait=false` 是明示放弃确认的逃生门。
-
-`--all` 的金丝雀语义：按 nid 字典序取**第一台强制 `--wait` 全确认**（staged → re-register 新版本）；
-金丝雀失败 / 回退 / 超时 ⇒ **中止其余全部节点**并打印 `canary failed, N nodes untouched`。
-金丝雀确认后其余节点沿既有 sequential 扇出（不逐台 wait），收尾提示用 `tether node ls`
-复核各节点 `RELEASE` 列。
-
-`--all` 的失败分类策略（区分瞬时 vs 配置错）：
-
-| 类型 | code | --all 行为 |
-|---|---|---|
-| 瞬时 | `node_offline` / `node_not_found` / `agent_no_responders` / `agent_malformed_resp` / `download_failed` / `download_http_retryable` / `pty_alloc_failed` / `upgrade_in_progress` | log + skip，结尾汇总 |
-| 配置 | `not_owner` / `url_not_allowed` / `sha256_invalid` / `proto_bump_requires_reinstall` / `actor_invalid` / `session_not_found_or_deleting` / `download_http_status` / `download_too_large` / `smoke_failed` | 立即终止（fail-fast） |
-| 两者皆非 | 其余（如 `pty_unavailable`） | 记为该节点失败，继续跑完剩余节点 |
-
-分类**按 wire code 精确匹配**（结构化携带在错误上，见 `cmd/tether/exitcode.go` 的 `ExitError.Code`），
-**不读错误文案**——运维可读的 hint 文案本来就会被改写，让它左右 fleet 控制流会在改一句话时
-静默把「跳过这台」变成「中止全队」。`agent_rejected:` 前缀在源头剥除，调用方按裸 code 匹配。
-
-唯一的文案兜底是 Go 自己的 transport/context 串（`deadline exceeded` / `context canceled`）——
-那类错误压根没有 wire code；且只在**没有**结构化 code 时才咨询，永不覆盖结构化判定。
-
-单台模式（不带 `--all`）任何错都直接终止。
-
-`--timeout` 默认 60s，必须大于 agent 下载 + 解压时间，超大 tarball / 慢链路记得
-显式调大。
-
-分布式 HA 影响：`node upgrade` 是 owner-only 写操作，但当前 CLI 没有
-`--ack-alerts` 覆盖；它连接任意可达 broker seed 后由 broker 做 owner、URL allowlist、
-proto 一致性和目标 ONLINE 校验。批量 `--all` 的节点枚举来自 cluster 复制后的
-session 视图；某个 broker 正在 drain / quorum 不足时，实际结果以 broker 返回的
-错误码和超时分类为准。
+flow/SS 只更换内部 carrier，原 SSH/TCP socket 与应用身份保持；legacy idle listener/retained slot 仍会拒绝。
+SS 密钥/盐/AEAD 状态只在 sealed memfd 中，不写 JSON/日志/argv/env。无 systemd 的无人监督启动即崩、
+整机故障与业务程序自身升级属于另外的恢复边界。契约见 [架构 §21.3](distributed-broker-architecture.md#213-agent-升级事务与首次迁入s8-当前路径)。
 
 ---
 
@@ -1590,41 +1585,24 @@ D 态线程），但它那次被放弃的 statfs 若后来返回成功，判定�
 
 ## 8. 升级
 
-### 8.1 三种角色的升级路径
+### 8.1 各层升级路径与证据
 
-| 角色 | 路径 | PID 变化 | 停机 |
-|---|---|---|---|
-| ctl    | `install.sh` 重跑 / 手动 wget+chmod | — | — |
-| agent  | `tether node upgrade <nid>`（owner 触发，远程） | **不变**（syscall.Exec 原地） | 几百 ms |
-| broker | 手动：`systemctl stop tether-broker && cp tether /usr/local/bin && systemctl start tether-broker` | 变 | 1-2 s |
+| 角色 / 组件 | 当前产品入口 | 身份与边界 |
+|---|---|---|
+| ctl | installer / 替换本地工件 | 退出的 ctl 不持久恢复原业务输出句柄 |
+| agent | §5.19 的 prepare→stage→原 TxID start/wait | 同 PID exec，原 child/PTY/socket/transfer 各有独立连续性 oracle |
+| broker | 下方 broker transaction 入口 | Run 内同 PID cut；current store/原 listener/flock 保留，拒绝旧无授权 reload |
+| NATS / Caddy | 下方 `admin infra` 或 `cluster upgrade --component` | 组件实际进程切换、原业务连接与内部 NC 迁移分别验证 |
+
+冷 stop/install/start 仍会中断；不能称几百 ms 或 1–2s 的无损保证。默认 single、sole-voter + standalone JS、
+N3 各自验收；同 proto 还须检查 reader/schema/config/domain 和实际 previous 工件。
 
 ### 8.2 owner 远程升级 agent
 
-```bash
-# 1. 从 GitHub Release 拿 tarball URL + SHA256SUMS
-VER=v0.1.1
-BASE=https://github.com/LinZiyang666/dist_experiment_control/releases/download/$VER
-URL=$BASE/tether_${VER}_linux_amd64.tar.gz
-SHA=$(curl -fsSL $BASE/SHA256SUMS | awk "/tether_${VER}_linux_amd64.tar.gz\$/ {print \$1}")
-
-# 2. 单台试点
-tether node upgrade gpu-01 --url $URL --sha256 $SHA
-
-# 3. 灰度 OK 后全量
-tether node upgrade --all --url $URL --sha256 $SHA
-```
-
-agent 内部步骤：
-1. broker 校验 owner / URL allowlist / proto / sha256 格式；
-2. agent 收到 → 本地再校 URL allowlist → 流式下载（≤64 MiB）→ sha256 校验 →
-   解 tar.gz（仅允许 `tether` 文件） → `O_EXCL|O_NOFOLLOW` 写到 tmp →
-   原子 rename 到自身路径 → `syscall.Exec(self)`；
-3. 新进程重连 broker → G.1 reconcile（进程 / 端口 状态保留）。
-
-如果失败：
-- broker 拒绝 ⇒ CLI 输出带 hint 的错误码（见 §9）；
-- agent 拒绝 ⇒ broker 转传 `agent_rejected:<sub-code>`，CLI 同样翻译；
-- 升级中 agent 崩溃 ⇒ 旧二进制还在原地（atomic rename 保证），systemd 拉起即恢复。
+按 §5.19 先在原 ctl HOME prepare，再在目标安装域 stage 两份 SHA 工件，然后使用原 TxID Start/wait。
+不要以 `node ls` 的新 release 替代三完成点，不手工放 `.prev` 或改 effective selector。
+真正的 N-1 发行兼容仍建议 broker 先升，agent/ctl 后升，回滚相反；S10 的 agent-first 五代机制轨迹
+以所有参与方已 capable 为前提，不授予任意旧 release 相同升级顺序。首次 legacy 迁入保持非热标签。
 
 ### 8.3 proto 升级
 
@@ -1704,6 +1682,7 @@ CLI 输出错误统一格式：`<verb> failed: <人话提示> (<架构稳定的 
 | `attach_subscribe_failed` | PTY 分配成功，但 agent 订阅 attach 主题失败——它的 NATS 连接此刻不健康 | **可重试（75）**；持续出现查 agent 到 broker 的连通性 |
 | `exec_failed`      | PTY 分了但 argv 起不来 | 检查 argv（typo / not in PATH / no exec bit） |
 | `argv_required`    | 没传 argv | `tether run gpu-01 -- bash` 形式调用 |
+| `pty_input_overflow` | legacy 输入有界队列已满，会话输入暂停并执行 Hangup/cleanup | exit 74；命令可能已执行，先核实远端状态，不盲目重跑 |
 
 > **本表在线二 §12 Y2 拆码后曾整节漏扫**（闭合核验 M17）：`/dev/ptmx 不可用` 当时仍挂在
 > `pty_alloc_failed` 名下，而那个码已改为专指资源耗尽，且新增的 `pty_unavailable` /
@@ -1779,8 +1758,18 @@ language version 1.23 is lower than the targeted Go version 1.25
 | `64` | 用法/参数错（EX_USAGE） | 缺必填 flag、互斥 flag、`--local` 越界、`name_taken`/`port_exhausted` 等需人工处置的 broker 码；也包括 **`pty_unavailable`**（宿主根本给不出 PTY：`/dev/ptmx` 不存在或容器禁止）与 **`download_http_status` / `download_too_large`**（URL 打错、产物超上限）——这三个物理上不可能靠重试成功，故归终态类而非 69 |
 | `69` | 服务不可达（EX_UNAVAILABLE） | broker/NATS 连不上、no-responder、admin socket 不在 |
 | `70` | 内部/未分类（EX_SOFTWARE） | malformed reply、解码失败、tether 没能分类的错误（=该上报的 tether 侧缺口） |
+| `74` | **已接纳、结果未知**（EX_IOERR，终态） | `exec` / `run` 的可靠路径发：远端命令**已被 agent 接纳**（create 已送达），但结果不在手上——输出被截断（流 aborted）、本地放弃等待（`--timeout` / Ctrl-C）、拥有它的 agent 实例已换代、agent 离线、会话中途被删。命令可能已带副作用跑完，**绝不盲目重试**——重跑会铸造新的 RequestID 再执行一次。详见 §9.13.2 |
 | `75` | 瞬时可重试（EX_TEMPFAIL） | `leader_unavailable`/`home_catching_up`/`catch_up_stalled`、deadline、no-responder 的 agent |
 | `77` | 权限（EX_NOPERM） | `not_owner`/`not_a_member`、非 leader 上跑 cluster mutate（`not_leader`） |
+
+热更新相关 wire code（完整原因表及批量升级规则见 §5.19）：
+
+| wire code | 退出码 | 处置 |
+|---|---|---|
+| `upgrade_deferred` | `75` | 保留并检查完整 `deferred: <reason> (<detail>); …`，解除忙资源或其它阻塞后重试；`--all` 在金丝雀确认后跳过此节点并继续。 |
+| `image_abi_unsupported` | `64` | 具体诊断保留并追加 hint：无 ABI 行且有待交接状态时换热更新 release 或排空；ABI 高于支持值时须换兼容候选，排空无效。初检拒绝无新 marker，冻结复核晚拒绝留下回滚收据；`--all` 停止后续分发。 |
+| `try_again`（detail: `agent_upgrading`） | `75` | 正在切换映像，业务请求暂未接纳；等几秒重试。 |
+| `upgrade_in_progress` | `75` | 原升级仍持准入或 pending 仍受保护；过期但有活 owner 也拒绝。若 `resource_phase=rollback_blocked`，解除原因后自动重试；不要删除 marker 或覆盖 `.prev`（§5.19）。 |
 
 **保留区间（不来自上表）**：
 
@@ -1797,9 +1786,10 @@ language version 1.23 is lower than the targeted Go version 1.25
   两者仍可区分，只是**不靠命令名**：透传码是远端进程自己选的码、stderr 上没有 tether 的解释；
   分类码一定带一行 `exec: <说明> (<broker 码>)`。
 
-**健壮重试规则**：把 `69`/`70`/`75` 当可重试（退避），仅 `64`/`77` 当终态。
+**健壮重试规则**：把 `69`/`70`/`75` 当可重试（退避），仅 `64`/`74`/`77` 当终态。
 **唯一的成文例外是 `reply_too_large`（h1 A2）**：它也退 `70`，但重试必然再次失败——broker 每次都会
-重新构造同一个超限回包。见下面 §9.13.1。
+重新构造同一个超限回包。见下面 §9.13.1。`74` 进终态类的理由在 §9.13.2：它意味着命令**可能已经执行过**，
+重试规则若把它当可重试，就会让自动化把一条带副作用的命令再跑一遍。
 
 > **这条规则没有例外，是靠把码归对类来维持的**（线二内审 M17）。审查发现 `pty_unavailable` 当时归了
 > `69`，而它自己的 hint 写着「retrying will not help until the host changes」——同一个码同时被规则说成
@@ -1840,11 +1830,105 @@ ERROR 的 subject 一起上报**，不要写重试循环。
 > 仍留在 `70` 的是**经判断确实无法分类**的兜底分支（如 `io_error`：磁盘满与瞬时 EIO 落进同一分支，
 > 无从区分）。它们在守门测试里带**书面理由**登记，而不是继续隐式落到 default。
 
+#### 9.13.2 `exec` 可靠路径的退出码（热更新 S1）
+
+`tether exec` 自 S1 起优先走**可靠路径**（`process-resume` 协议：稳定请求身份、断链续接、丢回复不重建；
+见 §5.12）。它把一次 exec 分成两个相位，退出码按相位而不是按错误文本归类：
+
+| 相位 | 情形 | 退出码 |
+|---|---|---|
+| **create 送达前**（probe / create 尚未发出） | 传输错误、no-responder、超时 | `69`/`75`（可重试：命令从未被接纳） |
+| | agent 或 broker 明确不支持可靠协议 | 自动退回 legacy `exec`（无退出码变化；probe 最多 2 s） |
+| | 权限/会话错误（`not_a_member`、`session_not_found_or_deleting`…） | `77`/`64`（不降级到 legacy） |
+| **create 送达后** | 远端进程真的跑起来并正常结束 | **透传**远端退出码；被信号杀 → `128+sig` |
+| | 远端从未启动（agent 报 spawn 失败：`remote_fs_spawn_timeout`、`too_many_wedged_spawns`…） | 该码自己的类（`75`/`64`：重试一条从未启动的命令是安全的） |
+| | 任一输出流 aborted（字节被截断）、或 agent 记录了 setup/wait 失败 | **`74`** |
+| | `--timeout` 到期 | **`74`**，stderr 写明「gave up waiting after --timeout …」与「远端任务**未被杀死**」 |
+| | Ctrl-C / SIGTERM | **`74`**，stderr 写明「interrupted (Ctrl-C/SIGTERM)」——不冒充超时到期 |
+| | agent 实例换代（`process_instance_lost`）、任务过期（`process_expired`）、agent OFFLINE、会话被删（`session_not_found_or_deleting`）、连接关闭 | **`74`**，stderr 附 wire 码与任务句柄 |
+| | 权限被撤（`not_a_member`） | **`77`**（撤权不伪装成结果未知） |
+| | agent 准入表满（`process_capacity`）——它只可能是 create 自己的回复，且只在此 handle **没有任何记录**时发出，所以「什么都没被接纳」是构造上确定的 | **`75`**（可重试：表排空后重发同一命令是安全的） |
+| | 请求体超过 1 MiB（`process_request_too_large`：argv + env + `--stdin` 一起）——ctl 在发出前本地拒绝；若 broker 收到一份仍以 CallID 0 拒绝，ctl 照样呈现而不重发 | **`64`**（同一命令下次还是同样大） |
+| | create 送达前 argv/`--stdin` 超过 nats-server 的 `max_payload`（`nats: maximum payload exceeded`） | **`64`**（legacy 路径同） |
+
+要点：
+
+- **`74` 一律终态**：命令可能已经执行过；自动化若要重试，必须先用 `ps` 或业务自身的幂等标记核实。
+  例外只有上表两个**构造上证明「什么都没被接纳」**的码（`process_capacity` → 75、`process_request_too_large` → 64）。
+- **ctl 中断 = 放弃，不是 kill**：`--timeout` / Ctrl-C 只让本地进程退出，远端任务继续跑到自己退出。
+  **没有 per-task 的 kill 动词**（`tether kill` 不存在，§4 的表也这么写）：要停掉它，只有三条真实的路——
+  它自己结束；`tether session rm <sid>`（杀掉该会话在**所有**节点上的**全部**任务，`session_destroyed` 事件让每个
+  agent SIGKILL 进程组并 tombstone）；或到节点上停进程。stderr 的指引只写这三条。没有人 ACK 输出时，每流最多在
+  agent 上保留 8 MiB，之后对原管道施加背压——被放弃的任务先卡在写上；**租约到期且 15 分钟无人碰它**之后，agent 把
+  那条已满的流**截断**：child 继续运行到自己退出，之后的输出被丢弃，已保留的 8 MiB 仍在——回来的 ctl 拿到这 8 MiB
+  与一个 `abandoned:` 开头的流截断标记（该流按 aborted 结清，其它未满的流与退出码不受影响）。
+  已到终态、无人结算的任务在租约到期 + 2 分钟后释放输出（agent 保留终态 tombstone 15 分钟，
+  晚到的 ctl 可以查到 `process_output_discarded` 的退出码但拿不回字节）。
+- **空闲轮询的节奏**：远端命令沉默时 ctl 仍要 ACK 才能续接，每次 ACK 是一趟 ctl→broker→agent 往返（broker 侧三次
+  SQLite 读）。间隔从 20 ms 起翻倍到 250 ms 封顶、一有字节就回到 20 ms——一条安静的长命令对 broker 约 4 请求/s
+  （原为 ~48），沉默后的第一个字节最多迟 250 ms + 一趟往返。
+- **legacy fallback 的税**：对不支持可靠协议的 agent（v0.6.0）或 broker，每条 `exec` 先花最多 2 s probe 再
+  退回 legacy；v0.6.0 agent 会为每次 probe 打几条 `unknown forwarded verb` 警告日志——升级 agent 即消失。
+  **broker 重启窗内发起的新 `exec`**（broker 缺席 = 与旧 broker同样的 no-responder）也会在 2 s 后退回 legacy，
+  该窗内的新请求不承诺可靠路径。
+- **carrier 可换**：agent 的 NATS 会话重建、broker 重启、nats-server 重启期间，已接纳的 exec 由 ctl 在同一
+  连接上续接；broker 对 attach 类请求容忍节点 STALE（心跳缺口 ≤60 s），只在 OFFLINE 时以 `node_offline`
+  拒绝。代价：agent 真死时最多再等 55 s 才得到 `74`。
+- **被撤权的 ctl**：ctl 连接现在带 `IgnoreAuthErrorAbort`（nats-server 重启时 auth_callout 黑窗内两次同错
+  不再永久关闭连接），所以在 `exec`/`run` 中途被撤权的 ctl 会一直重连到 `--timeout`/Ctrl-C；撤权仍由
+  broker 对每条请求以 `77` 拒绝收口。
+- **连接级有界重试**：对**曾在本会话成功认证过**的身份（`~/.tether/auth_receipts/<sid>`），CONNECT 阶段
+  的超时 / no-servers / 授权拒绝在 5 s 预算内退避重试，覆盖 broker/nats-server 滚动重启的黑窗。最坏墙钟 =
+  5 s 预算 + **一次** connect 尝试：单 URL 拨号时是一个端点的 2 s 超时（≈ 7 s）；走扩展拨号池（持久化的
+  `broker_url` 默认值被 manifest 展开成 N 个端点）时一次尝试可达 N × 3 s。从未认证过的身份单次尝试、快速失败；
+  **`login`（含 `--pin` 激活）永远不重试**——错 PIN 在第一次尝试就失败，不会把 5 s 预算花在每次都真实扣减
+  per-IP PIN 配额的重试上。收据按 (home, session, key) 记录：同名 session 在另一台 broker 上会被当作「认证过」而
+  多试几次（≤ 5 s、仍以 77 收口），是已知的宽松面。
+
+#### 9.13.3 `run` 可靠路径的退出码（热更新 S4）
+
+| 阶段 / 结果 | exit class |
+|---|---|
+| create 前旧协议/本地 stdio 不支持 | 回落 legacy，并非错误类；stdio 回落打印 §5.13 的提示 |
+| 参数、确定性超限且尚未接纳 | 64 |
+| 权限拒绝 | 77，任何阶段不回落 |
+| 未接纳的容量、pending busy、暂时不可用 | 75，条件改变后可重试；收到明确未接纳 busy 才按此类处理 |
+| 已发 create 后结果未知、180 s 耗尽、本地取消、instance lost/revoked、legacy 输入 overflow | 74，任务可能已执行，不盲目重跑 |
+| InputError/OutputError，含远端 rc0 但 A<Q | 交付尾流、结清 terminal 后 74，保留 A/Q、错误和真实远端结果 |
+| 正常完整结清 | 透传远端退出码；信号为 128+sig |
+
+终端恢复和本地 I/O join 在返回或退出之前完成。未知可靠拒绝有明确错误，不静默落 70；
+create 后 unsupported 也不 legacy 重建。session rm 影响整个会话，当前没有独立 `tether kill` 命令。
+
+#### 9.13.4 S7 transfer exit codes (PENDING receipts)
+
+This table follows the frozen transfer classification contract; P25/P27 implement the leaf classifier and
+CLI mapping, and P34 checks emit→classify→exit coverage. No runtime result is certified here.
+
+| Code / result | Exit | Meaning and handling |
+|---|---|---|
+| Exact `complete` receipt | 0 | Main invocation completed with confirmed history |
+| `transfer_unknown` legacy error | Existing legacy classifier | Not a v1 absence proof; no new v1 standalone error mapping is inferred |
+| `transfer_intent_conflict`, `transfer_object_version_mismatch`, `transfer_source_changed`, `transfer_payload_unsupported` | 64 | Deterministic intent/version/source/geometry refusal; correct inputs/configuration |
+| `transfer_permit_expired` | PENDING P25/P27 classifier receipt | First creation window ended; never recreate the old invocation; the plan does not assign this code an explicit standalone class |
+| `transfer_budget_exceeded` (admission) | 64 | Requested size/rate exceeds the 2108s ceiling before side effects |
+| `transfer_storage_horizon`, `transfer_capacity_exceeded`, `transfer_owner_recovering` | 75 | Pre-admission storage/capacity or owner recovery refusal; retain original responsibilities |
+| `session_not_found_or_deleting` / unsettled `session rm` | 75 | Ordinary business revoked; pending transfer IDs/reasons, DELETING evidence retained |
+| `not_a_member`, `not_owner_or_creator` / invalid identity | 77 | Authorization refused; an already-sent mutation also remains unresolved |
+| `transfer_result_unknown`, `transfer_commit_inflight`, `transfer_durability_unknown`, `transfer_terminal_conflict`, `transfer_object_conflict` | 74 | Main outcome cannot be safely confirmed; preserve evidence and query original ID |
+| `transfer_canceled`, post-admission `transfer_budget_exceeded` | By failed receipt's classified cause; 74 without receipt | Never call an uncertain outcome failed; completed primitive cannot become canceled |
+| Affirmative `state=unknown` status | 0 for the read-only query | Authority proved absence, not main-command success |
+| `transfer_reconcile_required` | Internal only | Hand control to the engine's status-first reconciliation; no fake retry success |
+| `settlement_abandoned` with `outcome_unknown=true` | Failed terminal reason; removal exit 0 only after deletion completes | Explicit abandonment is not a transfer-complete receipt or proof of no target effect |
+
+Business exit 75 is distinct from drill INCOMPLETE4. A fresh command after a sent-unknown result can repeat
+side effects; the generic69/70/75 backoff rule does not authorize replay of an uncertain mutation.
+
 ### 9.14 机器 JSON 接口（`--json`）
 
 list/status/结果类命令支持 `--json`（**opt-in，默认人读文本字节不变**）：`node ls` / `ps` /
 `session ls` / `alert ls` / `expose` / `expose rm` / `admin sessions·nodes·audit` / `cluster status`。
-（`node upgrade --all` 与 `transfer` 的 `--json` 在 B2.1 补。）
+（`node upgrade --all` 与 `transfer status --json` 已提供；其他输出面在 B2.1 补。）
 
 - 上述 8 个 list/result 载体各带 **`schema`（串判别符）+ `schema_version`（int）**；监控按
   `(schema, schema_version)` 派发。**例外**：`cluster status` 家族——socket/offline 报告带
@@ -2093,3 +2177,83 @@ GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -o tether_darwin_arm64
 
 排查 / 反馈：把 `tether version` + 完整错误输出 + `journalctl -u tether-broker
 --since '10 min ago'` 一起贴到 issue。
+
+### Broker image transaction entry (S8; final receipts pending)
+
+`node upgrade` 只更新 agent。broker 的独立状态查询可用：
+
+```sh
+tether broker upgrade status --socket <admin-socket>
+```
+
+返回的 `BrokerImageStatus` 只有 running_sha256/generation/phase/cut_id/mode。
+要执行热事务，候选须由合法供给放在 broker 已注册的 canonical staged 路径；describe 会验证实际候选
+version/SHA/reader。随后按同一事务走显式 stage（与 agent 示例相同，source 为 broker 的实际执行字节）：
+
+```sh
+tether broker upgrade reload --socket <admin-socket> --to-version <release> \
+  --expect-sha256 <binary-sha256> --prepare-only --grant-out <grant.json>
+tether upgrade stage --grant <grant.json> --source /proc/<broker-pid>/exe \
+  --candidate <candidate-binary> --receipt-out <receipt.json>
+tether broker upgrade reload --socket <admin-socket> --tx-id <tx-id> --artifact-receipt <receipt.json>
+tether broker upgrade status --socket <admin-socket> --tx-id <tx-id> --json
+tether broker upgrade wait --socket <admin-socket> --tx-id <tx-id> --timeout 2m
+tether broker upgrade rollback --socket <admin-socket> --tx-id <tx-id> --timeout 2m
+```
+
+prepare 与 start/query 使用同一 ctl HOME（可显式 `--home`）；本地 admin socket 权限提供授权。
+只给 to-version/expect-sha256 的旧 reload envelope 会被 legacy policy 拒绝，不能代替事务 grant。
+N≥3 每步前取得 fresh quorum/config/role 并转移领导权；`cluster upgrade --broker-only` 是显式范围，
+保留共址 agent。`cluster upgrade --resume <parent-tx-id>` 继续原 sealed parent plan，不重新规划。
+无 component 的 cluster roll 仍受真实子入口 policy 约束，不能从命令存在推断已放行 legacy child。
+备份用于灾难恢复；ACTIVE hot rollback 必须保留当前 DB/ACK，不做 backup restore。
+37/39.BR、最终门禁和资源收据仍 PENDING；详见 [运维](broker-ops.md#s8-transaction-operations)。
+
+### Infrastructure commands (S9)
+
+本地单节点无需先 cluster init；授权来自 admin Unix socket，实际特权操作还要通过 root policy。
+以下命令当前存在；85/86 实跑及最终 P39 收据为 NOT_RUN/PENDING：
+
+```sh
+tether admin infra upgrade --socket <admin-socket> --component nats \
+  --to-version 2.14.6 --expect-sha256 <catalog-binary-sha256>
+tether admin infra upgrade --socket <admin-socket> --component caddy \
+  --to-version 2.7.6 --expect-sha256 <catalog-binary-sha256>
+tether admin infra upgrade --socket <admin-socket> --component caddy --reload-config --config-sha256 <managed-config-sha256>
+tether admin infra upgrade --socket <admin-socket> --component nats --rollback
+tether admin infra status --socket <admin-socket> --tx <tx-id>
+tether admin infra recover --socket <admin-socket> --tx <tx-id>
+```
+
+集群入口是 `cluster upgrade --component nats|caddy`，同样使用 to-version/expect-sha256、rollback 或
+Caddy reload-config/config-sha256；签名管理要求 `--account-seed <path>`。查询与恢复用原 ID：
+
+```sh
+tether cluster upgrade --component nats --status <tx-id> --account-seed <path>
+tether cluster upgrade --component nats --recover <tx-id> --account-seed <path>
+```
+
+infra 与 `--broker-only` / `--ack-writefence` / `--backup-taken` / `--resume` 互斥。
+NATS/Caddy 不走 agent/broker image planner。缺能力不降级；lost reply 只查询原事务，不重发新 Start。
+`admin infra rotate-policy` 当前显式 unsupported；不要把存在的 CLI help 当作已落地 policy rotation。
+
+status 固定输出 `infracontract.Status` JSON，无需 `--json`：字段为 `Tx,Step,Phase,Revision,Code,Detail,Before,Current,Census,Proof`，
+保持 Go DTO 的大小写。ID/Digest 是定长字节数组，Phase 为数字：0 unknown，1 prepared，2 staged，3 ready，
+4 moving，5 cutting，6 verifying，7 returning，8 retiring，9 completed，10 deferred，11 halted。
+这是公开 report 的投影，未供给的 Before/Detail/完整进程字段可为零值；不能把零值解释成“旧进程已退出”。
+成功读取 unknown/halted/deferred 也 rc0；upgrade/recover 只有 completed、有 running SHA/proof、step/revision
+且 old-owner pending=0 才能成功。120s 超时保留责任和健康路径，显式 recover 同一事务。
+
+| rc | Infra code |
+|---|---|
+| 64 | `infra_unsupported` / `infra_artifact_invalid` / `infra_config_invalid` / `infra_incompatible` |
+| 77 | `infra_permission_denied` / `infra_policy_stale` |
+| 75 | `infra_not_enabled` / `infra_busy` / `infra_not_ready` / `infra_inventory_incomplete` / `infra_budget_exceeded` |
+| 74 | `infra_result_unknown` / `infra_recovery_required` |
+| 70 | `infra_internal`（未知 code 也 fail-closed 为该类） |
+
+hot 支持面限定 linux/amd64 + systemd/pidfd/cgroup/nft，stock NATS 2.14.5↔2.14.6、Caddy 2.7.5↔2.7.6。
+NATS N2、缺实际 quorum/current/replica、未知资产先 defer；不把 tether sole voter 当 clustered-JS N1。
+Caddy managed filesystem ACME/HTTP/WSS/TCP 与有限普通 HTTP 在范围内，活 QUIC/未知第三方长连接/
+自定义模块/外部 storage 先 defer。其他平台保留冷安装/构建；不能从 cross-build 签 hot 或 Darwin native。
+权限、证书目录、canonical ingress 和旧/临时进程退休细节见 [架构 §22.12](distributed-broker-architecture.md#2212-s9-natscaddy-infrastructure-receipts-pending)。

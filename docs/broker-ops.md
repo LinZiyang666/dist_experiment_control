@@ -811,34 +811,64 @@ root-init 污染的机器：停 daemon → `sudo chown -R tether:tether /var/lib
 （nats route mesh 走标准 x509、需 `subjectAltName` 匹配 route-URL host；tether 自己的 raft transport 不需要，
 勿被 `internal/cluster/transport.go` 的注释误导）。
 
-### 8.7 agent 升级安全（upgrade-safety 增量）— 运维须知
+### 8.7 agent 升级安全（S8 事务与 legacy 边界）
 
-机制全图（冒烟门 / prev 槽 / marker / 自动回退）见 `distributed-broker-architecture.md §21.3`，
-使用者视角见 `usage.md §5.19`。运维需要知道的硬事实：
+机制见 [架构 §21.3](distributed-broker-architecture.md#213-agent-升级事务与首次迁入s8-当前路径)，
+可执行 prepare→stage→start→wait 见 [usage §5.19](usage.md#519-tether-node-upgrade)。运维需保留：
 
-- **磁盘足迹**：升级期间 agent 二进制目录会多出 `<二进制>.prev`（旧版硬链接，≈10 MiB）与
-  `.tether-upgrade.json`（marker，<1 KiB），升级提交后 prev 保留（下次升级时被替换）。
-  小盘 VPS（如 racknerd）`df` 时记得算上这份常驻 ≈10 MiB；下载/解压期间另有一份新二进制的
-  **瞬时** tmp 副本（同目录 `.tether-upgrade-*`，安装结束即删，峰值再 +≈10 MiB）。
-- **首跳无保护**：把带本设施的第一个 release 推上现网的那一次 `node upgrade`，执行者仍是
-  **旧 agent 代码**（无冒烟/无 prev/无回退），风险与历史版本等同——那一跳请手工金丝雀：
-  先升 1 台非关键 agent，`tether node ls` 确认 RELEASE 列变了再扇出。
-- **setsid-nohup 部署 GAP**：无监督路径下"新二进制起来即崩"无人拉起（与旧版同险）；
-  systemd 部署（system 层或 user 层单元）不受此限。
-- **NAT 弱网下的假回退**：120s 内 register 不成会触发自动回退——弱网节点可能明明二进制没问题
-  也被退回旧版。无害（节点仍在线、旧版本），代价是浪费一轮：网络恢复后重跑一次 upgrade 即可。
-- **回退的观测**（外审 F7 订正措辞）：ctl 的 `--wait` **不消费任何持久升级状态**——
-  `COMMITTED` 是对 `node.list` release 轮询的**推断**（新 release + ONLINE），超时打印的是
-  `likely ROLLED BACK`（推断，非断言）。**权威状态**看两处日志：agent log 的状态机行、
-  broker log 的 `agent-reported upgrade outcome` 行（agent 重新 register 时携带
-  `upgrade_state`：committed / rolled_back / rollback_failed）。
-- **同宿主多 agent = 一个升级域**（外审 F1 裁决）：共享同一 `tether` 二进制的多个 agent
-  共享 prev/marker，同一时刻只允许一个在途升级（其余节点该跳返回 `upgrade_in_progress`，
-  `--all` 会 transient-skip、稍后重试）；升级的提交/回退只由 `node upgrade` 点名的那个
-  nid 驱动。跨进程互斥由二进制目录下的 `.tether-upgrade.lock`（flock）保证。
-- **同 tag 重装（same-tag re-push）**：`--wait` 无法用 release 变化区分"旧行"与"新 register"，
-  一律 fail-closed 报 **UNCONFIRMED**（exit 非零）；`--all` 的金丝雀遇到它会中止扇出。
-  同 tag 修复损坏二进制请**逐台**执行并以 agent/broker 日志人工确认。
+- **工件与 journal。** 计算当前 source 和 candidate 的独立 executable SHA，并预留两份 immutable 工件、
+  journal/archive 及临时下载空间；不再以“marker <1KiB / prev ≈10MiB”估算全域状态。root stage 只发布
+  grant 绑定的工件和 receipt，daemon 唯一写 journal，canonical 启动入口按 component effective selector 解析。
+- **首跳不是无保护。** 真实旧版已有 smoke/prev/rollback 的版本不能被描述成全无保护；缺的是全域 image/
+  quiescence、授权与因果 proof。默认旧 envelope 在新 broker 上 busy→bad_request/legacy_busy（64），
+  无法证明空闲→try_again/legacy_quiescence_unproved（75）。显式 interrupting 仍是 non_hot，不能冲抵热成功。
+- **提交与回退。** 当前 status 返回历史记录与 fresh observation；运行/effective SHA、三 completion receipts、
+  完整 census 与旧代退休共同证明完成。旧 release 的 COMMITTED 文案仅是 release+ONLINE 推断。
+  ACTIVE 后 reverse 必须当前态 generation+1，不用旧 image/DB/WAL。rollback_blocked 保持业务并待安全点。
+- **共享安装域。** 相同 canonical binary parent inode 的参与者共用长域锁，跨 exec/recovery/retirement；
+  与 journal RMW 短锁不同。共址 agent/broker/infra 不得各持一把互不相干的安装锁。
+- **恢复边界。** pending 永不 GC；历史保留最近128笔或30天（取较多）；下一 Start 关闭前一回滚窗口。
+  损坏状态 fail-closed，不能手工删除 marker/journal/selector 解除锁。无监督 setsid-nohup 启动即崩仍需外部恢复，
+  不从 systemd 结果推断所有部署形态。S8 drill 38/39 与 A-6 最终收据仍 NOT_RUN/PENDING。
+
+#### S5 carrier and SS operations
+
+The [S5 flow/SS contract](distributed-broker-architecture.md#228-s5-flow-and-ss-domains-binding-contract)
+is for agent exec and carrier rebuilding within the same broker process. Broker exec and SQLite/Raft
+handoff remain S6, NATS/Caddy switching S9. [Final S5 receipts](reviews/hot-update-evidence.md#16-s5-flow-carrier-ss-receipt-index)
+record the historical unsigned §16 rows; scoped stage closure/carry is in evidence §17/§18. Historical
+receipts certify only their recorded candidates.
+
+- A detached v1 Endpoint retains listener, original public sockets and allocation for its first absolute
+  8 s grace. Keep normal reaper/ready tracking; do not pause it, free the port, re-expose or redial application
+  sockets to manufacture continuity. Normal survivor/new-request stall≤5 s; freeze500 ms is calibration.
+- TLS/pins are checked before REGISTER. No ALPN intersection is legacy raw; a selected v1 error never
+  downgrades. Legacy idle listener/retained slot still produces legacy_session_busy; first migration is S8.
+- Inspect opaque owner/carrier IDs, generation/epoch, AppliedRevision, domain FD/replay counts and typed
+  reasons. Do not dump grants, tickets, keys, salts/nonces, target addresses or payloads into support logs.
+  Secrets travel in sealed memfd; marker and JSON bundle carry references/counts only.
+- Both authority lookups disable SQLite’s busy handler during their bounded single read transaction and
+  restore it before pool reuse. Expiry is retryable; v1 REGISTER preserves try_again/home_catching_up.
+  Fresh system-proxy grants require node participation in the same snapshot.
+- SS authority is a bounded local-applied transaction with known lag rejected, not a global leader-commit
+  revocation barrier. Rotation retains old material for authorized old actors; new trials use current keys.
+  Revoke must shut down originals and dup plus the public flow, including a silent victim; confirm survivors
+  independently. Authority orders generation, epoch, then revision: higher-generation recovery may lower
+  epoch/revision, stale grants have no side effects, and fresh RESUME dominates delayed pushes. Planned
+  freeze keeps previously real readiness until the original detached-grace deadline; expiry, revocation
+  and teardown clear it. Material FIFO8192 and node-history64 are explicit limits, not permanent salt memory.
+- At capacity, remove revoked authority first, refuse new material/authentication and retain history/survivors.
+  image_too_large describes byte/FD limits; ss_state_unrepresentable describes incomplete SS state;
+  both preserve existing ownership. Exec/PTY/flow share 256 MiB; each flow reserves an 8 MiB send log.
+  Images separately bound 32 active flows and 4096 retained terminal receipts; settled history leaves the
+  live RESUME set. OPEN admission’s remaining conservative combined-record ceiling is tracked in §22.8.
+- Pending old-reader rollback keeps new flow/SS domain admission closed until commit is durable.
+  Commit marker write failure after readiness keeps the genuine 120 s watchdog armed; it cuts current state
+  before rollback. Keep .prev/marker and diagnose rollback_blocked; do not manually force the W receipt.
+- Candidate and actual prev require SHA-bound support for every retained domain, even idle salt/retirement
+  state. The final prepareImageCut check includes late admission and every reader. Pristine Flow/SS
+  Detach transfers the exact sealed/business closure without socket shutdown; active rollback cuts current
+  state. `prev ∈ {running image, candidate}` permits a valid shared binary sibling; any third SHA refuses.
 
 ### 8.8 h1 增量的 broker 迁移（日志封顶 + 存储 GC + 新告警种类）
 
@@ -1040,3 +1070,154 @@ admin: dial /var/run/tether/admin.sock: connect: permission denied
 分布式 HA 额外只在 broker 私网/安全组内放行 `6222/tcp` 和 `7400/tcp`，不对公网开放。
 
 ---
+
+## S6 broker image operations (final receipts pending)
+
+[Architecture §22.9](distributed-broker-architecture.md#229-s6-broker-image-binding-contract-final-receipts-pending)
+and the [receipt boundary](reviews/hot-update-tasklist.md#s6-broker-image-receipt-boundary) govern planned broker cuts.
+The CLI tree in `cmd/tether/cluster_upgrade.go` contains these local operations:
+
+```sh
+tether broker upgrade status --socket <admin-socket>
+tether broker upgrade reload --socket <admin-socket> --to-version <release> --expect-sha256 <staged-sha256>
+```
+
+These are operator syntax examples, not executed cut receipts. The status entry reads image state;
+the bare reload form is now refused by S8 legacy policy. Use the transaction sequence below. The actual
+cut stays inside Broker.Run through brokerimage.ReloadCurrentStore; final gates/drills remain pending. Do not infer hot continuity from a successful
+reload reply. The cold stop/start recipe in §8.4 interrupts business.
+The S6 primary lane is single mode and a separate sole-voter lane, both same-PID exec with ≤5s
+maximum write/control/flow stall. N≥3 transfers leadership before each step. `node upgrade` is agent-only;
+there is no `node upgrade --broker` alias. `cluster upgrade --broker-only` leaves the co-located agent running.
+
+Check status `running_sha256`, `generation`, `mode`, `phase` and `cut_id` (the actual
+`proto.BrokerImageStatus` fields). Auth/control-ready timing and holder/proof observations require separate
+receipts; they are not fields of this status object. Staged disk SHA/version alone cannot prove the running image changed.
+Missing maintenance capability/installation ACK, expired proof, unsafe close or legacy/unknown transfer responsibility
+refuses before cut. Keep the business running and diagnose the reason. The S6 live-transfer refusal
+is the legacy baseline; S7 capable cuts are PENDING under the settlement operations contract below.
+Candidate/previous reader probes and config checks never open the live store. Hot reopen accepts only the
+exact current schema with no migration. Hot rollback preserves the current DB and takes current state
+after ACTIVE; a backup restore is an independent disaster-recovery operation with acknowledged data loss.
+Keep external NATS/JetStream and Caddy running: S6 does not upgrade them. P35 must archive callout blackout,
+ACK-prefix/read-before-replay, native verdict, running-SHA and current-stop receipts before signing completion.
+
+
+## S7 transfer settlement operations (PENDING receipts)
+
+[Architecture §22.10](distributed-broker-architecture.md#2210-s7-transfer-continuation-binding-contract-receipts-pending)
+and the [frozen plan](reviews/hot-update-transfer-continuation-plan.md) govern transfer-v1.
+Final product acceptance/deployments remain NOT_RUN pending owner receipts and P37 evidence.
+S7 push/pull rate, transfer status and session abandonment CLI syntax is present; workspace --help
+checks do not sign behavior.
+
+For a live capable transfer, planned agent/broker cut should preserve the original ID, NUID, source/tmp/
+parent OFDs, deadline, Grant and exact publication/cleanup responsibility without waiting for completion.
+Prepared and courier-only entries still require transfer-v1 in candidate and actual previous readers.
+Legacy/unknown owners, an unrepresentable syscall, missing reader or capacity excess must safely defer
+while originals remain alive. A status reply is insufficient to sign original FD or byte continuity.
+
+Before creation, check the recovery horizon H=2228s. OBJ Duplicates must be at least H; MaxAge must be 0
+or at least H, with compatible server duplicate-window limits and full-version reservation. Existing 48h
+TTL is valid and must be preserved. History requires MaxAge=0, DiscardNew and no message/subject eviction.
+`transfer_storage_horizon` refuses before the first chunk with required Duplicates/MaxAge; reconcile
+operator configuration through its normal owner. Transfer admission does not change TTL or downgrade.
+Broker config patches must preserve operator MaxBytes/TTL/placement/storage/replicas/compression values
+outside their responsibility. Controller/agent permissions do not include STREAM.UPDATE/CREATE/DELETE/PURGE.
+
+For unresolved operations, retain the original ID and inspect read-only status/history:
+
+```sh
+tether transfer status <transfer-id> --node <nid> --json
+tether history --kind transfer
+```
+
+Unknown is an affirmative ready-origin census result. Unreachable origin, incomplete cold census,
+conflicting receipts or unknown directory durability must remain errors/pending evidence. Raft commit,
+NATS Flush and an arbitrary terminal do not prove exact history; canonical START=1 and TERMINAL=1,
+sequence/digest and authenticated original receiver outcome are required. A landed target with failed
+parent Sync remains durability-unknown, not a reason to rename again.
+
+`session rm` first marks DELETING and revokes ordinary business. Within5s, unsettled receiver authority
+or START/TERMINAL delivery returns 75 with pending IDs/reasons. Keep original history/OBJ/SQL while
+settlement continues; cold/periodic orphan sweeps also protect that DELETING SID. SettlementCapsule
+reconnection proves the receiver NKey and grants only the original entry's terminal/status/cancel-settlement
+and private reply subjects, with no normal CMD/prepare/OBJ permissions. Never expose the capsule in logs
+or status JSON. Retry the same removal once obligations retire: the retry that passes the barrier and
+drives cleanup returns OK (exit 0). An ordinary retry without settlement involvement keeps
+`already_deleting` (exit 64). Absent flag, no unsettled deletion.
+
+If the original receiver is permanently unreachable, the explicit LQ1 escape is (live receipt pending):
+
+```sh
+tether session rm <sid> --abandon-unsettled-transfers
+```
+
+This stages one exact failed terminal per unsettled transfer, reason `settlement_abandoned`,
+`outcome_unknown=true`, before normal history→OBJ→SQL deletion. It never certifies complete or an
+unchanged target. Preserve the continuous observer/history evidence before streams disappear;
+a post-deletion empty history is not proof. `--ack-alerts` has no settlement-abandonment effect.
+The [exit table](usage.md#9134-s7-transfer-exit-codes-pending-receipts) maps pending removal/storage
+refusals to 75, unresolved transfer results to 74 and permission refusal to 77.
+
+Both TTL object List sites need cancellable bounded contexts, cancel/join and ≤5s reconcile passes;
+passing a Run root alone can wedge all passes when the final metadata expires. The existing incident
+[TTL List wedge](deploy-tier-gotchas.md#2026-09-30--xfer-reaper-在没有截止时间的-ctx-上调-storelist桶一旦带-ttl它会卡住并且串行冻结全部-reconcile-pass)
+remains open pending P17 T30/mutation and P37 receipts. Do not delete objects merely because old age or
+local tracker absence suggests abandonment. GC needs original-origin retirement proof; unreachable origins
+retain evidence, while proven orphans must still be reclaimed by the finalizer.
+
+S7 covers planned cut and same-store JS restart; it does not certify arbitrary kill-9/power-loss rename
+recovery, a dead ctl's transfer output reacquisition, or NATS/Caddy binary rollout (S9). Final 63/64/61/37.T/39.BR,
+resource, platform and cost receipts remain pending. Native drill red expectations are not exit 0 successes.
+
+## S8 transaction operations
+
+Use [the agent/broker CLI sequences](usage.md#broker-image-transaction-entry-s8-final-receipts-pending).
+Prepare describes the actual live target before candidate work, returns an inert grant and records it
+in the original ctl HOME. Root `upgrade stage` validates that grant, publishes immutable source and
+candidate images and returns a receipt. Only the original actor/admin Start advances the daemon journal.
+For lost replies, keep TxID/receipt and query/wait; do not repeat Prepare with a new execution identity.
+No installer or fixture may fill `.prev`, journal or effective selector in place of the product operation.
+
+`status --tx-id --json` returns the private Historical/Observation/Metadata View. Query rc0 means a read,
+including unknown ownership; wait/rollback require a fresh current proof and return 74 when unsettled.
+Control-ready, migrated original/late resources and old-generation release must all bind the same scope,
+revision/direction/cut and running SHA. Pending is never GC'd; archive requires a proven dead owner.
+Retain source/candidate/actual-prev hashes, domain registration, journal and raw receipts for diagnosis.
+ACTIVE rollback re-exports current state at generation+1; backup restore would discard later ACKs.
+Shared-bin/co-located participants keep one registered domain lease across exec and retirement.
+N3 transfers leadership before each step, and release N-1 order stays broker-first then agent/ctl;
+S10 agent-first mechanism tests assume already capable participants. Verified backup remains a roll
+precondition, not a hot rollback implementation. Final S8 38/39 and A-6 receipts remain pending.
+
+## S9 infrastructure operations
+
+The [CLI reference](usage.md#infrastructure-commands-s9) gives local admin and signed cluster syntax.
+Install the approved support artifacts and use the explicit local root helper bootstrap before enabling
+management. The current `admin infra rotate-policy` refuses unsupported until its root binding exists;
+help text about future support updates is not execution evidence. Keep pending records read-only across
+credential rotation until policy reauthorization. Root policy verifies fixed operations, domain, caller,
+nonce/revision and exact target incarnation; neither a caller path nor an admin socket bypasses it.
+
+Hot support is linux/amd64 + systemd/pidfd/cgroup/nft, stock catalog NATS 2.14.5↔2.14.6 and Caddy
+2.7.5↔2.7.6. Use catalog binary SHA for expect-sha256, and the separately verified archive for supply.
+Default single and sole-voter/standalone JS require original-store stop/restart without LDM or a double
+open. N3 must prove actual per-group quorum/current/replicas and migrate clients before LDM; N2 NATS
+and incomplete/lagged assets defer. Readiness does not alter operator replicas or storage retention.
+
+Caddy reload-config uses the managed staged config SHA and the same process; binary cut additionally
+uses alt-port transient plus nft canonical redirect and real WSS migrate/return proofs. Legacy root
+Caddy retrofit must handle root-only certificate keys, protected admin Unix sockets, tether ownership
+and finite graceful retirement. Warm filesystem ACME data is read-only; final current sync/fsync and
+selector commit occur after old-writer exit, before startup fence release. Active QUIC/unknown long
+connections/custom modules/external storage are deferred before destructive effects.
+
+Read `infracontract.Status` JSON by original Tx. Query rc0 includes unknown/deferred/halted; action
+success additionally needs completed plus current SHA/proof/step/revision and old-owner pending=0.
+A 120s action budget never kills a healthy serving shadow; halted/retiring is a recovery obligation.
+Ordinary auth-first CONNECT/normal-queue probe and pre-repair ACK-prefix verification precede resumed
+business writers/replay/reconcile/GC. Preserve exact process/socket/store identities, raw losses and
+source/artifact/running SHAs. [P39](reviews/hot-update-infra-nats-caddy-plan.md#p39--最终候选收据与关闭--hard)
+owns final candidate validation; 85/86, helper/launcher live updates, final hard gates and native Darwin
+are NOT_RUN/PENDING. S9 does not sign the S10 five-generation or A–H totals.

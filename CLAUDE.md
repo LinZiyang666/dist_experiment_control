@@ -176,12 +176,19 @@
 
   | 闸门 | 位置 | 管什么 |
   |---|---|---|
+  | Missing dependency evidence | `test/determinism/dependency_skip_test.go` | Reject Skip/Skipf/SkipNow carrying NOT_RUN or a pending stage/package owner; missing evidence must fail SETUP-RED. |
+  | S6 broker image contracts | `test/architecture/broker_image_contract_test.go` | Frozen shapes/signatures, runtime contracts and adversarial controls; no compile stub can sign production behavior |
+  | Broker code decrease | `test/architecture/broker_code_budget_test.go` | Broker-only raw code decrease below the entry baseline; independent controls reject growth and omitted source. |
+  | S6 broker private state | `test/architecture/broker_state_inventory_test.go` | Exact private namespace/owner/codec union and append-only inventory controls; broker kinds stay outside S5 global sealedstate |
+  | S9 infra contracts and receipts | `test/architecture/infra_contract_test.go` | Frozen declaration digests, forbidden stub imports and exact E1–E5 documentation claims with same-candidate native receipts; same-file controls |
+  | S9 infra runtime roots | `test/architecture/infra_runtime_test.go` | Live host-to-adapter bindings, exact asset producer/reader roots and unfiltered scanner reachability; same-file controls |
+  | S9 infra supply | `test/architecture/infra_supply_test.go` | Installer output matches runtime paths and units; helper/launcher supply uses compiled artifacts and the shared child supervisor; same-file controls |
   | lint 三层 | `.golangci.yml` | T1 零基线正确性／T2 结构棘轮（带理由 `//nolint` 落基线）／T3 `nolintlint` |
-  | 结构预算棘轮 | `test/architecture/structural_budget_test.go` + `testdata/` | **四维**：类型方法数／包文件数／包**代码行**（剥注释、量化 2000）／`cmd/tether` 非 CLI 代码行（剥注释、量化 100）。第三维是内审补的——前三维对「在已有文件里长大」全盲，而那是阻力最小的路 |
-  | 分层规则表 | `test/architecture/layering_test.go` | 谁不许 import 谁（单表，加规则=加一行）；带 `originalUnion` 收据，四份被删的 regression 文件的每条子句都可机械反查 |
+  | 结构预算棘轮 | `test/architecture/structural_budget_test.go` + `testdata/` | **四维**：类型方法数／包文件数／包**代码行**（剥注释、量化 2000）／`cmd/tether` 非 CLI 代码行（剥注释、量化 100）。S4 保持 Agent 恰 125 methods、生产文件≤19、剥注释代码<8000，cmd 非 CLI 不跨1300；新增状态机留子包，不以删注释换预算。第三维是内审补的——前三维对「在已有文件里长大」全盲，而那是阻力最小的路 |
+  | 分层规则表 | `test/architecture/layering_test.go` | 谁不许 import 谁（单表，加规则=加一行）；带 `originalUnion` 收据，四份被删的 regression 文件的每条子句都可机械反查；`internal/agentboot` 禁止传递 import agent/broker/NATS，`internal/upgradebudget` 禁止 import 本模块任何包；S4 合同要求（门扩展待 P16 接线）单向 execsession→ptysession→pty/workload，ptysession 禁 agent/broker/NATS/execsession，pty 禁 ptysession，terminalio 禁网络/agent；`internal/handoff/handofftest` 反向扫描只许 `_test.go` import，且至少一个导入者 |
   | TLS 配对门 | `test/architecture/tls_verify_pairing_test.go` | `InsecureSkipVerify:true` 必须配 `VerifyPeerCertificate`／`VerifyConnection`，或进带理由的账本；**站点数精确钉死**（今天 4），新增一处即使本身合规也变红——就是要逼人去读 |
   | nolint 指令自检 | `test/architecture/nolint_directive_test.go` | 每条 `//nolint` 必须点名一个**本仓真启用**的 linter（点名未启用的 linter 等于什么都没抑制，却读作「这是已知情的例外」）|
-  | build-tag 编译闸 | `make vet-tags` + `test/architecture/build_tags_test.go` | 隐身套件必须还能编译；**tag 列表从源码提取并与 Makefile 双向对账**；**tag 局部性**：`_integration` tag 门控的文件只许落在自己的 `test/<dir>`（例外账本 1 条：`internal/broker/phasefluidity_lifecycle_test.go`），门控文件总数**精确钉死**（今天 23）——这是矩阵去重「共享包在各 tag 下闭包全等」前提的守卫，往 `internal/proc` 放一个 `//go:build d5_integration` 文件会让 D5 的二进制与 D4 不同而无人察觉 |
+  | build-tag 编译闸 | `make vet-tags` + `test/architecture/build_tags_test.go` | 隐身套件必须还能编译；**tag 列表从源码提取并与 Makefile 双向对账**；**tag 局部性**：`_integration` tag 门控的文件只许落在自己的 `test/<dir>`（例外账本 1 条：`internal/broker/phasefluidity_lifecycle_test.go`），门控文件总数**精确钉死**（今天 24；S4 收尾加 `test/d7/leader_premise_test.go`）——这是矩阵去重「共享包在各 tag 下闭包全等」前提的守卫，往 `internal/proc` 放一个 `//go:build d5_integration` 文件会让 D5 的二进制与 D4 不同而无人察觉 |
   | T3 前提 | `test/determinism/leader_premise_test.go` + `legacy_leader_premise_sites.go` | 测试里裸读 `.IsLeader()` / `.State() == raft.Leader`——不在**身份已证明**的轮询 helper 的谓词闭包里（外部原语按 import 路径信任：`clusterharness.WaitForCond`/`WithLeader`、`testharness.WaitFor`；本包 helper 须由 `verifiedPollingHelpers` 从其实现证明"deadline 循环里反复求值谓词或转发给已证明原语"，同名一次性 shadow 不算——外审复审 R1）、也不是**body 只等待**的循环条件（body 里任何赋值/发送/业务调用/非 continue 分支都算对刚读到的 premise 行动——外审 F2 + R1）——即红，除非在 `path: func` 递减账本；helper 是 `test/clusterharness.WithLeader`（观测→行动→再观测，移动即整段重来；`test/d3` 的 follower PIN 写是第一个调用方）。「观测领导权然后假设它不变」是 parallel-flake-rootcause 根因 2，第二次被修错两回 |
   | inbox 配对 | `test/architecture/inbox_prefix_pairing_test.go` | **三件事**:①私有 inbox 前缀与 CONNECT 标记(`auth.InboxCapableMarker`)只许由 `internal/natsinbox` 的那**一个** helper 设置;②**helper 自己必须两半都设**——第一版只有①,于是从 helper 里删掉标记那一行,`make gates` 全绿而每个升级过的客户端静默退回共享 inbox;③标记的**读**方只许是账本里那两个文件(声明处 + callout),死条目即红。扫描按**选择器名**匹配(别名/点导入/`nats.Options{InboxPrefix:}`/字段直写都看得见),第一版只认 `nats.` 前缀。半接线的失败态是**响亮的**(SUB 被拒 + `-ERR` + 服务端日志 + nats.go 异步错误)——四处文档曾写成"静默超时无线索",而那条假前提正是"用源码门而不用运行时自检"的理由;`natsinbox.Connect` 现在两者都做。`completion_transport.go` 已经因为这条规则的弱化版漏过一次,shell 补全静默返回空 |
   | NATS 存活探测三方一致 | `test/architecture/nats_ping_defaults_test.go` | agent 的 `AgentPingInterval/AgentMaxPingsOut`（客户端半）↔ `scripts/install.sh` 写进 nats.conf 的 `ping_interval "…"`/`ping_max`（服务端半）↔ drill 98 的 `PING_INTERVAL_S`（预算推导）必须相等；install.sh 写成裸整数/未引号 duration 时门判**盲**而非绿（natsconf 对同样形状 fail-closed）。两半各是一个 Go 常量与一段 shell heredoc，没有任何东西把它们连起来——一边"顺手调一下 keepalive"，失联检测窗就悄悄变成 runbook 与 drill 都没写的那个数（simcluster-speed H） |
@@ -193,22 +200,36 @@
   | 就绪 sleep 冻结 | `test/determinism/sleep_barrier_test.go` + `legacy_sleep_barriers.go` | `startBroker*/startAgent*/seedSession*` 函数体内的裸 `time.Sleep` 屏障（不含轮询循环、func literal）冻结在 `path: func` 账本（初值 19）；`// sleep-fixture: <理由>` 豁免；替换目标是测试真正依赖的可观测量（`WaitNodeOnline` / 对 broker subject 的短超时 `nc.Request`），**不是** `WaitConnect` |
   | 测试身份清单 | `test/determinism/test_inventory_test.go` + `testdata/` | 每个 Test/Fuzz/Benchmark 函数以 `path: Name` 记入**只增不减**的 golden；`-update-test-inventory` 只追加、拒删——删/改名测试必须手改 golden 并在 commit message 写理由。**测试代码重构没有测试保护**：layering 四合一曾丢一整行 + 一条子句仍全绿、promised-guard 一装上抓到 34 条死承诺、runner 曾静默少跑 11 个套件——这份清单是所有后续测试重构（harness 吸收、矩阵去重、fuzz 目标）的前置收据（`docs/testing-standards.md §六`） |
   | 确定性 lint | `test/determinism/`（时序守卫在 `test/determinism/raft_timing_guard_test.go`） | raft Apply 可达性、版本字面量 SSOT、docs wire 版本（扫描面含 `test/simcluster/README.md`）、时序守卫（raft 计时门识别**复合字面量与赋值两种形式**——第一版只看 `KeyValueExpr`，`internal/cluster/prevote_test.go` 与 `transport_test.go` 共六处亚秒赋值从未被看见，现已豁免登记；**产品计时 sleep 门**：同一测试函数里既引用 `leaseGrantWindow/probeTTL/DefaultLeaseGrace…` 又 `time.Sleep(纯字面量)` 即红——`leaseGrantWindow` 从 1s 改 5s 后两处按旧值标定的注释六周没人发现）、`// origin:` 指向真实文档、promised-guard（注释里点名的测试必须存在，含 `[deleted]`/`[example]` 标记的上限与诚实性守卫）|
-  | 枚举 switch 的 `default:` | `test/determinism/enum_switch_default_test.go` | 15 个自有枚举家族：`default:` 只在**每个成员都被列举**时允许——`exhaustive` 的 `default-signifies-exhaustive:true` 让一个裸 `default:` 永久瞎掉该 switch（实测：注入 batch-C 那个 doctor 缺陷，加 default 后零报告）。`TestEnumFamiliesCoverEveryIotaEnum` 反向对账，防止家族表退回 3/15 |
-  | wire 错误码 ↔ exit class | `cmd/tether/` 4 处 | 每个码都有归类，不静默退 70；**双向**（含表键反查发射点） |
+  | 枚举 switch 的 `default:` | `test/determinism/enum_switch_default_test.go` | `default:` 只在**每个成员都被列举**时允许——`exhaustive` 的 `default-signifies-exhaustive:true` 让一个裸 `default:` 永久瞎掉该 switch（实测：注入 batch-C 那个 doctor 缺陷，加 default 后零报告）。`TestEnumFamiliesCoverEveryIotaEnum` 反向对账; S10 inventories exact source family/member identities, including upstream explicit string values and aliases, rather than a historical family count. |
+  | wire 错误码 ↔ exit class | `cmd/tether/` 4 处 + `cmd/tether/error_code_coverage_test.go` | 每个码都有归类，不静默退 70；**双向**（含表键反查发射点）; S10 final leaf roots and actual Code/alias/return/map emitters are independently inventoried, with same-file disk controls. Local setup errors and image deferral details do not prove wire emission. |
   | ACL ↔ 订阅表 | `internal/auth/acl_reconcile_test.go` | 双向：无订阅者的授权、无授权的订阅都报 |
   | wire 字段清单 append-only | `internal/proto/wire_inventory_test.go` + `testdata/` | N-1 窗口的机械半（requirements §6.7 / architecture §21.2）：每个导出消息结构的 {字段名, tag, 类型} 只增不删不改；updater 拒绝收缩——收缩是纪元决策，必须手改账本并在 commit message 写明理由 |
   | CLI 表面 golden | `cmd/tether/command_tree_inventory_test.go` | 命令/flag/Hidden 位漂移即红 |
-  | 泄漏门 | `test/concurrency/helpers_test.go` + `test/determinism/leak_assert_shape_test.go` | NumGoroutine + fd 基线，**刻意不用 goleak**；断言形状（≥5 轮 exercise，`leakExerciseAnchors` 表钉住每条断言在循环里的那个调用）；**风险包覆盖闸**（`TestLeakGateCoversRiskyPackages`：非测试文件 import raft/yamux/tunnel/pty 的包必须有 `Test*` 函数体内直接调用共享泄漏 helper——死 helper 里的调用不算；例外表带 cap）；`-race` 归属由「矩阵单元清单」行守 |
+  | 泄漏门 | `test/concurrency/helpers_test.go` + `test/determinism/leak_assert_shape_test.go` | NumGoroutine + fd 基线，**刻意不用 goleak**；断言形状（≥5 轮 exercise，`leakExerciseAnchors` 表钉住每条断言在循环里的那个调用）；**风险包覆盖闸**（`TestLeakGateCoversRiskyPackages`：非测试文件 import raft/yamux/tunnel/pty 的包必须有 `Test*` 函数体内直接调用共享泄漏 helper——死 helper 里的调用不算；例外表带 cap）；S4 ptysession/terminalio 与新 import pty 宿主同样直接调用共享 helper、真实≥5轮且每个断言站点有 exercise 锚，不增加例外；`-race` 归属由「矩阵单元清单」行守 |
   | seedSession 收据 | `test/stackharness/seed_test.go` | 8 个单机套件的 `seedSession` 必须仍是转发器（`absorbedSeedSession` 表 + 反向断言）；`test/stackharness` 只许被 `_test.go` / `test/` 树 import（layering 反向扫描）。它在 `make gates` 里真跑——2026-09-01 前只在 `make test` 里 |
   | docs 布局 | `test/architecture/docs_layout_test.go` | 已跟踪的过程产物（`*-plan/review/tasklist/roadmap.md`）不许留在 `docs/` 顶层——§3 step 7 那条曾整条无闸门 |
-  | 数据面生命周期 | `test/architecture/dataplane_lifetime_test.go` | ①`internal/agent/ssproxy` 非测试文件不得 import `context`；②`applyProxyDirective`/`proxyStartLocked` 不得再收 ctx 参数；③`Run` 必须接线 `defer stopProxyOnRunExit`。**控制面 ctx 绑数据面对象生命周期**曾让一次普通 NATS session 重建杀死活着的 SS 出口 7h40m（gotcha #80）；三条都是那条不变量的机械形式，第③条补的是"去掉 ctx 锚点后 agent 退出不再自动停它" |
+  | 数据面生命周期 | `test/architecture/dataplane_lifetime_test.go` | ①数据面对象不得接受 caller ctx；`ssproxy` 自有 stop/resolver root 允许私有 `context`，新增 root 按 `ctx-root:`/`ctx-none:` 标注；②`applyProxyDirective`/`proxyStartLocked` 不得再收 ctx 参数；③`Run` 必须接线 `defer stopProxyOnRunExit`；④（热更新 S2–S5；S5 扩展由 P26 接线并交实际 receipt）`internal/agentimage`、`internal/execsession`、`internal/agentboot`、`internal/ptysession`、`internal/pty`、`internal/flow`、`internal/rawsocket`、`internal/sealedstate` 与 `internal/agent/ssproxy` 的**导出**函数/方法一律 ctx-free（白名单只有 S0 既有的 `Runtime.Close(ctx)`，且白名单条目死掉即红）——image fence 用 deadline/`<-chan struct{}`，任何 ctx 只在标注的 ctx-none 站点派生。**控制面 ctx 绑数据面对象生命周期**曾让一次普通 NATS session 重建杀死活着的 SS 出口 7h40m（gotcha #80）；四条都是那条不变量的机械形式，第③条补的是"去掉 ctx 锚点后 agent 退出不再自动停它" |
+  | 热更新预算一致 | `test/architecture/upgrade_budget_pin_test.go` | 热更新 S3/S4（S4 pin 扩展待 P16 接线）：`hot_update_budget.sh` 的全部 `HOT_UPDATE_*` 整数赋值（含 PTY_RECOVERY=180s、PTY_RECOVERY_OPPORTUNITY=5s、PTY_INPUT_BYTES=256KiB、PTY_BATCH_BYTES=32KiB、LIVE_FLOW_STALL=5s）与 `internal/upgradebudget` 常量逐项相等；缺失、非整数、重复及新增未对账变量即红；`workload.DefaultReplayCapacity/DefaultReplayBudget` 同时钉住数值与对 `StreamReplayBytes/NodeReplayBytes` 的直接引用，防止重新写死字面量；同文件正负控制 |
+  | image 字段账本 | `test/architecture/image_field_inventory_test.go` + `testdata/image_field_inventory.txt` | 热更新 S2：从 `agentimage.Bundle` 经反射可达的每个具名 struct 的每个导出字段以 `pkg.Type.Field<TAB>tag<TAB>type` 记入**只增不减**的账本（含 execsession/procrequest/workload/spawnsafe/proto 嵌套域；标准库叶子只记字段不下钻——`syscall.Rusage` 在 darwin 是 int32）；`-update-image-inventory` 只追加、拒删。删/改名/改 tag/改类型 = image 纪元决策（architecture §22.5），必须手改账本并在 commit message 写理由。S4/S5/S7 每个都要往 bundle 加域，没有它回滚可读性只靠人读 |
   | simcluster 日志 oracle | `test/architecture/simcluster_log_oracle_test.go` | drill 只许经 `drills/lib/logs.sh` **一份**映射读四条流（broker slog／broker panic／agent slog／agent panic）；调用 helper 必须 source（漏 source 是 runtime not-found，`bash -n` 看不见）；例外进**精确计数**的递减账本。h1 挪了两条流，十来个各自内联的 drill 同时开始把**健康的产品报成失败**——这是本 harness 最坏的输出 |
   | spawn 停滞证据 | `test/architecture/spawn_stall_evidence_test.go` | `remote_fs_spawn_timeout` / `too_many_wedged_spawns` 的**铸造点**（`&FSError{Code:…}`、`return Err…`、`fmt.Errorf("%w",Err…)`；不含声明／`errors.Is`／分类返回）必须逐字等于精确账本（今天 4 条），且账本**双向** enforce（给 ceiling 站点接线＝静默反转裁决，同样变红）；标 wired 的两条，作废必须**在到达该 return 的每条路径上都已同步执行**（路径敏感；`go`/`defer`/func literal 均不算，**遇 `goto`/label 直接 fail-closed 不再分析**——臂内提前 return、裸 `go` 语句、`goto` 绕过都曾被记成 wired，外审 F2 + 复审 RR-F1）；**锁支配检查**（限 `internal/spawnsafe`）——能带着 `p.mu` 到达作废调用即红，分支不一致按**持有**处理，复合语句 initializer 按 Go 顺序处理；函数同时有 Policy lock+invalidation 时，`goto`/label 或 deferred invalidation 直接 fail-closed（条件 Unlock、if-init Lock、goto 绕 Unlock、LIFO defer 作废均曾漏掉确定性死锁）。同族正负控制在 `TestSpawnStallEvidenceGateControlFlowFamilies` 及外审反例。**healthy 判定曾是终态**，agent 活 18 天后整套 remote-fs 保护静默退化成只剩两条死线（gotcha #81）。⚠ 它**够不到**第四个证据站点 `boundedHomeRead`（那里不铸造任何哨兵），那条由 `internal/agent/remotefs_test.go` 的行为守卫钉住——闸门文件头已如实登记 |
   | spawn runtime 隔离 | `test/architecture/spawn_exec_isolation_test.go` + `internal/spawnexec`（由 `make gates` 直接运行） | safe exec 与 PTY run 的风险目标不得在 agent runtime 内直接 `cmd.Start`；必须经 `/proc/self/exe` helper + 可取消握手。dispatch 必须由 `internal/spawnexec.init` **对所有链接者统一执行**，不得要求各测试包手写 `TestMain`（漏一个就递归执行整个 `*.test`）。helper **只能原地 `syscall.Exec`，禁止再 `cmd.Start`/fork 目标**；私有 mode env 必须从继承与显式 child env 双向剥离；CLOEXEC 内核租约把跨 agent 重启遗留的 pre-exec helper 全局限制为 64。直接 goroutine+timeout 会冻结 agent runtime；漏 TestMain + helper 内二次 fork 曾让 5,789 个 `exe` 累积到约 307 GiB RSS、触发主机 global OOM（#81 / 2026-09-01 外审事故） |
   | hermetic 闸集 | `test/simcluster/tests/run-all.sh` + `test/architecture/simcluster_gate_set_test.go` | simcluster 的 hermetic 自检集（verdict 契约、expected-verdicts、lint-drills / lint-install、ledger-crosscheck、r9d / teardown 非空性、kept-sites…）作为 `make gates` 的一行与 CI build-test 的一步**真跑**（约 2 分钟，5 个 poll 类脚本在等真计时器）；`tests/*.sh` 与 run-all.sh 的循环**双向对账**（漏网脚本、点名不存在的脚本都红），脚本按 shebang 调用。2026-09-01 接线时它已在干净树上红了（gotcha #80 标题写"已修"、门的闭合词表只认"已修复"）、漏了 3 个脚本、其中 1 个是 bash-only 而旧循环一律用 `sh` 调用——即使列进去也跑不起来——"a gate nobody runs is a gate that does not exist"是它自己头注释里的话 |
   | CI 发布链 | `test/architecture/ci_workflow_test.go` | release job 必须 `needs` build-test / lint / e2e 三闸、只在 `refs/tags/v` 上跑、带 job 级 `contents: write`；**没有任何 workflow 在 ci.yml 之外发布**（`release.yml` 曾在 tag 上直接 goreleaser、与 e2e 互不可见，"发布时本机过了不够"是一条无人检查的声明）；fuzz job 必须无人值守可达（schedule + cron）且**绝不**挂在 push / PR / tag 上（非确定性红灯会训练人重跑到绿） |
   | fuzz 语料预算 | `test/architecture/fuzz_corpus_test.go` | 提交的 `testdata/fuzz/<Fuzz*>/` 每目录 ≤64 文件、全仓 ≤256KiB、首行必须是 `go test fuzz v1`（没有头的文件被工具链静默忽略）。`-fuzz` 只把 **crasher** 写进 testdata，interesting 语料在 `$GOCACHE/fuzz`——三份独立草案都把机制写错，见 `docs/testing-standards.md G7` |
-  | 矩阵单元清单 | `test/e2e/parallel/inventory_test.go` + `testdata/` | `all_phases_test.go` 声明的每个单元 `(matrix, pkg, tags, race, run)` 记入**只增不减**的 golden（删 glob 在 all_phases 里是静默的——它自己的 B5 note 承认；在这里是红）；**唯一 `go test` 入口**（test/e2e 之外任何 `_test.go` fork `go test` 即红）；**-race 归属**（import raft/yamux/tunnel/pty 的包必须被某个 -race 矩阵跑到；2026-09-01 前 `internal/clusteroffline` 起 raft 七次却不在任何矩阵，`test/chaos` 22 个测试从未跑过 -race）。runner 的 `-dedupe`（默认开）按**运行时 `go list -race` 闭包 hash 全等**折叠重复单元（cluster ×5、proc ×3、broker ×2、test/cluster ×2 → 各 1），不等即不折、`go list` 出错即不折，**两种「不折」都打印理由**（hasher 全坏与「没有重复」在收据上必须可区分）；whole 矩阵（5 个 helper 形状）的每个包字面量／`-run` 值／phase 也进 golden（第一版对它们完全不透明，内审 L4-F1）；矩阵源**只为 -race 归属加包**（D1 +clusteroffline 并 240s→300s、新增 `TestChaosMatrix`／`TestLeakRiskMatrix`），**不为去重改** |
+  | Exact matrix partitions | `test/e2e/parallel/partition_coverage_test.go` | Independently discover package/Test/Fuzz/Benchmark/tag identities; exact race selectors, labels and 600s budgets cover each suite once. S10 `TestFullstackPartitionsCoverEveryDiscoveredTest` includes recursive acceptance/harness/command leaves, integration tags and explicit resource owners; same-file `TestFullstackPartitionControls` rejects count-preserving substitutions, missing children/tags, duplicate selectors and raised budgets. |
+  | 矩阵单元清单 | `test/e2e/parallel/inventory_test.go` + `testdata/` | `all_phases_test.go` 声明的每个单元 `(matrix, pkg, tags, race, run)` 记入**只增不减**的 golden（删 glob 在 all_phases 里是静默的——它自己的 B5 note 承认；在这里是红）；**唯一 `go test` 入口**（test/e2e 之外任何 `_test.go` fork `go test` 即红）；**-race 归属**（import raft/yamux/tunnel/pty 的包必须被某个 -race 矩阵跑到；2026-09-01 前 `internal/clusteroffline` 起 raft 七次却不在任何矩阵，`test/chaos` 22 个测试从未跑过 -race）。runner 的 `-dedupe`（默认开）按**运行时 `go list -race` 闭包 hash 全等**折叠重复单元（cluster ×5、proc ×3、broker ×2、test/cluster ×2 → 各 1），不等即不折、`go list` 出错即不折，**两种「不折」都打印理由**（hasher 全坏与「没有重复」在收据上必须可区分）；whole 矩阵（5 个 helper 形状）的每个包字面量／`-run` 值／phase 也进 golden（第一版对它们完全不透明，内审 L4-F1）；矩阵源**只为 -race 归属加包**（D1 +clusteroffline 并 240s→300s、新增 `TestChaosMatrix`／`TestLeakRiskMatrix`；S4 要求追加 `TestReliableRunMatrix` 的 cli_e2e/-race/^TestRunReliable 单元，LeakRisk 扩 ptysession/terminalio 整包，保留 ReliableExec 原 tuple，PTY 整包 race 归属须闭合，已安装 ReliableRun 与整包 race 声明；最终执行收据另签），**不为去重改** |
+  | flow frame 库存（S5，待 P26/P27 receipt） | `test/architecture/flow_frame_inventory_test.go` | 真实 codec 的 40-byte header、九 kind、flags、body/modes 双向对账；与公开 NATS wire 库存分列，改编号/漏 flags 的同文件 Controls 必须红 |
+  | SS private state 库存（S5，待 P26/P27 receipt） | `test/architecture/ss_state_inventory_test.go` | runtime snapshot/build、descriptor、binary encode/decode 三向覆盖 nonce/cursor/FIFO/期限/撤权；只增库存，不用手写未被 codec 使用的表代签 |
+  | flow/SS 合同（S5，待 P26 receipt） | `test/architecture/flow_ss_contract_test.go` | Agent 恰125 methods/≤19 production files、九 deferred、两个精确 fuzzer、容量与秘密边界；同文件 Controls；Runtime 保持39 methods，新行为用包级函数 |
+  | transfer 合同库存（S7 T48/T49，待 P37 receipt） | `test/architecture/transfer_contract_test.go` | wire/public 字段与 contract root 可达 literal/selector 的**精确并集**对 `testdata/transfer_source_moves.tsv#contract-union`（多/少/重复皆红）；SDK `Put` 只许 `#legacy-put` 的 sdk/client/agent 三函数账本，capable 调用图（别名/闭包/方法值/包级变量）不得到达 Put、`Seek(0)` 或新 TransferID；同文件 Controls |
+  | transfer 私有状态/scanner root/文档收据（S7 T48/T50/T54，待 P37 receipt） | `test/architecture/transfer_state_inventory_test.go` | WorkerState/TrackerState/LedgerRow 可达私有字段对 `testdata/transfer_state_inventory.txt` 逐行相等且被真实 codec/build 根消费（描述表不代签）；`#scanner-roots` 每个 role 的 old→new→test 映射活着且非空；文档 claim 无收据（或非 NOT_RUN 的假收据）不得勾选；同文件 Controls |
+  | transfer drill 合同（S7 T43/T44，待 P37 receipt） | `test/architecture/transfer_drill_contract_test.go` | drill 63/64 的每条正臂（A…W2）与控制臂（M01…M14）在 driver/manifest/expected-verdicts 中逐一存在，缺腿/缺 child/等量替换皆红；控制臂必须是生产变异（running SHA == artifact SHA、native rc 精确）；同文件 Controls |
+  | 全栈合同源门（S10 P28，待 P35 receipt） | `test/architecture/fullstack_contract_test.go` | P00 合同 types/ports 声明摘要冻结；schema 的 role/topology/regime/tier/verdict 闭合词表与 native GREEN0…INCOMPLETE4 对 §5.1 逐项相等；`contractstub` 七个失败桩只能是带 owner 文本的单 return、不得返回空成功；P01–P04/P18/P19 真实 factory 以同形签名在最终包落地且非空成功；除 P00 自测外任何 fixture/driver/产品 import 失败桩或伪造桩文本即红；同文件 Controls 在拷贝的真实树上磁盘变异 |
+  | 全栈源码/结构门（S10 P28，待 P35 receipt） | `test/architecture/fullstack_source_test.go` + `fullstack_controls_test.go`（共享读取器与磁盘变异工具，不代任何同文件 control） | §10 manifest（36 包、文件数列与路径相等、无双 owner）∪ P29 实际 ownership ∪ S10 新目录 ∪ S10 命名族的每个新 Go/Python/shell/tool 文件 ≤700（Go 剥注释、脚本另以物理行为帽），旧文件只经冻结的 pre-S10 基线豁免；事件命名/首注释文件名/`hot-update S10 plan §x / Pnn` 锚点必须指向真实条款；S10 扩展在 layering/structural_budget/build_tags/dataplane_lifetime/simcluster_gate_set 五个既有门文件各带同文件 control（AllOS 分层、四个 leaf 首落帽与 Agent 恰 125、hotupdate_integration 只在 P21–P26 重型 owner 与 Linux twin、ctx-free 导出与带理由的 ctx-root、run-all 包装器与 Python 自测登记），本门的注册表核对七对门/control 均已文档化、锚定、存活且由 `make gates` 无过滤运行 |
+  | S10 drill declaration ledgers | `test/architecture/fullstack_drill_ledger_test.go` | The existing ledger-crosscheck entry joins actual 99/100 manifests, expected native values, full-directory launch catalog, topology cells, claim inventories and functional costs. Same-file controls prove on-disk red and restoration; live evidence remains NOT_RUN. |
+  | S10 documentation receipts | `test/architecture/fullstack_docs_test.go` | Candidate-bound external raw/hash/required-set checks for 12 capability rows, R1–R16 and all A–H leaves; preserves unsigned NOT_RUN claims. |
+  | S10 actual inventory union | `test/determinism/leak_assert_shape_test.go` + `test/determinism/test_inventory_test.go` | `TestFullstackInventoriesCoverActualUnion` reconciles actual test identities, observation fields, enum members, source ownership and each S10 leak assertion against disk ledgers; same-file `TestFullstackInventoryGateControls` proves omissions and dead rows red on copied real sources. Registration is not live execution evidence. |
   | 闸门清单自对账 | `test/architecture/gate_registry_test.go` | ① 本表点到的位置必须真在 `make gates` 里跑（`go test` 包按目录前缀、`sh <script>` 行按精确路径）；② `.golangci.yml` 的函数名账本里每个名字必须还存在（死豁免会被报出）|
 
   - **改闸门本身走同一流程**：动 `.golangci.yml`、任何 golden、任何递减账本**等同于改不变量**，
@@ -266,3 +287,88 @@
 - 只在 phase 收尾（step 7）、内审+外审通过后才 `commit`/`push`；**直接落 `main`，不开 phase/side 分支**——本仓是单开发者仓库，分支与 PR 只会制造无人评审的仪式。
 - commit message：conventional commits `<type>(scope): <imperative summary>`（如 `feat(ps): retention-bounded ps RPC`、`fix(auth): grant $JS.API.DIRECT.GET`）。
 - **绝不添加 `Co-Authored-By: Claude` 或任何 AI 署名**（全局规则；已推送的若混入，用户会 rebase 移除）。作者/协作者只保留用户本人。
+
+## S5 documentation and receipt boundary (historical stage closed)
+
+The binding implementation plan is [flow-carrier-ss](docs/reviews/hot-update-flow-carrier-plan.md).
+The live S5 contract is architecture §22.8; §22.7 remains the S4 PTY contract.
+P26/P27 gate extensions above are required contracts, pending their implementation receipts.
+The Markdown receipt/reference audit is a separate runnable block in
+[test/hotupdate/README.md](test/hotupdate/README.md#documentation-audit); it is not currently part of `make gates`.
+P29 supplies final source/artifact/running SHA, native rc, raw oracle and mutation receipts.
+P28 signs tasklist subitems only from those receipts; S6 broker exec, S8 authority incarnation/legacy migration,
+S9 NATS/Caddy switching and S10 final mixed rollout retain their own exits.
+
+## S6 broker-image implementation and evidence boundary
+
+The frozen [S6 plan](docs/reviews/hot-update-broker-image-plan.md) lead verdicts L1–L7 override its body.
+Default single mode is the primary lane; a real sole-voter cluster is a separate lane. Agent maintenance
+capability and installation ACK are S6 scope. `broker upgrade reload` is the local broker entry;
+`node upgrade` remains agent-only. New contracts/leaf implementations do not establish production continuity.
+The Run-owned cut, current rollback and live collector are implemented. Broker slim owners are
+internal/brokercontrol, internal/brokerimage and internal/brokerupgrade/brokerruntime; scanners/tagged
+tests follow those actual paths. Final deployment receipts remain pending, separately from source.
+
+The three hard gates are exactly `make test`, `make e2e-parallel`, `make lint`; `make gates` is a separate
+central gate check. Package workers run only authorized targeted checks; the lead/P35 runs the final gates,
+whole race matrix, Darwin checks and deploy drills on one candidate. Preserve direct caps: Broker ≤70
+production files/≤285 methods/<18000 code lines, cmd/tether ≤57 files, cluster ≤32 files, Agent exactly125
+methods/≤19 files, execsession.Runtime ≤39 methods. Keep comments and add all-OS leaf/lifetime coverage.
+[Testing standards](docs/testing-standards.md#s6-broker-image-validation) describe the required receipts.
+
+P34 owns coverage claims and tasklist signing; P35 supplies final candidate evidence. S6 package and
+lead gate history is archived in evidence §18; final combined deploy/drill certification remains NOT_RUN. Run the bounded [documentation audit](test/hotupdate/README.md#s6-documentation-audit)
+to reject dead source/command promises and checked completion without receipts. Native INCOMPLETE is rc4;
+a business command's retryable refusal is rc75. Estimates are never measured marginal costs.
+
+
+## S7 transfer-continuation contract and installed gate index
+
+The frozen [S7 plan](docs/reviews/hot-update-transfer-continuation-plan.md) lead LQ1–LQ3/L15–L18
+supersedes its candidate verdicts and conflicting body. Architecture §22.10 is the live transfer-v1
+contract. P00 types/compile stubs do not authorize IO or certify implementation. All S7 product exits
+remain PENDING/NOT_RUN until P37 supplies reviewed same-candidate receipts and P36 updates claims.
+S6 review/final gates and ENDPOINT-RESUME remain separate evidence obligations.
+
+Workers run authorized targeted checks only. Lead/P37 alone runs the three hard gates, separate gates,
+whole race matrix, Darwin and deployment drills on the frozen candidate; drills and Go tests are serial.
+Every spawned fixture process uses the shared FIX-ORPHAN supervisor, including panic/timeout/SIGKILL
+cleanup and PID+start-ticks survivor census. Pdeathsig alone is insufficient. P35 partitions heavy matrix
+units per test from the start; 600s stays fixed and units exceeding 70% must split or reduce overhead.
+S6 in-flight reliable-exec/control-admission, roll and supervision owners retain their file boundaries.
+
+The gates below are installed and included in §5. Declaration/control presence is separate from
+final candidate execution receipts; P34/P35/P37 retain their respective ownership.
+
+| Installed contract gate | Owner / receipt status | Required coverage |
+|---|---|---|
+| `test/architecture/transfer_contract_test.go` | P34 declarations installed; final P37 receipts PENDING | Actual contracts/SUB/ACL/header/error/exit/source-root union; capable SDK Put call graph; all-OS ownership/caps; same-file controls; documentation native-rc/receipt discipline |
+| `test/architecture/transfer_state_inventory_test.go` | P34 predicate installed, P35 inventory; final P37 receipts PENDING | Real worker+tracker build/descriptor/codec closure; missing and extra fields/resources both red; preserve S5/S6 private namespaces |
+| Existing image, structure, layering, lifetime, tags, ctx and budget gates | P34 predicates, P35 inventory/enum/move rows; PENDING S7 extension | Agent exactly 125 methods/≤19 files; Runtime 39; Broker 70/≤285/<18000 with raw code decrease; cmd 57/main below 900; no relaxed legacy ceilings or caller-ctx exports |
+| Test inventory, direct leak anchors and TransferContinuation matrix | P35 T52; PENDING | Exact test names; explicit risk set including filetransfer/transferpath/drillobserve; direct five-round goroutine+FD asserts and whole-package race; no dead or missing tuple |
+| Documentation audit | P36 local bounded check, P34 T54 central gate; PENDING central receipt | Ten owned documents, live declarations, explicit pending CLI entries, unchecked claims, native five-state mapping; no source-presence completion |
+
+Run the read-only [S7 documentation audit](test/hotupdate/README.md#s7-documentation-audit) separately;
+it is not currently registered in Makefile gates. P34 owns TestTransferDocumentationClaimsHaveReceipts;
+P36 supplies on-disk dead-path/dead-command/unchecked-claim/native-rc controls. P35 alone updates ledgers.
+P30 owns drill coverage/native child tables, P37 final receipt index, P36 live documentation claims.
+Explicit abandonment is failed/settlement_abandoned/outcome_unknown=true, never complete; absent flag,
+unsettled session deletion stays DELETING/rc75. Rate and storage-horizon refusal follow LQ2/LQ3.
+S8 transaction-handle query/incarnation/first migration, S9 infrastructure binary updates and S10 total rollout stay open.
+
+## S8/S9/S10 integrated work and receipt boundary
+
+The living contracts are architecture §21.3 and §22.11–§22.13. S8 transaction commands use
+describe→prepare→explicit `upgrade stage`→Start on the original TxID→fresh query/wait. The default old
+node/reload envelope is policy-refused; register, disk SHA and historical completion cannot sign three
+completion points. S9 infra uses a separate component CLI/status JSON, auth-first ordinary reconnect,
+pre-repair ACK gate and restricted helper/launcher; linux/amd64 + systemd/pidfd/cgroup/nft is the hot scope.
+
+S8 [P33](docs/reviews/hot-update-upgrade-orchestration-plan.md), S9
+[P38/P39](docs/reviews/hot-update-infra-nats-caddy-plan.md#p38--正式文档--normal) and S10
+[P33–P35](docs/reviews/hot-update-fullstack-acceptance-plan.md) separate prose, coverage and final receipts.
+38/39/85/86/99/100 live runs, three hard gates on the final candidate and Darwin native remain
+NOT_RUN/PENDING. Package workers run targeted checks only; lead runs global gates/matrices and deploy
+drills serially on the candidate. Heavy tests use per-test partitions with a 600s unit ceiling; units
+above 420s must split or reduce cost. Every process reuses shared subreaper/CLOEXEC lease/pidfd supervision;
+Pdeathsig or Setpgid alone is insufficient. No stage closure or docs audit signs A–H totals.

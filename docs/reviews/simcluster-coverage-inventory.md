@@ -86,11 +86,13 @@ Status: **随 roadmap 演进的受审清单**。本文件是命令/事件覆盖�
 | `manual:credrot:<node>` | **kind=`manual` + `AlertLabel="credrot:<node>"`**（`cmd/tether/cluster_rotation.go` 的 `rotationTrackingKey`——**不是独立 kind**，断言时勿按 kind 匹配） | S7-52 | raise→轮换完成→`alert clear manual:credrot:<node>` 生命周期 |
 | 系统 kind 的 dedup key | 由各 writer 按 kind+范围生成 | 随各 kind 行 | `alert ack <dedup_key>` 闭环用 `alert ls --json` 的 `dedup_key` 字段取值 |
 
-## 2. 命令树清单（构造后 Cobra 树全量遍历，2026-07-10 重建；`--help` 看不见 Hidden，禁作来源）
+## 2. 命令树清单（构造后 Cobra 树全量遍历，2026-10-20 对账；`--help` 看不见 Hidden，禁作来源）
 
 > **生成基准（round5 R5-F1 重建）**：临时诊断测试构造 `newRootCmd()`、递归 `Commands()`、
 > 采集每命令的 local/persistent/inherited flag 与 command/flag 两级 Hidden 后**逐行转录**
-> （测试已删、零残留；round-6 可按 §3 生成法复跑 diff）。共 **94 个 command path**。
+> （测试已删、零残留；round-6 可按 §3 生成法复跑 diff）。历史基线为 **94 个 command path**。
+> 2026-10-20 的 `TestCommandTreeInventory` 实际构造树为 **122 paths**，运行期树为 **127 paths**；
+> §2.3 对账 S7/S8/S9 新表面，先登记 drill owner 或 NOT-COVERED，再更新两份 golden。
 >
 > **统一排除规则（显式声明，生成器归一化时验证）**：`--home`、`--nats-url`（ctl 侧连接串）、
 > `--socket`（admin/cluster 本机 socket 路径，含 inherited 与 doctor/reconcile/alert-raise 的
@@ -99,13 +101,13 @@ Status: **随 roadmap 演进的受审清单**。本文件是命令/事件覆盖�
 > `login --broker`（`--nats-url` 别名 + 持久化 `broker_url` 的行为面）、`serve --nats-url`
 > 与 `agent --nats-url`（两者是 **daemon 部署 seam**——分别决定 broker→NATS 与 agent 拨入的
 > broker/seed list——非 ctl transport；round6 R6-F1 更正）。
-> Hidden **command**（8）：`takeover-natsconf`（字面 `Hidden: true`）、`force-single`/
+> Hidden **command**（9）：`broker-image-preflight`（内部 ABI probe，见 §2.3）、`takeover-natsconf`（字面 `Hidden: true`）、`force-single`/
 > `recover`/`restore`/`export-incident`/`remove` 五个 cluster 顶层旧拼写
 > （`deprecatedClusterAlias`，与 recovery 本体同 RunE + stderr 警告）、`node-pub`/`keygen`
 > （`hiddenDebugCmd`）。Hidden **flag**：`drain --retire`（MarkHidden REMOVED-redirect）+
 > 七处 `registerYesRejector` 的 Hidden `--yes`。`completion` 由 cobra 运行期注入（构造树不含此节点）——
 > **自 S1 外审 MINOR-3 起，命令树门另用第二份 runtime golden** 遍历 `InitDefaultCompletionCmd()` 注入后的树
-> （**99 path** = 构造 94 + `completion` + bash/fish/powershell/zsh + `--no-descriptions`），故 completion 面亦入结构门。
+> （当前 **127 paths** = 构造 122 + `completion` + bash/fish/powershell/zsh；shell flags 含 `--no-descriptions`），故 completion 面亦入结构门。
 
 ### 2.1 使用者 / agent / admin 面
 
@@ -116,14 +118,14 @@ Status: **随 roadmap 演进的受审清单**。本文件是命令/事件覆盖�
 | `login` | — | `--session/--pin/--broker`（别名+持久化 broker_url） | S1-60 + S2-80 | 激活/CONNECT 拒/G.3 重连（登出→经 broker admin socket 证 agt2 STALE→重登**首个** node ls 即反映=重连读当前态，非 login 取快照） |
 | `session create <name>` | — | `--pin` | 既有 10（写提交）+ S2-81 | |
 | `session ls` | — | — | S2-81 | STATE/ROLE/active 标记 |
-| `session rm <sid>` | — | `--ack-alerts` | S2-81 + S8-92(a) | 三阶段 + 告警态强推臂 |
+| `session rm <sid>` | — | `--ack-alerts/--abandon-unsettled-transfers` | S2-81 + S8-92(a)；S7 新 flag 见 §2.3 | 三阶段 + 告警态强推臂 |
 | `ps` | — | `--all` | S1-60 / S3-70 | LOST 合成、PORTS/HOME 列 |
 | `exec <node> …` | — | `--cwd/--timeout/--safe` | S1-60（62 `--safe`） | |
 | `run <node> -- …` | — | `--cwd/--safe/--ack-alerts` | S1-60 + S9-96 | 真 PTY / 混沌臂 |
 | `expose <node>` | — | `--local/--name/--remote-port/--on-broker`（+ `--no-rebuild`/`--ack-alerts` **NOT-COVERED**——无 G-A drill 实测独立臂，Stage-C ledger-1） | S3-70/71 | 四 flag 独立臂 |
 | `expose explain <name>` | — | — | S3-70/71 | home/epoch/moved |
 | `expose rm <node>` | — | `--name/--ack-alerts` | S3-70 | 断流 + 端口回收 |
-| `push` / `pull` | — | `--force/--timeout/--ack-alerts` | 既有 00 + S1-61 | 双向执法/边界 |
+| `push` / `pull` | — | `--force/--timeout/--ack-alerts/--rate-limit` | 既有 00 + S1-61；S7 rate 见 §2.3 | 双向执法/边界 |
 | `history` | — | `--lines/--kind/--follow` | S1-60/61 + S9-94 | 含 G.5 记录 |
 | `node ls` | — | `--all/--brokers` | S1-60 + S5-30/31 | skew 视图 |
 | `node upgrade <nid>\|--all` | — | `--url/--sha256`（S5-31✓）；**#28 已修**（R15：agent 侧 `upgrade.url_allow` 可配，31 drill 以 #28-FLIPPED 前置验证）；`--all` **enumeration/dispatch/`--timeout` COVERED**（外审 M4 可执行臂：ONLINE 枚举 + OFFLINE 排除 + dispatch-到-online + `url_not_allowed_local` config-abort + `--timeout 0` 金丝雀中止——upgrade-safety 契约改写后该臂由 skip-continue 变为 canary-abort）；**单台 SUCCESS/rollback/`--wait`（真 re-exec / re-register / watchdog 回退 oracle）→ owner = `33-node-upgrade-success`**（upgrade-safety follow-up 落地，INCOMPLETE/1：nc_gap 指 gotcha #73；2026-08-02 首次真跑 INCOMPLETE/1 pass=29 assert_fail=0）；fleet 级 `--all` 金丝雀确认后的全队扇出**仍 NOT-COVERED、无 owner**（31 的残余 nc_gap）；hermetic 面由 `test/p10/upgrade_e2e_test.go` 与 `cmd/tether/node_upgrade_wait_test.go` 覆盖 | S5-31◑+33 | fleet 扇出臂待立项（无 owner）；33 已于 2026-08-02 真跑 |
@@ -142,6 +144,9 @@ Status: **随 roadmap 演进的受审清单**。本文件是命令/事件覆盖�
 | `admin audit <sid>` | — | `-n` | S2-81 | |
 | `admin events` | — | `-n/--since/--kind` | **#30 新增；drill 覆盖 owner = 71/73/74 D2**（"raw sys.events have no operator reader"） | operator 读 H.1 `events` 流的 sys.events（session/member/agent/disk/`proxy_*`/`nats_topology_*`/rehome/grow-cutover 各 kind）。走 root-only 0600 admin socket（与 `admin runtime`/`alert raise` 同信任层），读**持久化流**故支持 `--since` 历史 + `--kind` 过滤；**无 `--follow`**（admin socket 一次性设计，运维需求是时点读；live tail 用 poll-loop，见 broker-ops）。载荷**恒无 secret**（生产者手搭 allow-list 标量 map，reader 原样转发）。cluster-mode `proxy sub create/revoke` 现补发 `proxy_keyset_changed`（此前只 bump epoch 不发事件） |
 | `serve` | — | `--config/--db/--admin-socket/--nats-url`（部署 seam 例外）`/--nats-conf-path/--nats-server-bin/--auth-callout-seeds-dir/--sub-http-listen/--cluster-manifest-listen/--metrics-listen/--alert-webhook-url/--log-level/--log-json/--upgrade-url-allow/--cluster-data-dir/--cluster-raft-addr/--cluster-secrets-dir/--colocated-agent-nid/--tunnel-addr/--tunnel-public-host/--store-dir/--public-host` | 既有组建 + S8-93（metrics/webhook/log-json）+ S4/S2（两 loopback listener）+ S5-30（colocated）+ 既有 13/doctor（nats-conf-path/nats-server-bin seam） | 两 listener 的 loopback fail-closed 是 S0-ingress 的产品边界断言 |
+
+
+**Hot-update continuity ownership (S3, 2026-10-02)**: `34-hot-update-process` owns seven GREEN acceptance arms A/G/U/N/P/W/F (single hop, reverse hop, body-equivalent system unit, nohup, mixed traffic, watchdog redispatch, remote-fs deferral/retry). `39-hot-update-legacy-n1` owns the real previous-release boundary: X safe refusal GREEN, Y legacy exporter PRODUCT-RED. All new deploy runs are **NOT_RUN**; hermetic sensor controls are not deployment evidence. U does not prove `systemctl --user` (82 U3 owns that gap). S1 red receipts remain verbatim in expected-verdicts-log §34. Drill 33 retains success/rollback/domain exclusion and #73; no PTY/SSH/transfer/full-stack claim is added.
 
 ### 2.2 `cluster` 面（root persistent flag：`--socket`）
 
@@ -166,7 +171,7 @@ Status: **随 roadmap 演进的受审清单**。本文件是命令/事件覆盖�
 | `cluster join prepare` | — | `--node-id/--name/--raft-addr/--nats-route/--tunnel-addr/--public-host/--secrets-dir/--seed/--cert-fp/--nats-server-id` | 既有 grow + S6-42 | `--cert-fp`（tunnel provenance）/`--nats-server-id`/`--name` 是 join bundle 身份面——42 的 rejoin 断言 bundle 携带真值（grow 已日常走） |
 | `cluster join approve <bundle>` | — | `--wait/--timeout` | 既有（非阻塞）+ S6-42（--wait/--timeout 落点） | |
 | `cluster rebalance proxy` | — | `--dry-run` | S4-74 | |
-| `cluster upgrade` | — | `--to-version/--dry-run/--expect-sha256/--account-seed/--backup-taken/--ack-writefence/--notify-webhook` | S5-30 | webhook 臂可并 93 的接收器 |
+| `cluster upgrade` | — | `--to-version/--dry-run/--expect-sha256/--account-seed/--backup-taken/--ack-writefence/--notify-webhook/--broker-only/--resume/--component/--config-sha256/--reload-config/--rollback/--status/--recover` | S5-30；S8/S9 additions 见 §2.3 | webhook 臂可并 93 的接收器；infra status 返回 bare Status JSON，无独立 `--json` flag |
 | `cluster add <joiner>` | — | `--self-id/--name/--raft-addr/--nats-route/--tunnel-addr/--public-host/--node-ident-pub/--secrets-dir/--account-seed/--confirm-node-id/--reset-former-js/--preserve-js-data/--auto-confirm-catchup/--dry-run/--notify-webhook/--data-dir/--db/--config/--timeout` + Hidden `--yes` | 既有（grow=可执行规格）；`--preserve-js-data`（former-N1 JS 保留语义）与 `--auto-confirm-catchup`（BLOCKED op 确认边界）归 S6-40/plan 定臂；`--dry-run` 零改动断言归 40 顺带 | |
 | `cluster pin <invite>` | — | `--force` | S8-91 | 首写胜/--force 换簇 |
 | `cluster invite` | — | `--account-pub/--seed/--bootstrap` | S2-82 + S8-91 | OOB 铸造 |
@@ -184,6 +189,55 @@ Status: **随 roadmap 演进的受审清单**。本文件是命令/事件覆盖�
 | `cluster node-pub` / `cluster keygen` | **Hidden**（debug） | `node-pub --seed`；`keygen --out` | node-pub：NOT-COVERED（纯本地输出）；keygen：S7-52（产品铸钥臂） | |
 | **Tier-2 Hidden `--yes` 拒绝面**（`registerYesRejector` ×7：`add`/`init`/`recovery node remove`/`recovery restore`/`recovery force-single`/`recovery resnapshot`/`recovery rejoin prepare`） | **Hidden flag** | `--yes`（接受解析、**必拒**并输出 "no --yes override by design" 类明确报错——B3 设计性无人值守禁区） | 各对应 drill 的 typed-confirm 臂顺带 `assert_refuses --yes`：22（force-single）、42（rejoin/resnapshot）、43（init）、50（restore）、40（node remove）、既有 grow（add） | 安全门 fail-closed 面；hermetic 已测拒绝逻辑，deploy-tier 断言真栈报错可见 |
 | **machine-confirm 双因子**（`--confirm-node-id` + `$TETHER_CONFIRM_NODE_ID`，#5 机器逃生） | — | 两者必须同时等于 node-id（缺一即按 TTY 要求拒）。**仅限 `machineEscapable=true` 的命令：`add`/`init`/`recovery node remove`/`recovery resnapshot`**——**`restore` 除外**（其 `--confirm-node-id` 是 provenance 锚、never-escapable，见 restore 行；R5-F2） | 既有 grow（add 全程在用）+ S6-40（node remove）/42（resnapshot）/43（init）各一条「只给 flag 不给 env → 拒」负例 | |
+
+### 2.3 Hot-update surface reconciliation (S7/S8/S9, 2026-10-20)
+
+This table supplements the earlier command rows with the actual constructed tree, including the S8 rows
+already present in the goldens. All commands and flags below are visible unless marked Hidden. The four
+common transport/output exclusions above still apply; `--json` is repeated where transaction semantics
+matter. A drill assignment records its implemented arm, **not a passing deployment receipt**. All new live
+acceptance is **NOT_RUN** pending the owning package's real supply and same-candidate receipts.
+
+| Actual command / operation | Added flags or surface | Drill arm / explicit gap | Assertion or reason |
+|---|---|---|---|
+| `node upgrade <nid>` | `--prepare-only/--grant-out/--tx-id/--artifact-receipt`; existing `--url/--sha256/--timeout/--wait/--all` remain | **NOT-COVERED (deploy CLI)**; intended 38.A-single/A-sole/A-n3, H-root/H-user/H-no-systemd/H-colocated/H-sibling/H-readonly, C-driver | Prepare writes the target-issued grant; Start consumes that same grant plus staged artifact receipt; wait uses the original transaction. The current production describer is `upgradecli.UndescribedNode`, so prepare defers. Drill 38's supplied operations and hermetic CLI tests do not prove this production CLI sequence. |
+| `node upgrade <nid>` | `--interrupting` | **NOT-COVERED (deploy CLI)**; intended 39's legacy first-migration arms | Explicit first migration has separate legacy semantics. No accepted live supplier receipt proves this flag's production dispatch; ordinary `--url/--sha256` does not stand in for it. |
+| `node upgrade-status <nid>` | `--tx-id/--timeout/--json` | **NOT-COVERED (deploy CLI)**; intended 38.C-reopen | A fresh query may return rc0 for unknown; the drill's protocol observation does not prove this Cobra entry or JSON rendering. |
+| `node upgrade-wait <nid>` | `--tx-id/--timeout/--json` | **NOT-COVERED (deploy CLI)**; intended 38.C-driver | Unknown or wait-budget exhaustion remains rc74, with the same transaction identity. |
+| `node upgrade-rollback <nid>` | `--tx-id/--timeout/--json` | **NOT-COVERED (deploy CLI)**; intended 38.R0/R1/R2 | Reverse the current state of the original transaction; no stale image replay. |
+| `node upgrade-cancel <nid>` | `--tx-id/--timeout/--json` | **NOT-COVERED (deploy CLI)**; intended 38.C-driver | Cancellation is allowed only before activation effects; no direct live CLI arm is supplied. |
+| `node upgrade-archive <nid>` | `--tx-id/--timeout/--json` | **NOT-COVERED (deploy CLI)**; intended 38.C-owner-dead/I-begin-archive-gc | Archive requires owner-death proof; a test fixture's archive operation does not cover this command. |
+| `upgrade` / `upgrade stage` | Group has no flags; stage has `--grant/--source/--candidate/--receipt-out` | **NOT-COVERED (deploy CLI)**; intended 38.H-root/H-user/H-no-systemd/H-colocated/H-sibling/H-readonly | Root-owned staging binds both image identities to the grant. The current drill supplier has no verified direct invocation of this new entry. |
+| `broker` / `broker upgrade` | Groups inherit `--socket` | 37.A/A1/B/R own broker reload; S8 transaction extensions below are **NOT-COVERED (deploy CLI)** | Groups select the local broker object, independently of `node upgrade`; no effect from a group alone. |
+| `broker upgrade reload` | `--prepare-only/--grant-out/--tx-id/--artifact-receipt`; existing `--to-version/--expect-sha256` remain | **NOT-COVERED (S8 deploy CLI)**; intended 38.A-single/A-sole/A-n3/H-root/R2 | The legacy reload drill does not prove prepare/stage/Start with the target's original grant. |
+| `broker upgrade status` | `--tx-id/--json` | **NOT-COVERED (S8 deploy CLI)**; intended 38.C-reopen | No-transaction running-image status and private transaction View are distinct queries. |
+| `broker upgrade wait` | `--tx-id/--timeout/--json` | **NOT-COVERED (deploy CLI)**; intended 38.C-driver | Same original transaction and absolute wait budget. |
+| `broker upgrade rollback` | `--tx-id/--timeout/--json` | **NOT-COVERED (deploy CLI)**; intended 38.R0/R1/R2 | Current-state reverse with fresh physical receipts. |
+| `broker upgrade cancel` | `--tx-id/--timeout/--json` | **NOT-COVERED (deploy CLI)**; intended 38.C-driver | No accepted direct live CLI cancellation arm. |
+| `broker upgrade archive` | `--tx-id/--timeout/--json` | **NOT-COVERED (deploy CLI)**; intended 38.C-owner-dead/I-begin-archive-gc | Requires actual owner-death evidence. |
+| `broker-image-preflight` | **Hidden command**, no flags | **NOT-COVERED as an operator command** | Internal candidate ABI probe; constructor/runtime goldens retain its Hidden bit. It is not an operator upgrade entry. |
+| `cluster upgrade` | `--broker-only` | 37.B, broker-only roll scope | Co-located agent identity must stay unchanged; existing whole-host scope remains independent. |
+| `cluster upgrade` | `--resume` | **NOT-COVERED (deploy CLI)**; intended 38.C-driver/I-driver-death-host-reservation and 99/100 | Resume must load the original sealed parent plan. The installed CLI refuses pending the durable parent-plan endpoint; protocol/fixture schedules cannot prove that CLI endpoint. |
+| Describe / Prepare / Start | **No standalone Cobra commands** | Same gaps as the node/broker prepare and resume rows | `upgradecli.NodePorts.Describe` / `BrokerPorts.Describe` are internal ports. Prepare is selected by `--prepare-only`; Start by `--tx-id` plus `--artifact-receipt`. No invented `describe`, `prepare` or `start` command is added to either golden. |
+| `admin infra` | Group inherits `--socket` | 85.A and 86.I/R, single-mode local management | `infracli.AdminCommand` selects the independent infra service without a cluster session. |
+| `admin infra upgrade` | `--component/--to-version/--expect-sha256/--rollback` | 85.A cycle; 86.I cycle | `85-hot-update-nats.sh:infra_drill_command/infra_drill_round` executes single-mode NATS/Caddy upgrade, rollback, reupgrade with original business. |
+| `admin infra upgrade` | `--reload-config/--config-sha256` | 86.R (valid), 86.C (invalid config/cert) | `86-hot-update-caddy.sh:infra_caddy_reload` checks reload success or rc64 refusal and retained original sockets. |
+| `admin infra status` | `--tx` (bare Status JSON, no `--json`) | 86.F; `hot_update_infra_verbs.py:transaction` | Read the unique Tx from the halted command, query that same Tx, require Status fields and Halted phase. |
+| `admin infra recover` | `--tx` | 86.F; `85-hot-update-nats.sh:infra_drill_recover` | Recover the observed halted transaction and prove retirement before fixture cleanup. |
+| `admin infra rotate-policy` | No local flags; inherits `--socket` | **NOT-COVERED (deploy)** | The frozen management protocol has no root rotate-policy operation. This visible guide refuses before effect (non-root 77, unsupported root 64); no successful policy rotation is claimed. |
+| `cluster upgrade` | `--component/--to-version/--expect-sha256/--rollback` | 85.A1/B and 86.B/H | The shared command helper invokes the signed component path for sole-voter/quorum/pair topology; whole-host and `--broker-only` meanings remain separate. |
+| `cluster upgrade` | `--status/--recover` (Tx operand; status emits bare Status JSON) | 85.F; `hot_update_infra_verbs.py:transaction` and `infra_drill_recover` | Query then recover the same halted Tx after the LDM/reply-cut fault; no synthetic completion. |
+| `cluster upgrade` | `--reload-config/--config-sha256` with `--component caddy` | **NOT-COVERED (deploy CLI)** | 86.R/C run single mode and therefore exercise `admin infra upgrade`; no cluster-mode config-reload arm invokes this spelling. Hermetic dispatch coverage is not deploy coverage. |
+| `cluster upgrade` | Existing `--dry-run` with infra selection | **NOT-COVERED (infra deploy CLI)** | Legacy S5-30 dry-run ownership remains; no 85/86 arm separately asserts infra dry-run has zero effects. |
+| `push` / `pull` | `--rate-limit` | 63 transfer cohorts; 85/86 and 99/100 retain the supplied S7 startup-rate contract; **NOT-COVERED for independent CLI parsing** | Driver owners freeze original rates before faults. No driver-only rate field or passing hermetic fixture substitutes for an accepted real CLI startup receipt. |
+| `transfer` / `transfer status <transfer-id>` | Group has no flags; status has `--node` (+ common `--json`) | **NOT-COVERED (deploy CLI)**; intended 63/37.T | The new query's unknown/live/terminal semantics require the original origin census. No direct live invocation of this command is present in those drill scripts. |
+| `session rm <sid>` | `--abandon-unsettled-transfers` | **NOT-COVERED (deploy CLI)**; intended 63 cancellation/session-removal arms | Explicit abandonment must publish one failed canonical terminal with outcome_unknown=true; no-flag removal must remain DELETING/rc75. Existing session-removal success is not coverage of this flag. |
+
+The source comparison for the S9 golden delta is exact: five new `admin infra` paths and six added
+`cluster upgrade` flags (`--component`, `--config-sha256`, `--recover`, `--reload-config`, `--rollback`,
+`--status`), with no removed command, flag or Hidden bit. The S8 transaction and S7 rows above were
+already golden-pinned before this reconciliation. Drills 39, 99 and 100 remain compatibility/full-stack
+owners; their delegated protocol operations do not independently cover an unbound CLI spelling.
 
 ## 3. 生成方法（每批 plan 收工闸重跑；diff 非零先落行）
 
@@ -567,3 +621,74 @@ grammar 校验 + rc 交叉校验 + **默认 fail-closed，waiver 须显式**）�
 **S1–S9 CLOSURE 断言**：主线 P0–P13 + B/C/D/G 系列 + S1–S9 的每一条使用者面/agent面/broker面/集群面/横切承诺/
 事件告警面，已各自归入某个 drill 或显式 NOT-COVERED（附源码理由）。**收官闸**：命令树 golden
 （`command_tree_inventory_test.go`）零 diff + `pubSysEvent`/`alert_ops` 重枚举无表外项。**无未勾且未登记的行。**
+
+**热更新 S1 补记（2026-09-21，内审 D7 / deploy 核验 V5）**：上一段的「真实部署执行 NOT_RUN」在写下之后被跑过一次——
+`34-hot-update-process` 的唯一真实运行（PRODUCT-RED rc=3 pass=17，旧签名、ctl `{"finished":false}`）记录在
+`hot-update-process-baseline.md`；S1 把 ctl 半重钉为 `ctl=owner_lost_rc74` 后，新签名于 2026-09-21 再次实跑 PRODUCT-RED（55 s，ctl 退 74，evidence §12.2）。
+新增 `35-hot-update-exec-carrier`（arm-split A/B/C）：可靠 exec 穿越 nats-server 重启 / 25 s 停机 / tether-broker 重启，以及
+以真实前一发布（`vendor/tether-prev`）跑的 N-1 双向；三臂 2026-09-21 首次实跑 **GREEN**（A 90 s / B 51 s / C 84 s，NO DEVIATIONS；evidence §12.2）；hermetic 半（probe selftest 65
+控制、r9d 三臂 25 条谓词负例、`prev-supply-test` 29 条）在 `tests/run-all.sh` 里真跑。`drill-costs.tsv` 补 34 与 35.A/B/C 四行。
+
+**S3 drill registration (2026-10-02; real execution pending):** 34's parent joins seven GREEN
+expectations; 39 joins X GREEN and Y PRODUCT-RED. Costs are worst-case estimates pending first real
+runs. Go source pins for image cut/activation/deferral are intentional merge gates; missing CUT/BOOT
+implementation is not waived by the probe. The Y timeout rc70 signature is predicted and needs its
+first real receipt. The mixed scheduler and its run-all registration are owned by MIXEDPROBE/lead.
+
+**S9 infrastructure drill declarations (2026-10-13; execution NOT_RUN).** The frozen
+[S9 plan](hot-update-infra-nats-caddy-plan.md) §9.3 assigns the following exact arm sets.
+These rows declare coverage obligations; they contain no observed native verdict,
+runtime identity, measured cost or deployment receipt. Positive parents must join
+every positive child with native GREEN/rc0 and nc_gap=0; independent mutation runs
+retain their native ASSERT-FAIL/rc1 and never enter a positive parent.
+
+| Drill | Arms | Declared coverage obligation | Evidence status |
+|---|---|---|---|
+| 85-hot-update-nats | A A1 B D Q L S J F | A default single and A1 sole voter with standalone JS: original-cohort adjacent cycle on the current store; B N3 nine-hop cycle; D N2 refusal, Q surviving-quorum refusal and L stream/consumer-lag refusal, each followed by fresh repair; S same-store double-open refusal; J exact-release temporary-broker join; F post-LDM halt, healthy-survivor preservation and product recover. | DECLARED / NOT_RUN |
+| 86-hot-update-caddy | R B I H C K F U | R same-PID configuration reload; B N3 adjacent binary cycle; I live root/on-failure retrofit with the final current ACME tree; H healthy N2 cycle; C bad config/cert before-effect refusal; K privilege, effective-unit, late-Upgrade and responsibility gates; F serving shadow survives controller failure across 120s before product recover; U warm ingress and helper/launcher adjacent cycles with old-image retirement. | DECLARED / NOT_RUN |
+
+Every success obligation preserves the original SSH/TCP/SS/PTY/exec and four live
+transfers, with the production transfer rate fixed at invocation start, exact 10/s
+request slots, requests/flows ≤5s and transfer progress gaps ≤10s. Caddy additionally
+requires zero failed first-attempt canonical fresh TCP/TLS handshakes and physical
+outbound/return attachment proofs. Missing live inputs or receipts remain NOT_RUN;
+hermetic fixture, oracle and ledger controls do not establish deployment continuity.
+
+### S10 full-stack coverage closure (2026-10-21; unsigned)
+
+The [frozen S10 plan](hot-update-fullstack-acceptance-plan.md) §13.1 defines this required
+12-row matrix. The [machine-readable manifest](hot-update-fullstack-coverage.tsv) additionally
+maps R1–R16, all A7/B6/C11/D6/E6/F7/G6/H10 top-level items and four C7 clauses, S0–S9 intake,
+P21–P33 deliveries and seven carry keys. Original wording/history remains in the
+[tasklist](hot-update-tasklist.md#s10-coverage-and-receipt-contract-unsigned). These rows declare
+obligations; historical GREEN, stage closure, source presence and expected-match do not sign S10.
+
+| Row | Capability / required deployment coverage | Current status / pending owner |
+|---|---|---|
+| CAP01 | Unique owner/admission; 38/39,99.A/B,100.M05/M06/M11 | NOT_RUN; S8/P32, S10/P24, P35 |
+| CAP02 | Original exec/retirement;34/35,99.A/B | NOT_RUN; S10/P21, P35 |
+| CAP03 | PTY pending control/zombie tail/cleanup;36/39.P,99.A/B | NOT_RUN; S10/P21, P35 |
+| CAP04 | Original SSH/TCP at every affected infra cut;75/37,99.A/B | NOT_RUN; S7/P37 S6 intake, S10/P22, P35 |
+| CAP05 | SS crypto/revoke/parser;70/72/75,99.S1/S3 and joint live fuzz | NOT_RUN; S10/P22, P35 |
+| CAP06 | Tier A/B both directions/state/OFD/Sync/primitive/history/GC;61/63/37.T,99.A/B | NOT_RUN; S7/P37, S10/P23, P35 |
+| CAP07 | Remote-fs and mixed controls;34,99.F1/F3/A/B | NOT_RUN; S10/P17, P25, P35 |
+| CAP08 | Single/sole/N3 broker pre-replay ACK/flock/current store;37 all required arms,99.A/B | NOT_RUN; S7/P37, S10/P08, P24, P35 |
+| CAP09 | Actual adjacent NATS/JS cut/readiness/single writer;85 and every 99 step | NOT_RUN; S9/P39, S10/P15, P22, P23, P35 |
+| CAP10 | Caddy reload/binary/first retrofit/unit/ACME/canonical ingress;86,99.A/B/S/F | NOT_RUN; S9/P39, S10/P11, P15, P22, P35 |
+| CAP11 | Actual N-1/40 wire cells/retained decoders/incarnation/rollback/first migration;38/39,99.A/B reverse step R2 | NOT_RUN; S8/P32, S10/P24, P27, P35 |
+| CAP12 | Mixed five-generation retirement/resources/soak;all nine 99 arms and 50 controls in100 | NOT_RUN; S10/P19–P26, P35 |
+
+38/39 live receipts are pending S8/P27/P28 execution and S8/P32 certification;85/86 and
+32/73/98 are pending S9/P32/P33 execution and S9/P39 certification.99/100, full default/live-grow
+catalogs and final test/e2e/lint/gates are NOT_RUN pending S10/P35/lead, after P19–P33 delivery.
+S6 37/39.BR and ENDPOINT-RESUME remain pending S7/P37 combined-close receipts; S7 63/61/37.T,
+original state/FD/history/GC and final inventory receipts remain pending S7/P30/P37.
+
+`TestFullstackDocumentationClaimsHaveReceipts` checks stable leaf digests, exact row/requirement
+unions, child obligations and each signed receipt's current candidate, actual external raw bytes,
+hashes, argv/native rc and real-release executable provenance. Its same-file controls reject empty
+raw evidence, old candidates, checks without leaf receipts and synthetic N-1. A passing gate
+permits honest NOT_RUN rows; it certifies no deployment. Every missing receipt retains an exact
+pending package in the TSV. P27 supplies behavioral compatibility intake; P33 supplies clause-level
+live-doc alignment; P35 seals/signs final evidence. S9's Linux/managed-route support boundary and
+the separate Darwin native/cross-build scopes remain as frozen; no coverage is extrapolated.

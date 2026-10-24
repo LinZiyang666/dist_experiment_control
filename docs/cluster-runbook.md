@@ -833,11 +833,12 @@ tether cluster init --from-manifest /root/brk-b-ident.json --secrets-dir /etc/te
 # Then rejoin via the §1 join flow on the leader (`join approve <bundle> --wait`).
 ```
 
-## 6. Rolling upgrade (followers-first, leader-last)
+## 6. Broker upgrade (followers-first, leader-last)
 
-A rolling upgrade replaces the binary on each broker one at a time WITHOUT downtime, as long as
-the new and old binaries speak the SAME proto version. A **proto bump (v2→v3) is a flag-day, NOT
-a rolling upgrade** (the wire is incompatible — stop the whole fleet, upgrade, restart).
+The stop/start recipe below is an interrupting cold upgrade. HA can retain control quorum, but the
+stopped broker's original business sockets are not preserved. For a planned same-PID cut, use the S8
+transaction sequence in [broker operations](broker-ops.md#s8-transaction-operations). Same proto alone
+does not establish reader/schema/config compatibility. A proto bump requires coordinated reinstall.
 
 ```bash
 # 0. Confirm the target release is the SAME proto. `cluster status` shows each node's running
@@ -861,14 +862,15 @@ tether cluster status
 ```
 
 Notes:
+- `cluster upgrade` 的共址 agent `ReExecOnly` 腿在 exec 失败时先 Thaw 并保持存活，不再 exit 1；driver 以运行 SHA 判断该腿是否成功（S3 契约见 distributed-broker-architecture §22.6）。
 - A mixed-release window (some nodes new, some old) is generally safe as long as the proto is
   unchanged — `cluster join approve` only WARNS on a release skew (it rejects only a proto mismatch), and a
   re-joining drained node may legitimately be older than the now-upgraded leader during a rollback.
-  **CAVEAT (DB schema):** if the NEW release adds a DB migration, an upgraded node forward-migrates
-  its DB and you CANNOT then roll that node back to the older binary (migrations are forward-only;
-  the old binary has no downgrade path). Upgrade is one-way per node once it has migrated — keep the
-  `tether.db` backup (`cluster backup`) from BEFORE the upgrade for a true rollback. Same-proto
-  releases that add NO migration are freely roll-back-able.
+  **Schema and rollback:** cold startup may migrate forward. A pre-upgrade backup is disaster-recovery
+  material; restoring it can discard writes ACKed after that backup and is not a hot rollback. S6 hot
+  preflight requires candidate and actual previous reader support for the exact current schema; hot reopen
+  never migrates. After activation, rollback uses a new current-state cut and the current DB/WAL.
+  Same-proto alone does not prove image-domain/schema compatibility or safe rollback.
 - Watch `cluster status` STREAMS (actual/target) between steps: a node restart transiently drops a
   JS replica; wait for `replication_degraded` to clear (actual==target) before upgrading the next.
 
@@ -904,3 +906,104 @@ tether cluster unlock --grow    --account-seed <path>
   exited, its terminal is closed, and `tether cluster ops ls` shows no in-flight op. Forcing a lock that
   someone is still renewing is how you get two concurrent membership changes.
 - `--account-seed` is required for the signed request (same trust anchor as `cluster upgrade`).
+
+## S6 planned broker cut readiness (final receipts pending)
+
+The manual stop/start sequence in §6 is an interrupting upgrade. The
+[S6 operations contract](broker-ops.md#s6-broker-image-operations-final-receipts-pending) defines the planned
+same-PID path inside Broker.Run, whose final gates/drill receipts remain pending. S8 requires a
+target-issued transaction grant; the old bare reload envelope is policy-refused. Single mode is primary; do not convert it
+with cluster init merely to claim the sole-voter drill passed. For N≥3, obtain fresh configuration/term/role
+and transfer leadership before every step; a join release-skew WARN establishes neither image compatibility
+nor installed maintenance capability. Planned cut requires all required observer ACKs, including the agent's
+installed route-hold capability; an old agent without it refuses before interruption.
+
+Maintenance holder acquire/renew/release is exact CAS. Cross-clock proof expiry consumes RTT and is fixed
+at ≤8s; delayed replies/replayed proof/new leader cannot extend it. Preserve historical home dwell and
+ordinary crash recovery. `cluster upgrade --broker-only` is an explicit scope, independent of whether a
+host has an agent. Never remove/rotate allocations or pause the reaper to help the fixture pass.
+Do not restore a backup/old SQLite snapshot during hot rollback; keep current ACKs and JS identity.
+
+Lead decision D-C (2026-10-22), “维护缺capability切前拒绝”: single-mode planned cuts also require the
+S6 capability and a signed challenge proof ACK from every currently reachable affected agent. Missing
+capability or an uninstalled hold refuses before queueing or fencing the cut, including S8 Start.
+Single mode retains a local maintenance owner in the same image, using the existing metadata CAS,
+fixed ≤8s lifetime and conservative proof deadline. It uses local storage without Raft or a new OpType.
+Prepare the agents' observer capability before attempting the broker cut; ordinary legacy traffic
+continues to work without granting permission for a planned cut.
+[Final claims](reviews/hot-update-tasklist.md#s6-broker-image-receipt-boundary) remain unchecked pending P35.
+
+
+## S7 transfer continuation during cluster cuts (PENDING receipts)
+
+The [frozen S7 plan](reviews/hot-update-transfer-continuation-plan.md) and
+[architecture §22.10](distributed-broker-architecture.md#2210-s7-transfer-continuation-binding-contract-receipts-pending)
+replace legacy transfer-loss clauses only for negotiated transfer-v1. This section supplies the operational
+contract, not authorization or evidence of a completed rollout. P37 must sign the final candidate receipts.
+
+Keep the original ctl invocation alive. Rehome/leadership moves do not remint its ID, permit or object
+version: continuation and settlement route to the original broker instance, possibly a follower. Before
+new v1 admission, all eligible brokers must prove transfer/history/config guard capabilities; failed probes
+are unknown, not cap0. During hot/cold startup, install the sleeping imported tracker as a current owner
+before store/control activation, subscriptions, watchdog and either reaper. Live responsibilities protect
+both primary and outbox; they do not stop their own finalizers from completing cleanup.
+
+Use the S8 agent/local broker transaction entries. S7 status/rate flags are present and workspace
+--help-verified; live acceptance remains NOT_RUN/PENDING.
+Single is the primary lane, sole voter is separate, and N3 retains S6 followers-first/leadership-before-step
+and installed maintenance ACK rules. Original-origin responsibility persists across every step. Missing
+transfer-v1 in either SHA-bound candidate/actual prev, legacy or unknown state, resource excess or a syscall
+without a safe point must defer with originals intact. Do not drain capable transfers or pause GC merely
+to make a drill pass. An ACTIVE failure takes a fresh current generation+1 cut; restoring old DB/WAL,
+Grant, source cursor or budget would erase already-acknowledged work.
+
+For storage-horizon refusal, preserve the existing 48h TTL and reconcile operator limits deliberately;
+no transfer path is allowed to modify TTL or downgrade silently. For session removal, pending original
+receiver/publication obligations return 75 and retain DELETING history/OBJ/SQL. Normal business stays
+revoked while the restricted original-receiver settlement connection remains available. Explicit
+`session rm <sid> --abandon-unsettled-transfers` (live receipt pending) stages failed/settlement_abandoned with
+outcome_unknown=true; it cannot be used to claim complete or no-effect. See
+[settlement operations](broker-ops.md#s7-transfer-settlement-operations-pending-receipts).
+
+Acceptance uses four independent sessions/buckets, 66,549,440 B and 1 GiB each push/pull, with real Caddy/WSS.
+Each sender and receiver leg requires agent→broker→current rollback hops while data is live plus post-cut
+progress. Single/sole-voter/N3 are distinct; C1 carrier, C2 data connection and C3 same-binary/same-store JS
+restart are distinct receipts. `37.T` single/N3 capable transfer requires a successful live cut; legacy/
+unknown safety-defer is separate. Genuine old N3 Run-unwind remains `39.BR` PRODUCT-RED3. No window,
+required child or drain receipt may be replaced with a completed short file or an empty observation.
+Costs are ESTIMATE/NOT_MEASURED until P37 supplies actual launch-unit/marginal timings. External NATS/
+Caddy binary changes, first legacy migration and final mixed rollout retain S9/S8/S10 ownership.
+
+## S8/S9 transaction order and infrastructure readiness
+
+For an already capable fleet, keep a verified pre-upgrade backup and check actual reader/schema/config
+compatibility, original business scope and each component's recorded previous image. Use describe→
+prepare→root stage→Start→fresh wait from [the executable sequence](usage.md#broker-image-transaction-entry-s8-final-receipts-pending).
+A resumed parent uses `cluster upgrade --resume <parent-tx-id>` with its original sealed plan/child
+handles; it must not infer completed children from release strings. Broker-only scope preserves the
+co-located agent; host/domain release follows all registered participants. Pending transactions are not
+GC candidates, and accepted-but-unknown effects require query/recover of the original ID.
+
+Keep the release N-1 operational order broker-first, agent/ctl-later and reverse for rollback. S10's
+agent-first mechanism trajectory assumes all participants already advertise the required capabilities;
+it cannot authorize that order on arbitrary old releases. Default legacy node/reload requests are
+safely refused; interrupting first migration is a separately labelled non-hot path. Three completion
+points and a fresh census, including original plus late work and zero old owners, close the transaction.
+
+For infrastructure, use the [S9 command surface](usage.md#infrastructure-commands-s9). Default single
+and tether sole-voter with standalone JS are independent N1 lanes with original-store stop/restart;
+neither uses LDM nor a concurrent opener. In N3, prove actual JS meta/stream/consumer groups retain
+quorum/current state, prepare successor and move clients before LDM, then verify pre-repair ACK prefix
+before writers/replay/reconcile/GC resume. N2 NATS and inadequate replica/quorum/current evidence defer.
+Healthy N2 Caddy is a separate positive lane. Readiness never silently repairs replica placement.
+
+Caddy binary cuts must move WSS clients away and back using real socket/cid/serverID/ingress-PID proof,
+while the nft canonical route admits fresh TLS without first-attempt failure. Config reload has separate
+semantics. Managed certificate/storage ownership and protected admin sockets precede retirement; final
+current ACME sync/fsync and selector commit follow old-writer exit. A serving shadow retained by halted
+recovery is pending, not completed; 120s does not license killing its business. Unsupported QUIC/custom
+module/storage/unknown long connections defer. Scope is linux/amd64 + systemd/pidfd/cgroup/nft.
+
+[S9 P39](reviews/hot-update-infra-nats-caddy-plan.md#p39--最终候选收据与关闭--hard) owns final infra receipts.
+38/39/85/86/99/100 live runs, final-candidate hard gates, Darwin native and S10 A–H totals remain
+NOT_RUN/PENDING. Existing native PRODUCT-RED3 / INCOMPLETE4 remain recorded in their original domains.
