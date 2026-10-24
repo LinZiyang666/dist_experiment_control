@@ -49,53 +49,19 @@ import (
 	"io"
 	"log"
 	"log/slog"
-	"math/rand/v2"
 	"net"
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/backoff"
+	"github.com/LinZiyang666/tether/internal/listenerimage"
 	"github.com/LinZiyang666/tether/internal/proto"
 	"github.com/LinZiyang666/tether/internal/tokenhash"
+	"github.com/LinZiyang666/tether/internal/tunnel/transport"
 	"github.com/hashicorp/yamux"
 )
-
-// ErrRegisterDenied wraps every broker DENY reply. errors.Is(err,
-// ErrRegisterDenied) is true for a *DenyError; the reconnect loop then
-// classifies the Reason as terminal (stop) or transient (retry).
-var ErrRegisterDenied = errors.New("tunnel: broker denied REGISTER")
-
-// DenyError carries the broker's DENY reason string for terminal-vs-
-// transient classification (see denyIsTransient).
-type DenyError struct{ Reason string }
-
-func (e *DenyError) Error() string { return "tunnel: broker denied REGISTER: " + e.Reason }
-
-func (e *DenyError) Is(target error) bool { return target == ErrRegisterDenied }
-
-// denyIsTransient reports whether a DENY reason is worth retrying. Only
-// the broker's two non-authoritative reasons are transient: a public-port
-// bind race (the old listener is mid-teardown) and a broker-side store
-// fault (try_again, see broker.tunnelTokenLookup). Every other reason —
-// including any UNKNOWN one from a newer broker — is treated terminal:
-// the safe default is to stop rather than hammer a broker that
-// authoritatively refused us.
-func denyIsTransient(reason string) bool {
-	switch reason {
-	case "public_port_bind_failed", "try_again", proto.ReasonHomeCatchingUp:
-		// home_catching_up (D6 §7.2): the home replica has not yet applied the
-		// latest OpPortReassignHome (presented epoch > its local row epoch). It is
-		// TRANSIENT — the agent must keep retrying until the home catches up, never
-		// treat it as terminal (which would brick the rehome). The reason string is
-		// the proto SSOT shared with the broker emit-side (no duplicated literal).
-		return true
-	default:
-		return false
-	}
-}
 
 // ErrHomePinsRequired is returned when targeting a CLUSTERED home (non-empty
 // brokerAddr) is targeted without cert pins (D6 §7.7/R-22). The agent must NOT
@@ -230,6 +196,13 @@ func (w yamuxWriter) Write(p []byte) (int, error) {
 // Server is the broker side of the tunnel. Owns the control listener
 // (`:7000`) plus one public listener per registered (agent, port).
 type Server struct {
+	// Installed by P1 only; legacy paths never inspect or invoke this owner.
+	// origin: hot-update S5 plan §2 / L13
+	flowState *serverFlowState
+	// Pristine metadata follows the Server terminal owner until activation/detach.
+	// origin: hot-update S6 plan §4.2; internal review rv-fd-8
+	importedImage *serverImportedImage
+
 	addr        string
 	publicHost  string // bind addr for public ports (default 0.0.0.0)
 	tokenLookup TokenLookup
@@ -269,6 +242,26 @@ type Server struct {
 	closed bool
 	ln     net.Listener   // control listener; Close() must close it
 	wg     sync.WaitGroup // tracks in-flight handleAgent goroutines
+
+	// Admission, accepted handshakes and carrier monitors have separate joins.
+	// origin: hot-update S6 plan §6.2 / T23
+	imagePaused   bool
+	retiringImage bool
+	// Installed only after the image safe point has joined workers. A hard
+	// revoke then shares Prepare/ExecCommit's latch and closes every Prepared
+	// alias before its authoritative caller can acknowledge the mutation.
+	// origin: hot-update S6 plan §6.2 / T25
+	imageRevoke   func([]string, func() error) error
+	legacyWorkers uint32
+	controlKeeper listenerimage.Keeper
+	controlRaw    net.Listener
+	runCtx        context.Context
+	acceptDone    chan struct{}
+	lifetimeDone  chan struct{}
+	lifetimeOnce  sync.Once
+	controlConns  map[net.Conn]chan struct{}
+	monitors      map[*flowCarrier]chan struct{}
+	callbacks     map[*endpointTimer]struct{}
 
 	// regLog (#78) dampens the `read REGISTER` WARN — the ONE unauthenticated
 	// internet-triggerable log site on this listener. A single agent behind a
@@ -406,6 +399,11 @@ func (s *Server) Start(ctx context.Context) error {
 	ln := tls.NewListener(rawLn, tlsCfg)
 	s.mu.Lock()
 	s.ln = ln
+	s.controlRaw = rawLn
+	s.runCtx = ctx
+	s.acceptDone = make(chan struct{})
+	s.lifetimeDone = make(chan struct{})
+	acceptDone, lifetimeDone := s.acceptDone, s.lifetimeDone
 	s.mu.Unlock()
 
 	// The accept loop owns every subsequent wg.Add for handleAgent. Register it before launch so Close's
@@ -414,14 +412,26 @@ func (s *Server) Start(ctx context.Context) error {
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
+		defer close(acceptDone)
 		s.acceptLoop(ctx, ln)
 	}()
 	go func() {
-		<-ctx.Done()
-		s.Close()
+		select {
+		case <-ctx.Done():
+			s.Close()
+		case <-lifetimeDone:
+		}
 	}()
 	s.logger.Info("tunnel: server listening", "addr", s.addr)
 	return nil
+}
+
+// StartOwned keeps the data-plane lifetime independent of Run's stop signal.
+// RuntimeSlot performs terminal Close after a canceled cut has reclaimed its
+// Prepared aliases; a context watcher must never SHUT_RDWR exported raw OFDs.
+// origin: hot-update S6 plan §1.2 / rv-fd-6
+func StartOwned(s *Server) error {
+	return s.Start(context.Background()) // ctx-root: explicit broker data-plane owner.
 }
 
 func (s *Server) SetCertificate(cert *tls.Certificate) {
@@ -441,7 +451,7 @@ func (s *Server) serverTLSConfig() (*tls.Config, error) {
 		s.tlsCert = &c
 	}
 	s.mu.Unlock()
-	return &tls.Config{
+	cfg := &tls.Config{
 		GetCertificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
 			s.mu.Lock()
 			defer s.mu.Unlock()
@@ -451,7 +461,13 @@ func (s *Server) serverTLSConfig() (*tls.Config, error) {
 			return s.tlsCert, nil
 		},
 		MinVersion: tls.VersionTLS12,
-	}, nil
+	}
+	s.mu.Lock()
+	enabled := s.flowState != nil
+	s.mu.Unlock()
+	// origin: hot-update S5 plan §4.1 / T15
+	cfg = flowServerTLSConfig(cfg, enabled)
+	return cfg, nil
 }
 
 func (s *Server) acceptLoop(ctx context.Context, ln net.Listener) {
@@ -505,6 +521,10 @@ func (s *Server) acceptLoop(ctx context.Context, ln net.Listener) {
 			continue
 		}
 		delay = 0
+		if !trackControlConnection(s, conn) {
+			_ = conn.Close()
+			continue
+		}
 		// PER-SOURCE FIRST, so one address cannot consume the process-wide budget and
 		// lock the fleet out — see maxRegisterHandshakesPerIP. Refused either way
 		// WITHOUT completing the TLS handshake: answering would cost exactly the work
@@ -512,6 +532,7 @@ func (s *Server) acceptLoop(ctx context.Context, ln net.Listener) {
 		host := remoteHostOf(conn)
 		if !s.acquireHandshakeSlotForIP(host) {
 			s.registerHandshakeRefused(conn, "per_ip")
+			untrackControlConnection(s, conn)
 			_ = conn.Close()
 			continue
 		}
@@ -521,33 +542,19 @@ func (s *Server) acceptLoop(ctx context.Context, ln net.Listener) {
 			// At the process-wide ceiling: refuse without spending a goroutine on it.
 			s.releaseHandshakeSlotForIP(host)
 			s.registerHandshakeRefused(conn, "global")
+			untrackControlConnection(s, conn)
 			_ = conn.Close()
 			continue
 		}
 		s.wg.Add(1)
 		go func(c net.Conn, h string) {
 			defer s.wg.Done()
+			defer untrackControlConnection(s, c)
 			defer func() { <-handshakes }()
 			defer s.releaseHandshakeSlotForIP(h)
 			s.handleAgent(ctx, c)
 		}(conn, host)
 	}
-}
-
-// remoteHostOf is the source address a handshake is accounted to. A conn whose
-// RemoteAddr cannot be parsed accounts to "" — one shared bucket, which is the
-// conservative direction: an unattributable peer competes with other unattributable
-// peers rather than getting an unmetered slot.
-func remoteHostOf(conn net.Conn) string {
-	addr := conn.RemoteAddr()
-	if addr == nil {
-		return ""
-	}
-	host, _, err := net.SplitHostPort(addr.String())
-	if err != nil {
-		return addr.String()
-	}
-	return host
 }
 
 // acquireHandshakeSlotForIP takes one of host's maxRegisterHandshakesPerIP slots,
@@ -610,22 +617,6 @@ func (s *Server) registerHandshakeRefused(conn net.Conn, which string) {
 	}
 	s.logger.Debug("tunnel server: handshake ceiling refusal (suppressed repeat)",
 		"ceiling", which, "remote", remote, "fails", fails)
-}
-
-// regLogClasses is the fixed, coarse REGISTER-read failure taxonomy (review
-// M1). NEVER err.Error(): variable detail (a port, a byte count) would defeat
-// suppression. Each class carries its OWN Tracker so a class change is a
-// different Tracker, not a logged transition — independent per-class pacing.
-func regLogClass(err error) string {
-	var ne net.Error
-	switch {
-	case errors.Is(err, io.EOF):
-		return "eof"
-	case errors.As(err, &ne) && ne.Timeout():
-		return "timeout"
-	default:
-		return "other"
-	}
 }
 
 // regLogTracker returns the per-class Tracker, creating it on first use.
@@ -758,14 +749,16 @@ func (s *Server) handleAgent(ctx context.Context, conn net.Conn) {
 	// run forever" was false for any handler that had not yet installed a session —
 	// per-session cancellation cannot reach a handler that has no serverSession yet.
 	hsDone := make(chan struct{})
+	hsJoined := make(chan struct{})
 	go func() {
+		defer close(hsJoined)
 		select {
 		case <-ctx.Done():
 			_ = conn.Close()
 		case <-hsDone:
 		}
 	}()
-	defer close(hsDone)
+	defer func() { close(hsDone); <-hsJoined }()
 
 	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 	_ = conn.SetWriteDeadline(time.Now().Add(registerWriteBudget))
@@ -835,6 +828,17 @@ func (s *Server) handleAgent(ctx context.Context, conn net.Conn) {
 		s.mu.Unlock()
 	}()
 
+	// A selected v1 carrier enters the independent Endpoint owner. Legacy
+	// listeners retain their established lifecycle and exact REGISTER grammar.
+	// origin: hot-update S5 plan §4.1 / §4.2
+	if selectedFlow(conn) {
+		if s.flowState == nil {
+			_ = conn.Close()
+			return
+		}
+		handleFlowRegister(s, conn, br, Allocation{SID: sid, NID: nid, Port: port, TokenHash: tokenHash, Epoch: epoch}, snap, ctx.Done())
+		return
+	}
 	if err := s.tokenLookup(sid, nid, port, tokenHash, epoch); err != nil {
 		// THROUGH THE DAMPER, like every other line on this listener.
 		//
@@ -878,7 +882,7 @@ func (s *Server) handleAgent(ctx context.Context, conn net.Conn) {
 	// loses under load. The post-yamux re-check stays as the authoritative
 	// install-time fence for the residual snapshot→install window.
 	s.mu.Lock()
-	fenced := s.closed || s.fenceChangedLocked(snap, port, sid, fenceKey)
+	fenced := s.closed || s.imagePaused || s.fenceChangedLocked(snap, port, sid, fenceKey)
 	s.mu.Unlock()
 	if fenced {
 		_ = publicLn.Close()
@@ -887,7 +891,7 @@ func (s *Server) handleAgent(ctx context.Context, conn net.Conn) {
 		return
 	}
 
-	if _, err := conn.Write([]byte("OK\n")); err != nil {
+	if err := writeRegisterOK(conn); err != nil {
 		_ = publicLn.Close()
 		_ = conn.Close()
 		return
@@ -897,7 +901,7 @@ func (s *Server) handleAgent(ctx context.Context, conn net.Conn) {
 	// ConnectionWriteTimeout and a live tunnel must not inherit an absolute
 	// deadline from the handshake.
 	_ = conn.SetWriteDeadline(time.Time{})
-	yamuxSess, err := yamux.Server(conn, muxConfig(s.logger))
+	yamuxSess, err := yamux.Server(retainRegisterReader(conn, br), muxConfig(s.logger))
 	if err != nil {
 		s.logger.Warn("tunnel server: yamux server", "err", err)
 		_ = publicLn.Close()
@@ -918,7 +922,7 @@ func (s *Server) handleAgent(ctx context.Context, conn net.Conn) {
 		cancel:     cancel,
 	}
 	s.mu.Lock()
-	if s.closed || s.fenceChangedLocked(snap, port, sid, fenceKey) {
+	if s.closed || s.imagePaused || s.fenceChangedLocked(snap, port, sid, fenceKey) {
 		// Server shutting down, OR a CloseProxy(port)/CloseSession(sid) fired
 		// during our handshake (round-2/round-5 F1). Either way don't install —
 		// roll back the per-conn state so we don't leak the public port or
@@ -947,997 +951,13 @@ func (s *Server) handleAgent(ctx context.Context, conn net.Conn) {
 	// Watch the yamux session's close channel so a client-side Close
 	// (or network drop) tears down the public listener instead of
 	// leaving an orphan accepting connections that go nowhere.
-	go func() {
+	launchLegacyServerWorker(s, func() {
 		<-yamuxSess.CloseChan()
 		cancel()
 		_ = sess.listener.Close()
-	}()
+	})
 
-	go s.publicAcceptLoop(sessCtx, sess)
-}
-
-// publicAcceptLoop pumps every TCP connection on the public port into
-// a brand-new yamux stream to the agent. The agent will write/read
-// bytes on that stream from/to its local port.
-func (s *Server) publicAcceptLoop(ctx context.Context, sess *serverSession) {
-	defer func() {
-		s.mu.Lock()
-		if cur, ok := s.sessions[sess.publicPort]; ok && cur == sess {
-			delete(s.sessions, sess.publicPort)
-		}
-		s.mu.Unlock()
-		_ = sess.listener.Close()
-		_ = sess.yamuxSess.Close()
-		_ = sess.rawConn.Close()
-	}()
-	for {
-		pubConn, err := sess.listener.Accept()
-		if err != nil {
-			if ctx.Err() != nil {
-				return
-			}
-			s.logger.Warn("tunnel: public accept", "err", err, "port", sess.publicPort)
-			return
-		}
-		go s.bridgePublicToYamux(pubConn, sess)
-	}
-}
-
-func (s *Server) bridgePublicToYamux(pubConn net.Conn, sess *serverSession) {
-	stream, err := sess.yamuxSess.Open()
-	if err != nil {
-		s.logger.Warn("tunnel: yamux Open", "err", err)
-		_ = pubConn.Close()
-		return
-	}
-	bridge(pubConn, stream)
-}
-
-// CloseProxy tears down the single public-port session for `port` (listener +
-// yamux + control conn) immediately, independent of the agent or NATS. Used by
-// the P13 `proxy off` authoritative kill switch so the public exit dies the
-// moment the owner disables, not whenever the agent next processes the OFF.
-// No-op (returns false) if no session owns that port.
-func (s *Server) CloseProxy(port int) bool {
-	s.mu.Lock()
-	// Advance the kill generation FIRST, so any in-flight handleAgent that
-	// already passed the token lookup for this port aborts its install (F1).
-	s.killGen[port]++
-	sess, ok := s.sessions[port]
-	if ok {
-		delete(s.sessions, port)
-	}
-	s.mu.Unlock()
-
-	if !ok {
-		return false
-	}
-	closeServerSession(sess)
-	return true
-}
-
-// CloseProxyIf tears down the public listener only if the currently installed
-// session still matches the supplied allocation identity. Even when no listener
-// is installed, it bumps an allocation-scoped generation so an old in-flight
-// REGISTER for that exact token cannot install after the caller freed/revoked
-// the allocation. The fence is not bare-port scoped: a stale close for token A
-// must not deny or close a new allocation on the same public port with token B.
-func (s *Server) CloseProxyIf(info SessionInfo) bool {
-	if info.PublicPort <= 0 {
-		return false
-	}
-	s.mu.Lock()
-	s.ensureAllocationFenceMapsLocked()
-	key := sessionFenceKeyFromInfo(info)
-	s.killGenAllocation[key]++
-	s.closedAllocation[key] = true
-	sess, ok := s.sessions[info.PublicPort]
-	if !ok {
-		s.maybePruneAllocationLocked(key)
-		s.mu.Unlock()
-		return false
-	}
-	if sess.sid != info.SID || sess.nid != info.NID || sess.tokenHash != info.TokenHash {
-		s.maybePruneAllocationLocked(key)
-		s.mu.Unlock()
-		return false
-	}
-	delete(s.sessions, info.PublicPort)
-	s.maybePruneAllocationLocked(key)
-	s.mu.Unlock()
-
-	closeServerSession(sess)
-	return true
-}
-
-// SessionInfos snapshots every installed public listener identity.
-func (s *Server) SessionInfos() []SessionInfo {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	out := make([]SessionInfo, 0, len(s.sessions))
-	for _, sess := range s.sessions {
-		out = append(out, SessionInfo{
-			PublicPort: sess.publicPort,
-			SID:        sess.sid,
-			NID:        sess.nid,
-			TokenHash:  sess.tokenHash,
-			Epoch:      sess.epoch,
-		})
-	}
-	return out
-}
-
-func closeServerSession(sess *serverSession) {
-	if sess == nil {
-		return
-	}
-	sess.cancel()
-	if sess.listener != nil {
-		_ = sess.listener.Close()
-	}
-	if sess.yamuxSess != nil {
-		_ = sess.yamuxSess.Close()
-	}
-	if sess.rawConn != nil {
-		_ = sess.rawConn.Close()
-	}
-}
-
-// ForgetSession closes any remaining listeners for sid and PRUNES its kill-gen
-// bookkeeping (self-review: killGenSession would otherwise grow unbounded across
-// session lifecycles). Safe to call ONLY when the session is permanently gone
-// (finalizeSessionRm, after dropSessionRows) — once its allocation rows are
-// deleted, tunnelTokenLookup denies every REGISTER for sid regardless of the
-// pruned generation, so a late in-flight REGISTER can never install.
-func (s *Server) ForgetSession(sid string) {
-	s.mu.Lock()
-	// round-6 F4: BUMP the session fence (not merely delete it) so an authorized
-	// REGISTER paused between snapshot and install observes a changed generation
-	// and aborts — even after its allocation rows are gone. Mark the session
-	// forgotten; the entry is only pruned once no handler is in-flight, so the
-	// fence can't be lost from under a paused handler.
-	s.killGenSession[sid]++
-	s.forgotten[sid] = true
-	var victims []*serverSession
-	for port, sess := range s.sessions {
-		if sess.sid == sid {
-			s.killGen[port]++
-			victims = append(victims, sess)
-			delete(s.sessions, port)
-		}
-	}
-	s.maybePruneSessionLocked(sid)
-	s.mu.Unlock()
-
-	for _, sess := range victims {
-		closeServerSession(sess)
-	}
-}
-
-// fenceSnap is the set of kill generations a REGISTER handler captured before
-// it started installing. Comparing the whole struct is what makes the fence
-// total: adding a fourth dimension means adding a field here, and every
-// comparison site picks it up automatically.
-//
-// Batch-A A9. This replaced a snapshot of three locals plus TWO hand-written
-// `||` chains that repeated the same three comparisons verbatim. The three
-// dimensions did not arrive together — killGen[port] came from round-2 F1,
-// killGenSession[sid] from round-5 F1, killGenAllocation[fenceKey] from
-// round-6 F4 — i.e. three consecutive external reviews each found the fence
-// incomplete in a new direction.
-//
-// A fourth is entirely plausible (per-nid, for multi-home). Under the old shape
-// that meant editing three places, and OMITTING one of the two chains COMPILES
-// CLEANLY. The consequence of that silent miss is not a crash: an exit that was
-// already killed gets resurrected by a REGISTER racing the kill, and re-binds
-// the public port. A data-plane hole, in precisely the spot three reviews in a
-// row already had to patch.
-type fenceSnap struct {
-	port  int64
-	sess  int64
-	alloc int64
-}
-
-// fenceSnapLocked captures the current fence. Caller holds s.mu.
-func (s *Server) fenceSnapLocked(port int, sid string, fenceKey sessionFenceKey) fenceSnap {
-	return fenceSnap{
-		port:  s.killGen[port],
-		sess:  s.killGenSession[sid],
-		alloc: s.killGenAllocation[fenceKey],
-	}
-}
-
-// fenceChangedLocked reports whether any fence dimension moved since snap.
-// Caller holds s.mu.
-//
-// s.closed is deliberately NOT folded in: it is server lifecycle, not a fence
-// dimension, and call sites read better spelling out `s.closed || changed`.
-func (s *Server) fenceChangedLocked(snap fenceSnap, port int, sid string, fenceKey sessionFenceKey) bool {
-	return s.fenceSnapLocked(port, sid, fenceKey) != snap
-}
-
-// releaseInflightLocked drops one in-flight REGISTER's bookkeeping, DELETING the
-// key when the count reaches zero. Caller holds s.mu.
-//
-// origin: prerelease audit broker-dataplane/BDP-F2 (reproduced by the main process:
-// 200 unauthenticated REGISTERs left 200 permanent entries in each map). `m[k]--`
-// writes 0 back, it does not remove the key, and the two pruners below can only fire
-// for a sid ForgetSession has marked forgotten or an allocation CloseProxyIf has
-// closed — neither is ever true for a session that never existed. So every denied
-// probe from a stranger used to leave two entries behind for the life of the
-// process.
-//
-// Deleting at zero is EXACTLY equivalent to the old bookkeeping for the fence: both
-// pruners read a missing key as 0, which still satisfies their `<= 0` test, so the
-// round-2 / round-5 / round-6 fence invariants are untouched. Order matters — decrement
-// (or delete) first, then let the pruners run.
-func (s *Server) releaseInflightLocked(sid string, key sessionFenceKey) {
-	if n := s.inflightBySID[sid] - 1; n > 0 {
-		s.inflightBySID[sid] = n
-	} else {
-		delete(s.inflightBySID, sid)
-	}
-	if n := s.inflightByAllocation[key] - 1; n > 0 {
-		s.inflightByAllocation[key] = n
-	} else {
-		delete(s.inflightByAllocation, key)
-	}
-	s.maybePruneSessionLocked(sid)
-	s.maybePruneAllocationLocked(key)
-}
-
-// maybePruneSessionLocked deletes a forgotten session's kill-gen bookkeeping
-// once no REGISTER handler is in-flight for it (so the fence is never removed
-// from under a paused handler). Caller holds s.mu.
-func (s *Server) maybePruneSessionLocked(sid string) {
-	if s.forgotten[sid] && s.inflightBySID[sid] <= 0 {
-		delete(s.killGenSession, sid)
-		delete(s.inflightBySID, sid)
-		delete(s.forgotten, sid)
-	}
-}
-
-func (s *Server) ensureAllocationFenceMapsLocked() {
-	if s.killGenAllocation == nil {
-		s.killGenAllocation = map[sessionFenceKey]int64{}
-	}
-	if s.inflightByAllocation == nil {
-		s.inflightByAllocation = map[sessionFenceKey]int{}
-	}
-	if s.closedAllocation == nil {
-		s.closedAllocation = map[sessionFenceKey]bool{}
-	}
-}
-
-func (s *Server) maybePruneAllocationLocked(key sessionFenceKey) {
-	if s.closedAllocation[key] && s.inflightByAllocation[key] <= 0 {
-		delete(s.killGenAllocation, key)
-		delete(s.inflightByAllocation, key)
-		delete(s.closedAllocation, key)
-	}
-}
-
-// CloseSession closes EVERY installed public listener owned by sid and bumps
-// each port's kill generation, WITHOUT consulting any database (round-4 F3).
-// `proxy off` calls it so the data plane dies even if the broker's subsequent
-// allocation-store query fails — the broker-side immediate kill must not depend
-// on a post-switch DB read. Returns the ports it closed.
-func (s *Server) CloseSession(sid string) []int {
-	s.mu.Lock()
-	// Bump the SESSION kill generation FIRST and unconditionally, so an in-flight
-	// REGISTER that already passed auth but hasn't inserted its session yet
-	// aborts at the install check (round-5 F1) — not just the listeners already
-	// in s.sessions.
-	s.killGenSession[sid]++
-	var victims []*serverSession
-	var ports []int
-	for port, sess := range s.sessions {
-		if sess.sid == sid {
-			s.killGen[port]++
-			victims = append(victims, sess)
-			ports = append(ports, port)
-			delete(s.sessions, port)
-		}
-	}
-	s.mu.Unlock()
-
-	for _, sess := range victims {
-		closeServerSession(sess)
-	}
-	return ports
-}
-
-// Close releases the control listener and every active agent session.
-// Idempotent. After Close returns, in-flight handleAgent goroutines
-// have all observed s.closed=true and either exited or rolled back
-// their would-be insert; the bound public ports are released.
-func (s *Server) Close() {
-	s.mu.Lock()
-	if s.closed {
-		s.mu.Unlock()
-		return
-	}
-	s.closed = true
-	ln := s.ln
-	// Snapshot sessions under lock; close them OUTSIDE the lock so
-	// a slow TLS close_notify or kernel listener teardown can't
-	// stall every other handleAgent waiting for s.mu (audit F9).
-	snap := make([]*serverSession, 0, len(s.sessions))
-	for _, sess := range s.sessions {
-		snap = append(snap, sess)
-	}
-	s.sessions = map[int]*serverSession{}
-	s.mu.Unlock()
-
-	if ln != nil {
-		_ = ln.Close()
-	}
-	for _, sess := range snap {
-		closeServerSession(sess)
-	}
-	// Wait for in-flight handleAgent goroutines to drain so the
-	// caller of Close knows the bound public ports are released
-	// (vs. just "scheduled to close"). Bound by the per-session
-	// cancellation above; can't run forever.
-	s.wg.Wait()
-}
-
-// ----- agent side -----------------------------------------------------------
-
-// Client is the agent side. Owns one yamux session per public port the
-// broker has authorized us to expose, plus one supervisor goroutine per
-// port that re-dials with capped backoff on session loss (see supervise).
-type Client struct {
-	brokerAddr string
-	sid        string
-	// nid is the name presented on the REGISTER line. It is settable because a
-	// cloned-credential instance learns its routing name from the broker's
-	// register reply, which happens strictly AFTER this client is constructed
-	// (cmd/tether builds the adapter before agent.New, before any connect).
-	// Without a seam here, an instance leased `foo-02` would still REGISTER on
-	// the tunnel as `foo`, tunnelTokenLookup would match the basename's
-	// allocation row, and the install — keyed on the public port alone — would
-	// evict the incumbent's live session.
-	//
-	// atomic because supervise/redial goroutines read it off the caller's
-	// goroutine.
-	nid atomic.Pointer[string]
-	// nidGen fences slow Opens against a rename. See SetNID and Open.
-	nidGen          atomic.Uint64
-	localPortLookup LocalPortLookup
-	logger          *slog.Logger
-
-	backoffBase time.Duration // first redial wait (default 500ms)
-	backoffMax  time.Duration // redial wait ceiling (default 30s)
-
-	mu        sync.Mutex
-	sessions  map[int]*clientSession        // public port -> session
-	nextGen   uint64                        // monotonic generation stamp (mu-guarded)
-	stateHook func(publicPort int, up bool) // set once before Start; nil = no-op
-	ctx       context.Context
-	cancel    context.CancelFunc
-}
-
-type clientSession struct {
-	publicPort int
-	localPort  int                // redial target; reused across redials
-	token      string             // in-memory only; NEVER logged, NEVER persisted here
-	conn       net.Conn           // swapped in place on a successful redial (under c.mu)
-	yamuxSess  *yamux.Session     // swapped in place on a successful redial (under c.mu)
-	cancel     context.CancelFunc // ONE per generation, for life (the sole stop signal)
-	gen        uint64             // fences a stale supervisor against a concurrent Open/Close
-
-	// D6 §7.5 per-expose home: the broker addr this expose dials, its home epoch,
-	// and the cert pins to verify the home with. These are stored on the session
-	// (NOT a single shared Client field) so one Client fans out to N homes; the
-	// SUPERVISOR reads them ONLY as spawn-time value params (R-13), never back from
-	// this struct in its loop. brokerAddr "" ⇒ fall back to Client.brokerAddr (N=1).
-	brokerAddr string
-	epoch      int64
-	certPins   proto.CertPins
-}
-
-// NewClient returns an agent-side tunnel client.
-func NewClient(brokerAddr, sid, nid string, lookup LocalPortLookup, logger *slog.Logger) *Client {
-	c := &Client{
-		brokerAddr:      brokerAddr,
-		sid:             sid,
-		localPortLookup: lookup,
-		logger:          logger,
-		backoffBase:     500 * time.Millisecond,
-		backoffMax:      30 * time.Second,
-		sessions:        map[int]*clientSession{},
-	}
-	c.nid.Store(&nid)
-	return c
-}
-
-// SetNID updates the name this client presents on the REGISTER line.
-//
-// Called when a cloned-credential instance adopts a broker-assigned lease name.
-// It is safe to call between sessions; an in-flight REGISTER already holds the
-// value it read, and the agent only adopts a name during a session rebuild, so
-// no dial observes a half-changed identity.
-func (c *Client) SetNID(nid string) {
-	prev := c.nidValue()
-	c.nid.Store(&nid)
-	// BUMP THE GENERATION BEFORE ANYTHING ELSE.
-	//
-	// Open reads the nid, then dials and completes a REGISTER handshake — all
-	// outside c.mu, because it is slow. A rename landing inside that window
-	// leaves an Open that already told the server it is the OLD name, and which
-	// then installs its session into the map the rename just emptied. The
-	// process goes on bridging a port it authorized under a name it no longer
-	// holds, which is the very fan-out this rename exists to end.
-	//
-	// The generation is the fence: Open samples it up front and re-checks it
-	// under the lock before installing. (external review F6)
-	c.nidGen.Add(1)
-	if prev == "" || prev == nid {
-		return
-	}
-	// RETIRE EVERY SESSION HELD UNDER THE PREVIOUS NAME.
-	//
-	// Changing the name means this process is no longer the holder of the name
-	// those sessions were authorized under — their allocations belong to
-	// whoever holds it now. Leaving them running would keep this process
-	// bridging another node's public ports, and the tunnel server's session map
-	// is keyed on the public port ALONE, so the incumbent could not take them
-	// back except opportunistically, on the next transport drop.
-	//
-	// Retiring here is not a data-plane regression for the retiring side: an
-	// instance that has just been told it is not the basename holder has no
-	// claim to those ports, and it will be issued its own if it exposes any.
-	c.mu.Lock()
-	retired := c.sessions
-	c.sessions = map[int]*clientSession{}
-	c.mu.Unlock()
-	closers := make([]func(), 0, len(retired))
-	for _, sess := range retired {
-		// CANCEL INLINE, CLOSE OFF-GOROUTINE.
-		//
-		// The sessions are already fenced out of c.sessions by the map swap
-		// above, so cancelling is enough to stop them being used. The Close
-		// calls are NOT bounded: tls.Conn.Close takes the connection's write
-		// lock before it can set a deadline, so a parked write on a blackholed
-		// socket blocks for the kernel's retransmit time.
-		//
-		// This runs synchronously from adoptRoutingNID — in one caller BEFORE
-		// the session finalizer is invoked, and in the other AFTER `rebuilding`
-		// has been latched. Blocking here would therefore stall the very
-		// teardown ladder gotcha #72 exists to bound, and in the second case
-		// would leave `rebuilding` latched forever: every later reconnect
-		// dropped, the finalizer never invoked, the node permanently dead with
-		// no escalation. That is the defect #72 documented, reintroduced
-		// outside the ladder built for it.
-		sess.cancel()
-		// EMIT THE DOWN EDGE. external review F6: retiring silently left every
-		// mirror of this port's health latched at the last value it saw —
-		// proxyTunnelUp / ProxyBound stayed true for a bridge that is being torn
-		// down, so the agent reported a working exit on a dead tunnel. The hook
-		// contract is one edge per transition, and this IS a transition.
-		c.notifyState(sess.publicPort, false)
-		conn, ysess := sess.conn, sess.yamuxSess
-		// BOUNDED, AND ONE GOROUTINE FOR THE WHOLE RETIREMENT rather than one
-		// per session. Close on a blackholed socket parks for the kernel's
-		// retransmit time (that is why it is off the caller's path at all), so
-		// an unbounded fan-out here is a goroutine and fd leak proportional to
-		// how many ports the instance happened to be serving.
-		closers = append(closers, func() {
-			if conn != nil {
-				_ = conn.Close()
-			}
-			if ysess != nil {
-				_ = ysess.Close()
-			}
-		})
-	}
-	if len(closers) > 0 {
-		go func() {
-			for _, fn := range closers {
-				fn()
-			}
-		}()
-	}
-}
-
-// nidValue reads the current REGISTER identity.
-func (c *Client) nidValue() string {
-	if p := c.nid.Load(); p != nil {
-		return *p
-	}
-	return ""
-}
-
-// SetSessionStateHook installs a callback fired (off any lock) whenever a
-// supervised port's data plane transitions up/down: on the first drop
-// (up→down), on every successful redial (down→up), and a final down
-// before a terminal-DENY exit. Set it once before Start. The agent wires
-// this to publish proxy ready/unready so /sub tracks real liveness.
-func (c *Client) SetSessionStateHook(fn func(publicPort int, up bool)) {
-	c.mu.Lock()
-	c.stateHook = fn
-	c.mu.Unlock()
-}
-
-// notifyState invokes the session-state hook (nil-guarded) OUTSIDE c.mu.
-// The supervisor that calls this owns transition de-duplication, so this
-// fires only on a genuine up/down edge.
-func (c *Client) notifyState(publicPort int, up bool) {
-	c.mu.Lock()
-	hook := c.stateHook
-	c.mu.Unlock()
-	if hook != nil {
-		hook(publicPort, up)
-	}
-}
-
-// Start anchors the lifecycle to ctx. Sessions registered via Open
-// are unwound on ctx.Done.
-func (c *Client) Start(ctx context.Context) {
-	c.ctx, c.cancel = context.WithCancel(ctx)
-	go func() {
-		<-c.ctx.Done()
-		c.mu.Lock()
-		for _, sess := range c.sessions {
-			sess.cancel()
-			_ = sess.conn.Close()
-			_ = sess.yamuxSess.Close()
-		}
-		c.sessions = map[int]*clientSession{}
-		c.mu.Unlock()
-	}()
-}
-
-// Open establishes (or replaces) a yamux session for one (publicPort,
-// token) pair and starts its supervisor. localPort is the agent-side port
-// to dial when the broker pushes a new stream. Blocks on the FIRST dial +
-// REGISTER (so AddProxy's rollback contract sees a first-attempt failure)
-// and returns that error verbatim. AFTER a successful Open, transient
-// session drops are recovered by the supervisor's reconnect loop; the
-// caller is not involved again unless it calls Close.
-// Open is the N=1 / single-home convenience entry: it dials the Client's
-// configured brokerAddr with epoch 0 and no cert pins (InsecureSkipVerify
-// fallback). Equivalent to OpenHome(publicPort, localPort, token, "", 0,
-// proto.CertPins{}). Kept so non-clustered callers (and existing tests) stay
-// unchanged.
-func (c *Client) Open(publicPort, localPort int, token string) error {
-	if c.ctx == nil {
-		return errors.New("tunnel client: Start not called")
-	}
-	return c.OpenHome(c.ctx, publicPort, localPort, token, "", 0, proto.CertPins{})
-}
-
-// OpenHome establishes (or epoch-monotone replaces) a yamux session for one
-// (publicPort, token) pair against a SPECIFIC home broker (D6 §7.5), pinned by
-// certPins, at home epoch. brokerAddr "" falls back to the Client's single
-// configured addr (N=1). See the package doc / Open for the supervisor contract.
-//
-// ctx bounds THE OPEN ONLY — the wait for a dial, the REGISTER handshake and the
-// install under c.mu — never the session it installs: the session and its
-// supervisor live on the Client's Start ctx exactly as before. When ctx ends
-// mid-handshake the conn is closed and the ctx error returned; when it ends
-// between a successful REGISTER and the install, the freshly-registered transport
-// is discarded and the ctx error returned, so a caller whose deadline has passed
-// never gets a late success it already reported as a failure. The agent's
-// forwarded-expose handler passes the remaining share of its reply budget here
-// (gotcha #86 / external review F1); reconcile and boot replay pass the run ctx.
-func (c *Client) OpenHome(ctx context.Context, publicPort, localPort int, token, brokerAddr string, epoch int64, certPins proto.CertPins) error {
-	if c.ctx == nil {
-		return errors.New("tunnel client: Start not called")
-	}
-	if err := ctx.Err(); err != nil {
-		return fmt.Errorf("tunnel client: Open: %w", err)
-	}
-	// Sample the rename generation BEFORE the REGISTER handshake reads the nid,
-	// so the check under the lock below covers the whole dial window.
-	openGen := c.nidGen.Load()
-	// D6 §7.7/R-22: never dial a NAMED home (non-empty brokerAddr) insecurely.
-	// A clustered expose with no pins yet (e.g. a state.json replay before the
-	// register reply re-delivers them) defers — the caller retries when pins
-	// arrive. The N=1 path (empty brokerAddr → Client.brokerAddr fallback) is
-	// unaffected and keeps its InsecureSkipVerify.
-	if brokerAddr != "" && certPins.Current == "" {
-		return ErrHomePinsRequired
-	}
-	// The handshake ends when EITHER the caller's ctx or the Client's Start ctx ends: hsCtx is a
-	// child of c.ctx (Start-cancel still reaps a blocked dial) that the caller's ctx cancels too.
-	// Only the handshake sees it — the session installed below is anchored to c.ctx, not to
-	// the caller (a control-plane deadline must not become a data-plane lifetime, gotcha #80).
-	hsCtx, cancelHS := context.WithCancel(c.ctx)
-	defer cancelHS()
-	stopRelay := context.AfterFunc(ctx, cancelHS)
-	defer stopRelay()
-	conn, yamuxSess, err := c.dialAndRegister(hsCtx, publicPort, token, brokerAddr, epoch, certPins)
-	if err != nil {
-		if cerr := ctx.Err(); cerr != nil {
-			// Name the caller's deadline, not the closed-conn symptom it produced ("use of closed
-			// network connection" reads as a broker fault; "context deadline exceeded" reads as
-			// what it is — the open did not finish inside the caller's budget).
-			return fmt.Errorf("tunnel client: Open: %w (%v)", cerr, err)
-		}
-		return fmt.Errorf("tunnel client: Open: %w", err)
-	}
-	sessCtx, cancel := context.WithCancel(c.ctx)
-
-	c.mu.Lock()
-	// External review F1: the caller's budget ran out between REGISTER OK and the install. Its
-	// caller has already (or is about to) report this open as failed; installing now would leave
-	// a live session for a port the broker rolled back. Discard the transport (the broker sees a
-	// session drop on a row it is deleting anyway) and return the deadline.
-	if err := ctx.Err(); err != nil {
-		c.mu.Unlock()
-		cancel()
-		_ = conn.Close()
-		_ = yamuxSess.Close()
-		return fmt.Errorf("tunnel client: Open finished after the caller's deadline: %w", err)
-	}
-	// THE RENAME FENCE (external review F6). This Open told the server which
-	// name it was during a REGISTER that happened outside the lock; if the name
-	// has changed since, that handshake is void and installing the session would
-	// keep this process bridging a port authorized under a name it no longer
-	// holds. Discard it exactly like a stale-epoch Open below.
-	if c.nidGen.Load() != openGen {
-		c.mu.Unlock()
-		cancel()
-		_ = conn.Close()
-		_ = yamuxSess.Close()
-		return nil
-	}
-	// Audit shard 01 F2: between Start's cleanup goroutine running
-	// (c.ctx already canceled) and an in-flight Open inserting into
-	// c.sessions, we'd leak the new session forever. Re-check ctx
-	// under mu — if Start is shutting down, roll back this Open.
-	if err := c.ctx.Err(); err != nil {
-		c.mu.Unlock()
-		cancel()
-		_ = conn.Close()
-		_ = yamuxSess.Close()
-		return fmt.Errorf("tunnel client: Open after Start ctx cancel: %w", err)
-	}
-	if old, ok := c.sessions[publicPort]; ok {
-		// D6 §7.4/R-13: epoch-monotone rehome replace. If a NEWER home epoch is
-		// already installed for this port (two directives raced; the higher won),
-		// THIS Open is stale — discard the freshly-dialed transport and report
-		// success (the port IS served, by the newer epoch). Equal/greater epoch
-		// (incl. the N=1 epoch-0 re-expose path) proceeds as a normal replace.
-		if old.epoch > epoch {
-			c.mu.Unlock()
-			cancel()
-			_ = conn.Close()
-			_ = yamuxSess.Close()
-			return nil
-		}
-		// Replace a prior session (re-expose / proxy rebuild / rehome). Canceling
-		// its ctx retires the old supervisor; bumping nextGen fences it out of
-		// swapTransport/dropSession on this port.
-		old.cancel()
-		_ = old.conn.Close()
-		_ = old.yamuxSess.Close()
-	}
-	c.nextGen++
-	gen := c.nextGen
-	c.sessions[publicPort] = &clientSession{
-		publicPort: publicPort,
-		localPort:  localPort,
-		token:      token,
-		conn:       conn,
-		yamuxSess:  yamuxSess,
-		cancel:     cancel,
-		gen:        gen,
-		brokerAddr: brokerAddr,
-		epoch:      epoch,
-		certPins:   certPins,
-	}
-	c.mu.Unlock()
-
-	// R-13: the supervisor receives brokerAddr/epoch/certPins as VALUE PARAMS
-	// snapshotted here — it MUST NOT read them back from c.sessions[port] in its
-	// loop (that would be an unsynchronized read racing Open-replace's map write).
-	go c.supervise(sessCtx, publicPort, localPort, token, brokerAddr, epoch, certPins, gen, yamuxSess)
-	c.logger.Info("tunnel: opened",
-		"public_port", publicPort, "local_port", localPort, "epoch", epoch)
-	return nil
-}
-
-// ApplyHome applies a home directive to an OPEN expose (D6 §7.4):
-//   - epoch > session epoch → an actual REHOME: Open-replace against the new home
-//     (reusing the existing localPort + token), the atomic cutover.
-//   - epoch == session epoch → a PURE-PIN (cert-rotation) update (R-24 / external
-//     review F4): refresh the session's cert pins IN PLACE, WITHOUT tearing the
-//     live transport (brokerAddr is unchanged at the same epoch; the running
-//     supervisor picks the new pins up on its next redial, which reads them under
-//     c.mu, gen-fenced).
-//   - epoch < session epoch → a stale duplicate: no-op.
-//
-// A directive for a port with no open session is a no-op (the agent's
-// open-from-state path handles a deferred/closed expose). The rehome dial BLOCKS;
-// the caller retries a returned transient home_catching_up (R-15).
-func (c *Client) ApplyHome(publicPort int, brokerAddr string, epoch int64, certPins proto.CertPins) error {
-	c.mu.Lock()
-	sess, ok := c.sessions[publicPort]
-	if !ok {
-		c.mu.Unlock()
-		return nil // not open — nothing to rehome (directive for a closed/unknown expose)
-	}
-	if epoch < sess.epoch {
-		c.mu.Unlock()
-		return nil // stale lower-epoch directive
-	}
-	if epoch == sess.epoch {
-		// Same home epoch, possibly rotated pins: update in place, no transport tear.
-		if (brokerAddr != "" || sess.brokerAddr != "") && certPins.Current == "" {
-			c.mu.Unlock()
-			return ErrHomePinsRequired
-		}
-		sess.certPins = certPins
-		c.mu.Unlock()
-		return nil
-	}
-	localPort, token := sess.localPort, sess.token
-	c.mu.Unlock()
-	// OpenHome is the atomic replace (re-checks the epoch under mu, cancels the
-	// old supervisor, installs the new session + supervisor). A transient/terminal
-	// DENY surfaces to the caller for retry/handling. The rehome dial is bounded by
-	// the Client's own lifetime only: its caller (the agent's reconcile ladder)
-	// owns the retry, and nobody upstream is holding a request open for it.
-	return c.OpenHome(c.ctx, publicPort, localPort, token, brokerAddr, epoch, certPins)
-}
-
-func (c *Client) HasSession(publicPort int) bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	_, ok := c.sessions[publicPort]
-	return ok
-}
-
-// dialAndRegister performs ONE TLS dial + REGISTER handshake + yamux client
-// setup. ctx cancels both the dial (DialContext) AND an in-flight handshake
-// read/write (a watcher closes the conn on ctx.Done) so Close/Start-cancel
-// reap a blocked redial promptly instead of waiting out the 5s read deadline.
-// A broker DENY returns *DenyError (wraps ErrRegisterDenied); all transport
-// failures return plain (transient) errors.
-//
-// TLS wraps the underlying TCP so REGISTER + token cannot be observed by a
-// passive listener (architecture F.5); v1 InsecureSkipVerify is sufficient
-// for the passive-eavesdrop threat model (see clientTLSConfig).
-func (c *Client) dialAndRegister(ctx context.Context, publicPort int, token, brokerAddr string, epoch int64, certPins proto.CertPins) (net.Conn, *yamux.Session, error) {
-	// D6 §7.5: dial THIS expose's home addr; "" falls back to the single
-	// configured Client.brokerAddr (the N=1 / --tunnel-addr path). The TLS config
-	// pins the home cert when pins are present, else InsecureSkipVerify (N=1).
-	addr := brokerAddr
-	if addr == "" {
-		addr = c.brokerAddr
-	}
-	dialer := &tls.Dialer{NetDialer: &net.Dialer{Timeout: 5 * time.Second}, Config: clientTLSConfigPinned(certPins)}
-	conn, err := dialer.DialContext(ctx, "tcp", addr)
-	if err != nil {
-		return nil, nil, fmt.Errorf("tunnel client: dial broker (TLS): %w", err)
-	}
-	// Close the conn on ctx.Done until the handshake completes so a blocked
-	// Write/ReadString is interrupted by Close/Start-cancel/the caller's open
-	// deadline. AfterFunc + stop is deterministic where a goroutine selecting on
-	// {ctx.Done, hsDone} was not: since OpenHome cancels its handshake ctx on
-	// EVERY return (external review F1), a watcher first scheduled after both
-	// channels were closed would pick a branch at random and could close the
-	// conn of a session that was just installed (re-review R2). stop() returning
-	// true means the close never started, so a completed handshake's conn is
-	// never touched; if ctx is ALREADY done the close runs at once, which is
-	// correct — the caller discards the result on ctx.Err().
-	stopClose := context.AfterFunc(ctx, func() { _ = conn.Close() })
-	defer stopClose()
-
-	// D6 §7.2(b): 6-field REGISTER carrying this expose's home epoch (0 in N=1).
-	line := fmt.Sprintf("REGISTER %s %s %d %s %d\n", c.sid, c.nidValue(), publicPort, token, epoch)
-	if _, err := conn.Write([]byte(line)); err != nil {
-		_ = conn.Close()
-		return nil, nil, fmt.Errorf("tunnel client: write REGISTER: %w", err)
-	}
-	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	br := bufio.NewReader(conn)
-	resp, err := br.ReadString('\n')
-	if err != nil {
-		_ = conn.Close()
-		return nil, nil, fmt.Errorf("tunnel client: read REGISTER reply: %w", err)
-	}
-	_ = conn.SetReadDeadline(time.Time{})
-	resp = strings.TrimRight(resp, "\r\n")
-	if resp != "OK" {
-		_ = conn.Close()
-		reason := strings.TrimSpace(strings.TrimPrefix(resp, "DENY"))
-		return nil, nil, &DenyError{Reason: reason}
-	}
-
-	yamuxSess, err := yamux.Client(conn, muxConfig(c.logger))
-	if err != nil {
-		_ = conn.Close()
-		return nil, nil, fmt.Errorf("tunnel client: yamux client: %w", err)
-	}
-	return conn, yamuxSess, nil
-}
-
-// supervise owns one (publicPort, generation) for life: it runs the accept
-// loop on the current yamux session, and on a session drop re-dials with
-// backoff, swapping the live transport in place. It exits ONLY on ctx
-// cancel (Close / Start-cancel / a newer Open replacing this port) or a
-// terminal DENY (proxy off / revoke). The loop structure makes the state
-// hook fire exactly once per edge: one notifyState(false) per drop, one
-// notifyState(true) per successful reconnect — they strictly alternate.
-// R-13: brokerAddr/epoch are VALUE PARAMS snapshotted at the `go c.supervise(...)`
-// spawn in Open — this goroutine NEVER reads THEM back from c.sessions[port]
-// (which Open-replace mutates under c.mu); a rehome is a fresh Open (new
-// supervisor with new params), not a mutation of this one's. certPins is the
-// ONE exception: a same-epoch cert rotation (ApplyHome / R-24) updates
-// sess.certPins in place, so redialWithBackoff reads the CURRENT pins under c.mu
-// (gen-fenced) instead of the spawn-time value — off the hot accept path, so
-// race-free. certPins here is only the initial/fallback value.
-func (c *Client) supervise(ctx context.Context, publicPort, localPort int, token, brokerAddr string, epoch int64, certPins proto.CertPins, gen uint64, initial *yamux.Session) {
-	sess := initial
-	for {
-		c.runAcceptLoop(ctx, publicPort, localPort, sess)
-		if ctx.Err() != nil {
-			return // intentional teardown — owner already knows; no callback
-		}
-		c.notifyState(publicPort, false) // down edge (one per drop)
-		conn, ys, err := c.redialWithBackoff(ctx, publicPort, token, brokerAddr, epoch, certPins, gen)
-		if err != nil {
-			// ctx-cancel or terminal DENY: the down edge above is the final
-			// state; drop the slot so status reflects a dead exit, then stop.
-			c.dropSession(publicPort, gen)
-			return
-		}
-		if !c.swapTransport(publicPort, gen, conn, ys) {
-			// A concurrent Open/Close superseded us. Close the freshly-dialed
-			// transport (FD-leak guard) and let the new owner take over.
-			_ = conn.Close()
-			_ = ys.Close()
-			return
-		}
-		sess = ys
-		c.notifyState(publicPort, true) // up edge (one per reconnect)
-	}
-}
-
-// redialWithBackoff retries dialAndRegister with full-jitter exponential
-// backoff until it succeeds, hits a terminal error (terminal DENY or ctx
-// cancel), or ctx is done. Returns the new transport on success, or a
-// non-nil error on terminal stop.
-func (c *Client) redialWithBackoff(ctx context.Context, publicPort int, token, brokerAddr string, epoch int64, certPins proto.CertPins, gen uint64) (net.Conn, *yamux.Session, error) {
-	sleep := c.backoffBase
-	for {
-		timer := time.NewTimer(jitter(sleep))
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return nil, nil, ctx.Err()
-		case <-timer.C:
-		}
-		// Pick up a same-epoch cert rotation (ApplyHome / R-24): read THIS session's
-		// current pins under c.mu (gen-fenced so we never read a successor's pins).
-		// Off the hot accept path → race-free with ApplyHome's write.
-		pins := certPins
-		c.mu.Lock()
-		if cur, ok := c.sessions[publicPort]; ok && cur.gen == gen {
-			pins = cur.certPins
-		}
-		c.mu.Unlock()
-		conn, ys, err := c.dialAndRegister(ctx, publicPort, token, brokerAddr, epoch, pins)
-		if err == nil {
-			return conn, ys, nil
-		}
-		var de *DenyError
-		if errors.As(err, &de) && !denyIsTransient(de.Reason) {
-			// Authoritative refusal (proxy off / revoke / unknown reason):
-			// stop. A revoked exit can never be resurrected by reconnect.
-			c.logger.Warn("tunnel: reconnect denied, stopping",
-				"public_port", publicPort, "reason", de.Reason)
-			return nil, nil, err
-		}
-		// Transient (network error OR a transient DENY): back off and retry.
-		if de != nil {
-			c.logger.Info("tunnel: reconnect transient DENY, retrying",
-				"public_port", publicPort, "reason", de.Reason)
-		}
-		sleep *= 2
-		if sleep > c.backoffMax {
-			sleep = c.backoffMax
-		}
-	}
-}
-
-// swapTransport replaces a supervised port's live conn+yamux in place IFF
-// the slot still belongs to this generation (not superseded by a concurrent
-// Open/Close). Returns false to tell the caller to discard its freshly-dialed
-// transport. KEEPS the same cancel — the one-cancel-for-life invariant.
-func (c *Client) swapTransport(publicPort int, gen uint64, conn net.Conn, ys *yamux.Session) bool {
-	c.mu.Lock()
-	cur, ok := c.sessions[publicPort]
-	if !ok || cur.gen != gen {
-		c.mu.Unlock()
-		return false
-	}
-	oldConn, oldYS := cur.conn, cur.yamuxSess
-	cur.conn = conn
-	cur.yamuxSess = ys
-	c.mu.Unlock()
-	// Close the predecessor transport AFTER releasing c.mu. On a HALF-OPEN drop
-	// (the residential-link case) the old conn's fd + yamux goroutines are not
-	// yet reaped — the local side only saw a keepalive timeout, not a peer FIN —
-	// so without this every reconnect would leak one fd + yamux internals,
-	// unbounded over a long flaky-link outage. Closing an already-closed
-	// conn/session (the clean-drop path) is a harmless no-op.
-	_ = oldYS.Close()
-	_ = oldConn.Close()
-	return true
-}
-
-// dropSession removes a supervised port's slot IFF it still belongs to this
-// generation, scrubbing the cached token. A no-op if a newer Open already
-// replaced the slot.
-func (c *Client) dropSession(publicPort int, gen uint64) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if cur, ok := c.sessions[publicPort]; ok && cur.gen == gen {
-		// Release the per-session ctx (and its children) — matching Close and the
-		// Open-replace path. On the terminal-DENY exit the sessCtx was NEVER
-		// canceled, so without this its cancelCtx lingers in c.ctx's children list
-		// until the whole agent run-ctx ends; repeated revoke/off cycles would
-		// accumulate them. Idempotent on the ctx-cancel path (already canceled).
-		cur.cancel()
-		cur.token = ""
-		delete(c.sessions, publicPort)
-	}
-}
-
-// jitter returns a full-jitter sleep in (0, d]. Per-attempt randomness
-// de-synchronizes a fleet reconnecting after a shared broker blip.
-func jitter(d time.Duration) time.Duration {
-	if d <= 0 {
-		return 0
-	}
-	return time.Duration(rand.Int64N(int64(d)) + 1)
-}
-
-// Close drops the session for one public port (e.g. after expose-rm).
-// No-op if not open.
-func (c *Client) Close(publicPort int) {
-	c.mu.Lock()
-	sess, ok := c.sessions[publicPort]
-	delete(c.sessions, publicPort)
-	c.mu.Unlock()
-	if !ok {
-		return
-	}
-	sess.cancel()
-	_ = sess.conn.Close()
-	_ = sess.yamuxSess.Close()
-}
-
-// runAcceptLoop pumps streams off ONE yamux session value (passed in, not
-// re-read from c.sessions — keeps the hot path lock-free) until that session
-// errors. It returns on any Accept error; the caller (supervise) checks
-// ctx.Err() to tell an intentional close from a drop that warrants a redial.
-func (c *Client) runAcceptLoop(ctx context.Context, publicPort, localPort int, sess *yamux.Session) {
-	for {
-		stream, err := sess.Accept()
-		if err != nil {
-			if ctx.Err() == nil {
-				c.logger.Info("tunnel: session closed", "public_port", publicPort, "err", err)
-			}
-			return
-		}
-		go c.bridgeStreamToLocal(stream, localPort)
-	}
-}
-
-func (c *Client) bridgeStreamToLocal(stream net.Conn, localPort int) {
-	local, err := net.DialTimeout("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(localPort)), 5*time.Second)
-	if err != nil {
-		c.logger.Warn("tunnel: dial local", "err", err, "local_port", localPort)
-		_ = stream.Close()
-		return
-	}
-	bridge(local, stream)
+	launchLegacyServerWorker(s, func() { s.publicAcceptLoop(sessCtx, sess) })
 }
 
 // ----- common helpers --------------------------------------------------------
@@ -1962,29 +982,6 @@ func bridge(a, b io.ReadWriteCloser) {
 	<-done
 }
 
-func parseRegisterLine(line string) (sid, nid string, port int, token string, epoch int64, ok bool) {
-	line = strings.TrimRight(line, "\r\n")
-	parts := strings.Split(line, " ")
-	// D6 §7.2(b): the v2 REGISTER grammar is EXACTLY 6 fields
-	// (REGISTER <sid> <nid> <port> <token> <epoch>). A 5-field (pre-D6) or
-	// 7-field line is rejected — never mis-bound.
-	if len(parts) != 6 || parts[0] != "REGISTER" {
-		return "", "", 0, "", 0, false
-	}
-	port, err := strconv.Atoi(parts[3])
-	if err != nil {
-		return "", "", 0, "", 0, false
-	}
-	// ParseInt(_, 10, 64) matches port_allocations.epoch (int64) and rejects
-	// overflow that strconv.Atoi would silently truncate; negatives are rejected
-	// (epoch is a non-negative monotone counter).
-	epoch, err = strconv.ParseInt(parts[5], 10, 64)
-	if err != nil || epoch < 0 {
-		return "", "", 0, "", 0, false
-	}
-	return parts[1], parts[2], port, parts[4], epoch, true
-}
-
 // hashToken is the SHA256 hex digest of raw. Kept locally
 // (duplicated with internal/port.HashToken) to keep tunnel a
 // dep-graph leaf: importing port would pull SQLite into the wire
@@ -1993,3 +990,19 @@ func parseRegisterLine(line string) (sid, nid string, port int, token string, ep
 // hashToken delegates to the shared scheme (batch-A A11). tokenhash imports
 // stdlib only, so tunnel stays a dependency-graph leaf.
 func hashToken(raw string) string { return tokenhash.Sum(raw) }
+
+// The runtime retains its API while the leaf owns this implementation.
+// origin: hot-update S6 plan §9.3 / TUNNEL-SLIM
+var ErrRegisterDenied = transport.ErrRegisterDenied
+
+type DenyError = transport.DenyError
+
+func denyIsTransient(reason string) bool { return retryRegisterDenied(reason) }
+
+// Primitive REGISTER parsing and damping classification stay below the runtime.
+// origin: hot-update S6 plan §9.3 / TUNNEL-SLIM
+func remoteHostOf(conn net.Conn) string { return transport.RemoteHostOf(conn) }
+func regLogClass(err error) string      { return transport.RegLogClass(err) }
+func parseRegisterLine(line string) (sid, nid string, port int, token string, epoch int64, ok bool) {
+	return transport.ParseRegisterLine(line)
+}

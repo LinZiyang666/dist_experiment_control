@@ -352,27 +352,6 @@ func (s *syncWriter) Write(p []byte) (int, error) {
 	return s.w.Write(p)
 }
 
-// TestDenyIsTransient pins the terminal-vs-transient taxonomy.
-func TestDenyIsTransient(t *testing.T) {
-	cases := []struct {
-		reason    string
-		transient bool
-	}{
-		{"public_port_bind_failed", true},
-		{"try_again", true},
-		{"token_unknown_or_revoked", false},
-		{"session_closed", false},
-		{"malformed_register", false},
-		{"", false},
-		{"anything_unknown", false},
-	}
-	for _, c := range cases {
-		if got := denyIsTransient(c.reason); got != c.transient {
-			t.Errorf("denyIsTransient(%q)=%v, want %v", c.reason, got, c.transient)
-		}
-	}
-}
-
 // pollGoroutinesAtMost polls runtime.NumGoroutine down to <= ceiling for up to
 // `within`, returning the last sample. Mirrors the concurrency-suite floor.
 func pollGoroutinesAtMost(ceiling int, within time.Duration) int {
@@ -478,16 +457,4 @@ func TestTunnelReconnectClosesPredecessorConn(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatal("predecessor conn still writable after reconnect — swapTransport leaked it")
-}
-
-// TestDenyErrorIsRegisterDenied pins errors.Is wrapping.
-func TestDenyErrorIsRegisterDenied(t *testing.T) {
-	err := fmt.Errorf("wrap: %w", &DenyError{Reason: "token_unknown_or_revoked"})
-	if !errors.Is(err, ErrRegisterDenied) {
-		t.Fatal("DenyError must satisfy errors.Is(ErrRegisterDenied)")
-	}
-	var de *DenyError
-	if !errors.As(err, &de) || de.Reason != "token_unknown_or_revoked" {
-		t.Fatalf("errors.As failed to recover reason; de=%v", de)
-	}
 }

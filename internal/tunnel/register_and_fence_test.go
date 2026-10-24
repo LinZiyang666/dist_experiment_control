@@ -262,14 +262,22 @@ func TestD6VerifyConnectionRunsOnResume(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = ln.Close() }()
+	// The next image test samples exact FD identities. Join both the accept
+	// loop and every accepted TLS connection before this fixture returns.
+	// origin: hot-update S6 plan §9.3 / T56
+	var serverWorkers sync.WaitGroup
+	serverWorkers.Add(1)
+	defer func() { _ = ln.Close(); serverWorkers.Wait() }()
 	go func() {
+		defer serverWorkers.Done()
 		for {
 			c, err := ln.Accept()
 			if err != nil {
 				return
 			}
+			serverWorkers.Add(1)
 			go func(c net.Conn) {
+				defer serverWorkers.Done()
 				_ = c.(*tls.Conn).Handshake()
 				// Read a byte so the session ticket is flushed before close.
 				_ = c.SetReadDeadline(time.Now().Add(time.Second))
@@ -338,6 +346,8 @@ func TestD6ReviewPurePinUpdateSameEpoch(t *testing.T) {
 	c := NewClient("fallback:7000", "lab", "lab-1", nil, nil)
 	c.ctx = ctx
 	c.sessions[14000] = &clientSession{
+		// This fixture represents an already pin-verified transport undergoing rotation.
+		pinned:     true,
 		publicPort: 14000,
 		localPort:  9000,
 		token:      "tok",

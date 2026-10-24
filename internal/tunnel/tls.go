@@ -1,139 +1,81 @@
 package tunnel
 
 import (
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
-	"crypto/sha256"
+	"context"
 	"crypto/tls"
 	"crypto/x509"
-	"crypto/x509/pkix"
-	"encoding/hex"
-	"fmt"
-	"math/big"
-	"time"
+	"errors"
+	"net"
 
 	"github.com/LinZiyang666/tether/internal/proto"
+	"github.com/LinZiyang666/tether/internal/tunnel/transport"
 )
 
-// generateSelfSignedCert produces a fresh ephemeral P-256 ECDSA cert
-// suitable for the tunnel control TLS layer. v1 fallback per
-// architecture F.5: "frps 证书来源 ... 否则 frps 回落到自签（仅 v1
-// 够用，业务通信安全由业务自己负责）".
-//
-// Lifetime: 10 years — broker process lifetime is much shorter than
-// that, but a too-short cert risks rolling out of validity mid-session.
-// CN=tether-broker, no SANs (agents don't verify the cert anyway in
-// v1, see Client.tlsConfig).
-func generateSelfSignedCert() (tls.Certificate, error) {
-	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		return tls.Certificate{}, fmt.Errorf("tunnel tls: gen key: %w", err)
+// dialFlowTLS finishes TLS before its caller may send REGISTER. The one allowed
+// retry clones the same pin/PKI settings and shares the original operation ctx,
+// so it neither extends the deadline nor changes identity. A retained v1 flow
+// requires v1 on every attachment, including an old peer that returns no ALPN.
+// origin: hot-update S5 plan §4.1 / T15
+func dialFlowTLS(ctx context.Context, network, addr string, dialer *net.Dialer, cfg *tls.Config, retained bool) (*tls.Conn, error) {
+	// TLS applies NetDialer.Timeout anew for each DialContext. Convert it to
+	// one operation deadline before retrying so fallback cannot renew the budget.
+	// An earlier caller or NetDialer absolute deadline still wins.
+	// origin: hot-update S5 plan §4.1 / T15
+	if dialer != nil && dialer.Timeout > 0 {
+		operation, cancel := context.WithTimeout(ctx, dialer.Timeout)
+		defer cancel()
+		ctx = operation
 	}
-	serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
-	if err != nil {
-		return tls.Certificate{}, fmt.Errorf("tunnel tls: serial: %w", err)
-	}
-	tmpl := x509.Certificate{
-		SerialNumber: serial,
-		Subject:      pkix.Name{CommonName: "tether-broker"},
-		NotBefore:    time.Now().Add(-1 * time.Hour),
-		NotAfter:     time.Now().Add(10 * 365 * 24 * time.Hour),
-		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
-		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-	}
-	der, err := x509.CreateCertificate(rand.Reader, &tmpl, &tmpl, &priv.PublicKey, priv)
-	if err != nil {
-		return tls.Certificate{}, fmt.Errorf("tunnel tls: create cert: %w", err)
-	}
-	return tls.Certificate{
-		Certificate: [][]byte{der},
-		PrivateKey:  priv,
-	}, nil
-}
-
-// clientTLSConfig returns the TLS config the agent tunnel client uses
-// to dial the broker. v1 sets InsecureSkipVerify because the broker's
-// fallback cert is self-signed and the agent has no PKI to compare
-// against — confidentiality (passive eavesdropper can't read REGISTER
-// or token bytes) is the threat model F.5 actually targets here, and
-// that's still satisfied. Active MITM is acknowledged-not-blocked in
-// v1; D6 adds cert pinning (clientTLSConfigPinned) for clustered homes.
-func clientTLSConfig() *tls.Config {
-	return &tls.Config{
-		MinVersion: tls.VersionTLS12,
-		// Documented v1 fallback per architecture F.5/§16.7 (N=1): no cluster CA and no pins, so there
-		// is nothing to verify against. Registered in unverifiedTLSFallbacks with the full argument.
-		InsecureSkipVerify: true,
+	attempt := cfg.Clone()
+	for retry := 0; ; retry++ {
+		td := tls.Dialer{NetDialer: dialer, Config: attempt}
+		conn, err := td.DialContext(ctx, network, addr)
+		if err != nil {
+			if retry == 0 && !retained && len(attempt.NextProtos) == 1 &&
+				attempt.NextProtos[0] == FlowALPN && isRemoteALPNRefusal(err) {
+				attempt = cfg.Clone()
+				attempt.NextProtos = nil
+				continue
+			}
+			return nil, err
+		}
+		// origin: hot-update S5 plan §4.1 / T15
+		secure, ok := conn.(*tls.Conn) // tls.Dialer returns the completed TLS connection.
+		if !ok {
+			_ = conn.Close()
+			return nil, errors.New("tunnel: TLS dial returned an invalid connection")
+		}
+		if _, err := flowProtocol(secure.ConnectionState(), retained); err != nil {
+			_ = secure.Close()
+			return nil, err
+		}
+		return secure, nil
 	}
 }
 
-// LoadServerCert parses a stable tunnel server certificate + key from PEM bytes
-// (D6 §15 RF3). Used by the broker tunnel server (via NewServerWithCert) to pin
-// a persistent cert whose fingerprint the agent verifies, instead of the
-// ephemeral self-signed fallback. In D6 build-and-prove this is harness-only;
-// production stays on the ephemeral path (cutover = D9). The leaf's DER is
-// validated so CertFingerprint and the agent's pin agree.
+// The runtime retains its API while the leaf owns this implementation.
+// origin: hot-update S6 plan §9.3 / TUNNEL-SLIM
+func flowServerTLSConfig(base *tls.Config, ready bool) *tls.Config {
+	return transport.FlowServerTLSConfig(base, ready)
+}
+func flowClientTLSConfig(base *tls.Config, ready bool) *tls.Config {
+	return transport.FlowClientTLSConfig(base, ready)
+}
+func flowProtocol(state tls.ConnectionState, retained bool) (bool, error) {
+	return transport.FlowProtocol(state, retained)
+}
+func generateSelfSignedCert() (tls.Certificate, error) { return transport.GenerateSelfSignedCert() }
+func clientTLSConfig() *tls.Config                     { return transport.ClientTLSConfig() }
+
 func LoadServerCert(certPEM, keyPEM string) (*tls.Certificate, error) {
-	cert, err := tls.X509KeyPair([]byte(certPEM), []byte(keyPEM))
-	if err != nil {
-		return nil, fmt.Errorf("tunnel tls: load server cert: %w", err)
-	}
-	if len(cert.Certificate) == 0 {
-		return nil, fmt.Errorf("tunnel tls: loaded cert has no leaf DER")
-	}
-	return &cert, nil
+	return transport.LoadServerCert(certPEM, keyPEM)
 }
+func CertFingerprint(cert *x509.Certificate) string { return transport.CertFingerprint(cert) }
 
-// CertFingerprint is the SINGLE SOURCE OF TRUTH for a tunnel cert pin (D6
-// §7.7/§15/R-20): "sha256:" + hex(SHA-256(leaf DER)). The same function is used
-// by the harness/operator that seeds cluster_nodes.cert_fp AND by the agent that
-// verifies the home's presented cert — a divergent formula would silently bypass
-// pinning. It hashes cert.Raw (the leaf certificate DER), NOT the SPKI.
-func CertFingerprint(cert *x509.Certificate) string {
-	sum := sha256.Sum256(cert.Raw)
-	return "sha256:" + hex.EncodeToString(sum[:])
-}
-
-// certFingerprintDER is the raw-DER variant used inside VerifyConnection (where
-// only the parsed leaf's .Raw is in hand). Identical output to CertFingerprint.
-func certFingerprintDER(der []byte) string {
-	sum := sha256.Sum256(der)
-	return "sha256:" + hex.EncodeToString(sum[:])
-}
-
-// clientTLSConfigPinned returns the agent dial TLS config for one expose (D6
-// §7.7/R-21). With EMPTY pins (pins.Current == "") it is the legacy N=1 fallback
-// — InsecureSkipVerify, no callback, byte-equivalent to clientTLSConfig (the
-// ONLY remaining InsecureSkipVerify path, §16.7). With NON-EMPTY pins it keeps
-// InsecureSkipVerify (the home cert is self-signed, no CA chain) but installs a
-// VerifyConnection callback — which runs on EVERY handshake INCLUDING TLS 1.3
-// session resumption (VerifyPeerCertificate does NOT) — that fingerprints the
-// presented leaf and accepts it iff it matches Current, or Previous within an
-// unexpired rotation window. The handshake fails BEFORE the REGISTER token is
-// written, so a MITM presenting a non-pinned cert never receives the bearer
-// token. Fail-closed: empty peer certs, or a Previous with no/zero ValidUntil,
-// are rejected.
 func clientTLSConfigPinned(pins proto.CertPins) *tls.Config {
-	if pins.Current == "" {
-		return clientTLSConfig()
-	}
-	return &tls.Config{
-		MinVersion: tls.VersionTLS12,
-		// Hostname verification off, peer verification ON: the pin check is in VerifyConnection below.
-		InsecureSkipVerify: true,
-		VerifyConnection: func(cs tls.ConnectionState) error {
-			if len(cs.PeerCertificates) == 0 {
-				return fmt.Errorf("tunnel tls: home presented no certificate")
-			}
-			fp := certFingerprintDER(cs.PeerCertificates[0].Raw)
-			if fp == pins.Current {
-				return nil
-			}
-			if pins.Previous != "" && pins.ValidUntil != nil && time.Now().Before(*pins.ValidUntil) && fp == pins.Previous {
-				return nil
-			}
-			return fmt.Errorf("tunnel tls: home cert %s not in pin set", fp)
-		},
-	}
+	return transport.ClientTLSConfigPinned(pins.Current, pins.Previous, pins.ValidUntil)
 }
+
+func isRemoteALPNRefusal(err error) bool { return transport.IsRemoteALPNRefusal(err) }
+
+func certFingerprintDER(der []byte) string { return transport.CertFingerprintDER(der) }

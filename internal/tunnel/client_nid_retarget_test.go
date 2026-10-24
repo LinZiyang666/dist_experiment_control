@@ -2,9 +2,12 @@ package tunnel
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/LinZiyang666/tether/internal/proto"
 )
 
 // origin: docs/reviews/cloned-credential-instances-plan.md §0.4
@@ -37,27 +40,32 @@ func TestSetNIDRetiresSessionsRegisteredUnderTheOldName(t *testing.T) {
 
 // origin: docs/reviews/cloned-credential-instances-plan.md §0.4
 //
-// The other half of the same seam, and the part that DOES work: once the
-// transport drops, the redial presents the new name, tunnelTokenLookup answers
-// token_unknown_or_revoked (the allocation row still carries the basename), and
-// denyIsTransient classifies that terminal — so the supervisor exits instead of
-// hammering. This is the property the SetNID seam actually buys.
+// SetNID retires the old supervisor and asynchronously closes its transport.
+// A future redial presents the new name, whose old allocation is terminally
+// denied. Dropping the retired transport races that legitimate teardown and
+// never proves the REGISTER identity or refusal classification.
+// origin: hot-update S5 plan §8 / T12 / testing-standards T3
 func TestRedialAfterSetNIDIsTerminallyDeniedUnderTheNewName(t *testing.T) {
 	h := newReconnectHarness(t, silentLog())
 	h.waitRoundTrip(t, 3*time.Second)
 
 	h.cli.SetNID("lab-1-02")
-	if !h.srv.DropTransport(h.publicPort) {
-		t.Fatal("no live session to drop")
+	ctx, cancel := context.WithTimeout(t.Context(), ResumeAttempt)
+	defer cancel()
+	conn, mux, err := h.cli.dialAndRegister(ctx, h.publicPort, h.token, "", 0, proto.CertPins{})
+	if conn != nil {
+		_ = conn.Close()
 	}
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		if !h.cli.SessionUp(h.publicPort) {
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
+	if mux != nil {
+		_ = mux.Close()
 	}
-	t.Fatal("a redial under the lease name must be terminally denied and drop the slot")
+	var deny *DenyError
+	if !errors.As(err, &deny) || deny.Reason != "token_unknown_or_revoked" || denyIsTransient(deny.Reason) {
+		t.Fatalf("redial under the lease name lost its terminal denial: %v", err)
+	}
+	if h.cli.SessionUp(h.publicPort) {
+		t.Fatal("a redial under the lease name must be terminally denied and drop the slot")
+	}
 }
 
 // origin: docs/reviews/cloned-credential-instances-external-review.md F6

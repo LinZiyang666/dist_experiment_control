@@ -2,20 +2,19 @@ package ssproxy
 
 import (
 	"context"
-	"crypto/cipher"
-	"crypto/rand"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net"
+	"runtime"
 	"strconv"
 	"sync"
 	"syscall"
 	"time"
 
-	"golang.org/x/crypto/chacha20poly1305"
+	"github.com/LinZiyang666/tether/internal/rawsocket"
 )
 
 const (
@@ -33,8 +32,9 @@ type Key struct {
 }
 
 type keyEntry struct {
-	keyID  string
-	master []byte
+	keyID    string
+	master   []byte
+	material *materialState
 }
 
 // ErrStopped is returned by SetKeys (and by Start) once the server has been
@@ -55,15 +55,18 @@ var ErrStopped = errors.New("ssproxy: server stopped")
 // yamux tunnel. Safe for concurrent use; all methods are idempotent where
 // noted.
 type Server struct {
+	// The actor owner outlives control-plane sessions and transient image cuts.
+	// origin: hot-update S5 plan §2 / L13
+	imageState *serverImageState
+
 	logger *slog.Logger
 
 	mu        sync.Mutex
 	ln        net.Listener
 	localPort int
 	keys      []*keyEntry                      // copy-on-write snapshot
-	allConns  map[net.Conn]struct{}            // every conn this server owns -- accepted AND upstream (closed by Stop; see handleConn)
+	allConns  map[net.Conn]struct{}            // every conn this server owns -- accepted AND upstream (closed by Stop; see runActor)
 	keyConns  map[string]map[net.Conn]struct{} // keyID -> live conns (force-close on revoke)
-	saltSeen  map[string]*saltRing             // keyID -> bounded seen-salt filter (F11 replay)
 	closed    bool
 	// acceptExited latches when the accept loop returns. It exists so Serving can
 	// answer "am I able to serve?" rather than "was I once started": an accept loop
@@ -98,48 +101,6 @@ type Server struct {
 	allowPrivate bool
 
 	wg sync.WaitGroup
-}
-
-// maxSaltsPerKey bounds the per-key replay filter (round-6 F11). Sized for a
-// generous recent-connection window; a replay older than this for the same key
-// slips through (a bounded mitigation of the SS-AEAD salt-uniqueness rule).
-const maxSaltsPerKey = 8192
-
-// saltRing is a bounded FIFO set of recently-seen client salts for one key.
-type saltRing struct {
-	set   map[string]struct{}
-	order []string
-}
-
-// observe records salt and returns true if it is NEW (not a replay).
-func (r *saltRing) observe(salt []byte) bool {
-	k := string(salt)
-	if _, dup := r.set[k]; dup {
-		return false
-	}
-	r.set[k] = struct{}{}
-	r.order = append(r.order, k)
-	if len(r.order) > maxSaltsPerKey {
-		old := r.order[0]
-		r.order = r.order[1:]
-		delete(r.set, old)
-	}
-	return true
-}
-
-// recordSalt returns false if (keyID, salt) was already seen — i.e. a replay.
-func (s *Server) recordSalt(keyID string, salt []byte) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.saltSeen == nil {
-		s.saltSeen = map[string]*saltRing{}
-	}
-	r := s.saltSeen[keyID]
-	if r == nil {
-		r = &saltRing{set: map[string]struct{}{}}
-		s.saltSeen[keyID] = r
-	}
-	return r.observe(salt)
 }
 
 // New returns an unstarted Server. The destination policy defaults to permissive
@@ -279,7 +240,7 @@ func (s *Server) dialTarget(ctx context.Context, target string) (net.Conn, error
 				return err
 			}
 			if blockedIP(net.ParseIP(h)) {
-				return fmt.Errorf("ssproxy: destination %s not publicly routable", address)
+				return errors.New("ssproxy: destination policy denied")
 			}
 			return nil
 		}
@@ -339,7 +300,19 @@ func (s *Server) Start(wantLocalPort int, keys []Key) (int, error) {
 	s.localPort = tcpAddr.Port
 	s.allConns = map[net.Conn]struct{}{}
 	s.keyConns = map[string]map[net.Conn]struct{}{}
-	s.setKeysLocked(keys)
+	entries, keyErr := prepareKeys(keys)
+	if keyErr != nil {
+		_ = ln.Close()
+		s.ln = nil
+		return 0, keyErr
+	}
+	if _, keyErr = applyKeysLocked(s, entries); keyErr != nil {
+		_ = ln.Close()
+		s.ln = nil
+		return 0, keyErr
+	}
+	s.imageState.authority = AuthorityPhaseAuthorized
+	s.imageState.acceptRunning = true
 	// ctx-root: this server's own lifetime root. Deliberately NOT derived from any caller
 	// context — see the stopCtx field comment. shutdown() cancels it, which is what makes an
 	// in-flight resolve/dial abandonable and Stop() genuinely bounded.
@@ -347,19 +320,6 @@ func (s *Server) Start(wantLocalPort int, keys []Key) (int, error) {
 	s.wg.Add(1)
 	go s.acceptLoop(ln)
 	return s.localPort, nil
-}
-
-// opContext returns the server's own cancellation context for one in-flight operation.
-// Before Start (or in a Server built by a test that never started) it degrades to a
-// background context, so callers never have to nil-check.
-func (s *Server) opContext() context.Context {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.stopCtx == nil {
-		// ctx-root: unstarted server; there is nothing to cancel yet.
-		return context.Background()
-	}
-	return s.stopCtx
 }
 
 // Serving reports whether this server is actually able to serve traffic right
@@ -409,46 +369,6 @@ func (s *Server) LocalPort() int {
 	return s.localPort
 }
 
-// SetKeys atomically replaces the active key set. Connections whose KeyID is
-// no longer present are force-closed (hard revoke). Idempotent.
-func (s *Server) SetKeys(keys []Key) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.closed {
-		return ErrStopped
-	}
-	s.setKeysLocked(keys)
-	return nil
-}
-
-func (s *Server) setKeysLocked(keys []Key) {
-	newKeys := make([]*keyEntry, 0, len(keys))
-	present := make(map[string]bool, len(keys))
-	for _, k := range keys {
-		newKeys = append(newKeys, &keyEntry{keyID: k.KeyID, master: evpBytesToKey(k.Secret, keySize)})
-		present[k.KeyID] = true
-	}
-	s.keys = newKeys
-	if s.keyConns != nil {
-		for keyID, set := range s.keyConns {
-			if present[keyID] {
-				continue
-			}
-			for c := range set {
-				_ = c.Close()
-			}
-			delete(s.keyConns, keyID)
-		}
-	}
-	// round-6 F11: drop the per-key replay state for any revoked key so it can't
-	// grow unbounded and so a re-created key starts fresh.
-	for keyID := range s.saltSeen {
-		if !present[keyID] {
-			delete(s.saltSeen, keyID)
-		}
-	}
-}
-
 // Stop closes the listener and every live connection, then waits for all
 // goroutines to exit. Idempotent; safe to call when never started.
 func (s *Server) Stop() {
@@ -460,11 +380,9 @@ func (s *Server) Stop() {
 // waiting on the WaitGroup. Stop is shutdown + wg.Wait; keeping the two separate
 // means a caller that must not block can still tear the listeners down.
 //
-// The previous wording described cancelling a ctx and being callable "from the
-// ctx-watch goroutine". Both are gone: proxy-lifecycle removed this type's context
-// entirely, and with it that goroutine. A comment describing deleted machinery is
-// worse than no comment — it sends the next reader looking for a cancellation path
-// that does not exist.
+// The caller-owned ctx watcher was removed by proxy-lifecycle. The remaining
+// operation context belongs to this server and only interrupts its own DNS/dial;
+// transient control-plane cancellation still cannot tear down the listener.
 func (s *Server) shutdown() {
 	s.mu.Lock()
 	if s.closed {
@@ -472,317 +390,83 @@ func (s *Server) shutdown() {
 		return
 	}
 	s.closed = true
-	// Cancel BEFORE closing sockets: a handler blocked in LookupIPAddr or DialContext is
-	// unreachable by closing the accepted conn, and this is the only thing that frees it.
-	// Without it Stop() waits out the system resolver while the agent holds proxyRuntime.mu
-	// (external review F1).
-	if s.stopCancel != nil {
-		s.stopCancel()
+	st := ensureImageState(s)
+	st.authority = AuthorityPhaseRevoked
+	releaseImportedStateLocked(s)
+	var actors []*ssActor
+	for _, a := range st.actors {
+		markRevokedLocked(a)
+		actors = append(actors, a)
 	}
-	if s.ln != nil {
-		_ = s.ln.Close()
-	}
-	for c := range s.allConns {
-		_ = c.Close()
-	}
+	ln, cancel := s.ln, s.stopCancel
+	listenerFile := st.listenerFile
+	st.listenerFile = nil
+	signalStateLocked(st)
 	s.mu.Unlock()
+	// No socket close, callback or join runs under the table guard. In particular
+	// a flow-revoke callback may itself stop the server.
+	if cancel != nil {
+		cancel()
+	}
+	if ln != nil {
+		_ = ln.Close()
+	}
+	cleanupActors(s, actors)
+	if listenerFile != nil {
+		_ = listenerFile.Close()
+	}
 }
 
 func (s *Server) acceptLoop(ln net.Listener) {
 	defer s.wg.Done()
-	// Latch that the loop is gone so Serving stops claiming this server can take
-	// traffic. Accept can return a non-temporary error (fd exhaustion, the listener
-	// closed under us) while `closed` is still false, and without this latch the
-	// server would keep reporting itself healthy with nobody listening -- the exact
-	// shape of the incident this increment exists to close.
-	defer func() {
-		s.mu.Lock()
-		s.acceptExited = true
-		s.mu.Unlock()
-	}()
 	for {
-		c, err := ln.Accept()
-		if err != nil {
+		s.mu.Lock()
+		st := s.imageState
+		if s.closed || st.frozen {
+			finishAcceptLocked(s)
+			s.mu.Unlock()
 			return
 		}
-		if !s.trackConn(c) {
-			_ = c.Close()
-			continue
+		s.mu.Unlock()
+		if tcp, ok := ln.(*net.TCPListener); ok {
+			_ = tcp.SetDeadline(time.Now().Add(actorPollInterval))
 		}
-		s.wg.Add(1)
-		go func() {
-			defer s.wg.Done()
-			defer s.untrackConn(c)
-			defer func() { _ = c.Close() }()
-			s.handleConn(c)
-		}()
-	}
-}
-
-func (s *Server) trackConn(c net.Conn) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.closed {
-		return false
-	}
-	s.allConns[c] = struct{}{}
-	return true
-}
-
-func (s *Server) untrackConn(c net.Conn) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	delete(s.allConns, c)
-	for id, set := range s.keyConns {
-		if _, ok := set[c]; ok {
-			delete(set, c)
-			if len(set) == 0 {
-				delete(s.keyConns, id)
+		c, err := ln.Accept()
+		if err != nil {
+			if timeoutError(err) {
+				continue
 			}
+			s.mu.Lock()
+			finishAcceptLocked(s)
+			s.mu.Unlock()
+			return
+		}
+		s.mu.Lock()
+		a, err := acceptActorLocked(s, c)
+		if err == nil && !st.frozen {
+			startActorLocked(s, a)
+		}
+		s.mu.Unlock()
+		if err != nil {
+			_ = c.Close()
 		}
 	}
 }
 
-// bindKeyConn registers c under keyID iff that key is still active. Returns
-// false if the key was revoked between trial decryption and registration.
-func (s *Server) bindKeyConn(keyID string, c net.Conn) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.closed {
-		return false
-	}
-	active := false
-	for _, k := range s.keys {
-		if k.keyID == keyID {
-			active = true
-			break
-		}
-	}
-	if !active {
-		return false
-	}
-	set := s.keyConns[keyID]
-	if set == nil {
-		set = map[net.Conn]struct{}{}
-		s.keyConns[keyID] = set
-	}
-	set[c] = struct{}{}
-	return true
-}
-
-// unbindKeyConn removes one conn from its key's live set. Without it a long-lived server
-// would accumulate an entry per completed relay in keyConns (the same class of leak the
-// allConns untrack closes), and a revoke would walk conns that are already gone.
-func (s *Server) unbindKeyConn(keyID string, c net.Conn) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	set := s.keyConns[keyID]
-	if set == nil {
-		return
-	}
-	delete(set, c)
-	if len(set) == 0 {
-		delete(s.keyConns, keyID)
-	}
+// Retire the accept worker before releasing the guard that observed Freeze.
+// Otherwise a cut timeout can resume between that observation and deferred
+// cleanup, miss the still-running worker, and leave no accept owner afterward.
+// origin: hot-update S5 plan §5.3 / T22
+func finishAcceptLocked(s *Server) {
+	s.acceptExited = true
+	s.imageState.acceptRunning = false
+	signalStateLocked(s.imageState)
 }
 
 func (s *Server) snapshotKeys() []*keyEntry {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.keys
-}
-
-func (s *Server) handleConn(c net.Conn) {
-	_ = c.SetReadDeadline(time.Now().Add(handshakeTimeout))
-
-	salt := make([]byte, saltSize)
-	if _, err := io.ReadFull(c, salt); err != nil {
-		return
-	}
-	firstLen := make([]byte, 2+tagSize)
-	if _, err := io.ReadFull(c, firstLen); err != nil {
-		return
-	}
-
-	// Trial-decrypt the first length chunk against each active key. The PSK
-	// whose derived subkey authenticates the chunk identifies the subscriber.
-	var (
-		chosenID     string
-		chosenMaster []byte
-		rdAEAD       cipher.AEAD
-		rdNonce      []byte
-		firstN       int
-	)
-	for _, k := range s.snapshotKeys() {
-		sk, err := sessionSubkey(k.master, salt)
-		if err != nil {
-			continue
-		}
-		aead, err := chacha20poly1305.New(sk)
-		if err != nil {
-			continue
-		}
-		nonce := make([]byte, aead.NonceSize())
-		trial := append([]byte(nil), firstLen...)
-		plain, err := aead.Open(trial[:0], nonce, trial, nil)
-		if err != nil {
-			continue
-		}
-		n := int(binary.BigEndian.Uint16(plain))
-		if n == 0 || n > maxChunk {
-			continue
-		}
-		chosenID = k.keyID
-		chosenMaster = k.master
-		rdAEAD = aead
-		incNonce(nonce)
-		rdNonce = nonce
-		firstN = n
-		break
-	}
-	if rdAEAD == nil {
-		return // no key matched: fail-closed (empty keyset rejects all)
-	}
-	// round-6 F11: reject a replayed client salt for this key BEFORE doing any
-	// further work — the SS-AEAD salt must be unique per key, and a replayed
-	// handshake would otherwise re-open the target connection.
-	if !s.recordSalt(chosenID, salt) {
-		s.logger.Debug("ssproxy: rejecting replayed client salt", "key", chosenID)
-		return
-	}
-	if !s.bindKeyConn(chosenID, c) {
-		return // revoked mid-handshake
-	}
-
-	// Read the first payload chunk (already have its length).
-	payBuf := make([]byte, firstN+tagSize)
-	if _, err := io.ReadFull(c, payBuf); err != nil {
-		return
-	}
-	firstPlain, err := rdAEAD.Open(payBuf[:0], rdNonce, payBuf, nil)
-	if err != nil {
-		return
-	}
-	incNonce(rdNonce)
-
-	reader := &aeadReader{r: c, aead: rdAEAD, nonce: rdNonce, buf: firstPlain, off: 0}
-	target, err := readTargetAddr(reader)
-	if err != nil {
-		return
-	}
-	_ = c.SetReadDeadline(time.Time{}) // clear handshake deadline for relay
-
-	// round-6 F12 / round-7 F1,F2: destination policy. Fast-fail precheck, then
-	// dialTarget validates the ACTUAL connected IP (closes the rebinding TOCTOU).
-	// One server-owned context covers BOTH pre-track blocking spans (resolve + dial), so a
-	// concurrent Stop() abandons them instead of waiting them out (external review F1).
-	opCtx := s.opContext()
-	host, _, splitErr := net.SplitHostPort(target)
-	if splitErr != nil || !s.destAllowed(opCtx, host) {
-		s.logger.Warn("ssproxy: blocked non-public destination", "target", target)
-		return
-	}
-
-	remote, err := s.dialTarget(opCtx, target)
-	if err != nil {
-		s.logger.Debug("ssproxy: dial target failed", "target", target, "err", err)
-		return
-	}
-	defer func() { _ = remote.Close() }()
-	// Track the UPSTREAM conn too, so shutdown() can close it.
-	//
-	// origin: proxy-lifecycle plan A2 (bounded teardown; same family as gotcha #72).
-	// allConns used to hold only ACCEPTED conns, so shutdown closed the client side and
-	// left this one open -- and relay's wg.Wait() needs BOTH directions to finish, while
-	// io.Copy(w, remote) sits blocked in remote.Read(). An upstream that does not answer
-	// the half-close therefore hung Stop() indefinitely, and Stop() is called while
-	// holding the agent's p.mu (internal/agent/proxy.go proxyTeardownLocked) -- one idle
-	// upstream could wedge the whole proxy runtime. This increment makes rebuild paths
-	// far more reachable, so an unbounded Stop is no longer a latent risk.
-	//
-	// If the server is ALREADY shutting down, trackConn returns false: close immediately
-	// rather than starting a relay nobody will tear down.
-	if !s.trackConn(remote) {
-		return
-	}
-	defer s.untrackConn(remote)
-
-	// Bind the UPSTREAM to the SAME key as the accepted conn, so a hard revoke closes BOTH
-	// halves atomically.
-	//
-	// origin: proxy-lifecycle external review F2. keyConns held only the subscriber side, so
-	// SetKeys' revoke closed the accepted socket and left the upstream blocked in
-	// relay's remote->client copy. The DATA-plane guarantee still held (the subscriber's
-	// socket was gone), but the RESOURCE contract did not: handler goroutine, both map
-	// entries and both fds survived until the whole server stopped. An authorised key could
-	// pre-open many silent upstreams and have them outlive its own revocation.
-	//
-	// bindKeyConn re-checks that the key is still active, so a key revoked DURING the dial
-	// never reaches a relay: the bind fails and the deferred Close reclaims the upstream
-	// immediately.
-	//
-	// SCOPE, stated precisely because the earlier wording over-claimed (external rereview R2):
-	// this does NOT prevent the outbound connect itself. The dial's context is the SERVER's
-	// (cancelled by Stop), not the key's, so a revoke arriving while the resolver or the TCP
-	// handshake is in flight can still let that one connect COMPLETE before the bind rejects
-	// it. What is guaranteed is narrower and is the part that matters for the revoke contract:
-	// no relay is started for a dead credential, and the socket is reclaimed at once rather
-	// than surviving until the whole server stops. Making revocation cancel in-flight dials
-	// would need a per-key/per-session cancellable context; that is a deliberate non-goal here
-	// (it would put a caller-shaped lifetime back into this type's hot path), and if the hard
-	// revoke contract is ever tightened to "no outbound side effects after revoke" it should be
-	// its own increment.
-	if !s.bindKeyConn(chosenID, remote) {
-		return
-	}
-	defer s.unbindKeyConn(chosenID, remote)
-
-	// Response direction: fresh salt + subkey, written before any payload.
-	wsalt := make([]byte, saltSize)
-	if _, err := rand.Read(wsalt); err != nil {
-		return
-	}
-	if _, err := c.Write(wsalt); err != nil {
-		return
-	}
-	wsk, err := sessionSubkey(chosenMaster, wsalt)
-	if err != nil {
-		return
-	}
-	wAEAD, err := chacha20poly1305.New(wsk)
-	if err != nil {
-		return
-	}
-	writer := newAEADWriter(c, wAEAD)
-
-	s.relay(c, reader, writer, remote)
-}
-
-func (s *Server) relay(client net.Conn, r io.Reader, w io.Writer, remote net.Conn) {
-	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		_, _ = io.Copy(remote, r) // client -> remote
-		halfCloseWrite(remote)    // propagate the client's half-close, don't truncate the response
-	}()
-	go func() {
-		defer wg.Done()
-		_, _ = io.Copy(w, remote) // remote -> client
-		halfCloseWrite(client)
-	}()
-	wg.Wait()
-}
-
-// halfCloseWrite shuts down only the write half of a TCP conn (so a pending
-// response in the other direction is not truncated). Falls back to a full
-// close for non-TCP conns. The final full close is the caller's deferred Close.
-func halfCloseWrite(c net.Conn) {
-	if tc, ok := c.(*net.TCPConn); ok {
-		_ = tc.CloseWrite()
-		return
-	}
-	_ = c.Close()
 }
 
 // readTargetAddr parses the SOCKS-style target address (ATYP + addr + port)
@@ -824,4 +508,163 @@ func readTargetAddr(r io.Reader) (string, error) {
 		return "", err
 	}
 	return net.JoinHostPort(host, strconv.Itoa(int(binary.BigEndian.Uint16(pb)))), nil
+}
+
+// Legacy retains the existing precheck plus dial-time policy check. Its resolver
+// and dial are cancellable but not exportable; Freeze rejects this operation
+// until the connected socket and the chosen address have been committed.
+func connectLegacyActorLocked(s *Server, a *ssActor, target string) error {
+	p := a.state
+	now, err := actorNow()
+	if err != nil {
+		return err
+	}
+	if p.number("connect_deadline_boot_ns") == 0 {
+		p.put("connect_deadline_boot_ns", uint64(now+int64(dialTimeout)))
+	}
+	left := time.Duration(int64(p.number("connect_deadline_boot_ns")) - now)
+	if left <= 0 {
+		return errors.New("ssproxy: connect deadline")
+	}
+	ctx, cancel := context.WithTimeout(s.stopCtx, left)
+	a.dnsInFlight = true
+	s.mu.Unlock()
+	host, _, err := net.SplitHostPort(target)
+	var remote net.Conn
+	if err == nil && !s.destAllowed(ctx, host) {
+		// The decrypted target and KeyID are private state, including on denial.
+		// origin: hot-update S5 plan §6.6 / T26
+		s.logger.Warn("ssproxy: blocked destination", "reason", "destination_policy_denied")
+		err = errors.New("ssproxy: destination policy denied")
+	}
+	if err == nil {
+		remote, err = s.dialTarget(ctx, target)
+	}
+	cancel()
+	s.mu.Lock()
+	a.dnsInFlight = false
+	if err != nil {
+		return errors.New("ssproxy: destination unavailable")
+	}
+	// origin: hot-update S5 plan §6.1 / T17
+	upstream, ok := remote.(*net.TCPConn)
+	if !ok {
+		_ = remote.Close()
+		return ErrStateUnrepresentable
+	}
+	addr, ok := remote.RemoteAddr().(*net.TCPAddr)
+	if !ok {
+		_ = remote.Close()
+		return ErrStateUnrepresentable
+	}
+	a.upstream = upstream
+	a.upstreamConn = remote
+	if p.flag("revoked") || s.closed {
+		shutdownSocket(a.upstream)
+		return ErrStopped
+	}
+	ip := addr.AddrPort().Addr().As16()
+	p.putBytes("resolved_ip_candidates", ip[:])
+	p.put("dns_decided", 1)
+	p.put("policy_approved", 1)
+	p.put("connect_state", uint64(rawsocket.ConnectConnected))
+	p.put("connect_so_error_consumed", 1)
+	s.allConns[remote] = struct{}{}
+	id := string(p.bytes("authorized_key_id"))
+	if s.keyConns[id] == nil {
+		s.keyConns[id] = make(map[net.Conn]struct{})
+	}
+	s.keyConns[id][remote] = struct{}{}
+	p.put("phase", uint64(SSPhaseRelay))
+	return nil
+}
+
+func (s *Server) ExpectFlow(id [16]byte, tuple rawsocket.Tuple) error {
+	if id == ([16]byte{}) {
+		return ErrStateUnrepresentable
+	}
+	return expectSocket(s, id, tuple)
+}
+
+// ExpectLegacyFlow reserves the actual pre-SYN tuple without inventing a v1
+// FlowID. Legacy carrier ownership still blocks every image cut; key removal
+// closes this actor's original socket and lets the legacy bridge terminate.
+// origin: hot-update S5 plan §4.1 / §6.5 / §9.1 / DRILL-RUN
+func ExpectLegacyFlow(s *Server, tuple rawsocket.Tuple) error {
+	return expectSocket(s, [16]byte{}, tuple)
+}
+
+func expectSocket(s *Server, id [16]byte, tuple rawsocket.Tuple) error {
+	if runtime.GOOS != "linux" {
+		return rawsocket.ErrUnsupported
+	}
+	if !tuple.Local.IsValid() || !tuple.Remote.IsValid() || !tuple.Local.Addr().IsLoopback() || !tuple.Remote.Addr().IsLoopback() {
+		return ErrStateUnrepresentable
+	}
+	now, err := actorNow()
+	if err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	st := ensureImageState(s)
+	if s.closed {
+		return ErrStopped
+	}
+	if st.frozen {
+		return ErrAuthorityPending
+	}
+	if st.revoke == nil {
+		return ErrStateUnrepresentable
+	}
+	if tuple.Remote.Port() != uint16(s.localPort) {
+		return ErrStateUnrepresentable
+	}
+	if _, ok := st.bindings[tuple]; ok {
+		return ErrStateUnrepresentable
+	}
+	for _, b := range st.bindings {
+		if id != ([16]byte{}) && b.id == id {
+			return ErrStateUnrepresentable
+		}
+	}
+	// Expired reservations cannot accumulate unbounded state after a failed dial.
+	for k, b := range st.bindings {
+		if !b.consumed && b.deadline <= now {
+			delete(st.bindings, k)
+		}
+	}
+	if len(st.bindings) >= MaxActors {
+		return ErrCapacity
+	}
+	st.bindings[tuple] = &flowBinding{id: id, tuple: tuple, deadline: now + int64(handshakeTimeout)}
+	return nil
+}
+func (s *Server) SetFlowRevoke(fn func([16]byte, string)) error {
+	if fn == nil {
+		return ErrStateUnrepresentable
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	st := ensureImageState(s)
+	if s.closed {
+		return ErrStopped
+	}
+	st.revoke = fn
+	return nil
+}
+
+// The absolute authority deadline belongs to the actor, including while fresh
+// authorization is unavailable. It is never renewed by Freeze/Thaw/import.
+// origin: hot-update S5 plan §6.5
+func actorAuthorityDeadline(a *ssActor) (time.Duration, bool) {
+	deadline := a.state.number("authority_deadline_boot_ns")
+	if deadline == 0 {
+		return 0, false
+	}
+	now, err := actorNow()
+	if err != nil || uint64(now) >= deadline {
+		return 0, true
+	}
+	return time.Duration(deadline - uint64(now)), false
 }

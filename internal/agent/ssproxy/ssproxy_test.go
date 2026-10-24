@@ -30,7 +30,7 @@ func dialSS(t *testing.T, serverAddr, password, target string) *ssClient {
 	if err != nil {
 		t.Fatalf("dial ss server: %v", err)
 	}
-	master := evpBytesToKey(password, keySize)
+	master := evpBytesToKey(password)
 	salt := make([]byte, saltSize)
 	if _, err := rand.Read(salt); err != nil {
 		t.Fatalf("rand salt: %v", err)

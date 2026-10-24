@@ -78,7 +78,7 @@ func encryptedTargetHandshake(t *testing.T, password, target string, salt []byte
 	header = append(header, host...)
 	header = append(header, byte(port>>8), byte(port))
 
-	subkey, err := sessionSubkey(evpBytesToKey(password, keySize), salt)
+	subkey, err := sessionSubkey(evpBytesToKey(password), salt)
 	if err != nil {
 		t.Fatal(err)
 	}

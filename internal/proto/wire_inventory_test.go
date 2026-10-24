@@ -18,7 +18,9 @@ var updateWireInventory = flag.Bool("update-wire-inventory", false,
 	"append newly added wire fields to testdata/wire_field_inventory.txt (refuses to drop entries)")
 
 // wireInventoryPath is the append-only ledger of every exported field of every
-// exported struct in this package: one line per field, `Type.Field<TAB>tag<TAB>type`.
+// exported struct in proto, plus the reachable local admin roots: one line
+// per field, `Type.Field<TAB>tag<TAB>type`. Existing proto identities retain
+// their spelling; admin identities are package-qualified to avoid collisions.
 const wireInventoryPath = "testdata/wire_field_inventory.txt"
 
 // origin: upgrade-safety plan §2 — the mechanical half of the N-1 window
@@ -117,60 +119,133 @@ func TestWireFieldInventoryAppendOnly(t *testing.T) {
 	}
 }
 
-// collectWireFields parses every non-test .go file of this package and returns
-// one sorted line per exported field of an exported struct type:
-// `Type.Field<TAB>tag<TAB>type` (embedded fields use the embedded type name).
+// collectWireFields uses the AllOS AST union rather than the host's build
+// selection. Local admin replies are real wire too; omitting their roots would
+// let a broker-only status field disappear while the proto ledger stayed green.
+// origin: hot-update S6 plan §9.1 / T46
 func collectWireFields(t *testing.T) []string {
 	t.Helper()
-	fset := token.NewFileSet()
-	pkgs, err := parser.ParseDir(fset, ".", func(fi os.FileInfo) bool {
-		return !strings.HasSuffix(fi.Name(), "_test.go")
-	}, parser.SkipObjectResolution)
-	if err != nil {
-		t.Fatalf("parse package proto: %v", err)
-	}
-
 	var lines []string
-	for _, pkg := range pkgs {
-		fileNames := make([]string, 0, len(pkg.Files))
-		for name := range pkg.Files {
-			fileNames = append(fileNames, name)
+	for _, source := range []struct {
+		dir, namespace string
+		roots          []string
+	}{
+		{".", "", nil},
+		{"../adminsock", "adminsock.", []string{"Request", "Response", "RuntimeReport"}},
+	} {
+		entries, err := os.ReadDir(source.dir)
+		if err != nil {
+			t.Fatalf("parse wire source %s: %v", source.dir, err)
 		}
-		sort.Strings(fileNames)
-		for _, name := range fileNames {
-			ast.Inspect(pkg.Files[name], func(n ast.Node) bool {
-				ts, ok := n.(*ast.TypeSpec)
-				if !ok || !ts.Name.IsExported() {
-					return true
-				}
-				st, ok := ts.Type.(*ast.StructType)
-				if !ok {
-					return true
-				}
-				for _, f := range st.Fields.List {
-					tag := "-"
-					if f.Tag != nil {
-						tag = strings.Trim(f.Tag.Value, "`")
-					}
-					typeStr := types.ExprString(f.Type)
-					if len(f.Names) == 0 {
-						// Embedded field: its wire identity is the embedded type itself.
-						lines = append(lines, fmt.Sprintf("%s.%s\t%s\t%s", ts.Name.Name, typeStr, tag, typeStr))
-						continue
-					}
-					for _, fn := range f.Names {
-						if !fn.IsExported() {
-							continue
-						}
-						lines = append(lines, fmt.Sprintf("%s.%s\t%s\t%s", ts.Name.Name, fn.Name, tag, typeStr))
-					}
-				}
-				return true
-			})
+		var files []*ast.File
+		for _, entry := range entries {
+			if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".go") || strings.HasSuffix(entry.Name(), "_test.go") {
+				continue
+			}
+			file, err := parser.ParseFile(token.NewFileSet(), source.dir+"/"+entry.Name(), nil, parser.SkipObjectResolution)
+			if err != nil {
+				t.Fatalf("parse wire source %s: %v", entry.Name(), err)
+			}
+			files = append(files, file)
 		}
+		fields, err := wireFieldsFromFiles(files, source.namespace, source.roots)
+		if err != nil {
+			t.Fatalf("collect wire source %s: %v", source.dir, err)
+		}
+		lines = append(lines, fields...)
 	}
 	sort.Strings(lines)
 	return lines
+}
+
+// Only named structs reachable from actual admin requests/replies are wire
+// roots. Walking field types includes slice/pointer/map elements without
+// registering unrelated internal server implementation state as public wire.
+func wireFieldsFromFiles(files []*ast.File, namespace string, roots []string) ([]string, error) {
+	structs := map[string]*ast.StructType{}
+	for _, file := range files {
+		for _, decl := range file.Decls {
+			gen, ok := decl.(*ast.GenDecl)
+			if !ok || gen.Tok != token.TYPE {
+				continue
+			}
+			for _, spec := range gen.Specs {
+				ts, ok := spec.(*ast.TypeSpec)
+				if !ok || !ts.Name.IsExported() {
+					continue
+				}
+				if st, ok := ts.Type.(*ast.StructType); ok {
+					if _, duplicate := structs[ts.Name.Name]; duplicate {
+						return nil, fmt.Errorf("duplicate wire struct %s%s", namespace, ts.Name.Name)
+					}
+					structs[ts.Name.Name] = st
+				}
+			}
+		}
+	}
+	selected := map[string]bool{}
+	var visit func(string)
+	visit = func(name string) {
+		st, found := structs[name]
+		if !found || selected[name] {
+			return
+		}
+		selected[name] = true
+		for _, field := range st.Fields.List {
+			// Unexported implementation fields do not extend the wire graph.
+			exported := len(field.Names) == 0
+			for _, name := range field.Names {
+				exported = exported || name.IsExported()
+			}
+			if exported {
+				ast.Inspect(field.Type, func(n ast.Node) bool {
+					// Imported proto types are already covered by the proto
+					// source. A selector's local identifier is not a type.
+					if _, selector := n.(*ast.SelectorExpr); selector {
+						return false
+					}
+					if id, ok := n.(*ast.Ident); ok {
+						visit(id.Name)
+					}
+					return true
+				})
+			}
+		}
+	}
+	if roots == nil {
+		for name := range structs {
+			selected[name] = true
+		}
+	} else {
+		for _, name := range roots {
+			if _, found := structs[name]; !found {
+				return nil, fmt.Errorf("missing wire root %s%s", namespace, name)
+			}
+			visit(name)
+		}
+	}
+	var lines []string
+	for name := range selected {
+		for _, field := range structs[name].Fields.List {
+			tag := "-"
+			if field.Tag != nil {
+				tag = strings.Trim(field.Tag.Value, "`")
+			}
+			typ := types.ExprString(field.Type)
+			if len(field.Names) == 0 {
+				// Embedded field: its wire identity is the embedded type itself.
+				lines = append(lines, fmt.Sprintf("%s%s.%s\t%s\t%s", namespace, name, typ, tag, typ))
+				continue
+			}
+			for _, fn := range field.Names {
+				if fn.IsExported() {
+					lines = append(lines, fmt.Sprintf("%s%s.%s\t%s\t%s", namespace, name, fn.Name, tag, typ))
+				}
+			}
+		}
+	}
+	sort.Strings(lines)
+	return lines, nil
 }
 
 func writeWireInventory(t *testing.T, lines []string) {
@@ -179,7 +254,7 @@ func writeWireInventory(t *testing.T, lines []string) {
 		t.Fatal(err)
 	}
 	header := "# Append-only wire field inventory (TestWireFieldInventoryAppendOnly).\n" +
-		"# One line per exported field of an exported struct in internal/proto:\n" +
+		"# One line per exported field of an exported struct in internal/proto and reachable internal/adminsock roots:\n" +
 		"#   Type.Field<TAB>struct tag<TAB>Go type\n" +
 		"# Entries may be ADDED by -update-wire-inventory; removing or editing one is an\n" +
 		"# epoch decision (architecture §21.4) and must be done by hand with a commit-message\n" +
