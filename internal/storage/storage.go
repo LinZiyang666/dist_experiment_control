@@ -13,10 +13,9 @@ import (
 	"embed"
 	"errors"
 	"fmt"
+	"net/url"
 	"sort"
 	"strings"
-
-	_ "modernc.org/sqlite"
 )
 
 // SQLite PRAGMAs are connection-local. A one-shot `PRAGMA foreign_keys = ON`
@@ -61,10 +60,7 @@ const migrationsTable = "schema_migrations"
 //
 // On any failure the partially-opened DB is closed before returning.
 func Open(dsn string) (*sql.DB, error) {
-	db, err := sql.Open("sqlite", withForeignKeysPragma(dsn))
-	if err != nil {
-		return nil, fmt.Errorf("storage: open: %w", err)
-	}
+	db := openRegistered(withForeignKeysPragma(dsn), false)
 	db.SetMaxOpenConns(1)
 	if err := ApplyMigrations(db); err != nil {
 		_ = db.Close()
@@ -85,10 +81,7 @@ func Open(dsn string) (*sql.DB, error) {
 // see the long comment above). The snapshot's read-only backup source is a
 // SEPARATE handle (OpenReadOnly), never a relaxation of this write pool.
 func OpenWAL(dsn string) (*sql.DB, error) {
-	db, err := sql.Open("sqlite", withWALPragmas(dsn))
-	if err != nil {
-		return nil, fmt.Errorf("storage: open (wal): %w", err)
-	}
+	db := openRegistered(withWALPragmas(dsn), false)
 	db.SetMaxOpenConns(1)
 	if err := ApplyMigrations(db); err != nil {
 		_ = db.Close()
@@ -103,9 +96,17 @@ func OpenWAL(dsn string) (*sql.DB, error) {
 // can never slip in), and runs NO migrations (the file is already current). It is
 // a SEPARATE *sql.DB; it must never be conflated with the write pool.
 func OpenReadOnly(dsn string) (*sql.DB, error) {
-	db, err := sql.Open("sqlite", withReadOnlyPragmas(dsn))
+	readOnlyDSN, err := withReadOnlyPragmas(dsn)
 	if err != nil {
-		return nil, fmt.Errorf("storage: open (ro): %w", err)
+		return nil, err
+	}
+	db := openRegistered(readOnlyDSN, false)
+	// origin: hot-update S6 plan §3.2 / T08
+	// A returned snapshot reader must already participate in the real census;
+	// sql.OpenDB alone is lazy and would falsely report an empty reader pool.
+	db.SetMaxOpenConns(1)
+	if err := db.Ping(); err != nil {
+		return nil, errors.Join(err, db.Close())
 	}
 	return db, nil
 }
@@ -119,10 +120,7 @@ func OpenReadOnly(dsn string) (*sql.DB, error) {
 // can yield a false-negative, so the runbook's `systemctl stop` stays the primary guard.
 // busy==false,err==nil means "no writer detected" (or the file is absent / read-only).
 func ProbeWriterLock(dbPath string) (busy bool, err error) {
-	db, err := sql.Open("sqlite", "file:"+dbPath+"?_pragma=busy_timeout(0)")
-	if err != nil {
-		return false, fmt.Errorf("storage: probe open: %w", err)
-	}
+	db := openRegistered("file:"+dbPath+"?_pragma=busy_timeout(0)", false)
 	defer func() { _ = db.Close() }()
 	db.SetMaxOpenConns(1)
 	if _, execErr := db.Exec("BEGIN IMMEDIATE"); execErr != nil {
@@ -169,18 +167,30 @@ func withWALPragmas(dsn string) string {
 // withReadOnlyPragmas opens the file mode=ro (OS-level read-only) while keeping
 // foreign_keys/busy_timeout. The DSN is promoted to file: form so the mode=ro
 // URI parameter is honored by the driver.
-func withReadOnlyPragmas(dsn string) string {
+func withReadOnlyPragmas(dsn string) (string, error) {
 	base := dsn
 	if dsn == ":memory:" {
 		base = "file::memory:"
 	} else if !strings.HasPrefix(base, "file:") {
 		base = "file:" + base
 	}
-	sep := "?"
-	if strings.Contains(base, "?") {
-		sep = "&"
+	u, err := url.Parse(base)
+	if err != nil {
+		return "", fmt.Errorf("storage: read-only URI: %w", err)
 	}
-	return base + sep + "mode=ro&_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)"
+	query, err := url.ParseQuery(u.RawQuery)
+	if err != nil {
+		return "", fmt.Errorf("storage: read-only URI options: %w", err)
+	}
+	// origin: hot-update S6 plan §3.2 / T08
+	// Normalize to one explicit read-only mode, regardless of supplied modes.
+	// The census still inspects the driver's actual mode instead of trusting
+	// this DSN declaration to prove that a backup reader cannot write.
+	query.Set("mode", "ro")
+	query.Add("_pragma", "foreign_keys(1)")
+	query.Add("_pragma", "busy_timeout(5000)")
+	u.RawQuery = query.Encode()
+	return u.String(), nil
 }
 
 // ApplyMigrations applies every embedded migration file (sorted by filename)

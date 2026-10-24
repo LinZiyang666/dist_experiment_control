@@ -111,3 +111,120 @@ func TestActivatedMemberSidIsLockedAtMint(t *testing.T) {
 		}
 	}
 }
+
+// origin: hot-update S7 plan §6.3–§6.4 / T31
+func TestTransferContinuationPermissionsStayInScope(t *testing.T) {
+	member := PermissionsForActivatedMember(sampleActor, "lab", false)
+	allowed := func(patterns []string, subject string) bool {
+		for _, p := range patterns {
+			if tokenMatch(p, subject) {
+				return true
+			}
+		}
+		return false
+	}
+	for _, op := range []string{"probe", "permit", "status", "source", "reserve", "terminal", "cancel"} {
+		own := "tether.v2.ctrl.by." + sampleActor + ".s.lab.node.node.transfer.id." + op + ".req"
+		if !allowed(member.Pub.Allow, own) {
+			t.Errorf("missing own %s", op)
+		}
+		for _, foreign := range []string{strings.Replace(own, ".s.lab.", ".s.other.", 1), strings.Replace(own, sampleActor, "other", 1)} {
+			if allowed(member.Pub.Allow, foreign) {
+				t.Errorf("foreign grant: %s", foreign)
+			}
+		}
+	}
+	for _, op := range []string{"census", "bucket-config", "unknown"} {
+		if allowed(member.Pub.Allow, "tether.v2.ctrl.by."+sampleActor+".s.lab.node.node.transfer.id."+op+".req") {
+			t.Errorf("management grant: %s", op)
+		}
+	}
+	p := PermissionsForTransferSettlement(sampleActor, "lab", "node", "id")
+	for _, op := range []string{"status", "terminal", "cancel"} {
+		own := "tether.v2.ctrl.by." + sampleActor + ".s.lab.node.node.transfer.id." + op + ".req"
+		if !allowed(p.Pub.Allow, own) {
+			t.Errorf("missing settlement %s", op)
+		}
+		for _, foreign := range []string{strings.Replace(own, ".s.lab.", ".s.other.", 1), strings.Replace(own, sampleActor, "other", 1), strings.Replace(own, ".transfer.id.", ".transfer.other.", 1), strings.Replace(own, ".node.node.", ".node.other.", 1)} {
+			if allowed(p.Pub.Allow, foreign) {
+				t.Errorf("settlement scope escaped: %s", foreign)
+			}
+		}
+	}
+	for _, subject := range []string{"$JS.API.STREAM.INFO.OBJ_xfer-lab", "$JS.API.STREAM.UPDATE.OBJ_xfer-lab", "$O.xfer-lab.C.chunk", "tether.v2.s.lab.cmd.by." + sampleActor + ".node.node.push.req", "tether.v2.ctrl.by." + sampleActor + ".s.lab.node.node.transfer.id.permit.req", "tether.v2.s.lab.audit.transfer", "_INBOX.any", "tether.v2.ctrl.s.lab.node.node.register.req"} {
+		if allowed(p.Pub.Allow, subject) || allowed(p.Sub.Allow, subject) {
+			t.Errorf("settlement acquired business permission %s", subject)
+		}
+	}
+	if !allowed(p.Sub.Allow, InboxPrefixFor(sampleActor)+".reply") || allowed(p.Sub.Allow, InboxPrefixFor("other")+".reply") {
+		t.Fatal("settlement private reply scope drifted")
+	}
+	if !allowed(PermissionsForBroker().Pub.Allow, "$JS.API.STREAM.UPDATE.OBJ_xfer-lab") {
+		t.Fatal("broker missing bucket config authority")
+	}
+	removal := PermissionsForSessionRemoval(sampleActor, "lab")
+	for _, subject := range []string{"tether.v2.ctrl.by." + sampleActor + ".session.lab.rm.req", "tether.v2.ctrl.by." + sampleActor + ".cluster-health.req"} {
+		if !allowed(removal.Pub.Allow, subject) {
+			t.Errorf("removal owner cannot retry: %s", subject)
+		}
+	}
+	for _, subject := range []string{"tether.v2.ctrl.by." + sampleActor + ".session.other.rm.req", "tether.v2.ctrl.by.other.session.lab.rm.req", "tether.v2.ctrl.by." + sampleActor + ".session.lab.join.req", "tether.v2.ctrl.by." + sampleActor + ".s.lab.node.node.transfer.id.permit.req", "$O.xfer-lab.C.chunk", "tether.v2.s.lab.audit.transfer"} {
+		if allowed(removal.Pub.Allow, subject) || allowed(removal.Sub.Allow, subject) {
+			t.Errorf("removal owner acquired unrelated authority: %s", subject)
+		}
+	}
+	if !allowed(removal.Sub.Allow, InboxPrefixFor(sampleActor)+".reply") || allowed(removal.Sub.Allow, InboxPrefixFor("other")+".reply") || allowed(removal.Sub.Allow, "_INBOX.any") {
+		t.Fatal("removal owner private reply scope drifted")
+	}
+}
+
+// origin: hot-update S7 plan §6.3 / T31
+func TestTransferAgentPermissionsKeepClosedOperations(t *testing.T) {
+	p := PermissionsForAgent("lab", "node", sampleActor, false)
+	allows := func(subject string) bool {
+		for _, pattern := range p.Pub.Allow {
+			if tokenMatch(pattern, subject) {
+				return true
+			}
+		}
+		return false
+	}
+	for _, op := range []string{"source", "reserve", "terminal", "cancel"} {
+		subject := "tether.v2.s.lab.ev.node.node.transfer.id." + op + ".req"
+		if !allows(subject) {
+			t.Errorf("own %s denied", op)
+		}
+		for _, other := range []string{strings.Replace(subject, ".s.lab.", ".s.other.", 1), strings.Replace(subject, ".node.node.", ".node.other.", 1)} {
+			if allows(other) {
+				t.Errorf("foreign request allowed: %s", other)
+			}
+		}
+	}
+	for _, op := range []string{"probe", "permit", "status", "census", "bucket-config", "unknown"} {
+		if allows("tether.v2.s.lab.ev.node.node.transfer.id." + op + ".req") {
+			t.Errorf("agent acquired %s authority", op)
+		}
+	}
+	for _, leaf := range []string{"state", "proc.pid.started", "proc.pid.exit", "proxy.ready", "proxy.unready", "transfer.id.complete", "transfer.id.failed"} {
+		if !allows("tether.v2.s.lab.ev.node.node." + leaf) {
+			t.Errorf("legacy event denied: %s", leaf)
+		}
+	}
+}
+
+// origin: hot-update S7 plan §11.4 / T31
+func TestTransferPermissionScannerIncludesEveryGrant(t *testing.T) {
+	grants := grantSubjects(t, "permissions.go")
+	for _, op := range []string{"probe", "permit", "status", "source", "reserve", "terminal", "cancel"} {
+		want := "PREFIX.ctrl.by.*.s.*.node.*.transfer.*." + op + ".req"
+		found := false
+		for _, grant := range grants {
+			if grant == want {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("ACL scanner lost the transfer leaf grant: %s", want)
+		}
+	}
+}

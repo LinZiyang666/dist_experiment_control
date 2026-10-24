@@ -9,6 +9,8 @@
 //     only, overridden via -ldflags at build time.
 package proto
 
+import "github.com/LinZiyang666/tether/internal/upgradeprotocol"
+
 const (
 	// ProtoVersion is the wire/contract version. Bump only on breaking changes.
 	//
@@ -48,6 +50,35 @@ var ReleaseVersion = "v0.0.0-dev"
 // UpgradeForwardedResp.NewVersion, which ctl --wait compares against the
 // new binary's registered ReleaseVersion. Changing this shape strands the
 // FLEET's ability to upgrade INTO the release that changed it.
-func VersionLine() string {
-	return "tether " + ReleaseVersion + " (proto " + SubjectVersionToken + ")"
+func VersionLine() string { return upgradeprotocol.VersionLine(ReleaseVersion, SubjectVersionToken) }
+
+// ImageABIVersion is the epoch of the agent's runtime-layer image
+// (agentimage.Bundle.Version reads it): a same-PID upgrade may only carry
+// live work INTO a binary that speaks the same epoch. `tether version`
+// prints it as its LAST line (ImageABILine) so an upgrading agent can ask
+// the candidate before the flip; a candidate with no such line predates
+// hot update and is refused when there is live work to carry
+// (image_abi_unsupported — hot-update S3 plan §2.1). Append-only: the line
+// stays last, earlier lines keep their shape (the N-1 smoke gate reads the
+// first line only).
+const ImageABIVersion = 1
+
+// ImageABILine is the frozen shape of that last line: `image-abi v<N>`.
+func ImageABILine() string { return upgradeprotocol.ImageABILine(ImageABIVersion) }
+
+// ImageDomainsLine advertises which additive image domains this reader can
+// restore. ABI v1 alone only proves the original exec domain is understood.
+// These are reader declarations, including on Darwin; Linux data-plane
+// availability is negotiated separately and cannot be inferred from this line.
+// origin: hot-update S4 plan §5.2; hot-update S5 plan §5.2 / L1
+// origin: hot-update S6 plan §9.1 / T46
+// origin: hot-update S7 plan §6.2 / §8.4 / P01
+func ImageDomainsLine() string { return transferImageDomainsLine }
+
+// ImageVersionLines keeps the domain advertisement before the final ABI line.
+// Version emitters can append these lines without changing the N-1 first or
+// last line contract. The CLI emitter is wired by the upgrade owner.
+// origin: hot-update S4 plan §5.2
+func ImageVersionLines() []string {
+	return upgradeprotocol.ImageVersionLines(ImageDomainsLine(), ImageABILine())
 }

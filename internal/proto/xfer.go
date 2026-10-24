@@ -104,6 +104,9 @@ func XferLegBudget(size int64) time.Duration {
 // size==0 means "not known here" (the pull path carries no declared size) and yields the floor, i.e.
 // exactly the pre-batch-C behaviour. That fallback is deliberate and pinned by a test: it is also
 // what an OLD on-disk ledger record, written before Size existed, degrades to.
+// Capable continuations instead use TransferBudget and retain a BudgetSeal;
+// this legacy helper deliberately does not learn rate limits or provisional pulls.
+// origin: hot-update S7 plan §1.2 / P01
 func XferBudget(tier string, size int64, legs int) time.Duration {
 	if tier != "b" {
 		return XferTimeoutTierA

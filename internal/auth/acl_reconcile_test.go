@@ -122,11 +122,42 @@ func grantSubjects(t *testing.T, file string) []string {
 		}
 		return true
 	})
+	// Follow the transfer permission owner in all three scan directions.
+	// origin: hot-update S7 plan §11.4 / T31
+	if filepath.Base(file) == "permissions.go" {
+		out = append(out, grantSubjects(t, filepath.Join(filepath.Dir(file), "transfer_permissions.go"))...)
+		// The broker ACL moved with its comments; all scanner directions must
+		// follow the new owner instead of silently forgetting the moved grants.
+		// origin: hot-update S9 plan §10.1 / T47
+		out = append(out, grantSubjects(t, filepath.Join(filepath.Dir(file), "infra_permissions.go"))...)
+	}
 	return out
 }
 
+// All directions and their controls read the same owners, including moved callout sites.
+// origin: hot-update S6 plan §9.3 / HARDGATE-A
+//
+// internal/xfercontrol owns the transfer SUB table since S7 P16: Registrations() is the one
+// closed descriptor that cold Run and the hot image both subscribe from
+// (broker brokerTransferWireSubscriptions -> startBrokerTransfers nc.Subscribe), and
+// ValidateSubscriptions refuses a graph that leaves any of its rows without a handler.
+// Without this owner the seven ctl transfer grants read as "no subscriber" although the broker
+// serves every one of them.
+// origin: hot-update S7 plan §6.3 / §12 P16 (SUB table) / T31
+func aclSubscriptionSourceDirs(root string) []string {
+	return []string{
+		filepath.Join(root, "internal", "broker"),
+		filepath.Join(root, "internal", "brokercontrol"),
+		// Follow moved live subscriptions in both reconciliation directions.
+		// origin: S7 internal review MAKETEST-TRANSFER F3; S7 plan §11.4
+		filepath.Join(root, "internal", "brokerupgrade", "brokerruntime"),
+		filepath.Join(root, "internal", "proto"),
+		filepath.Join(root, "internal", "xfercontrol"),
+	}
+}
+
 // subscribedSubjects extracts subscription subject literals from every
-// non-test file under internal/broker. Scanning only broker.go would report
+// non-test file under internal/broker and its brokercontrol owner. Scanning only broker.go would report
 // handlers registered elsewhere (alerts, cluster health, grow/upgrade triggers)
 // as unsubscribed — a false positive that would train readers to ignore this
 // test, which is exactly the failure mode it exists to prevent.
@@ -207,12 +238,34 @@ func subjectLiterals(f *ast.File) []string {
 }
 
 func subjectLiteralsWith(f *ast.File, globalConsts map[string]string) []string {
+	// Named tables retain the same subject/handler evidence as anonymous ones.
+	// The business table moved to reexec.go so cold and restored Run share it.
+	// origin: hot-update S6 plan §6.3 / HARDGATE-A
+	structs := map[string]*ast.StructType{}
+	for _, decl := range f.Decls {
+		block, ok := decl.(*ast.GenDecl)
+		if !ok || block.Tok != token.TYPE {
+			continue
+		}
+		for _, spec := range block.Specs {
+			typ := spec.(*ast.TypeSpec)
+			if st, ok := typ.Type.(*ast.StructType); ok {
+				structs[typ.Name.Name] = st
+			}
+		}
+	}
 	// Local const/var name -> subject value, so `Subscribe(subjFoo)`
 	// resolves. Values are only USED when referenced by a subscribe call below.
 	local := map[string]string{}
 	for k, v := range globalConsts {
 		local[k] = v
 	}
+	// scoped holds the `name := <subject>` definitions of the function being inspected, and
+	// only that function: a file-wide map would let one function's `ctl` resolve another
+	// function's unrelated variable of the same name. xfercontrol.Registrations builds its
+	// three subject roots this way.
+	// origin: hot-update S7 plan §6.3 / §12 P16
+	var scoped map[string]string
 	var flatten func(ast.Expr) (string, bool)
 	flatten = func(e ast.Expr) (string, bool) {
 		switch v := e.(type) {
@@ -225,6 +278,9 @@ func subjectLiteralsWith(f *ast.File, globalConsts map[string]string) []string {
 		case *ast.Ident:
 			if v.Name == "SubjectPrefix" {
 				return "PREFIX", true
+			}
+			if s, ok := scoped[v.Name]; ok {
+				return s, true
 			}
 			if s, ok := local[v.Name]; ok {
 				return s, true
@@ -274,7 +330,7 @@ func subjectLiteralsWith(f *ast.File, globalConsts map[string]string) []string {
 		}
 	}
 
-	ast.Inspect(f, func(n ast.Node) bool {
+	inspect := func(n ast.Node) bool {
 		switch v := n.(type) {
 		case *ast.CallExpr:
 			var name string
@@ -303,7 +359,7 @@ func subjectLiteralsWith(f *ast.File, globalConsts map[string]string) []string {
 			// The elements carry no field names, and the subject reaches
 			// nc.Subscribe as a loop variable, so neither the call-site rule nor
 			// the keyed rule sees it. Recognising the table by its FIELD NAMES
-			// keeps the "real subscription required" property: an anonymous
+			// keeps the "real subscription required" property: a named or anonymous
 			// struct declaring `subj` plus a nats.MsgHandler is a subscription
 			// table, not a stray declaration.
 			at, ok := v.Type.(*ast.ArrayType)
@@ -311,13 +367,20 @@ func subjectLiteralsWith(f *ast.File, globalConsts map[string]string) []string {
 				return true
 			}
 			st, ok := at.Elt.(*ast.StructType)
-			if !ok || st.Fields == nil {
+			if !ok {
+				if id, named := at.Elt.(*ast.Ident); named {
+					st = structs[id.Name]
+				}
+			}
+			if st == nil || st.Fields == nil {
 				return true
 			}
 			subjIdx, isTable := -1, false
+			declared := map[string]bool{}
 			idx := 0
 			for _, fl := range st.Fields.List {
 				for _, nm := range fl.Names {
+					declared[nm.Name] = true
 					if nm.Name == "subj" || nm.Name == "subject" {
 						subjIdx = idx
 					}
@@ -326,6 +389,48 @@ func subjectLiteralsWith(f *ast.File, globalConsts map[string]string) []string {
 					}
 					idx++
 				}
+			}
+			// The transfer registration descriptor carries no handler: the broker binds
+			// one per row at subscribe time and ValidateSubscriptions refuses any row it
+			// left unbound, so a {Subject, PlainBroadcast} descriptor row IS a live
+			// subscription. Rows marked LegacyCarrier are served by the business table
+			// and ClusterVerb rows by the broker-only cluster forward; both are skipped
+			// exactly as brokerTransferWireSubscriptions skips them, so this rule
+			// certifies no subject the broker does not itself subscribe from this table.
+			// origin: hot-update S7 plan §6.3 / §12 P16 / T31
+			if declared["Subject"] && declared["PlainBroadcast"] {
+				for _, el := range v.Elts {
+					row, ok := el.(*ast.CompositeLit)
+					if !ok {
+						continue
+					}
+					var subject ast.Expr
+					servedElsewhere := false
+					for _, e := range row.Elts {
+						kv, ok := e.(*ast.KeyValueExpr)
+						if !ok {
+							continue
+						}
+						key, ok := kv.Key.(*ast.Ident)
+						if !ok {
+							continue
+						}
+						switch key.Name {
+						case "Subject":
+							subject = kv.Value
+						case "ClusterVerb":
+							servedElsewhere = true
+						case "LegacyCarrier":
+							if id, ok := kv.Value.(*ast.Ident); !ok || id.Name != "false" {
+								servedElsewhere = true
+							}
+						}
+					}
+					if subject != nil && !servedElsewhere {
+						record(subject)
+					}
+				}
+				return true
 			}
 			if subjIdx < 0 || !isTable {
 				return true
@@ -359,7 +464,28 @@ func subjectLiteralsWith(f *ast.File, globalConsts map[string]string) []string {
 			}
 		}
 		return true
-	})
+	}
+	for _, decl := range f.Decls {
+		scoped = nil
+		if fd, ok := decl.(*ast.FuncDecl); ok && fd.Body != nil {
+			scoped = map[string]string{}
+			ast.Inspect(fd.Body, func(n ast.Node) bool {
+				as, ok := n.(*ast.AssignStmt)
+				if !ok || as.Tok != token.DEFINE || len(as.Lhs) != len(as.Rhs) {
+					return true
+				}
+				for i, lhs := range as.Lhs {
+					if id, ok := lhs.(*ast.Ident); ok {
+						if s, ok := flatten(as.Rhs[i]); ok {
+							scoped[id.Name] = s
+						}
+					}
+				}
+				return true
+			})
+		}
+		ast.Inspect(decl, inspect)
+	}
 	return out
 }
 
@@ -447,6 +573,7 @@ var subscribeFuncs = map[string]bool{
 // with a written justification, not the path of least resistance.
 var knownUnsubscribedGrants = map[string]string{}
 
+// origin: S7 internal review MAKETEST-TRANSFER F3
 func TestACLGrantsHaveSubscribers(t *testing.T) {
 	root, err := os.Getwd()
 	if err != nil {
@@ -458,9 +585,7 @@ func TestACLGrantsHaveSubscribers(t *testing.T) {
 	// internal/proto is scanned too: many subscriptions reference a named
 	// constant (proto.SubjCtrlClusterHealthWildcard and friends) rather than
 	// concatenating the subject inline, and those constants are defined there.
-	subs := subscribedSubjects(t,
-		filepath.Join(root, "internal", "broker"),
-		filepath.Join(root, "internal", "proto"))
+	subs := subscribedSubjects(t, aclSubscriptionSourceDirs(root)...)
 
 	if len(grants) == 0 || len(subs) == 0 {
 		t.Fatalf("extraction degenerated (grants=%d subs=%d); a green result would be meaningless",
@@ -596,7 +721,9 @@ func unresolvedSubscriptionSites(t *testing.T, dirs ...string) []string {
 			// unqualified variant and internal review (M1/M2) reproduced the silent absorption on the
 			// real tree; the two gates now use ONE key scheme, so "copy the shape from the other one"
 			// is literally true rather than approximately true.
-			rel, _ := filepath.Rel(filepath.Dir(filepath.Dir(dir)), p)
+			// Nested owners retain repository-relative keys just like their parents.
+			// origin: S7 internal review MAKETEST-TRANSFER F3; S7 plan §11.4
+			rel, _ := filepath.Rel(filepath.Dir(filepath.Dir(dirs[0])), p)
 			relSlash := filepath.ToSlash(rel)
 			ord := map[string]int{}
 			var walk func(fnName string, n ast.Node)
@@ -658,6 +785,14 @@ var dynamicSubscriptionExemptions = map[string]string{
 	"internal/broker/broker.go:(*Broker).Run#1": "QueueSubscribe(ss.subj, ...) — the loop variable of the positional " +
 		"subscription table; every row's subject IS extracted, from the table literal above.",
 	"internal/broker/broker.go:(*Broker).Run#2": "Subscribe(ss.subj, ...) — same loop variable as #1 in this function.",
+	// origin: hot-update S6 plan §6.3 / HARDGATE-A
+	"internal/broker/reexec.go:subscribeBrokerImageBusiness#1": "QueueSubscribe(ss.subj, ...) — the shared cold/image business table; every subject is extracted from brokerBusinessSubscriptions.",
+	"internal/broker/reexec.go:subscribeBrokerImageBusiness#2": "Subscribe(ss.subj, ...) — the same shared table as #1, not a new subject family.",
+	// origin: hot-update S7 plan §6.3 / §8.2 / T39
+	"internal/broker/cluster_forward_transfer.go:SubscribeTransferClusterForward#1": "Subscribe(proto.SubjClusterApply(verb), ...) " +
+		"over the closed verb set {transfer-bucket-config, transfer-census, transfer-probe} — broker-only " +
+		"`tether.v2.cluster.apply.<verb>` forwarding subjects reached with broker identities through the " +
+		"SubjClusterApplyWildcard grant, never by a member ctl grant (same family as cluster_forward.go's envelope).",
 }
 
 // aclQualifiedFuncName renders a FuncDecl the way a site key names it: `(*Broker).Run` for a method,
@@ -695,13 +830,11 @@ func TestACLDynamicSubscriptionsAreDeclared(t *testing.T) {
 		t.Fatalf("getwd: %v", err)
 	}
 	root = filepath.Dir(filepath.Dir(root))
-	// The SAME two trees TestACLSubscribersHaveGrants extracts subjects from. origin: p-b2 internal
+	// The SAME trees TestACLSubscribersHaveGrants extracts subjects from. origin: p-b2 internal
 	// review n5 — this scanned only internal/broker, so a dynamic subscription added to internal/proto
 	// would have been checked for a grant it could not have and exempted by nobody. Latent today (no
 	// non-test Subscribe( in internal/proto) and cheap to close before it is not.
-	sites := unresolvedSubscriptionSites(t,
-		filepath.Join(root, "internal", "broker"),
-		filepath.Join(root, "internal", "proto"))
+	sites := unresolvedSubscriptionSites(t, aclSubscriptionSourceDirs(root)...)
 	live := map[string]bool{}
 	for _, s := range sites {
 		live[s] = true
@@ -738,9 +871,7 @@ func TestACLSubscribersHaveGrants(t *testing.T) {
 	root = filepath.Dir(filepath.Dir(root))
 
 	grants := grantSubjects(t, filepath.Join(root, "internal", "auth", "permissions.go"))
-	subs := subscribedSubjects(t,
-		filepath.Join(root, "internal", "broker"),
-		filepath.Join(root, "internal", "proto"))
+	subs := subscribedSubjects(t, aclSubscriptionSourceDirs(root)...)
 
 	if len(grants) == 0 || len(subs) == 0 {
 		t.Fatalf("extraction degenerated (grants=%d subs=%d); a green result would be meaningless",
@@ -806,9 +937,86 @@ func TestACLExtractorsAreNotVacuous(t *testing.T) {
 	root = filepath.Dir(filepath.Dir(root))
 
 	grants := grantSubjects(t, filepath.Join(root, "internal", "auth", "permissions.go"))
-	subs := subscribedSubjects(t,
-		filepath.Join(root, "internal", "broker"),
-		filepath.Join(root, "internal", "proto"))
+	subs := subscribedSubjects(t, aclSubscriptionSourceDirs(root)...)
+	t.Logf("resolved subscription sites across broker, brokercontrol and proto: %d", len(subs))
+	// Scope controls exercise every owner through the same directory list as
+	// both live directions, so a missing extracted package cannot look green.
+	// origin: hot-update S6 plan §9.3 / HARDGATE-A
+	fixtureRoot := t.TempDir()
+	for _, pkg := range []string{"broker", "brokercontrol", "brokerupgrade/brokerruntime", "proto", "xfercontrol"} {
+		dir := filepath.Join(fixtureRoot, "internal", pkg)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, pkg := range []string{"broker", "brokercontrol", "brokerupgrade/brokerruntime", "proto", "xfercontrol"} {
+		path := filepath.Join(fixtureRoot, "internal", pkg, "subscription.go")
+		src := `package fixture
+func register(nc interface{Subscribe(string, func())}, suffix string) {
+ nc.Subscribe(SubjectPrefix + ".ctrl.by.*.session.create.req", nil)
+ nc.Subscribe(suffix, nil)
+}`
+		if err := os.WriteFile(path, []byte(src), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		resolved := subscribedSubjects(t, aclSubscriptionSourceDirs(fixtureRoot)...)
+		unresolved := unresolvedSubscriptionSites(t, aclSubscriptionSourceDirs(fixtureRoot)...)
+		if len(resolved) != 1 || resolved[0] != "PREFIX.ctrl.by.*.session.create.req" ||
+			len(unresolved) != 1 || unresolved[0] != "internal/"+pkg+"/subscription.go:register#1" {
+			t.Errorf("owner %s escaped subscription scope: resolved=%v unresolved=%v", pkg, resolved, unresolved)
+		}
+		if err := os.Remove(path); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Both positional spellings must yield the same evidence. A named config
+	// without a handler remains dead, even when its field is named subject.
+	// origin: hot-update S6 plan §6.3 / HARDGATE-A
+	for _, declaration := range []string{
+		"[]struct{subj string;handler nats.MsgHandler}",
+		"[]businessSubscription",
+	} {
+		src := `package broker
+type businessSubscription struct{subj string;handler nats.MsgHandler}
+type config struct{subject string}
+var dead = []config{{subject: SubjectPrefix + ".ctrl.by.*.dead.req"}}
+var subscriptions = ` + declaration + `{{SubjectPrefix + ".ctrl.by.*.session.create.req", handleCreate}}`
+		file, err := parser.ParseFile(token.NewFileSet(), "table.go", src, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := subjectLiterals(file)
+		if len(got) != 1 || got[0] != "PREFIX.ctrl.by.*.session.create.req" {
+			t.Errorf("subscription table %s produced %v; named and anonymous tables must agree without counting dead config", declaration, got)
+		}
+	}
+
+	// The transfer registration descriptor: only rows the broker binds from this table count.
+	// A legacy-carrier row (served by the business table), a cluster-verb row (broker-only
+	// forward) and a Subject field on a non-descriptor config are NOT subscriptions; a
+	// function-scoped `ctl :=` root must resolve, and must not leak into another function.
+	// origin: hot-update S7 plan §6.3 / §12 P16 / T31
+	registrationSrc := `package xfercontrol
+type Registration struct{Subject string;ClusterVerb string;PlainBroadcast bool;LegacyCarrier bool}
+type config struct{Subject string}
+var dead = []config{{Subject: SubjectPrefix + ".ctrl.by.*.dead.req"}}
+func Registrations() []Registration {
+ ctl := SubjectPrefix + ".ctrl.by.*.s.*.node.*.transfer.*."
+ return []Registration{
+  {Subject: ctl + "probe.req", PlainBroadcast: true},
+  {Subject: ctl + "legacy.req", PlainBroadcast: true, LegacyCarrier: true},
+  {Subject: ctl + "census.req", ClusterVerb: "transfer-census", PlainBroadcast: true},
+ }
+}
+func other() []Registration { return []Registration{{Subject: ctl + "leak.req", PlainBroadcast: true}} }`
+	registrationFile, err := parser.ParseFile(token.NewFileSet(), "routing.go", registrationSrc, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := subjectLiterals(registrationFile); len(got) != 1 || got[0] != "PREFIX.ctrl.by.*.s.*.node.*.transfer.*.probe.req" {
+		t.Errorf("transfer registration descriptor produced %v; want only the broker-bound probe row", got)
+	}
 
 	// Anchors that must be present: if the extractor degenerates to matching
 	// nothing structured, these disappear and every reconciliation goes green.
@@ -817,6 +1025,13 @@ func TestACLExtractorsAreNotVacuous(t *testing.T) {
 	if !contains(grants, mustGrant) {
 		t.Errorf("grant extractor did not find %q; it has degenerated and every reconciliation above "+
 			"is now vacuously green. Found %d grants.", mustGrant, len(grants))
+	}
+	// This literal exists only in the relocated broker builder. An extractor
+	// that forgot the leaf would otherwise retain plenty of member grants and
+	// falsely appear non-vacuous after the move.
+	// origin: hot-update S9 plan §10.1 / T47
+	if !contains(grants, "PREFIX.ctrl.by.*.>") {
+		t.Error("grant extractor did not follow the relocated broker ACL owner")
 	}
 	if !contains(subs, mustSub) {
 		t.Errorf("subscription extractor did not find %q; same problem. Found %d subscriptions.",

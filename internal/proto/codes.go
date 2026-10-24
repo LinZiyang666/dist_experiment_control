@@ -135,12 +135,17 @@ const (
 
 	// --- upgrade / artifact fetch ---
 
-	CodeSha256Invalid  = "sha256_invalid"
-	CodeSha256Mismatch = "sha256_mismatch"
-	CodeURLNotAllowed  = "url_not_allowed"
+	// S8 refuses the grantless install envelope before fetch/install effects.
+	// Its four former agent-only codes have no emitter or constant consumer;
+	// retaining declarations would falsely describe the current wire registry.
+	// Their historical refusal notes stay below, and old-response classifiers
+	// continue to accept their literal spellings during the N-1 window.
+	// origin: S7 internal review GATE-CONVERGE-contracts F2
+
+	CodeSha256Invalid = "sha256_invalid"
+	CodeURLNotAllowed = "url_not_allowed"
 	// CodeURLNotAllowedLocal: the artifact URL resolved to a loopback/private
 	// address on the agent. A deliberate SSRF-shaped refusal, not a transient.
-	CodeURLNotAllowedLocal = "url_not_allowed_local"
 	// CodeProtoBumpRequiresReinstall: the peer's ProtoVersion differs across a
 	// breaking boundary. Upgrading in place cannot fix it — a ProtoVersion bump
 	// is an epoch change, the one permitted compatibility break of the N-1
@@ -152,14 +157,17 @@ const (
 	// was NOT touched. The artifact is bad for every node it would be sent to
 	// (wrong arch, truncated, not a tether binary) — not retryable, and
 	// `node upgrade --all` must abort the fleet rather than fan it out.
-	CodeSmokeFailed = "smoke_failed"
 	// CodeUpgradeInProgress: an upgrade marker in state "pending" exists — a
 	// prior upgrade on this agent has staged its binary but has not yet
 	// committed (re-registered as the new version) or rolled back. Installing
 	// over it would clobber the only known-good binary in the prev slot.
 	// Transient: resolves as soon as the in-flight upgrade commits or rolls
 	// back (bounded by the register deadline).
-	CodeUpgradeInProgress = "upgrade_in_progress"
+	// The existing agent deferral also travels on broker reload responses.
+	// Maintenance refusal details stay separate from this transient exit-75
+	// code; unknown store closure remains store_error, not a safe deferral.
+	// origin: hot-update S6 plan §9.1 / T46
+	CodeUpgradeDeferred = "upgrade_deferred"
 	// CodeFrpcFailed: the agent's data-plane helper failed to come up.
 	// Needs a human to read the agent log; blind retry does not help.
 	CodeFrpcFailed = "frpc_failed"

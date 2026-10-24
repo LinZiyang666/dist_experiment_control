@@ -261,7 +261,7 @@ func PermissionsForUnactivated(actor string, legacyInbox bool) jwt.Permissions {
 // (`internal/broker/transfer_finalize.go`); see file-transfer-plan
 // §Auth.
 func PermissionsForActivatedMember(actor, sid string, legacyInbox bool) jwt.Permissions {
-	return jwt.Permissions{
+	return transferMemberPermissions(jwt.Permissions{
 		Pub: jwt.Permission{Allow: []string{
 			subjectPrefix + ".ctrl.by." + actor + ".session.create.req",
 			subjectPrefix + ".ctrl.by." + actor + ".session.list.req",
@@ -317,6 +317,9 @@ func PermissionsForActivatedMember(actor, sid string, legacyInbox bool) jwt.Perm
 			subjectPrefix + ".ctrl.by." + actor + ".s." + sid + ".proxy.sub.create.req",
 			subjectPrefix + ".ctrl.by." + actor + ".s." + sid + ".proxy.sub.list.req",
 			subjectPrefix + ".ctrl.by." + actor + ".s." + sid + ".proxy.sub.revoke.req",
+			// upgrade-tx uses this existing verb slot. Actor and session stay bound
+			// at mint time; the broker verifies ownership before forwarding it.
+			// origin: hot-update S8 plan §2.2 / §7.1 / P13
 			subjectPrefix + ".s." + sid + ".cmd.by." + actor + ".node.*.*.req",
 			subjectPrefix + ".s." + sid + ".pty.*.in",
 			subjectPrefix + ".s." + sid + ".pty.*.resize",
@@ -401,7 +404,7 @@ func PermissionsForActivatedMember(actor, sid string, legacyInbox bool) jwt.Perm
 			// wildcard. It does not any more, so "claims to be old" buys a different
 			// space rather than a larger one, and the exemption is withdrawn.
 		}, legacyInbox),
-	}
+	}, actor, sid)
 }
 
 // PermissionsForAgent returns permissions for an agent in session sid with
@@ -411,9 +414,9 @@ func PermissionsForActivatedMember(actor, sid string, legacyInbox bool) jwt.Perm
 // File transfer (P11): adds the literal OBJ_xfer-<sid> JS subjects so agent can
 // Put (push receiver: Get from bucket; pull sender: Put into bucket).
 // No STREAM.CREATE/DELETE/PURGE — broker owns bucket lifecycle. The
-// existing `ev.node.<nid>.>` wildcard already covers
-// `ev.node.<nid>.transfer.<id>.<kind>` (push receiver-side finalize),
-// no addition needed.
+// legacy `ev.node.<nid>.transfer.<id>.<kind>` grant still covers push
+// receiver-side finalize. S7 grants the four continuation request operations
+// separately so a deeper request cannot borrow the legacy event wildcard.
 // legacyInbox says whether this agent predates the per-identity inbox and therefore
 // needs the shared pre-cutover `_INBOX.>` instead of a subtree under InboxRoot. The
 // caller reads it from auth.InboxCapableMarker on the CONNECT; see inboxPermission for
@@ -421,11 +424,10 @@ func PermissionsForActivatedMember(actor, sid string, legacyInbox bool) jwt.Perm
 // the Sub side only — the agent's responder Pub grants cover both roots unconditionally.
 func PermissionsForAgent(sid, nid, actor string, legacyInbox bool) jwt.Permissions {
 	return jwt.Permissions{
-		Pub: jwt.Permission{Allow: []string{
+		Pub: jwt.Permission{Allow: append(transferAgentEvents(sid, nid), []string{
 			subjectPrefix + ".ctrl.s." + sid + ".node." + nid + ".register.req",
 			subjectPrefix + ".ctrl.s." + sid + ".node." + nid + ".unregister.req",
 			subjectPrefix + ".ctrl.s." + sid + ".node." + nid + ".heartbeat",
-			subjectPrefix + ".s." + sid + ".ev.node." + nid + ".>",
 			subjectPrefix + ".s." + sid + ".pty.*.out",
 			subjectPrefix + ".s." + sid + ".pty.*.ready",
 			subjectPrefix + ".s." + sid + ".pty.*.failed",
@@ -452,7 +454,7 @@ func PermissionsForAgent(sid, nid, actor string, legacyInbox bool) jwt.Permissio
 			// silently, because a refused Respond simply drops the reply.
 			"_INBOX.>",
 			InboxRoot + ".>",
-		}},
+		}...)},
 		Sub: inboxPermission(actor, []string{
 			subjectPrefix + ".s." + sid + ".cmd.node." + nid + ".*.req.forwarded",
 			// THE NODE'S OWN nid, not a wildcard — origin: prerelease audit round 2,
@@ -530,80 +532,6 @@ func inboxPermission(actor string, rest []string, legacy bool) jwt.Permission {
 		return jwt.Permission{Allow: append(allow, LegacyInboxAllow...)}
 	}
 	return jwt.Permission{Allow: append(allow, inboxSubjectFor(actor))}
-}
-
-// PermissionsForBroker returns the permissions tetherd's own NATS connection
-// uses (broad subscribe for routing + pub for forwarded/ev/audit + auth
-// reply on `$SYS._INBOX.>`).
-//
-// Note the wildcards here are intentional — only tetherd is allowed `s.*.>`
-// reach (the broker has cross-session authority). The static guard test
-// allow-lists this template for that reason.
-func PermissionsForBroker() jwt.Permissions {
-	return jwt.Permissions{
-		Pub: jwt.Permission{Allow: []string{
-			subjectPrefix + ".s.*.cmd.node.*.*.req.forwarded",
-			subjectPrefix + ".s.*.ev.>",
-			subjectPrefix + ".s.*.audit.>",
-			subjectPrefix + ".ctrl.version.announce",
-			subjectPrefix + ".sys.events",
-			// RF1 broker-only cluster ACL (distributed-broker §6.2). Granted ONLY
-			// to broker nkey AuthUsers; the D4 follower publishes a forwarded write
-			// here, so the broker needs PUB. Version-prefixed, SSOT in
-			// proto.SubjClusterApplyWildcard / proto.SubjClusterWildcard.
-			subjectPrefix + ".cluster.apply.>",
-			subjectPrefix + ".cluster.>",
-			// BOTH INBOX ROOTS — the broker answers pre-cutover and upgraded requesters
-			// alike; see the same pair in PermissionsForAgent for why neither may be
-			// conditioned on the responder's own vintage.
-			//
-			// FOR A CLUSTERED BROKER THIS LIST IS ALSO A FILE. natsconf.Render writes it
-			// into nats.conf as the static nkey user's permissions block, and only the
-			// topology reconciler rewrites that file — a single broker's conf is
-			// hand-written per broker-ops §3.4 and carries no permissions block at all,
-			// so it is unaffected. The gap that remains is a broker whose conf WAS
-			// rendered and then went single (force-single): its file is frozen with the
-			// old list and nothing re-renders it. natsinbox.Connect's probe is what turns
-			// that from "the broker's replies silently vanish" into a logged, named
-			// failure, and TestEveryResponderCanPublishToBothInboxRoots is what stops the
-			// list itself from drifting.
-			"_INBOX.>",
-			InboxRoot + ".>",
-			// auth_callout responses (msg.Respond → $SYS._INBOX.<server>.<rand>).
-			"$SYS._INBOX.>",
-			// JetStream API surface — broker manages history/events
-			// streams + xfer Object Stores. `>` here is a real
-			// wildcard (matches any tail), and broker has
-			// cross-session authority by design (see template
-			// docstring).
-			"$JS.API.>",
-			"$JS.FC.>",
-			"$O.>",
-		}},
-		Sub: jwt.Permission{Allow: []string{
-			subjectPrefix + ".ctrl.by.*.>",
-			subjectPrefix + ".ctrl.s.*.node.*.register.req",
-			subjectPrefix + ".ctrl.s.*.node.*.unregister.req",
-			subjectPrefix + ".ctrl.s.*.node.*.heartbeat",
-			subjectPrefix + ".s.*.cmd.by.*.node.*.*.req",
-			subjectPrefix + ".s.*.ev.>",
-			subjectPrefix + ".s.*.pty.*.failed",
-			// RF1 broker-only cluster ACL (distributed-broker §6.2). The D4 leader
-			// SUBSCRIBES here to receive forwarded writes. Granted ONLY to broker
-			// nkey AuthUsers.
-			subjectPrefix + ".cluster.apply.>",
-			subjectPrefix + ".cluster.>",
-			"$SYS.REQ.USER.AUTH",
-			// `_INBOX.>` is the broker's LEGACY reply space and it stays: replies to
-			// requests the broker itself made before it opted into a private inbox, and
-			// anything a pre-cutover peer addresses back to it, still land there.
-			// InboxRoot is where its own replies land now — brokerConnectOptions asks
-			// nats.go for `_TINBOX.<hash(broker nkey)>.…` — and without this line the
-			// broker could not subscribe to its own inbox.
-			"_INBOX.>",
-			InboxRoot + ".>",
-		}},
-	}
 }
 
 // InboxCapableMarker is the CONNECT-time signal that this client takes its replies in a

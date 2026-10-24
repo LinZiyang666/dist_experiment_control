@@ -33,18 +33,38 @@ type SessionCreateResp struct {
 	Code string `json:"code,omitempty"`
 }
 
+// ClusterHealthSchemaVersion versions the ClusterHealthResp wire shape. v2 (C3) adds the topology
+// reconcile self-report (TopoApplied/TopoObserved/TopoReconcileReason/TopoReported); v3 (G5/G7b) adds the
+// version-skew + JS-503 + voter self-report batch (ProxyHomeCount/ProxyHomeReported/JetStreamUnavailable/
+// CommandVer/ColocatedAgentNID/IsVoter/UpgradeLockActive); v4 (G4) adds GrowLockActive; v5 (R7b) adds the
+// two lock-lease expiries (UpgradeLeaseExpiry/GrowLeaseExpiry); v6 (batch B / B4) adds the account-key
+// self-report (AccountNkPub/AccountNkReported) that makes the `cluster status` ACCT.NK column honest;
+// v7 (batch C / C3) adds TopoAction, the closed-enum topology reconcile action that replaces
+// substring-matching TopoReconcileReason on both status renderers; v8 (S6) adds
+// BrokerImage, the currently measured running image status shared with local
+// admin_runtime (whose schema_version remains unchanged).
+// No consumer gates on this value — decoding is omitempty-additive — so it is a documentation ledger,
+// not a compat switch.
+// origin: hot-update S6 plan §9.1 / T46
+const ClusterHealthSchemaVersion = 8
+
 // NodeRegisterReq — agent pub on ctrl.s.<S>.node.<N>.register.req.
 // First field is proto_version per J.2 strict same-version handshake.
 // LocalProcesses / LocalPorts implement architecture G.1: agent's view of
 // "what should be live right now" so the broker can converge SQLite
 // against the agent's reality on (re)connect.
 type NodeRegisterReq struct {
-	ProtoVersion   int    `json:"proto_version"`
-	ReleaseVersion string `json:"release_version"`
-	NID            string `json:"nid"`
-	OS             string `json:"os"`
-	Arch           string `json:"arch"`
-	BootID         string `json:"boot_id,omitempty"`
+	// A hot image's expectation must be acknowledged by the authority writer;
+	// zero remains ordinary N-1 registration, never continuity proof.
+	// origin: hot-update S8 plan §2.2 / §6.2 / P13
+	Incarnation    string          `json:"incarnation,omitempty"`
+	Upgrade        *UpgradeSummary `json:"upgrade,omitempty"`
+	ProtoVersion   int             `json:"proto_version"`
+	ReleaseVersion string          `json:"release_version"`
+	NID            string          `json:"nid"`
+	OS             string          `json:"os"`
+	Arch           string          `json:"arch"`
+	BootID         string          `json:"boot_id,omitempty"`
 
 	// ServerID (D6 §6.5) is the DETERMINISTIC nats server_name the agent is
 	// currently connected to (== nc.ConnectedServerName() == INFO.Name, e.g.
@@ -199,6 +219,20 @@ type NodeRegisterReq struct {
 	// — absent means "the presented NID is itself the root", which is exactly
 	// what a pre-feature agent means and what an unleased agent means.
 	ConfiguredNID string `json:"configured_nid,omitempty"`
+
+	// This explicit reader capability is independent of ReleaseVersion and
+	// of ordinary registration. Missing or unknown values cannot promise a
+	// route hold during a planned broker cut; ordinary N-1 wire still works.
+	// origin: hot-update S6 plan §9.1 / T46
+	BrokerImageMaintenance string `json:"broker_image_maintenance,omitempty"`
+	// Public observer key is bound to agent_provisioning before accepting ACKs.
+	// origin: hot-update S6 internal review rv-cluster-3
+	BrokerImageMaintenanceKey string `json:"broker_image_maintenance_key,omitempty"`
+
+	// A normal register advertises the complete continuation implementation.
+	// Absence preserves N-1 bytes; a farewell cannot install this capability.
+	// origin: hot-update S7 plan §6.2 / P01
+	TransferVersion string `json:"transfer_version,omitempty"`
 }
 
 // NodeLease is the register reply's lease verdict (non-nil ONLY when the
@@ -236,6 +270,11 @@ const ProxyReasonLeasedInstance = "leased_instance"
 // both permission templates use full-token verb wildcards.
 const ClaimProbeVerb = "claim-probe"
 
+// BrokerMaintenanceVerb uses the existing forwarded request/reply tree with
+// its own body and signed ACK, so route holds never overload lease probes.
+// origin: hot-update S6 plan §9.1 / T46
+const BrokerMaintenanceVerb = "broker-maintenance"
+
 // ClaimProbeResp is an agent's answer to a lease claim probe.
 //
 // WHY THE PROBE NEEDS AN ANSWER AT ALL. Asking NATS "is anyone subscribed under
@@ -259,14 +298,6 @@ const ClaimProbeVerb = "claim-probe"
 // takes the conservative branch — exactly what it did before this existed.
 type ClaimProbeResp struct {
 	InstanceID string `json:"instance_id,omitempty"`
-}
-
-type NodeLease struct {
-	// AssignedNID is the lease name this instance must adopt.
-	AssignedNID string `json:"assigned_nid"`
-	// Basename echoes the name the agent registered with, so the agent can log
-	// the transition without re-deriving it.
-	Basename string `json:"basename,omitempty"`
 }
 
 // CapProxyV1 is the capability token an agent advertises when it implements the
@@ -303,6 +334,15 @@ type LocalProcess struct {
 	// clamps it to min(EndedAt, now): a skewed agent clock must not write a
 	// future ended_at into replicated state.
 	EndedAt *time.Time `json:"ended_at,omitempty"`
+
+	// StartedUnacked (hot-update S1 C-5, additive/omitempty): this agent has
+	// spawned the pid but the broker has not yet acknowledged its proc.started,
+	// so the row may not exist on the broker yet. A new broker must not
+	// orphan-kill it (reconcile.go); an old broker ignores the field, which is
+	// today's G.1 window — never worse. Only ever true, never a new State value:
+	// a "starting" state would hit the known-row default arm and be recorded
+	// EXITED(-1). origin: docs/reviews/hot-update-reliable-exec-plan.md §2.5.
+	StartedUnacked bool `json:"started_unacked,omitempty"`
 }
 
 // LocalPort is one entry in NodeRegisterReq.LocalPorts — the agent's
@@ -336,9 +376,11 @@ type LocalPort struct {
 // neither set reads as "settled" and destroys the only copy of the real exit
 // code. See internal/broker/reconcile.go's F1 comments.
 type NodeRegisterResp struct {
-	OK    bool   `json:"ok"`
-	Code  string `json:"code,omitempty"`  // e.g. "proto_mismatch", "session_not_found_or_deleting"
-	Error string `json:"error,omitempty"` // human-readable; populated when OK=false
+	// origin: hot-update S8 plan §2.2 / §6.2 / P13
+	Incarnation string `json:"incarnation,omitempty"`
+	OK          bool   `json:"ok"`
+	Code        string `json:"code,omitempty"`  // e.g. "proto_mismatch", "session_not_found_or_deleting"
+	Error       string `json:"error,omitempty"` // human-readable; populated when OK=false
 
 	AcceptedProcesses   []string         `json:"accepted_processes,omitempty"`
 	ReconciledProcesses []ReconciledProc `json:"reconciled_processes,omitempty"`
@@ -366,6 +408,10 @@ type NodeRegisterResp struct {
 	// (the Proxy/Home precedent). Discovery-ONLY: it confers zero membership authority.
 	Roster *ClusterRoster `json:"roster,omitempty"`
 
+	// ConnectedBrokerID identifies the broker hosting the request's ServerID,
+	// which can differ from the leader replying. Discovery only; absent on N-1.
+	ConnectedBrokerID string `json:"connected_broker_id,omitempty"`
+
 	// Lease, when non-nil, means this register was CONTESTED: another live
 	// instance already holds the name this agent presented, so the broker
 	// assigned it a different one. A contested register deliberately touches
@@ -383,6 +429,14 @@ type NodeRegisterResp struct {
 	// as "legacy mode" and never rebuild its session, so new-agent × old-broker
 	// is exactly today's behaviour (no auth denial, no crash loop).
 	Lease *NodeLease `json:"lease,omitempty"`
+
+	// Only broker-maint-v1 confirms acceptance of the agent's capability.
+	// It is not an ACK that a particular maintenance hold has been installed.
+	// origin: hot-update S6 plan §9.1 / T46
+	BrokerImageMaintenance string `json:"broker_image_maintenance,omitempty"`
+	// Acceptance is explicit so a capable agent cannot infer support from release names.
+	// origin: hot-update S7 plan §6.2 / P01
+	TransferVersion string `json:"transfer_version,omitempty"`
 }
 
 // HomeAssignment is the register-reply container for per-expose home
@@ -488,22 +542,9 @@ type ReconciledProc struct {
 	RC       int    `json:"rc"`
 }
 
-// HeartbeatPayload — agent core pub on ctrl.s.<S>.node.<N>.heartbeat (no reply).
-type HeartbeatPayload struct {
-	Ts time.Time `json:"ts"`
-	// ProxyGeneration + ProxyEpoch (P13 round-4) report the agent's last
-	// SUCCESSFULLY-applied ordering pair. The broker considers a node converged
-	// only when BOTH match the current (broker generation, session epoch); on
-	// any mismatch — including the SAME epoch under a different generation (two
-	// DB snapshots can share an epoch with different keysets) — it re-pushes the
-	// current directive. Epoch alone is insufficient to fence that case.
-	ProxyGeneration int64 `json:"proxy_generation,omitempty"`
-	ProxyEpoch      int64 `json:"proxy_epoch,omitempty"`
-	// ProxyBound (C5) reports whether the agent currently has its proxy SS server bound. In cluster mode
-	// the heartbeat is BROADCAST, so EVERY broker writes its own livenessDB proxy_ready from this — the
-	// cross-broker convergence signal that makes /sub correct on any broker (no replicated proxy_ready).
-	ProxyBound bool `json:"proxy_bound,omitempty"`
-}
+// HeartbeatPayload moved verbatim to cluster_health.go (liveness DTOs), so the
+// S8 control-probe field does not grow this legacy file past its ceiling.
+// origin: S8 FIX-DESCRIBE (slim move)
 
 // ErrorReply is the canonical shape for any req that responds with an error
 // instead of its normal success body. Code is machine-readable; Message is for
@@ -533,13 +574,18 @@ type SessionListResp struct {
 	Error    string         `json:"error,omitempty"`
 }
 
-// SessionRmReq — ctl pub on ctrl.by.<A>.session.<sid>.rm.req. Empty body
-// (sid is in subject; owner check is server-side).
-type SessionRmReq struct{}
+// SessionRmReq — ctl pub on ctrl.by.<A>.session.<sid>.rm.req. The ordinary body
+// is empty (sid is in subject; owner check is server-side). Abandonment is explicit.
+type SessionRmReq struct {
+	// Explicit operator abandonment writes a failed outcome-unknown terminal
+	// before deletion. Absence keeps the mandatory settlement barrier.
+	// origin: hot-update S7 plan lead LQ1 / P01 wire carrier
+	AbandonUnsettledTransfers bool `json:"abandon_unsettled_transfers,omitempty"`
+}
 
 type SessionRmResp struct {
 	OK    bool   `json:"ok"`
-	Code  string `json:"code,omitempty"` // not_found | already_deleting | not_owner | store_error
+	Code  string `json:"code,omitempty"` // not_found | already_deleting | not_owner | store_error | transfer_owner_recovering | json_parse
 	Error string `json:"error,omitempty"`
 }
 
@@ -1131,106 +1177,6 @@ type UpgradeForwardedResp struct {
 // checked broker-side so the audit triplet stays correct under
 // crashes / forgery attempts.
 
-// PushPrepareReq — ctl pub on s.<sid>.cmd.by.<actor>.node.<nid>.push.req.
-// One shape covers both tiers; agent reads Tier and dispatches.
-//
-// Tier A: InlineData populated; agent SHA-verifies, writes via tmp+rename
-// into Path, replies OK; agent then publishes ev.transfer.<id>.complete
-// (receiver-finalization). Size MUST equal len(InlineData).
-//
-// Tier B: InlineData empty; broker has already ensured bucket Bucket exists
-// and the actor's session-scoped permissions allow Put (not in this struct).
-// Agent validates Path against allow_roots, replies OK +
-// echoes Bucket/ObjectKey/ChunkSize. ctl then ObjectStore.Puts to Bucket
-// keyed by ObjectKey, then sends TransferCommitReq.
-type PushPrepareReq struct {
-	TransferID string `json:"transfer_id"` // random ctl-generated id; broker echoes into audit
-	Path       string `json:"path"`        // absolute remote path; under agent's allow_roots only when narrowing is configured
-	Size       int64  `json:"size"`
-	SHA256     string `json:"sha256"`                // hex; expected digest after upload
-	Force      bool   `json:"force,omitempty"`       // overwrite existing regular file
-	Tier       string `json:"tier"`                  // "a" | "b" — chosen by ctl, validated by agent
-	InlineData []byte `json:"inline_data,omitempty"` // tier A only (base64 over JSON)
-	// Bucket / ObjectKey are BROKER-ASSIGNED and any ctl-supplied value is
-	// DISCARDED — the same rule as ActorFP below. handlePushReq clears both before
-	// the tier-b arm refills them, because the tracker serialises per bucket by
-	// plain string compare with no session in it, so a client-chosen bucket name is
-	// a cross-session denial of service (prerelease audit broker-transfer/BT-F2).
-	// NOTE this does NOT apply to TransferCommitReq's fields of the same names:
-	// there they are ctl-supplied and required.
-	Bucket    string `json:"bucket,omitempty"`     // tier B only; broker-assigned, ctl value discarded
-	ObjectKey string `json:"object_key,omitempty"` // tier B only; broker-assigned, ctl value discarded
-	ChunkSize int    `json:"chunk_size,omitempty"` // tier B hint
-
-	// ActorFP — broker-stamped at forward time (same convention as ExecReq.ActorFP).
-	// ctl-supplied value is discarded.
-	ActorFP string `json:"actor_fp,omitempty"`
-}
-
-// PushPrepareResp — agent pub on the push.req reply inbox. For tier A
-// this means "file is on disk + SHA verified + renamed into place"; for
-// tier B it means "I validated Path + ready for you to Put".
-//
-// Code taxonomy for the tier-B provisioning refusals (G67 / gotcha #67). These two are the
-// TRANSIENT/PERMANENT split of what used to be a single terminal code, and the distinction is the
-// whole point — do not collapse them again:
-//
-//	jetstream_not_ready   TRANSIENT. The broker could not provision the per-session object store
-//	                      because JetStream did not accept the request (a broker restart, a leader
-//	                      election, or a cluster grow in flight). The broker has ALREADY retried a
-//	                      bounded number of times before replying. Retrying the command shortly is
-//	                      the correct operator response; ctl maps it to exit 75.
-//	bucket_create_failed  PERMANENT. Provisioning failed for a reason retrying cannot fix (the JS
-//	                      store is too small for the tier-B floor, replicas>1 on a non-clustered
-//	                      node, ...). Its text deliberately carries NO retry vocabulary.
-//	jetstream_unavailable This broker has no JetStream client at all — a configuration/boot state,
-//	                      not a stall. Distinct from jetstream_not_ready, which means JetStream
-//	                      exists but would not serve this request right now.
-//
-// Adding jetstream_not_ready is purely ADDITIVE: Code is a free-form string, the struct is
-// unchanged, and ProtoVersion does NOT move. An older ctl prints an unknown code through its
-// default branch exactly as it always did.
-type PushPrepareResp struct {
-	OK    bool   `json:"ok"`
-	Tier  string `json:"tier,omitempty"` // echoed for paranoia
-	Code  string `json:"code,omitempty"` // transfer_id_in_flight | dst_exists | path_outside_roots (narrow mode) | not_a_regular_file | path_parent_missing | sha_mismatch | too_large | tier_invalid | transfer_disabled (explicit allow_roots: []) | jetstream_unavailable | io_error | ...
-	Error string `json:"error,omitempty"`
-}
-
-// PullPrepareReq — ctl pub on s.<sid>.cmd.by.<actor>.node.<nid>.pull.req.
-// Single shape; agent decides tier based on size vs MaxInline. Broker ensures
-// the per-session tier-B bucket exists before forwarding; a tier-A response
-// simply leaves that shared bucket untouched.
-type PullPrepareReq struct {
-	TransferID string `json:"transfer_id"`
-	Path       string `json:"path"`            // absolute remote path; under agent's allow_roots only when narrowing is configured
-	MaxInline  int64  `json:"max_inline"`      // ctl's tier-A budget (server max_payload aware)
-	Force      bool   `json:"force,omitempty"` // overwrite existing local file
-
-	ActorFP string `json:"actor_fp,omitempty"`
-}
-
-// PullPrepareResp — agent pub on the pull.req reply inbox.
-//
-// Tier A: InlineData populated with the entire file contents; ctl
-// SHA-verifies, writes locally via tmp+rename, then sends
-// SubjCtrlTransferFinalize{kind:complete}.
-//
-// Tier B: agent has Put the file into Bucket/ObjectKey (broker created
-// the bucket synchronously between subscribe and forward); ctl Gets it,
-// SHA-verifies, writes locally, then sends finalize.
-type PullPrepareResp struct {
-	OK         bool   `json:"ok"`
-	Tier       string `json:"tier,omitempty"` // a | b
-	Size       int64  `json:"size,omitempty"`
-	SHA256     string `json:"sha256,omitempty"`      // hex
-	InlineData []byte `json:"inline_data,omitempty"` // tier A only
-	Bucket     string `json:"bucket,omitempty"`      // tier B only
-	ObjectKey  string `json:"object_key,omitempty"`  // tier B only
-	Code       string `json:"code,omitempty"`        // transfer_id_in_flight | path_not_found | path_outside_roots (narrow mode) | not_a_regular_file | too_large | transfer_disabled (explicit allow_roots: []) | jetstream_unavailable | io_error | ...
-	Error      string `json:"error,omitempty"`
-}
-
 // TransferCommitReq — ctl pub on s.<sid>.cmd.by.<actor>.node.<nid>.push-commit.req.
 // Tier B push only. ctl signals "ObjectStore.Put completed; please Get,
 // SHA-verify, rename into place, then publish ev.transfer.<id>.<kind>".
@@ -1238,11 +1184,20 @@ type PullPrepareResp struct {
 // the ev.transfer subject so the broker (subscribed) can write audit
 // and delete the transfer object without sitting in the request path.
 type TransferCommitReq struct {
+	// Terminal identity is never substituted for a commit's logical CallID.
+	// origin: hot-update S7 plan §6.2 / P01
+	CallID     string `json:"call_id,omitempty"`
 	TransferID string `json:"transfer_id"`
 	Bucket     string `json:"bucket"`
 	ObjectKey  string `json:"object_key"`
 
 	ActorFP string `json:"actor_fp,omitempty"`
+	// Replayed commits reconcile this entry rather than opening another receiver.
+	// origin: hot-update S7 plan §6.2 / P01
+	Continuation *TransferContinuation `json:"continuation,omitempty"`
+	// Broker→agent continuation control (transfer_agent.go); never sent by a ctl.
+	// origin: hot-update S7 plan §6.3 / P20 / P22
+	Link *TransferLink `json:"transfer_link,omitempty"`
 }
 
 // TransferCommitResp acknowledges that the agent picked up the commit
@@ -1251,6 +1206,12 @@ type TransferCommitResp struct {
 	OK    bool   `json:"ok"`
 	Code  string `json:"code,omitempty"` // bucket_unknown | jetstream_unavailable | not_owner | ...
 	Error string `json:"error,omitempty"`
+	// A pickup ACK is still distinct from the terminal history receipt.
+	// origin: hot-update S7 plan §6.2 / P01
+	Continuation *TransferContinuation `json:"continuation,omitempty"`
+	// Capable agent's answer to a TransferLink; absent on every legacy reply.
+	// origin: hot-update S7 plan §6.3 / P20 / P22
+	Link *TransferLinkResult `json:"transfer_link,omitempty"`
 }
 
 // TransferEvent — agent pub on s.<sid>.ev.node.<nid>.transfer.<id>.<kind>
@@ -1275,6 +1236,9 @@ type TransferEvent struct {
 // (transfer_id ↔ actor) and (sid via NATS-layer ACL), writes
 // audit.transfer{kind}, and (tier B only) deletes the transfer object.
 type TransferFinalize struct {
+	// Retries reconcile this operation against the original decision.
+	// origin: hot-update S7 plan §6.2 / P01
+	CallID     string `json:"call_id,omitempty"`
 	Kind       string `json:"kind"` // complete | failed
 	TransferID string `json:"transfer_id"`
 	Tier       string `json:"tier,omitempty"` // a | b — broker uses to decide bucket cleanup
@@ -1284,6 +1248,9 @@ type TransferFinalize struct {
 	DurationMs int64  `json:"duration_ms,omitempty"`
 	Code       string `json:"code,omitempty"` // failed only: sha_mismatch | object_get_failed | io_error | ...
 	Error      string `json:"error,omitempty"`
+	// The legacy finalizer routes capable requests to the same original decision.
+	// origin: hot-update S7 plan §6.2 / P01
+	Continuation *TransferContinuation `json:"continuation,omitempty"`
 }
 
 // TransferFinalizeResp — broker ack on the finalize.req reply inbox.
@@ -1294,6 +1261,9 @@ type TransferFinalizeResp struct {
 	OK    bool   `json:"ok"`
 	Code  string `json:"code,omitempty"`
 	Error string `json:"error,omitempty"`
+	// Retained authority does not replace exact history confirmation.
+	// origin: hot-update S7 plan §6.2 / P01
+	Continuation *TransferContinuation `json:"continuation,omitempty"`
 }
 
 // CapsReq — ctl pub on ctrl.by.<actor>.s.<sid>.caps.req. Pre-flight
@@ -1311,6 +1281,11 @@ type CapsResp struct {
 	BrokerProto    int    `json:"broker_proto,omitempty"`
 	Code           string `json:"code,omitempty"` // not_a_member | session_not_found_or_deleting | actor_invalid | ...
 	Error          string `json:"error,omitempty"`
+	// An installed continuation graph answers transfer-v1. A complete OK reply
+	// without it is the explicit, authenticated cap0 answer of an old broker or
+	// of one without the graph; only that, never a timeout, selects legacy.
+	// origin: hot-update S7 plan §9 / §6.2 / INTEG-D capability compatibility
+	TransferVersion string `json:"transfer_version,omitempty"`
 }
 
 // ---------------------------------------------------------------------------
