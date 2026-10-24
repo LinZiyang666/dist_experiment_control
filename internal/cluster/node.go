@@ -9,10 +9,14 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/LinZiyang666/tether/internal/clusterio"
+	"github.com/LinZiyang666/tether/internal/controlbudget"
+	"github.com/LinZiyang666/tether/internal/handoff"
 	"github.com/LinZiyang666/tether/internal/storage"
 	"github.com/hashicorp/raft"
 	raftboltdb "github.com/hashicorp/raft-boltdb/v2"
@@ -61,6 +65,15 @@ type Config struct {
 	// builder; tests inject an inmem factory. nil => online recover is unavailable (the offline
 	// floor still works). Declarative wiring here keeps the field test-settable from any package.
 	TransportFactory func() (raft.Transport, error)
+
+	// ImageOpenCurrent and ImageReadOnly are supplied by the storage owner. The
+	// hot constructor never falls back to OpenWAL: that would run migrations.
+	// Registry counts actual driver handles, including snapshot/backup readers.
+	// origin: hot-update S6 plan §3.3 / T10
+	ImageOpenCurrent storage.OpenCurrentFunc
+	ImageReadOnly    func(string) (*sql.DB, error)
+	ImageRegistry    storage.DriverRegistry
+	ImageStamp       func(*sql.DB) (storage.StoreStamp, error)
 }
 
 // Multinode raft timeouts (§8.4 / d3-plan R6): the safe values D3 harnesses and
@@ -102,33 +115,142 @@ type Node struct {
 	// it (they touch disjoint tables/columns — the table-ownership disjointness
 	// argument in d2-plan §3).
 	applyMu sync.Mutex
+	image   *nodeImageLifecycle
 }
 
 // New opens the cluster DB (WAL + a dedicated read-only handle), the raft
 // log/stable/snapshot stores, bootstraps a single-node cluster on first boot, and
 // starts raft. On any failure the partially-opened resources are closed.
-func New(cfg Config) (*Node, error) {
+func New(cfg Config) (*Node, error) { return newNode(cfg, nil) }
+
+// NewForImage opens only the current store, then restarts the existing Raft
+// stores. No cold migrations, CREATE or bootstrap are allowed on this path.
+// origin: hot-update S6 plan §3.3 / T10
+func NewForImage(cfg Config, stamp storage.StoreStamp) (*Node, error) { return newNode(cfg, &stamp) }
+
+func newNode(cfg Config, stamp *storage.StoreStamp) (result *Node, resultErr error) {
 	if cfg.Transport == nil {
 		return nil, errors.New("cluster: New requires a Transport")
 	}
 	// On ANY error exit, close the injected transport ourselves: New returns
-	// (nil, err) so the caller has no *Node to Shutdown, and the transport's
+	// (nil, err) after complete cleanup, and the transport's
 	// listener fd + accept goroutine would otherwise leak (d3-review B3). On
-	// success the Node owns it and Shutdown closes it.
-	success := false
+	// success the Node owns it and Shutdown closes it. A failed actual Close
+	// returns the non-nil partial owner too, so unknown resources remain liable.
+	n := &Node{transport: cfg.Transport, cfg: cfg, localID: cfg.LocalID, transportFactory: cfg.TransportFactory, image: newNodeImageLifecycle()}
+	cfg.Transport = wrapNodeImageTransport(cfg.Transport, n)
+	n.transport, n.cfg = cfg.Transport, cfg
+	n.image.seal.Transport = storage.CloseOpen
 	defer func() {
-		if !success {
-			if c, ok := cfg.Transport.(io.Closer); ok {
-				_ = c.Close()
+		if resultErr != nil {
+			closeErr := n.Shutdown()
+			resultErr = errors.Join(resultErr, closeErr)
+			if closeErr != nil || stamp != nil {
+				// Hot constructors keep even a fully closed partial owner reachable;
+				// the caller owns the original lock and needs these phase receipts.
+				result = n
 			}
 		}
 	}()
+	if stamp != nil && runtime.GOOS != "linux" {
+		return nil, handoff.ErrUnsupported
+	}
 	if cfg.DBPath == "" || cfg.DataDir == "" {
 		return nil, errors.New("cluster: New requires DBPath and DataDir")
 	}
 	if cfg.LocalID == "" {
 		return nil, errors.New("cluster: New requires a LocalID")
 	}
+	if err := openNodeStores(n, stamp); err != nil {
+		return nil, err
+	}
+	return startNodeRaft(n, stamp)
+}
+
+// openNodeStores attaches each returned pool before checking its error so
+// constructor cleanup also owns partial current-store opens.
+// origin: hot-update S6 plan §3.3 / T10
+func openNodeStores(n *Node, stamp *storage.StoreStamp) error {
+	cfg := n.cfg
+	dsn := "file:" + cfg.DBPath
+	var err error
+	if stamp != nil {
+		if cfg.ImageOpenCurrent == nil || cfg.ImageReadOnly == nil || cfg.ImageRegistry == nil {
+			return errors.New("cluster: image storage callbacks and actual driver registry required")
+		}
+		if cfg.DBPath != stamp.Identity.Path || cfg.DataDir != stamp.Identity.DataDir || stamp.Journal != "wal" || stamp.Synchronous != 2 {
+			return errors.New("cluster: image store binding or durability mismatch")
+		}
+		if err := cfg.ImageRegistry.AssertExclusive(stamp.Identity); err != nil {
+			return err
+		}
+		if writers, readers := cfg.ImageRegistry.Connections(stamp.Identity); writers != 0 || readers != 0 {
+			return errors.New("cluster: current reopen requires zero actual driver handles")
+		}
+		if err := requireImageDataDirLock(cfg.DataDir); err != nil {
+			return err
+		}
+		n.db, err = cfg.ImageOpenCurrent(storage.OpenImageConfig{Stamp: *stamp, Registry: cfg.ImageRegistry})
+		n.image.seal.Stamp = *stamp
+	} else {
+		n.db, err = storage.OpenWAL(dsn)
+	}
+	if n.db != nil {
+		n.image.seal.Writer = storage.CloseOpen
+	}
+	if err != nil {
+		return err
+	}
+	if stamp != nil {
+		n.ro, err = cfg.ImageReadOnly(dsn)
+	} else {
+		n.ro, err = storage.OpenReadOnly(dsn)
+	}
+	if n.ro != nil {
+		n.image.seal.ReadOnly = storage.CloseOpen
+	}
+	if err != nil {
+		return err
+	}
+	if n.db == nil || n.ro == nil {
+		return errors.New("cluster: storage callback returned no owned database")
+	}
+	// Cold construction alone may create the Raft directory; the image path
+	// requires pre-existing stores.
+
+	raftDir := filepath.Join(cfg.DataDir, "raft")
+	if stamp != nil {
+		if info, err := os.Stat(raftDir); err != nil || !info.IsDir() {
+			return errors.New("cluster: image raft directory missing")
+		}
+	} else if err := os.MkdirAll(raftDir, 0o700); err != nil {
+		return fmt.Errorf("cluster: mkdir raft dir: %w", err)
+	}
+	if stamp != nil {
+		if info, err := os.Lstat(filepath.Join(raftDir, "raft.db")); err != nil || !info.Mode().IsRegular() {
+			return errors.New("cluster: image Bolt store missing or aliased")
+		}
+	}
+	n.store, err = raftboltdb.New(raftboltdb.Options{Path: filepath.Join(raftDir, "raft.db")})
+	if n.store != nil {
+		n.image.seal.Bolt = storage.CloseOpen
+	}
+	if err != nil {
+		return fmt.Errorf("cluster: open boltstore: %w", err)
+	}
+	n.snaps, err = raft.NewFileSnapshotStore(raftDir, 2, io.Discard)
+	if err != nil {
+		return fmt.Errorf("cluster: open snapshot store: %w", err)
+	}
+
+	return nil
+}
+
+// startNodeRaft activates observers and transport only after both database pools
+// and Raft stores belong to the constructor's cleanup owner.
+// origin: hot-update S6 plan §3.2 / T55
+func startNodeRaft(n *Node, stamp *storage.StoreStamp) (*Node, error) {
+	cfg := n.cfg
 	logger := cfg.Logger
 	if logger == nil {
 		logger = slog.Default()
@@ -137,55 +259,31 @@ func New(cfg Config) (*Node, error) {
 	if applyTimeout == 0 {
 		applyTimeout = defaultApplyTimeout
 	}
-
-	dsn := "file:" + cfg.DBPath
-	db, err := storage.OpenWAL(dsn)
-	if err != nil {
-		return nil, err
-	}
-	ro, err := storage.OpenReadOnly(dsn)
-	if err != nil {
-		_ = db.Close()
-		return nil, err
-	}
-
-	raftDir := filepath.Join(cfg.DataDir, "raft")
-	if err := os.MkdirAll(raftDir, 0o700); err != nil {
-		_ = ro.Close()
-		_ = db.Close()
-		return nil, fmt.Errorf("cluster: mkdir raft dir: %w", err)
-	}
-	store, err := raftboltdb.New(raftboltdb.Options{Path: filepath.Join(raftDir, "raft.db")})
-	if err != nil {
-		_ = ro.Close()
-		_ = db.Close()
-		return nil, fmt.Errorf("cluster: open boltstore: %w", err)
-	}
-	snaps, err := raft.NewFileSnapshotStore(raftDir, 2, io.Discard)
-	if err != nil {
-		_ = store.Close()
-		_ = ro.Close()
-		_ = db.Close()
-		return nil, fmt.Errorf("cluster: open snapshot store: %w", err)
-	}
-
 	f := &fsm{
-		db:       db,
-		ro:       ro,
+		db:       n.db,
+		ro:       n.ro,
 		tmpDir:   filepath.Dir(cfg.DBPath),
 		dbPath:   cfg.DBPath,
 		appliers: defaultAppliers(),
 		logger:   logger,
 		localID:  string(cfg.LocalID),
 	}
+	n.fsm, n.logger, n.applyTimeout = f, logger, applyTimeout
+	if _, network := n.transport.(*imageNetworkTransport); network && imageSnapshotInitialize != nil {
+		if err := imageSnapshotInitialize(n); err != nil {
+			return nil, err
+		}
+	}
 	rc := raftConfig(cfg)
+	rc.NotifyCh = n.image.notify
+	startImageRoleObserver(n)
 
-	existing, err := raft.HasExistingState(store, store, snaps)
+	existing, err := raft.HasExistingState(n.store, n.store, n.snaps)
 	if err != nil {
-		_ = store.Close()
-		_ = ro.Close()
-		_ = db.Close()
 		return nil, fmt.Errorf("cluster: probe existing raft state: %w", err)
+	}
+	if !existing && stamp != nil {
+		return nil, errors.New("cluster: image requires existing raft stores")
 	}
 	if !existing {
 		// D3 static multi-node bootstrap: if BootstrapPeers is set, bring up the
@@ -198,38 +296,67 @@ func New(cfg Config) (*Node, error) {
 			}}
 		}
 		cfgr := raft.Configuration{Servers: servers}
-		if err := raft.BootstrapCluster(rc, store, store, snaps, cfg.Transport, cfgr); err != nil {
-			_ = store.Close()
-			_ = ro.Close()
-			_ = db.Close()
+		if err := raft.BootstrapCluster(rc, n.store, n.store, n.snaps, cfg.Transport, cfgr); err != nil {
 			return nil, fmt.Errorf("cluster: bootstrap: %w", err)
 		}
 	}
 
-	r, err := raft.NewRaft(rc, f, store, store, snaps, cfg.Transport)
+	r, err := raft.NewRaft(rc, f, n.store, n.store, n.snaps, cfg.Transport)
+	if r != nil {
+		n.raft.Store(r)
+		n.image.seal.Raft = storage.CloseOpen
+	}
 	if err != nil {
-		_ = store.Close()
-		_ = ro.Close()
-		_ = db.Close()
 		return nil, fmt.Errorf("cluster: NewRaft: %w", err)
 	}
-
-	success = true // Node now owns the transport; Shutdown will close it.
-	n := &Node{
-		fsm:              f,
-		store:            store,
-		snaps:            snaps,
-		db:               db,
-		ro:               ro,
-		transport:        cfg.Transport,
-		transportFactory: cfg.TransportFactory, // online-recover seam (nil => offline floor only)
-		cfg:              cfg,
-		applyTimeout:     applyTimeout,
-		localID:          cfg.LocalID,
-		logger:           logger,
+	if transport, ok := n.transport.(*imageNetworkTransport); ok {
+		transport.start()
+		if stamp != nil {
+			return n, campaignImageSoleVoter(n, transport, rc.ProtocolVersion)
+		}
 	}
-	n.raft.Store(r)
+
 	return n, nil
+}
+
+// A validated current-store reopen has no live predecessor. A configuration
+// whose only voter is self can campaign immediately through Raft's normal
+// TimeoutNow RPC instead of waiting a randomized heartbeat timeout. Raft still
+// increments its term, votes, persists and commits its leader barrier normally;
+// production heartbeat/election/lease timers and quorum elections stay intact.
+// origin: hot-update S6 plan §5 / T37 / T48 / EXITS-2-3
+func campaignImageSoleVoter(n *Node, transport *imageNetworkTransport, version raft.ProtocolVersion) error {
+	future := n.raft.Load().GetConfiguration()
+	if err := future.Error(); err != nil {
+		return err
+	}
+	voters, self := 0, false
+	for _, server := range future.Configuration().Servers {
+		if server.Suffrage == raft.Voter {
+			voters++
+			self = server.ID == n.localID
+		}
+	}
+	if voters != 1 || !self {
+		return nil
+	}
+	response := make(chan raft.RPCResponse, 1)
+	rpc := raft.RPC{Command: &raft.TimeoutNowRequest{RPCHeader: raft.RPCHeader{ProtocolVersion: version}}, RespChan: response}
+	// No dial or detached waiter is needed for a local election. A buffered
+	// response lets shutdown join Raft even if scheduling exhausts this bound.
+	timer := time.NewTimer(MultinodeElectionTimeout)
+	defer timer.Stop()
+	select {
+	case transport.consumer <- rpc:
+	case <-timer.C:
+		return errors.New("cluster: image sole-voter campaign admission expired")
+	}
+	select {
+	case reply := <-response:
+		return reply.Error
+	case <-timer.C:
+		return errors.New("cluster: image sole-voter campaign response expired")
+	}
 }
 
 // SelfID returns this node's raft ServerID as a string (== cluster_nodes.node_id).
@@ -270,8 +397,24 @@ func (n *Node) DB() *sql.DB { return n.db }
 // B6 `cluster backup` seam: the bundle's state.db is exactly this file; the raft log is
 // node-local and is re-bootstrapped fresh on restore, so it is intentionally not carried.
 func (n *Node) BackupDBTo(ctx context.Context, dstPath string) error {
+	done, err := beginNodeImageWork(n, true)
+	if err != nil {
+		return err
+	}
+	defer done()
+	// P05's backup adapter reads the current FSM. A transport rebuild cannot
+	// replace that pointer while an admitted backup still owns its reader.
+	n.image.generationMu.RLock()
+	defer n.image.generationMu.RUnlock()
+	ctx, cancel := context.WithCancel(ctx)
+	stop := context.AfterFunc(n.image.backupContext, cancel)
+	defer stop()
+	defer cancel()
 	if n.ro == nil {
 		return fmt.Errorf("cluster: BackupDBTo: node has no read handle")
+	}
+	if imageSnapshotBackup != nil {
+		return imageSnapshotBackup(ctx, n, dstPath)
 	}
 	return backupTo(ctx, n.ro, dstPath)
 }
@@ -369,6 +512,15 @@ var ErrForwardNotLeader = errors.New("cluster: forwarded write not committed by 
 // is raft.ErrLeadershipLost / raft.ErrNotLeader, UNWRAPPED so D4 can type-match.
 // A typed FSM error (e.g. an op business error) surfaces via the future Response.
 func (n *Node) Apply(cmd *Command) error {
+	done, err := beginNodeImageWork(n, false)
+	if err != nil {
+		return err
+	}
+	defer done()
+	return applyNodeCommand(n, cmd)
+}
+
+func applyNodeCommand(n *Node, cmd *Command) error {
 	data, err := cmd.encode()
 	if err != nil {
 		return err
@@ -398,11 +550,16 @@ func (n *Node) Apply(cmd *Command) error {
 // the leader-only Planner renders the op (reading the leader DB + baking the
 // literal), then it is proposed through raft and applied on every replica.
 func (n *Node) ApplyMetaSet(key, value string) error {
+	done, err := beginNodeImageWork(n, false)
+	if err != nil {
+		return err
+	}
+	defer done()
 	cmd, err := clusterMetaPlanner{}.Plan(context.Background(), n.db, metaSetReq{Key: key, Value: value})
 	if err != nil {
 		return err
 	}
-	return n.Apply(cmd)
+	return applyNodeCommand(n, cmd)
 }
 
 // Propose renders an op on the leader DB and applies it through raft, holding the
@@ -440,6 +597,11 @@ func (n *Node) Propose(plan func(db *sql.DB) (*Command, error)) error {
 // reqID is the broker-side forwarding key (the originating broker mints it; NEVER
 // the leader — a per-leader re-mint cannot dedup an already-committed entry).
 func (n *Node) ProposeWithReqID(reqID string, plan func(db *sql.DB) (*Command, error)) error {
+	done, err := beginNodeImageWork(n, false)
+	if err != nil {
+		return err
+	}
+	defer done()
 	// Validate the key BEFORE proposing (external-review F2): an invalid reqID would
 	// otherwise be stamped into a Command that decodeCommand POISONS on apply — the
 	// FSM skips the op SQL but still advances applied_index, and Node.Apply maps the
@@ -464,13 +626,17 @@ func (n *Node) ProposeWithReqID(reqID string, plan func(db *sql.DB) (*Command, e
 	if reqID != "" {
 		cmd.ReqID = reqID
 	}
-	return n.Apply(cmd)
+	return applyNodeCommand(n, cmd)
 }
 
 // DedupCount returns how many committed entries the FSM has short-circuited via the
 // §4.1 D4 cross-retry ReqID ledger. Tests read it to assert the dedup branch fired
 // (the in-scope writes are SQL-idempotent, so a row-count assertion is vacuous).
-func (n *Node) DedupCount() uint64 { return n.fsm.dedupCount.Load() }
+func (n *Node) DedupCount() uint64 {
+	n.image.generationMu.RLock()
+	defer n.image.generationMu.RUnlock()
+	return n.fsm.dedupCount.Load()
+}
 
 // Snapshot forces raft to take a snapshot now (tests; raft's automatic cadence is
 // time/threshold based). Returns the raw raft error, including ErrNothingNewToSnapshot
@@ -520,28 +686,7 @@ func (n *Node) IsLeader() bool { return n.raft.Load().State() == raft.Leader }
 func (n *Node) TransferLeadership() error { return n.raft.Load().LeadershipTransfer().Error() }
 
 // Shutdown stops raft and closes the stores + DB handles in deterministic order.
-func (n *Node) Shutdown() error {
-	var errs []error
-	if r := n.raft.Load(); r != nil {
-		errs = append(errs, r.Shutdown().Error())
-	}
-	// Close the injected transport ourselves — raft.Shutdown() does not reap an
-	// externally-supplied transport (d3-plan R5). NetworkTransport holds a listener
-	// + goroutines; InmemTransport.Close is a harmless DisconnectAll.
-	if c, ok := n.transport.(io.Closer); ok {
-		errs = append(errs, c.Close())
-	}
-	if n.store != nil {
-		errs = append(errs, n.store.Close())
-	}
-	if n.ro != nil {
-		errs = append(errs, n.ro.Close())
-	}
-	if n.db != nil {
-		errs = append(errs, n.db.Close())
-	}
-	return errors.Join(errs...)
-}
+func (n *Node) Shutdown() error { return shutdownNode(n) }
 
 // RecoverToSelfOnline hot-swaps this node's raft instance to a lone single-voter {self} cluster
 // IN-PROCESS — the online force-single escape hatch (the broker process never stops; reads keep
@@ -557,12 +702,19 @@ func (n *Node) Shutdown() error {
 // transport → NewRaft(fresh FSM) → atomic Store on FULL SUCCESS ONLY. On any failure the field keeps the
 // old Shutdown instance (never nil), so the survivor is never bricked and never panics.
 func (n *Node) RecoverToSelfOnline(selfRaftAddr string) error {
+	done, err := beginNodeImageWork(n, false)
+	if err != nil {
+		return err
+	}
+	defer done()
 	if n.transportFactory == nil {
 		return errors.New("cluster: online recover unavailable (no transport factory wired)")
 	}
 	if selfRaftAddr == "" {
 		return errors.New("cluster: RecoverToSelfOnline requires a self raft addr")
 	}
+	n.image.generationMu.Lock()
+	defer n.image.generationMu.Unlock()
 	// applyMu serializes vs Propose's {gate->Plan->Apply}, guaranteeing NO in-flight raft.Apply across
 	// the swap. Liveness/GC writes hit n.db directly (NOT under applyMu); they serialize against
 	// RecoverCluster's replay on MaxOpenConns(1) and touch disjoint columns.
@@ -585,6 +737,7 @@ func (n *Node) RecoverToSelfOnline(selfRaftAddr string) error {
 		localID:  string(n.cfg.LocalID),
 	}
 	rc := raftConfig(n.cfg)
+	rc.NotifyCh = n.image.notify
 	// RecoverCluster performs NO network IO (the transport only feeds snapshot peer-encode) → a throwaway
 	// inmem transport, exactly as the offline path. The live transport's :7400 listener stays bound here.
 	_, tmp := raft.NewInmemTransport(raft.ServerAddress(selfRaftAddr))
@@ -607,6 +760,7 @@ func (n *Node) RecoverToSelfOnline(selfRaftAddr string) error {
 	if err != nil {
 		return fmt.Errorf("cluster: rebuild transport after recover: %w", err)
 	}
+	newTrans = wrapNodeImageTransport(newTrans, n)
 	r, err := raft.NewRaft(rc, f, n.store, n.store, n.snaps, newTrans)
 	if err != nil {
 		if c, ok := newTrans.(io.Closer); ok {
@@ -614,8 +768,98 @@ func (n *Node) RecoverToSelfOnline(selfRaftAddr string) error {
 		}
 		return fmt.Errorf("cluster: NewRaft after online recover: %w", err)
 	}
+	previousFSM := n.fsm
 	n.fsm = f
+	if _, network := newTrans.(*imageNetworkTransport); network && imageSnapshotInitialize != nil {
+		if initErr := imageSnapshotInitialize(n); initErr != nil {
+			shutdownErr := r.Shutdown().Error()
+			var closeErr error
+			if closer, ok := newTrans.(io.Closer); ok {
+				closeErr = closer.Close()
+			}
+			n.fsm = previousFSM
+			return errors.Join(initErr, shutdownErr, closeErr)
+		}
+	}
 	n.transport = newTrans
-	n.raft.Store(r) // ATOMIC — the new instance is now visible to every n.raft.Load() reader
+	n.raft.Store(r) // publish only after the new FSM's snapshot policy is initialized
+	// Only the initialized generation may expose a runtime snapshot Consumer.
+	if transport, ok := newTrans.(*imageNetworkTransport); ok {
+		transport.start()
+	}
 	return nil
+}
+
+// P05 registers these real adapters during package initialization. Raft replaces
+// the network reader with its own staged file before FSM.Restore, so a ticket on
+// rpc.Reader alone cannot bind the runtime restore. Nil staging rejects the RPC
+// before Raft can change term/configuration; it is never a success stub.
+// Initialize must use the opened FSM and durable configuration metadata: it
+// runs before any new Raft instance is published. Stage retains its returned
+// io.ReadCloser through the RPC response; Fence returns the actual join receipt.
+// origin: hot-update S6 plan §3.4 / T15 / T16
+var (
+	imageSnapshotInitialize = initializeNodeSnapshotWork
+	imageSnapshotStage      = stageNodeSnapshotRPC
+	imageSnapshotFence      = FenceSnapshotWork
+	imageSnapshotResume     = ResumeSnapshotWork
+	imageSnapshotBackup     = BackupSnapshotDB
+)
+
+// Install real snapshot owners before exposing the transport Consumer. Cold
+// operation and image shutdown share these adapters; a missing hook must never
+// turn all ordinary follower catch-up into a permanent refusal.
+// origin: hot-update S6 plan §3.4 / T15 / T16; internal review rv-writer-2
+func initializeNodeSnapshotWork(n *Node) error {
+	RequireSnapshotTickets(n)
+	snapshots, err := n.snaps.List()
+	if err != nil {
+		return err
+	}
+	if len(snapshots) != 0 {
+		snapshot := snapshots[0]
+		f := n.fsm
+		f.mutationMu.Lock()
+		f.snapshotIndex, f.snapshotTerm = snapshot.Index, snapshot.Term
+		f.mutationMu.Unlock()
+		recordSnapshotConfiguration(f, snapshot.ConfigurationIndex, snapshot.Configuration)
+	}
+	return nil
+}
+
+func stageNodeSnapshotRPC(n *Node, req *raft.InstallSnapshotRequest, ticket clusterio.SnapshotTicket, source io.Reader) (io.ReadCloser, error) {
+	if err := ValidateSnapshotRPC(ticket, req); err != nil {
+		return nil, err
+	}
+	reader, ok := source.(io.ReadCloser)
+	if !ok {
+		return nil, errors.New("cluster: snapshot source has no close owner")
+	}
+	return StageSnapshotRPC(n, ticket, reader)
+}
+
+func joinImageSnapshotWork(n *Node, deadline controlbudget.Deadline) error {
+	if n.fsm == nil || imageSnapshotFence == nil {
+		return nil
+	} // cold embedding; image admission checks hook availability
+	joined := imageSnapshotFence(n)
+	if joined == nil {
+		return errors.New("cluster: snapshot work has no join receipt")
+	}
+	if deadline == 0 {
+		<-joined
+		return nil
+	}
+	remaining, err := clusterio.Remaining(deadline)
+	if err != nil {
+		return err
+	}
+	timer := time.NewTimer(remaining)
+	defer timer.Stop()
+	select {
+	case <-joined:
+		return nil
+	case <-timer.C:
+		return clusterio.ErrDeadline
+	}
 }

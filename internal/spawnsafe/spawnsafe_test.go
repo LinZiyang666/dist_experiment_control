@@ -1359,11 +1359,17 @@ func TestMountHealthy_reArmSurvivesConcurrentLauncherWakeup(t *testing.T) {
 			atomic.AddInt64(&rearms, 1)
 		}
 	}()
+	// origin: hot-update S4 make-test (1.5% flake on both the S3 and S4 trees). A fixed
+	// 3200 consults could finish under machine load before the invalidator saw five
+	// healthy generations, so the churn guard below failed on scheduling, not on the
+	// product. Consult at least 3200 times AND until five re-arms happened, bounded by a
+	// deadline: no churn within it still fails, exactly as before.
+	churnDeadline := time.Now().Add(5 * time.Second)
 	for i := 0; i < 16; i++ {
 		workers.Add(1)
 		go func() {
 			defer workers.Done()
-			for j := 0; j < 200; j++ {
+			for j := 0; j < 200 || (atomic.LoadInt64(&rearms) < 5 && time.Now().Before(churnDeadline)); j++ {
 				f.policy.mountHealthy(staleMount)
 			}
 		}()
@@ -1373,7 +1379,7 @@ func TestMountHealthy_reArmSurvivesConcurrentLauncherWakeup(t *testing.T) {
 	invalidator.Wait()
 
 	if n := atomic.LoadInt64(&rearms); n < 5 {
-		t.Fatalf("only %d healthy generations were re-armed against 3200 consults — there was no churn "+
+		t.Fatalf("only %d healthy generations were re-armed within 5s of concurrent consults — there was no churn "+
 			"to survive, so a pass here proves nothing", n)
 	}
 	// Probes are the observable proof that those generations were really replaced. At
@@ -1788,5 +1794,24 @@ func TestPrepare_healthyHangableMountZeroProbesWithinTTL(t *testing.T) {
 	}
 	if c := f.probe.count(staleMount); c != 2 {
 		t.Fatalf("probe count %d after one TTL, want exactly 2", c)
+	}
+}
+
+// origin: hot-update S5 plan §6.6 / T26 / DRILL-OBSERVER
+func TestChildEnvironmentStripsBothObserverCustodyKeys(t *testing.T) {
+	env := []string{"PATH=/safe", "TETHER_TEST_DRILL_OBSERVER=v1", "TETHER_TEST_DRILL_CUSTODY_FD=23"}
+	got := MergeChildEnv(env, map[string]string{"TETHER_TEST_DRILL_OBSERVER": "v1", "TETHER_TEST_DRILL_CUSTODY_FD": "23"})
+	for _, entry := range got {
+		if strings.HasPrefix(entry, "TETHER_TEST_DRILL_") {
+			t.Fatal("workload inherited observer custody")
+		}
+	}
+	if !strings.Contains(strings.Join(got, "\n"), "PATH=/safe") {
+		t.Fatal("ordinary workload environment lost")
+	}
+
+	got = EnvSliceFromMap(map[string]string{"TETHER_TEST_DRILL_OBSERVER": "v1", "TETHER_TEST_DRILL_CUSTODY_FD": "23", "PATH": "/safe"})
+	if len(got) != 1 || got[0] != "PATH=/safe" {
+		t.Fatal("explicit exec environment retained custody")
 	}
 }

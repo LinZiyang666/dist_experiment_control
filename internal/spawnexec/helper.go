@@ -15,6 +15,8 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+
+	"github.com/LinZiyang666/tether/internal/drillobserve"
 )
 
 const helperEnv = "_TETHER_SPAWN_EXEC_HELPER"
@@ -263,7 +265,7 @@ func stripHelperEnv(env []string) []string {
 			out = append(out, entry)
 		}
 	}
-	return out
+	return drillobserve.StripEnvironment(out)
 }
 
 // acquireGlobalWedgeSlot bounds abandoned pre-exec helpers across agent

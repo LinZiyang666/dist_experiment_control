@@ -1,16 +1,19 @@
 package proc
 
 import (
+	"cmp"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/cluster"
 	"github.com/LinZiyang666/tether/internal/schema"
+	"github.com/LinZiyang666/tether/internal/upgradeauthority"
 )
 
 // Plan* are the D2 leader-side renderers for the process mutators (architecture
@@ -36,6 +39,10 @@ import (
 // is the brick. VerbProcInsert forwards with reqID="" (the 0011 ledger does NOT dedup it),
 // so this OR IGNORE is the SOLE idempotency anchor.
 func PlanInsert(db *sql.DB, p Process) (*cluster.Command, error) {
+	return planInsert(db, p, "INSERT OR IGNORE")
+}
+
+func planInsert(db upgradeauthority.RowReader, p Process, insertVerb string) (*cluster.Command, error) {
 	if p.PID == "" {
 		return nil, fmt.Errorf("proc: pid required")
 	}
@@ -46,6 +53,7 @@ func PlanInsert(db *sql.DB, p Process) (*cluster.Command, error) {
 	var found int
 	switch err := db.QueryRow(`SELECT 1 FROM nodes WHERE sid=? AND nid=?`, p.SID, p.NID).Scan(&found); err {
 	case nil:
+		// node exists
 	case sql.ErrNoRows:
 		return nil, ErrNodeMissing
 	default:
@@ -56,11 +64,17 @@ func PlanInsert(db *sql.DB, p Process) (*cluster.Command, error) {
 	if err != nil {
 		return nil, fmt.Errorf("proc: plan insert literal: %w", err)
 	}
+	// Zero start ticks render as SQL NULL so the
+	// processes.start_time_ticks column stays NULL when the agent didn't
+	// report it (e.g. exec children). Without this the column gets
+	// literal 0, which would compare-equal to a real "boot tick 0"
+	// reading on a freshly-booted box and pass the G.1 triple check
+	// spuriously.
 	ticks := cluster.LitNull()
 	if p.StartTimeTicks != 0 {
 		ticks = cluster.LitInt(p.StartTimeTicks)
 	}
-	sql := `INSERT OR IGNORE INTO processes(pid, sid, nid, argv, cwd, started_at, status, started_by_fp, boot_id, start_time_ticks)` +
+	sql := insertVerb + ` INTO processes(pid, sid, nid, argv, cwd, started_at, status, started_by_fp, boot_id, start_time_ticks)` +
 		` VALUES (` + lits[0] + `, ` + lits[1] + `, ` + lits[2] + `, ` + lits[3] + `, ` + lits[4] + `, ` +
 		cluster.LitTime(p.StartedAt) + `, ` + lits[5] + `, ` + lits[6] + `, ` + lits[7] + `, ` + ticks + `)`
 	return cluster.NewCommand(cluster.OpProcCreate, cluster.Stmt(sql)), nil
@@ -85,12 +99,44 @@ func PlanInsert(db *sql.DB, p Process) (*cluster.Command, error) {
 // one. Nothing on THIS release ever produces an empty sid — exec.go takes it from the
 // SUBJECT, which NATS ACLs pin to the publisher's own session.
 func PlanMarkExited(db *sql.DB, pid, sid string, exitCode int, when time.Time) (*cluster.Command, error) {
+	return planMarkExited(db, pid, sid, exitCode, when)
+}
+
+func planMarkExited(db upgradeauthority.RowReader, pid, sid string, exitCode int, when time.Time) (*cluster.Command, error) {
 	if sid == "" {
 		return nil, ErrUnscopedExit
 	}
+	// This scoped probe now runs before the UPDATE, inside the direct writer
+	// transaction or serialized planner. Sharing it preserves the same refusal
+	// and idempotence decisions for both writers.
+	// Either unknown pid or already non-RUNNING. Distinguish.
+	// Audit shard 03 F6: previously the SELECT err was discarded
+	// — a transient DB error would silently report success while
+	// SQLite still says RUNNING but audit.proc{exit} got
+	// published. Surface non-ErrNoRows errors so the caller
+	// knows the row is in an unknown state.
+	//
+	// The existence probe is sid-scoped TOO, and that is load-bearing rather than
+	// symmetry: an unscoped probe would find the victim's row, conclude "already
+	// EXITED, idempotent no-op" and return nil — reporting SUCCESS to the very
+	// caller the UPDATE predicate just refused, which in exec.go publishes an
+	// audit.proc{exit} for a process that is still running. Scoped, a foreign pid
+	// is indistinguishable from an unknown one: ErrNotFound, no audit, and the
+	// caller's terminal ack tells the sender nothing about whether the pid exists.
+	//
+	// THAT LAST SENTENCE IS ABOUT THIS FUNCTION, and round 2 (E3) caught it being
+	// read as a claim about the SYSTEM. It was not true of the system: the only
+	// caller, handleProcEvent, answered its ack from an UNSCOPED pre-read that ran
+	// before this code was ever reached, so the indistinguishability this comment
+	// establishes was handed straight back one frame up. Both pre-reads are scoped
+	// now (GetInSession). What is NOT closed, and cannot be here, is that
+	// processes.pid is a GLOBAL primary key: a forged `started` for a pid that
+	// exists in another session fails its INSERT where an unused pid succeeds, so
+	// pid-existence remains observable to a caller willing to write. Closing that
+	// means re-keying the table on (sid, pid) — a migration, not a predicate.
+	// Already EXITED (or LOST). Idempotent — treat as no-op.
 	var any int
-	err := db.QueryRow(`SELECT 1 FROM processes WHERE pid=? AND sid=?`, pid, sid).Scan(&any)
-	switch {
+	switch err := db.QueryRow(`SELECT 1 FROM processes WHERE pid=? AND sid=?`, pid, sid).Scan(&any); {
 	case err == nil:
 	case errors.Is(err, sql.ErrNoRows):
 		return nil, ErrNotFound
@@ -112,30 +158,18 @@ func PlanRefileStatements(sid, from, to string, pids []string) ([]cluster.Statem
 	if from == "" || from == to || len(pids) == 0 {
 		return nil, nil
 	}
-	uniq := make(map[string]struct{}, len(pids))
-	for _, pid := range pids {
-		if pid != "" {
-			uniq[pid] = struct{}{}
-		}
-	}
-	ordered := make([]string, 0, len(uniq))
-	for pid := range uniq {
-		ordered = append(ordered, pid)
-	}
+	ordered := append([]string(nil), pids...)
 	sort.Strings(ordered)
-	lits, err := cluster.LitTextAll(to, sid, from)
+	ordered = slices.Compact(ordered)
+	ordered = slices.DeleteFunc(ordered, func(pid string) bool { return pid == "" })
+	lits, err := cluster.LitTextAll(append([]string{to, sid, from}, ordered...)...)
 	if err != nil {
 		return nil, fmt.Errorf("proc: refile literal: %w", err)
 	}
-	toL, sidL, fromL := lits[0], lits[1], lits[2]
 	out := make([]cluster.Statement, 0, len(ordered))
-	for _, pid := range ordered {
-		pidL, err := cluster.LitText(pid)
-		if err != nil {
-			return nil, fmt.Errorf("proc: refile pid literal: %w", err)
-		}
-		out = append(out, cluster.Stmt(`UPDATE processes SET nid=`+toL+
-			` WHERE sid=`+sidL+` AND pid=`+pidL+` AND nid=`+fromL+` AND status='RUNNING'`))
+	for _, pidL := range lits[3:] {
+		out = append(out, cluster.Stmt(`UPDATE processes SET nid=`+lits[0]+
+			` WHERE sid=`+lits[1]+` AND pid=`+pidL+` AND nid=`+lits[2]+` AND status='RUNNING'`))
 	}
 	return out, nil
 }
@@ -154,17 +188,13 @@ func markExitedSQL(pid, sid string, exitCode int, when time.Time) (string, error
 	if sid == "" {
 		return "", ErrUnscopedExit
 	}
-	pidLit, err := cluster.LitText(pid)
-	if err != nil {
-		return "", fmt.Errorf("proc: mark exited literal: %w", err)
-	}
-	sidLit, err := cluster.LitText(sid)
+	lits, err := cluster.LitTextAll(pid, sid)
 	if err != nil {
 		return "", fmt.Errorf("proc: mark exited sid literal: %w", err)
 	}
 	return `UPDATE processes SET status='EXITED', exit_code=` + cluster.LitInt(int64(exitCode)) +
 		`, ended_at=` + cluster.LitTime(when) +
-		` WHERE pid=` + pidLit + ` AND sid=` + sidLit + ` AND status='RUNNING'`, nil
+		` WHERE pid=` + lits[0] + ` AND sid=` + lits[1] + ` AND status='RUNNING'`, nil
 }
 
 // ExitMark is one resolved G.1 reconcile decision: a process to transition to
@@ -247,21 +277,12 @@ func PlanReconcileBatch(in ReconcileBatchInput) (*cluster.Command, error) {
 
 	aux := reconAuxV1{SID: in.SID}
 	aux.ProcAudit = append(aux.ProcAudit, in.ProcAudit...)
-	sort.Slice(aux.ProcAudit, func(i, j int) bool {
-		if aux.ProcAudit[i].PID != aux.ProcAudit[j].PID {
-			return aux.ProcAudit[i].PID < aux.ProcAudit[j].PID
-		}
-		return aux.ProcAudit[i].Kind < aux.ProcAudit[j].Kind
+	slices.SortFunc(aux.ProcAudit, func(a, b ReconProcAudit) int {
+		return cmp.Or(strings.Compare(a.PID, b.PID), strings.Compare(a.Kind, b.Kind))
 	})
 	aux.PortAudit = append(aux.PortAudit, in.PortAudit...)
-	sort.Slice(aux.PortAudit, func(i, j int) bool {
-		if aux.PortAudit[i].Port != aux.PortAudit[j].Port {
-			return aux.PortAudit[i].Port < aux.PortAudit[j].Port
-		}
-		if aux.PortAudit[i].LocalPort != aux.PortAudit[j].LocalPort {
-			return aux.PortAudit[i].LocalPort < aux.PortAudit[j].LocalPort
-		}
-		return aux.PortAudit[i].Name < aux.PortAudit[j].Name
+	slices.SortFunc(aux.PortAudit, func(a, b ReconPortAudit) int {
+		return cmp.Or(cmp.Compare(a.Port, b.Port), cmp.Compare(a.LocalPort, b.LocalPort), strings.Compare(a.Name, b.Name))
 	})
 	// Strip the monotonic reading (review m6): time.Time.MarshalJSON already emits
 	// only the wall RFC3339Nano (never the monotonic part), so this is NOT required
@@ -306,8 +327,8 @@ func ReplayReconcileAudit(cmd *cluster.Command) ([]schema.AuditProc, []schema.Au
 	procs := make([]schema.AuditProc, 0, len(aux.ProcAudit))
 	for _, t := range aux.ProcAudit {
 		procs = append(procs, schema.AuditProc{
-			V: schema.AuditSchemaVersion, Kind: t.Kind, Ts: t.Ts,
-			Session: aux.SID, Node: t.NID, PID: t.PID, RC: t.RC,
+			V: schema.AuditSchemaVersion, Kind: t.Kind, Ts: t.Ts, Session: aux.SID,
+			Node: t.NID, PID: t.PID, RC: t.RC,
 		})
 	}
 	ports := make([]schema.AuditPort, 0, len(aux.PortAudit))
@@ -379,4 +400,28 @@ func PlanGCExited(db *sql.DB, cutoff time.Time, limit int) (*cluster.Command, in
 	sql := `DELETE FROM processes WHERE pid IN (` + strings.Join(lits, `, `) +
 		`) AND status='EXITED'`
 	return cluster.NewCommand(cluster.OpProcGC, cluster.Stmt(sql)), len(pids), nil
+}
+
+// PlanMarkExitedGuarded retains the creation fence in the existing process op.
+// origin: hot-update S8 plan §6.2 / P34
+func PlanMarkExitedGuarded(db *sql.DB, guard upgradeauthority.Guard, pid string, exitCode int, when time.Time) (string, *cluster.Command, error) {
+	return guardProcessPlan(db, &guard, func() (*cluster.Command, error) {
+		return planMarkExited(db, pid, guard.SID, exitCode, when)
+	})
+}
+
+func planRefile(sid, from, to string, pids []string) (*cluster.Command, error) {
+	statements, err := PlanRefileStatements(sid, from, to, pids)
+	return cluster.NewCommand(cluster.OpNodeRegister, statements...), err
+}
+
+// PlanReconcileBatchGuarded fences every delayed G.1 exit, including batches.
+// origin: hot-update S8 plan §6.2 / P34
+func PlanReconcileBatchGuarded(db *sql.DB, guard upgradeauthority.Guard, in ReconcileBatchInput) (string, *cluster.Command, error) {
+	return guardProcessPlan(db, &guard, func() (*cluster.Command, error) {
+		if in.SID != guard.SID {
+			return nil, ErrUnscopedExit
+		}
+		return PlanReconcileBatch(in)
+	})
 }

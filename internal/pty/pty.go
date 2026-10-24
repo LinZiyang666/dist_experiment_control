@@ -23,12 +23,14 @@ package pty
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"sync"
 	"syscall"
 
 	"github.com/LinZiyang666/tether/internal/spawnexec"
+	"github.com/LinZiyang666/tether/internal/workload"
 	cpty "github.com/creack/pty"
 )
 
@@ -49,6 +51,14 @@ type Session struct {
 	cancelStart func()    // closes a helper handshake blocked on target exec
 	started     bool      // set when Start begins: it now OWNS the slave fd lifecycle
 	closed      bool      // set by Close; Start that resumes after Close cleans up + bails
+	ready       bool      // Start completed successfully; ownership may now transfer
+	osPID       int       // immutable after successful Start; Process.Release changes Process.Pid
+	waitStarted bool      // unmanaged Wait and adoption must never race
+	owner       *workload.Manager
+	taskID      string
+	draining    bool // adoption retained the leader until the terminal source ends
+	transferred bool // the old Session must never signal or close the new terminal owner
+	borrowers   int  // Session I/O and the portable legacy owner exclude TakeMaster
 }
 
 // Allocate creates a fresh PTY pair sized to (cols, rows) but does NOT
@@ -62,7 +72,13 @@ func Allocate(cols, rows int) (*Session, error) {
 	if err != nil {
 		return nil, fmt.Errorf("pty: open: %w", err)
 	}
-	s := &Session{Master: master, slave: slave}
+	pollable, err := prepareMaster(master)
+	if err != nil {
+		_ = master.Close()
+		_ = slave.Close()
+		return nil, fmt.Errorf("pty: prepare master: %w", err)
+	}
+	s := &Session{Master: pollable, slave: slave}
 	if err := s.SetSize(cols, rows); err != nil {
 		_ = s.Close()
 		// Wrapped with what failed. origin: line-2 external review M17. This returned the bare ioctl error,
@@ -175,6 +191,10 @@ func (s *Session) Start(argv []string, env []string, cwd string, resolvedPath st
 	s.slave = nil
 	s.cancelStart = nil
 	closedDuringStart := s.closed
+	if !closedDuringStart {
+		s.ready = true
+		s.osPID = cmd.Process.Pid
+	}
 	s.mu.Unlock()
 	if closedDuringStart {
 		// Close ran while we were (possibly) wedged in cmd.Start; we own the
@@ -191,6 +211,23 @@ func (s *Session) Start(argv []string, env []string, cwd string, resolvedPath st
 	return nil
 }
 
+// Adopt transfers successful child wait/signal ownership to the runtime table.
+// The master remains owned by this session until its I/O adapter takes over.
+// A failed or still-running Start cannot be adopted, and an unmanaged Wait
+// already in progress cannot be retroactively made safe for image replacement.
+func (s *Session) Adopt(owner *workload.Manager, id workload.Identity) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if owner == nil || !s.ready || s.closed || s.waitStarted || s.owner != nil {
+		return fmt.Errorf("pty: child ownership cannot be transferred")
+	}
+	if err := owner.Adopt(id, s.cmd.Process); err != nil {
+		return err
+	}
+	s.owner, s.taskID = owner, id.ID
+	return nil
+}
+
 // Wait blocks until the child exits and returns its exit code. A non-nil
 // error is returned only for setup failures (Wait without a successful
 // Start, wait syscall failure). Normal non-zero exits — including
@@ -198,11 +235,27 @@ func (s *Session) Start(argv []string, env []string, cwd string, resolvedPath st
 // a nil error.
 func (s *Session) Wait() (int, error) {
 	s.mu.Lock()
+	if s.owner != nil {
+		s.waitStarted = true
+		owner, id := s.owner, s.taskID
+		s.mu.Unlock()
+		result, err := owner.Wait(id)
+		if err != nil {
+			return -1, err
+		}
+		return result.Code, nil
+	}
+	if !s.ready {
+		s.mu.Unlock()
+		return -1, fmt.Errorf("pty: Wait without successful Start")
+	}
+	if s.waitStarted {
+		s.mu.Unlock()
+		return -1, fmt.Errorf("pty: child wait already started")
+	}
+	s.waitStarted = true
 	cmd := s.cmd
 	s.mu.Unlock()
-	if cmd == nil {
-		return -1, fmt.Errorf("pty: Wait without Start")
-	}
 	err := cmd.Wait()
 	if err == nil {
 		return 0, nil
@@ -236,32 +289,27 @@ func (s *Session) Wait() (int, error) {
 // under the lock is all that is needed: os.File serializes its own Write against Close,
 // and a write to an already-closed file returns ErrClosed.
 func (s *Session) WriteInput(p []byte) (int, error) {
-	s.mu.Lock()
-	master := s.Master
-	s.mu.Unlock()
-	if master == nil {
-		return 0, fmt.Errorf("pty: master closed")
+	master, err := s.borrowMaster()
+	if err != nil {
+		return 0, err
 	}
+	defer s.releaseMaster()
 	return master.Write(p)
 }
 
 func (s *Session) SetSize(cols, rows int) error {
-	s.mu.Lock()
-	master := s.Master
-	s.mu.Unlock()
-	if master == nil {
-		return fmt.Errorf("pty: master closed")
+	master, err := s.borrowMaster()
+	if err != nil {
+		return err
 	}
+	defer s.releaseMaster()
 	if cols <= 0 || rows <= 0 {
 		// 80x24 is the conventional dumb-terminal default — used when
 		// ctl forgets to send size or sends nonsense; never fail
 		// silently with a 0x0 PTY.
 		cols, rows = 80, 24
 	}
-	return cpty.Setsize(master, &cpty.Winsize{
-		Cols: uint16(cols),
-		Rows: uint16(rows),
-	})
+	return resizeMaster(master, uint16(cols), uint16(rows))
 }
 
 // Signal forwards sig to the child's process GROUP (negative pid). With
@@ -270,12 +318,18 @@ func (s *Session) SetSize(cols, rows int) error {
 // spawned). v1 sends only SIGINT this way (Ctrl-C semantics).
 func (s *Session) Signal(sig syscall.Signal) error {
 	s.mu.Lock()
-	cmd := s.cmd
+	owner, id, pgid := s.owner, s.taskID, s.osPID
+	transferred := s.transferred
 	s.mu.Unlock()
-	if cmd == nil || cmd.Process == nil {
+	if transferred {
+		return fmt.Errorf("pty: terminal ownership transferred")
+	}
+	if owner != nil {
+		return owner.Signal(id, sig)
+	}
+	if pgid <= 0 {
 		return fmt.Errorf("pty: process not started")
 	}
-	pgid := cmd.Process.Pid
 	if err := syscall.Kill(-pgid, sig); err != nil {
 		return fmt.Errorf("pty: kill -%d -%d: %w", int(sig), pgid, err)
 	}
@@ -288,12 +342,8 @@ func (s *Session) Signal(sig syscall.Signal) error {
 // the architecture G.1 PID-reuse triple.
 func (s *Session) OSPID() int {
 	s.mu.Lock()
-	cmd := s.cmd
-	s.mu.Unlock()
-	if cmd == nil || cmd.Process == nil {
-		return 0
-	}
-	return cmd.Process.Pid
+	defer s.mu.Unlock()
+	return s.osPID
 }
 
 // KillAndWaitAfterAbandonedStart owns the narrow timeout race where cmd.Start
@@ -303,6 +353,13 @@ func (s *Session) OSPID() int {
 // this method exactly once after observing that nil Start result.
 func (s *Session) KillAndWaitAfterAbandonedStart() {
 	s.mu.Lock()
+	// Adoption has already assigned the sole waiter. A late watchdog callback
+	// must not steal its status or kill a transferred terminal's process group.
+	// origin: hot-update S4 plan §3.1 / T10
+	if s.owner != nil || s.transferred {
+		s.mu.Unlock()
+		return
+	}
 	cmd := s.cmd
 	s.mu.Unlock()
 	if cmd == nil || cmd.Process == nil {
@@ -334,11 +391,19 @@ func (s *Session) KillAndWaitAfterAbandonedStart() {
 func (s *Session) Hangup() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.closed || s.cmd == nil || s.cmd.Process == nil {
+	if s.closed || !s.ready || s.transferred {
 		return
 	}
 	// ESRCH (group already gone) is fine — the exit is what we wanted.
-	_ = syscall.Kill(-s.cmd.Process.Pid, syscall.SIGHUP)
+	if s.owner != nil {
+		if err := s.owner.Signal(s.taskID, syscall.SIGHUP); err != nil {
+			// Reaped or frozen means this callback no longer has authority to
+			// close a live master (or truncate an exited child's output tail).
+			return
+		}
+	} else {
+		_ = syscall.Kill(-s.osPID, syscall.SIGHUP)
+	}
 	if s.Master != nil {
 		_ = s.Master.Close() // fd closed in place; pointer NOT nil'd (see above)
 	}
@@ -372,4 +437,70 @@ func (s *Session) Close() error {
 		s.slave = nil
 	}
 	return firstErr
+}
+
+// AdoptDraining keeps an exited leader waitable while descendants still own the
+// slave. Neither a Start attempt nor an unmanaged waiter can grant that hold.
+// origin: hot-update S4 plan §3.1 / T10
+func (s *Session) AdoptDraining(owner *workload.Manager, id workload.Identity) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if owner == nil || !s.ready || s.closed || s.waitStarted || s.owner != nil {
+		return fmt.Errorf("pty: child ownership cannot be transferred")
+	}
+	if err := owner.AdoptDraining(id, s.cmd.Process); err != nil {
+		return err
+	}
+	s.owner, s.taskID, s.draining = owner, id.ID, true
+	return nil
+}
+
+// TakeMaster moves the existing wrapper exactly once. Callers must stop using
+// the exported legacy Master field before entry; direct file borrowers cannot
+// be counted by Session. All Session methods and LegacyIO are counted here.
+// origin: hot-update S4 plan §3.1 / T10
+func (s *Session) TakeMaster() (Master, TerminalIdentity, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.ready || !s.draining || s.closed || s.transferred || s.waitStarted || s.borrowers != 0 || s.Master == nil {
+		return nil, TerminalIdentity{}, fmt.Errorf("pty: master ownership cannot be transferred")
+	}
+	row, ok := s.owner.Lookup(s.taskID)
+	if !ok {
+		return nil, TerminalIdentity{}, fmt.Errorf("pty: process ownership missing")
+	}
+	master, identity, err := takeTerminalMaster(s.Master, row)
+	if err != nil {
+		return nil, TerminalIdentity{}, err
+	}
+	s.Master, s.transferred = nil, true
+	return master, identity, nil
+}
+
+func (s *Session) borrowMaster() (*os.File, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed || s.transferred || s.Master == nil {
+		return nil, fmt.Errorf("pty: master closed or transferred")
+	}
+	s.borrowers++
+	return s.Master, nil
+}
+
+func (s *Session) releaseMaster() {
+	s.mu.Lock()
+	s.borrowers--
+	s.mu.Unlock()
+}
+
+// terminalReadResult is deliberately not a generic EIO-to-EOF adapter. Only a
+// successful, identity-verified terminal read has Linux last-slave semantics;
+// write failures, deadlines and explicit Close retain their original errors.
+// n survives an error because callers must retain those bytes before FIN.
+// origin: hot-update S4 plan §3.3 / T01
+func terminalReadResult(n int, err error, verified bool) (int, error) {
+	if verified && errors.Is(err, syscall.EIO) {
+		err = io.EOF
+	}
+	return n, err
 }

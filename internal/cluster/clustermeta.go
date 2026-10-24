@@ -3,9 +3,16 @@ package cluster
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
+
+	"github.com/LinZiyang666/tether/internal/brokermaint"
+	"github.com/LinZiyang666/tether/internal/cluster/state"
 )
+
+// SQL planning stays below Raft; this facade preserves the cluster API.
+// origin: hot-update S6 plan §9.3 / CLUSTER-SLIM
 
 // clusterMetaPlanner / clusterMetaApplier are D1's single representative
 // Plan/Apply pair (architecture §2.10). The op is a pure baked-literal upsert
@@ -51,30 +58,13 @@ func newClusterMetaSet(key, value string) (*Command, error) {
 	}, nil
 }
 
-// genericExecApplier execs an op's baked statements inside the FSM's
-// transaction, in Body order. It is the shared Applier for every D2 op: because
-// the leader bakes ALL values into Statement.SQL as literals (sqlbake.go), the
-// Apply side is a pure "exec the leader-rendered SQL" with no per-op branching
-// and no out-of-band Args. (OpClusterMetaSet rides the same applier carrying its
-// one string value via Args, which is JSON-round-trip-stable.)
-//
-// Consequence the determinism lint must own (d2-plan §6): this generic applier
-// SEVERS the static call graph from a per-op Plan, so an import-reachability lint
-// rooted at the Applier is tautologically clean and CANNOT prove Plan-side
-// determinism. The real determinism guarantor is §13.2 multi-FSM equivalence;
-// the lint is a tripwire, not a proof.
 type genericExecApplier struct{}
 
 // compile-time proof the shared Applier is *sql.Tx-bound (§3.2/§3.7).
 var _ Applier = genericExecApplier{}
 
 func (genericExecApplier) ApplyTx(tx *sql.Tx, cmd *Command) error {
-	for i, st := range cmd.Body {
-		if _, err := tx.Exec(st.SQL, st.Args...); err != nil {
-			return fmt.Errorf("cluster: exec stmt %d: %w", i, err)
-		}
-	}
-	return nil
+	return state.ApplyStatements(tx, (*state.Command)(cmd))
 }
 
 // defaultAppliers is the op→Applier dispatch table the FSM uses. Every D2 op
@@ -138,4 +128,31 @@ func defaultAppliers() map[OpType]Applier {
 		OpAlertClear: exec,
 		OpAlertAck:   exec,
 	}
+}
+
+const BrokerMaintenanceKeyPrefix = state.BrokerMaintenanceKeyPrefix
+
+func ReadBrokerMaintenance(db *sql.DB, home string) (brokermaint.Record, error) {
+	return state.ReadBrokerMaintenance(db, home)
+}
+
+func PlanBrokerMaintenance(db *sql.DB, record brokermaint.Record, lock UpgradeLockState) (*Command, error) {
+	cmd, err := state.PlanBrokerMaintenance(db, record, lock)
+	return (*Command)(cmd), err
+}
+
+// ValidateBrokerMaintenanceTerm runs inside Node.Propose before record planning.
+// A changed term cannot rebind the original maintenance lifetime. Config index,
+// voter digest and role edges are validated by P04's final role receipt: Raft
+// v1.7.3 GetConfiguration().Index() is not populated by its local snapshot API.
+// origin: hot-update S6 plan §7.1 / T40
+func ValidateBrokerMaintenanceTerm(n *Node, record brokermaint.Record) error {
+	if record.Term != n.raft.Load().CurrentTerm() {
+		return errors.New("cluster: maintenance term changed")
+	}
+	return nil
+}
+func PlanExpireBrokerMaintenance(db *sql.DB, expected brokermaint.Record, lock UpgradeLockState) (*Command, error) {
+	cmd, err := state.PlanExpireBrokerMaintenance(db, expected, lock)
+	return (*Command)(cmd), err
 }

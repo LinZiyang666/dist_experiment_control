@@ -4,18 +4,35 @@ import (
 	"bytes"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
 	"testing"
+
+	"github.com/LinZiyang666/tether/internal/testharness"
 )
 
 func TestHelperStartsTargetAndPreservesOutputAndExit(t *testing.T) {
+	// origin: hot-update S5 PROC-LEAK / final process census.
+	testharness.GuardProcessDirectory(t, filepath.Dir(t.TempDir()))
+
 	target := exec.Command("/bin/sh", "-c", "printf helper-ok; exit 7")
+	target.Dir = t.TempDir()
 	helper, handshake, err := Prepare(target)
 	if err != nil {
 		t.Fatal(err)
 	}
+	// origin: hot-update S5 PROC-LEAK. The fixture owns the helper's
+	// group even before its target exec applies the private cwd.
+	helper.Dir = target.Dir
+	helper.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	t.Cleanup(func() {
+		if helper.Process != nil {
+			_ = syscall.Kill(-helper.Process.Pid, syscall.SIGKILL)
+			_ = helper.Wait()
+		}
+	})
 	var out bytes.Buffer
 	helper.Stdout = &out
 	helper.Stderr = &out
@@ -33,11 +50,25 @@ func TestHelperStartsTargetAndPreservesOutputAndExit(t *testing.T) {
 }
 
 func TestHelperReportsTargetStartFailure(t *testing.T) {
+	// origin: hot-update S5 PROC-LEAK / final process census.
+	testharness.GuardProcessDirectory(t, filepath.Dir(t.TempDir()))
+
 	target := &exec.Cmd{Path: "/definitely/not/a/tether-binary", Args: []string{"missing"}}
+	target.Dir = t.TempDir()
 	helper, handshake, err := Prepare(target)
 	if err != nil {
 		t.Fatal(err)
 	}
+	// origin: hot-update S5 PROC-LEAK. The fixture owns the helper's
+	// group even before its target exec applies the private cwd.
+	helper.Dir = target.Dir
+	helper.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	t.Cleanup(func() {
+		if helper.Process != nil {
+			_ = syscall.Kill(-helper.Process.Pid, syscall.SIGKILL)
+			_ = helper.Wait()
+		}
+	})
 	err = handshake.Start(helper)
 	if err == nil || !strings.Contains(err.Error(), "no such file") {
 		t.Fatalf("start error=%v, want target ENOENT", err)
@@ -45,14 +76,28 @@ func TestHelperReportsTargetStartFailure(t *testing.T) {
 }
 
 func TestHelperDoesNotLeakPrivateModeIntoTarget(t *testing.T) {
+	// origin: hot-update S5 PROC-LEAK / final process census.
+	testharness.GuardProcessDirectory(t, filepath.Dir(t.TempDir()))
+
 	target := exec.Command("/bin/sh", "-c", "test -z \"$_TETHER_SPAWN_EXEC_HELPER\" && test \"$KEEP\" = yes && test ! -e /proc/self/fd/3")
 	// An RPC caller can supply an explicit environment, including a collision
 	// with our private key. It must neither trigger recursion nor reach target.
 	target.Env = []string{helperEnv + "=1", "KEEP=yes"}
+	target.Dir = t.TempDir()
 	helper, handshake, err := Prepare(target)
 	if err != nil {
 		t.Fatal(err)
 	}
+	// origin: hot-update S5 PROC-LEAK. The fixture owns the helper's
+	// group even before its target exec applies the private cwd.
+	helper.Dir = target.Dir
+	helper.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	t.Cleanup(func() {
+		if helper.Process != nil {
+			_ = syscall.Kill(-helper.Process.Pid, syscall.SIGKILL)
+			_ = helper.Wait()
+		}
+	})
 	if err := handshake.Start(helper); err != nil {
 		t.Fatal(err)
 	}
@@ -62,16 +107,30 @@ func TestHelperDoesNotLeakPrivateModeIntoTarget(t *testing.T) {
 }
 
 func TestHelperExecsTargetInPlace(t *testing.T) {
+	// origin: hot-update S5 PROC-LEAK / final process census.
+	testharness.GuardProcessDirectory(t, filepath.Dir(t.TempDir()))
+
 	// Regression for the 2026-09-01 host OOM: the old helper used cmd.Start,
 	// retaining a full Go helper plus a fork child for every wedged exec. The
 	// target must now replace the helper and therefore keep the same PID.
 	target := exec.Command("/bin/sh", "-c", "printf %s $$")
+	target.Dir = t.TempDir()
 	helper, handshake, err := Prepare(target)
 	if err != nil {
 		t.Fatal(err)
 	}
 	var out bytes.Buffer
 	helper.Stdout = &out
+	// origin: hot-update S5 PROC-LEAK. The fixture owns the helper's
+	// group even before its target exec applies the private cwd.
+	helper.Dir = target.Dir
+	helper.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	t.Cleanup(func() {
+		if helper.Process != nil {
+			_ = syscall.Kill(-helper.Process.Pid, syscall.SIGKILL)
+			_ = helper.Wait()
+		}
+	})
 	if err := handshake.Start(helper); err != nil {
 		t.Fatal(err)
 	}
@@ -85,14 +144,28 @@ func TestHelperExecsTargetInPlace(t *testing.T) {
 }
 
 func TestHelperPreservesExplicitEmptyEnvironment(t *testing.T) {
+	// origin: hot-update S5 PROC-LEAK / final process census.
+	testharness.GuardProcessDirectory(t, filepath.Dir(t.TempDir()))
+
 	target := exec.Command("/usr/bin/env")
 	target.Env = []string{}
+	target.Dir = t.TempDir()
 	helper, handshake, err := Prepare(target)
 	if err != nil {
 		t.Fatal(err)
 	}
 	var out bytes.Buffer
 	helper.Stdout = &out
+	// origin: hot-update S5 PROC-LEAK. The fixture owns the helper's
+	// group even before its target exec applies the private cwd.
+	helper.Dir = target.Dir
+	helper.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	t.Cleanup(func() {
+		if helper.Process != nil {
+			_ = syscall.Kill(-helper.Process.Pid, syscall.SIGKILL)
+			_ = helper.Wait()
+		}
+	})
 	if err := handshake.Start(helper); err != nil {
 		t.Fatal(err)
 	}
@@ -141,5 +214,19 @@ func TestGlobalWedgeCeilingSurvivesProcessLifetimeBoundaries(t *testing.T) {
 	}
 	if err := syscall.Close(fd); err != nil {
 		t.Fatalf("close reacquired slot: %v", err)
+	}
+}
+
+// origin: hot-update S5 plan §6.6 / T26 / DRILL-OBSERVER
+func TestHelperStripsObserverCustodyFromExplicitWorkloadEnvironment(t *testing.T) {
+	env := []string{"PATH=/safe", "TETHER_TEST_DRILL_OBSERVER=v1", "TETHER_TEST_DRILL_CUSTODY_FD=23"}
+	got := stripHelperEnv(env)
+	for _, entry := range got {
+		if strings.HasPrefix(entry, "TETHER_TEST_DRILL_") {
+			t.Fatal("workload inherited observer custody")
+		}
+	}
+	if !strings.Contains(strings.Join(got, "\n"), "PATH=/safe") {
+		t.Fatal("ordinary workload environment lost")
 	}
 }

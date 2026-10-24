@@ -4,12 +4,16 @@ import (
 	"bytes"
 	"errors"
 	"io"
+	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/LinZiyang666/tether/internal/testharness"
 )
 
 func TestAllocateSetSizeClose(t *testing.T) {
@@ -29,13 +33,24 @@ func TestAllocateSetSizeClose(t *testing.T) {
 }
 
 func TestStartCapturesEcho(t *testing.T) {
+	// origin: hot-update S5 PROC-LEAK / final process census.
+	testharness.GuardProcessDirectory(t, filepath.Dir(t.TempDir()))
+
+	dir := t.TempDir()
+
 	s, err := Allocate(80, 24)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = s.Close() }()
+	t.Cleanup(func() {
+		if pid := s.OSPID(); pid > 0 {
+			_ = syscall.Kill(-pid, syscall.SIGKILL)
+			_, _ = s.Wait()
+		}
+		_ = s.Close()
+	})
 
-	if err := s.Start([]string{"sh", "-c", "echo hello-pty"}, nil, "", ""); err != nil {
+	if err := s.Start([]string{"sh", "-c", "echo hello-pty"}, nil, dir, ""); err != nil {
 		t.Fatal(err)
 	}
 	// Drain master in a goroutine to avoid the child blocking on output.
@@ -64,13 +79,24 @@ func TestStartCapturesEcho(t *testing.T) {
 }
 
 func TestStartResolvedPathUsesIsolatedHelper(t *testing.T) {
+	// origin: hot-update S5 PROC-LEAK / final process census.
+	testharness.GuardProcessDirectory(t, filepath.Dir(t.TempDir()))
+
+	dir := t.TempDir()
+
 	s, err := Allocate(80, 24)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = s.Close() }()
+	t.Cleanup(func() {
+		if pid := s.OSPID(); pid > 0 {
+			_ = syscall.Kill(-pid, syscall.SIGKILL)
+			_, _ = s.Wait()
+		}
+		_ = s.Close()
+	})
 
-	if err := s.Start([]string{"sh", "-c", "echo helper-pty"}, nil, "", "/bin/sh"); err != nil {
+	if err := s.Start([]string{"sh", "-c", "echo helper-pty"}, nil, dir, "/bin/sh"); err != nil {
 		t.Fatal(err)
 	}
 	out := make(chan string, 1)
@@ -93,15 +119,26 @@ func TestStartResolvedPathUsesIsolatedHelper(t *testing.T) {
 }
 
 func TestSignalDeliversSIGINTToProcessGroup(t *testing.T) {
+	// origin: hot-update S5 PROC-LEAK / final process census.
+	testharness.GuardProcessDirectory(t, filepath.Dir(t.TempDir()))
+
+	dir := t.TempDir()
+
 	s, err := Allocate(80, 24)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = s.Close() }()
+	t.Cleanup(func() {
+		if pid := s.OSPID(); pid > 0 {
+			_ = syscall.Kill(-pid, syscall.SIGKILL)
+			_, _ = s.Wait()
+		}
+		_ = s.Close()
+	})
 
 	// `sleep 30` traps and exits 130 on SIGINT; if our signal fails to
 	// deliver, the test will hang for 30s and time out.
-	if err := s.Start([]string{"sh", "-c", "trap 'exit 130' INT; sleep 30"}, nil, "", ""); err != nil {
+	if err := s.Start([]string{"sh", "-c", "trap 'exit 130' INT; sleep 30"}, nil, dir, ""); err != nil {
 		t.Fatal(err)
 	}
 	go func() { _, _ = io.Copy(io.Discard, s.Master) }()
@@ -127,13 +164,24 @@ func TestSignalDeliversSIGINTToProcessGroup(t *testing.T) {
 }
 
 func TestStartTwiceRejected(t *testing.T) {
+	// origin: hot-update S5 PROC-LEAK / final process census.
+	testharness.GuardProcessDirectory(t, filepath.Dir(t.TempDir()))
+
+	dir := t.TempDir()
+
 	s, err := Allocate(80, 24)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = s.Close() }()
+	t.Cleanup(func() {
+		if pid := s.OSPID(); pid > 0 {
+			_ = syscall.Kill(-pid, syscall.SIGKILL)
+			_, _ = s.Wait()
+		}
+		_ = s.Close()
+	})
 
-	if err := s.Start([]string{"true"}, nil, "", ""); err != nil {
+	if err := s.Start([]string{"true"}, nil, dir, ""); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.Wait(); err != nil {
@@ -146,7 +194,7 @@ func TestStartTwiceRejected(t *testing.T) {
 	done := make(chan struct{})
 	go func() { _, _ = io.Copy(io.Discard, master); close(done) }()
 
-	if err := s.Start([]string{"true"}, nil, "", ""); err == nil {
+	if err := s.Start([]string{"true"}, nil, dir, ""); err == nil {
 		t.Error("Start twice must fail; slave fd should be consumed")
 	}
 	_ = s.Close() // EOF the drain goroutine
@@ -159,15 +207,20 @@ func TestStartTwiceRejected(t *testing.T) {
 // and Close's teardown never race and never double-close the slave fd. Run under
 // -race; the pre-fix unsynchronized code trips the detector here.
 func TestSession_concurrentStartClose_noRace(t *testing.T) {
+	// origin: hot-update S5 PROC-LEAK / final process census.
+	testharness.GuardProcessDirectory(t, filepath.Dir(t.TempDir()))
+
 	before := runtime.NumGoroutine()
 	for i := 0; i < 30; i++ {
+		dir := t.TempDir()
+
 		s, err := Allocate(80, 24)
 		if err != nil {
 			t.Fatal(err)
 		}
 		var wg sync.WaitGroup
 		wg.Add(2)
-		go func() { defer wg.Done(); _ = s.Start([]string{"true"}, nil, "", "") }()
+		go func() { defer wg.Done(); _ = s.Start([]string{"true"}, nil, dir, "") }()
 		go func() { defer wg.Done(); _ = s.Close() }()
 		wg.Wait()
 		_ = s.Close() // idempotent, must not double-close
@@ -188,24 +241,40 @@ func TestSession_concurrentStartClose_noRace(t *testing.T) {
 // closed) before Start ⇒ Start fails cleanly without touching/closing fds Close
 // already reclaimed (no double-close, review M1).
 func TestSession_closeBeforeStart(t *testing.T) {
+	// origin: hot-update S5 PROC-LEAK / final process census.
+	testharness.GuardProcessDirectory(t, filepath.Dir(t.TempDir()))
+
+	dir := t.TempDir()
+
 	s, err := Allocate(80, 24)
 	if err != nil {
 		t.Fatal(err)
 	}
 	_ = s.Close()
-	if err := s.Start([]string{"true"}, nil, "", ""); err == nil {
+	if err := s.Start([]string{"true"}, nil, dir, ""); err == nil {
 		t.Error("Start after Close must fail")
 	}
 	_ = s.Close() // idempotent
 }
 
 func TestKillAndWaitAfterAbandonedStart_reapsProcessGroup(t *testing.T) {
+	// origin: hot-update S5 PROC-LEAK / final process census.
+	testharness.GuardProcessDirectory(t, filepath.Dir(t.TempDir()))
+
+	dir := t.TempDir()
+
 	s, err := Allocate(80, 24)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = s.Close() }()
-	if err := s.Start([]string{"sh", "-c", "sleep 30"}, nil, "", ""); err != nil {
+	t.Cleanup(func() {
+		if pid := s.OSPID(); pid > 0 {
+			_ = syscall.Kill(-pid, syscall.SIGKILL)
+			_, _ = s.Wait()
+		}
+		_ = s.Close()
+	})
+	if err := s.Start([]string{"sh", "-c", "sleep 30"}, nil, dir, ""); err != nil {
 		t.Fatal(err)
 	}
 	pid := s.OSPID()
@@ -222,16 +291,31 @@ func TestKillAndWaitAfterAbandonedStart_reapsProcessGroup(t *testing.T) {
 // child like a real terminal close would, and Wait maps the signal death to
 // rc=-1 (pty.Wait's documented mapping — NOT 128+HUP).
 func TestHangupDeliversSIGHUPToProcessGroup(t *testing.T) {
+	// origin: hot-update S5 PROC-LEAK / final process census.
+	testharness.GuardProcessDirectory(t, filepath.Dir(t.TempDir()))
+
+	dir := t.TempDir()
+
 	s, err := Allocate(80, 24)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = s.Close() }()
-	if err := s.Start([]string{"sleep", "30"}, nil, "", ""); err != nil {
+	t.Cleanup(func() {
+		if pid := s.OSPID(); pid > 0 {
+			_ = syscall.Kill(-pid, syscall.SIGKILL)
+			_, _ = s.Wait()
+		}
+		_ = s.Close()
+	})
+	if err := s.Start([]string{"python3", "-c", "import os,signal; signal.signal(signal.SIGHUP,signal.SIG_DFL); open('ready','w').close(); os.execlp('sleep','sleep','30')"}, nil, dir, ""); err != nil {
 		t.Fatal(err)
 	}
 	go func() { _, _ = io.Copy(io.Discard, s.Master) }()
-	time.Sleep(100 * time.Millisecond)
+	// origin: hot-update S5 PROC-LEAK. The launcher can ignore HUP; a
+	// default-handler fixture must reset it explicitly and prove readiness.
+	if !testharness.WaitFor(t, 2*time.Second, 10*time.Millisecond, func() bool { _, err := os.Stat(filepath.Join(dir, "ready")); return err == nil }) {
+		t.Fatal("default HUP handler did not become ready")
+	}
 
 	s.Hangup()
 
@@ -254,12 +338,23 @@ func TestHangupDeliversSIGHUPToProcessGroup(t *testing.T) {
 // running — Hangup is "the terminal went away", NOT a kill escalation, and a
 // survivor honestly keeps its RUNNING row.
 func TestHangupSparesHUPImmuneChild(t *testing.T) {
+	// origin: hot-update S5 PROC-LEAK / final process census.
+	testharness.GuardProcessDirectory(t, filepath.Dir(t.TempDir()))
+
+	dir := t.TempDir()
+
 	s, err := Allocate(80, 24)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = s.Close() }()
-	if err := s.Start([]string{"sh", "-c", "trap '' HUP; sleep 30"}, nil, "", ""); err != nil {
+	t.Cleanup(func() {
+		if pid := s.OSPID(); pid > 0 {
+			_ = syscall.Kill(-pid, syscall.SIGKILL)
+			_, _ = s.Wait()
+		}
+		_ = s.Close()
+	})
+	if err := s.Start([]string{"sh", "-c", "trap '' HUP; sleep 30"}, nil, dir, ""); err != nil {
 		t.Fatal(err)
 	}
 	go func() { _, _ = io.Copy(io.Discard, s.Master) }()
@@ -282,12 +377,23 @@ func TestHangupSparesHUPImmuneChild(t *testing.T) {
 // Mutation check: making Hangup call Close() (which nils the pointer) makes
 // this test fail under -race.
 func TestHangupConcurrentMasterIONoRace(t *testing.T) {
+	// origin: hot-update S5 PROC-LEAK / final process census.
+	testharness.GuardProcessDirectory(t, filepath.Dir(t.TempDir()))
+
+	dir := t.TempDir()
+
 	s, err := Allocate(80, 24)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = s.Close() }()
-	if err := s.Start([]string{"sleep", "5"}, nil, "", ""); err != nil {
+	t.Cleanup(func() {
+		if pid := s.OSPID(); pid > 0 {
+			_ = syscall.Kill(-pid, syscall.SIGKILL)
+			_, _ = s.Wait()
+		}
+		_ = s.Close()
+	})
+	if err := s.Start([]string{"sleep", "5"}, nil, dir, ""); err != nil {
 		t.Fatal(err)
 	}
 	stop := make(chan struct{})

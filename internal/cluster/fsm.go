@@ -1,11 +1,14 @@
 package cluster
 
 import (
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -47,6 +50,23 @@ type fsm struct {
 	ro     *sql.DB // dedicated read-only handle (online-backup source, §3.8)
 	tmpDir string  // same-filesystem scratch for snapshot/restore temp files
 	dbPath string  // path of the live cluster DB file (for size guards/tests)
+
+	// origin: hot-update S6 plan §3.4 / T15
+	// Apply and the final restore check/install share one serialization point.
+	// Staging stays outside it so a slow snapshot cannot block new durable ACKs.
+	mutationMu sync.Mutex
+	snapshots  snapshotWork
+
+	// Raft snapshot/configuration floors are distinct from the SQL command
+	// cursor. Configuration-only entries must not change applied_index.
+	snapshotIndex, snapshotTerm, snapshotConfigIndex uint64
+	snapshotConfigDigest                             string
+	snapshotRaftIndex                                func() uint64
+	snapshotConfiguration                            func() (uint64, string, error)
+
+	// Test-only observer at the actual restore mutation point; nil in production.
+	// It witnesses serialization without manufacturing a database close receipt.
+	snapshotInstallObserve func()
 
 	appliers map[OpType]Applier
 	logger   *slog.Logger
@@ -162,6 +182,8 @@ func (f *fsm) Apply(l *raft.Log) any {
 // op (unless poison), same-txn applied_index UPSERT, commit. A nil cmd is a
 // poison entry that advances the cursor without executing any op SQL.
 func (f *fsm) applyCommand(l *raft.Log, cmd *Command) (any, error) {
+	f.mutationMu.Lock()
+	defer f.mutationMu.Unlock()
 	tx, err := f.db.Begin()
 	if err != nil {
 		return nil, fmt.Errorf("cluster: begin apply txn: %w", err)
@@ -411,7 +433,7 @@ func readAppliedIndexDB(db *sql.DB) (uint64, error) {
 // Apply). The DB file IS the state; the snapshot embeds no separate index
 // (raft v1.7.3 sets snapshot.Index itself; see snapshot.go).
 func (f *fsm) Snapshot() (raft.FSMSnapshot, error) {
-	return &fsmSnapshot{ro: f.ro, tmpDir: f.tmpDir}, nil
+	return &fsmSnapshot{ro: f.ro, tmpDir: f.tmpDir, owner: f}, nil
 }
 
 // Restore replaces live state from a snapshot stream (architecture §3.8 D1
@@ -422,3 +444,19 @@ func (f *fsm) Restore(rc io.ReadCloser) error {
 }
 
 var _ raft.FSM = (*fsm)(nil)
+
+// Configuration metadata has its own floor. Keep this a package function:
+// implementing raft.ConfigurationStore changes Raft's command-only FSM snapshot
+// cursor, including Snapshot's "nothing new" contract. The runtime reader below
+// obtains committed configuration metadata from the durable Raft stores instead.
+// origin: hot-update S6 plan §3.4 / T15; internal review rv-writer-11
+func recordSnapshotConfiguration(f *fsm, index uint64, configuration raft.Configuration) {
+	f.mutationMu.Lock()
+	defer f.mutationMu.Unlock()
+	if index < f.snapshotConfigIndex {
+		return // Raft replay of an already installed configuration.
+	}
+	digest := sha256.Sum256(raft.EncodeConfiguration(configuration))
+	f.snapshotConfigIndex = index
+	f.snapshotConfigDigest = hex.EncodeToString(digest[:])
+}

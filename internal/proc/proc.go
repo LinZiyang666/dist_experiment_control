@@ -16,9 +16,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/oklog/ulid/v2"
+
+	"github.com/LinZiyang666/tether/internal/cluster"
+	"github.com/LinZiyang666/tether/internal/upgradeauthority"
+	"github.com/LinZiyang666/tether/internal/upgradetx"
 )
 
 type State string
@@ -74,88 +79,17 @@ var (
 // NewPID generates a fresh ULID (lowercase) suitable for processes.pid.
 // Architecture B.5 specifies ULID for pid; lowercase keeps it subject-safe.
 func NewPID() string {
-	return ulidLower(ulid.Make())
-}
-
-func ulidLower(u ulid.ULID) string {
-	const enc = "0123456789abcdefghjkmnpqrstvwxyz"
-	const t = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
-	s := u.String()
-	out := make([]byte, len(s))
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		// ulid.String uses Crockford uppercase; lowercase the alpha part.
-		if idx := bytePos(t, c); idx >= 0 {
-			out[i] = enc[idx]
-		} else {
-			out[i] = c
-		}
-	}
-	return string(out)
-}
-
-func bytePos(s string, c byte) int {
-	for i := 0; i < len(s); i++ {
-		if s[i] == c {
-			return i
-		}
-	}
-	return -1
+	// ulid.String uses Crockford uppercase; lowercase the alpha part.
+	return strings.ToLower(ulid.Make().String())
 }
 
 // Insert records a new RUNNING process. The (sid, nid) tuple must already
 // exist in nodes (FK contract); if not, returns ErrNodeMissing.
 func Insert(db *sql.DB, p Process) error {
-	if p.PID == "" {
-		return fmt.Errorf("proc: pid required")
-	}
-	argvJSON, err := json.Marshal(p.Argv)
-	if err != nil {
-		return fmt.Errorf("proc: marshal argv: %w", err)
-	}
-
-	tx, err := db.Begin()
-	if err != nil {
-		return fmt.Errorf("proc: begin: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
-
-	var found int
-	switch err := tx.QueryRow(
-		`SELECT 1 FROM nodes WHERE sid=? AND nid=?`, p.SID, p.NID,
-	).Scan(&found); err {
-	case nil:
-		// node exists
-	case sql.ErrNoRows:
-		return ErrNodeMissing
-	default:
-		return fmt.Errorf("proc: lookup node: %w", err)
-	}
-
-	if _, err := tx.Exec(`
-		INSERT INTO processes(pid, sid, nid, argv, cwd, started_at, status, started_by_fp, boot_id, start_time_ticks)
-		VALUES (?,?,?,?,?,?,?,?,?,?)
-	`,
-		p.PID, p.SID, p.NID, string(argvJSON), p.Cwd,
-		p.StartedAt, string(StateRunning), p.StartedByFP, p.BootID,
-		nullableInt64(p.StartTimeTicks),
-	); err != nil {
-		return fmt.Errorf("proc: insert: %w", err)
-	}
-	return tx.Commit()
-}
-
-// nullableInt64 returns sql.NullInt64{Valid:false} for zero so the
-// processes.start_time_ticks column stays NULL when the agent didn't
-// report it (e.g. exec children). Without this the column gets
-// literal 0, which would compare-equal to a real "boot tick 0"
-// reading on a freshly-booted box and pass the G.1 triple check
-// spuriously.
-func nullableInt64(v int64) any {
-	if v == 0 {
-		return nil
-	}
-	return v
+	_, _, err := mutateProcess(db, nil, func(reader upgradeauthority.RowReader) (*cluster.Command, error) {
+		return planInsert(reader, p, "INSERT")
+	})
+	return err
 }
 
 // MarkExited transitions pid to EXITED with the given exit code. Returns
@@ -185,68 +119,75 @@ func MarkExited(db *sql.DB, pid, sid string, exitCode int, when time.Time) error
 	// FAIL CLOSED ON A MISSING sid, loudly, rather than degrading to the predicate
 	// this fence replaced.
 	//
-	// PlanMarkExited has an N-1 escape hatch for an empty sid because a broker on the
-	// previous release forwards without the field. THIS writer has no such caller: it
-	// runs only in single mode, where nothing is forwarded and every call site
+	// PlanMarkExited once had an N-1 escape hatch for an empty sid because a broker
+	// on the previous release forwards without the field; both writers now refuse it.
+	// THIS writer has no such caller: it runs only in single mode, where nothing is
+	// forwarded and every call site
 	// (exec.go, reconcileOnRegister) has the sid in hand. So an empty sid here can
 	// only be a future call site that forgot to pass one — and the failure mode of
 	// silently accepting it is that the fence disappears for that path while every
 	// test in exit_session_fence_test.go still passes, because they all pass a sid.
 	if sid == "" {
 		return fmt.Errorf("proc: mark exited: empty sid — this writer is single-mode only and all of " +
-			"its call sites have the session; the empty-sid N-1 hatch exists ONLY on the forwarded " +
+			"its call sites have the session; unscoped N-1 exits are also refused on the forwarded " +
 			"cluster path (PlanMarkExited)")
 	}
-	res, err := db.Exec(`
-		UPDATE processes
-		SET status='EXITED', exit_code=?, ended_at=?
-		WHERE pid=? AND sid=? AND status='RUNNING'
-	`, exitCode, when, pid, sid)
+	_, _, err := mutateProcess(db, nil, func(reader upgradeauthority.RowReader) (*cluster.Command, error) {
+		return planMarkExited(reader, pid, sid, exitCode, when)
+	})
+	return err
+}
+
+// MarkExitedGuarded rejects a delayed exit from another creation of the SID.
+// Destructive work must carry its original nonempty incarnation; it cannot learn
+// the replacement's identity as an ordinary first register can.
+// origin: hot-update S8 plan §6.2 / P34
+func MarkExitedGuarded(db *sql.DB, guard upgradeauthority.Guard, pid string, exitCode int, when time.Time) (string, error) {
+	_, actual, err := mutateProcess(db, &guard, func(reader upgradeauthority.RowReader) (*cluster.Command, error) {
+		return planMarkExited(reader, pid, guard.SID, exitCode, when)
+	})
+	return actual, err
+}
+
+// mutateProcess retains the creation comparison and actual UPDATE in one SQLite
+// transaction. Both direct writers consume the same SQL as their leader plans;
+// every statement retains the predicate so a saved plan also fences recreation.
+// origin: hot-update S8 plan §6.2 / P34
+func mutateProcess(db *sql.DB, guard *upgradeauthority.Guard, plan func(upgradeauthority.RowReader) (*cluster.Command, error)) (bool, string, error) {
+	tx, err := db.Begin()
 	if err != nil {
-		return fmt.Errorf("proc: mark exited: %w", err)
+		return false, "", err
 	}
-	n, _ := res.RowsAffected()
-	if n == 0 {
-		// Either unknown pid or already non-RUNNING. Distinguish.
-		// Audit shard 03 F6: previously the SELECT err was discarded
-		// — a transient DB error would silently report success while
-		// SQLite still says RUNNING but audit.proc{exit} got
-		// published. Surface non-ErrNoRows errors so the caller
-		// knows the row is in an unknown state.
-		//
-		// The existence probe is sid-scoped TOO, and that is load-bearing rather than
-		// symmetry: an unscoped probe would find the victim's row, conclude "already
-		// EXITED, idempotent no-op" and return nil — reporting SUCCESS to the very
-		// caller the UPDATE predicate just refused, which in exec.go publishes an
-		// audit.proc{exit} for a process that is still running. Scoped, a foreign pid
-		// is indistinguishable from an unknown one: ErrNotFound, no audit, and the
-		// caller's terminal ack tells the sender nothing about whether the pid exists.
-		//
-		// THAT LAST SENTENCE IS ABOUT THIS FUNCTION, and round 2 (E3) caught it being
-		// read as a claim about the SYSTEM. It was not true of the system: the only
-		// caller, handleProcEvent, answered its ack from an UNSCOPED pre-read that ran
-		// before this code was ever reached, so the indistinguishability this comment
-		// establishes was handed straight back one frame up. Both pre-reads are scoped
-		// now (GetInSession). What is NOT closed, and cannot be here, is that
-		// processes.pid is a GLOBAL primary key: a forged `started` for a pid that
-		// exists in another session fails its INSERT where an unused pid succeeds, so
-		// pid-existence remains observable to a caller willing to write. Closing that
-		// means re-keying the table on (sid, pid) — a migration, not a predicate.
-		var any int
-		switch err := db.QueryRow(`SELECT 1 FROM processes WHERE pid=? AND sid=?`, pid, sid).Scan(&any); {
-		case errors.Is(err, sql.ErrNoRows):
-			return ErrNotFound
-		case err != nil:
-			return fmt.Errorf("proc: existence check after no-op update: %w", err)
+	defer func() { _ = tx.Rollback() }()
+	actual, cmd, err := guardProcessPlan(tx, guard, func() (*cluster.Command, error) { return plan(tx) })
+	if err != nil {
+		return false, "", err
+	}
+	var changed int64
+	if cmd != nil {
+		for _, statement := range cmd.Body {
+			result, err := tx.Exec(statement.SQL)
+			if err != nil {
+				return false, "", err
+			}
+			n, err := result.RowsAffected()
+			if err != nil {
+				// Cannot tell. Report NOT moved: the caller's only use of a true is to
+				// unlock a kill, so an unknown must never read as evidence.
+				return false, "", fmt.Errorf("proc: mutation rows affected: %w", err)
+			}
+			changed += n
 		}
-		// Already EXITED (or LOST). Idempotent — treat as no-op.
 	}
-	return nil
+	if err := tx.Commit(); err != nil {
+		return false, "", err
+	}
+	return changed > 0, actual, nil
 }
 
 // GetInSession returns the row for pid WITHIN sid, or ErrNotFound.
 //
-// origin: prerelease audit round 2, E3. MarkExited's existence probe above is
+// origin: prerelease audit round 2, E3. MarkExited's shared existence probe is
 // sid-scoped so that "somebody else's pid" and "no such pid" are indistinguishable
 // to a caller, and the comment there says exactly that. It was only true of the
 // WRITE. Both of the broker's audit-dedup pre-reads (internal/broker/exec.go)
@@ -262,13 +203,7 @@ func MarkExited(db *sql.DB, pid, sid string, exitCode int, when time.Time) error
 // in", and folding the two would make every one of them assert something weaker
 // than it does today.
 func GetInSession(db *sql.DB, sid, pid string) (*Process, error) {
-	row := db.QueryRow(`
-		SELECT pid, sid, nid, argv, cwd, started_at, ended_at, status, exit_code,
-		       started_by_fp, boot_id, start_time_ticks
-		FROM processes
-		WHERE pid = ? AND sid = ?
-	`, pid, sid)
-	return scanProcess(row)
+	return scanProcess(db.QueryRow(`SELECT `+processColumns+` FROM processes WHERE pid = ? AND sid = ?`, pid, sid))
 }
 
 // Get returns the row for pid, IGNORING which session owns it.
@@ -278,13 +213,7 @@ func GetInSession(db *sql.DB, sid, pid string) (*Process, error) {
 // that has a sid — and every one of them does, it is in the subject — wants
 // GetInSession.
 func Get(db *sql.DB, pid string) (*Process, error) {
-	row := db.QueryRow(`
-		SELECT pid, sid, nid, argv, cwd, started_at, ended_at, status, exit_code,
-		       started_by_fp, boot_id, start_time_ticks
-		FROM processes
-		WHERE pid = ?
-	`, pid)
-	return scanProcess(row)
+	return scanProcess(db.QueryRow(`SELECT `+processColumns+` FROM processes WHERE pid = ?`, pid))
 }
 
 // ListBySessionOpts narrows the result of the per-session process list.
@@ -322,9 +251,7 @@ type ListBySessionOpts struct {
 // IncludeExited=true uses the (sid, started_at) composite from
 // migration 0005 with the LIMIT short-circuiting the index walk.
 func ListBySessionFiltered(db *sql.DB, sid string, opts ListBySessionOpts) ([]Process, error) {
-	q := `SELECT pid, sid, nid, argv, cwd, started_at, ended_at, status, exit_code,
-	             started_by_fp, boot_id, start_time_ticks
-	      FROM processes WHERE sid = ?`
+	q := `SELECT ` + processColumns + ` FROM processes WHERE sid = ?`
 	args := []any{sid}
 	if !opts.IncludeExited {
 		// Equality, not inequality — see ListBySessionOpts doc.
@@ -433,6 +360,8 @@ func GCExited(db *sql.DB, cutoff time.Time) (int64, error) {
 	return res.RowsAffected()
 }
 
+const processColumns = `pid, sid, nid, argv, cwd, started_at, ended_at, status, exit_code, started_by_fp, boot_id, start_time_ticks`
+
 type scanner interface {
 	Scan(dest ...any) error
 }
@@ -446,17 +375,11 @@ func scanProcess(s scanner) (*Process, error) {
 }
 
 func scanProcessRow(s scanner) (*Process, error) {
-	var (
-		p              Process
-		argvJSON       string
-		cwd            sql.NullString
-		endedAt        sql.NullTime
-		exitCode       sql.NullInt64
-		startedBy      sql.NullString
-		bootID         sql.NullString
-		startTimeTicks sql.NullInt64
-		statusStr      string
-	)
+	var p Process
+	var argvJSON, statusStr string
+	var cwd, startedBy, bootID sql.NullString
+	var endedAt sql.NullTime
+	var exitCode, startTimeTicks sql.NullInt64
 	if err := s.Scan(&p.PID, &p.SID, &p.NID, &argvJSON, &cwd, &p.StartedAt,
 		&endedAt, &statusStr, &exitCode, &startedBy, &bootID, &startTimeTicks); err != nil {
 		return nil, err
@@ -466,8 +389,7 @@ func scanProcessRow(s scanner) (*Process, error) {
 	}
 	p.Cwd = cwd.String
 	if endedAt.Valid {
-		t := endedAt.Time
-		p.EndedAt = &t
+		p.EndedAt = &endedAt.Time
 	}
 	p.Status = State(statusStr)
 	if exitCode.Valid {
@@ -476,9 +398,7 @@ func scanProcessRow(s scanner) (*Process, error) {
 	}
 	p.StartedByFP = startedBy.String
 	p.BootID = bootID.String
-	if startTimeTicks.Valid {
-		p.StartTimeTicks = startTimeTicks.Int64
-	}
+	p.StartTimeTicks = startTimeTicks.Int64
 	return &p, nil
 }
 
@@ -511,17 +431,70 @@ func scanProcessRow(s scanner) (*Process, error) {
 // SIGKILL on the operator's running work, so "did it move" has to be an ANSWER, not an
 // inference from the absence of an error.
 func Refile(db *sql.DB, sid, pid, from, to string) (bool, error) {
-	res, err := db.Exec(
-		`UPDATE processes SET nid = ? WHERE sid = ? AND pid = ? AND nid = ? AND status = 'RUNNING'`,
-		to, sid, pid, from)
+	moved, _, err := mutateProcess(db, nil, func(upgradeauthority.RowReader) (*cluster.Command, error) {
+		return planRefile(sid, from, to, []string{pid})
+	})
+	return moved, err
+}
+
+// RefileGuarded refuses adoption by a cleanup/register from a previous creation.
+// The returned incarnation is meaningful only after the transaction commits.
+// origin: hot-update S8 plan §6.2 / P34
+func RefileGuarded(db *sql.DB, guard upgradeauthority.Guard, pid, from, to string) (bool, string, error) {
+	return mutateProcess(db, &guard, func(upgradeauthority.RowReader) (*cluster.Command, error) {
+		return planRefile(guard.SID, from, to, []string{pid})
+	})
+}
+
+// guardProcessPlan is called inside the writer transaction or serialized leader
+// planner. An entry-only comparison would authorize a saved command after the
+// SID was deleted and recreated; the exact creation predicate must reach Apply.
+// The process fence retains SID/PID and refile's from-NID/RUNNING checks. Instance
+// and configured-name admission belongs to the node adapter: nodes has no durable
+// instance column, and a live lease rename must not make its exit reports invalid.
+// origin: hot-update S8 plan §6.2 / P34
+func guardProcessPlan(reader upgradeauthority.RowReader, guard *upgradeauthority.Guard, plan func() (*cluster.Command, error)) (string, *cluster.Command, error) {
+	actual, predicate := "", ""
+	if guard != nil {
+		if guard.Incarnation == "" {
+			return "", nil, &upgradetx.Error{Code: upgradetx.CodeSessionIncarnationMismatch, Detail: "process mutation requires an incarnation"}
+		}
+		creation, err := upgradeauthority.ReadCreation(reader, *guard)
+		if err != nil {
+			return "", nil, err
+		}
+		query, _, err := upgradeauthority.CreationPredicate(creation)
+		if err != nil {
+			return "", nil, err
+		}
+		lits, err := cluster.LitTextAll(creation.SID, creation.Owner, creation.CreatedAtText, creation.EncodedPINHash)
+		if err != nil {
+			return "", nil, fmt.Errorf("proc: creation literal: %w", err)
+		}
+		parts := strings.Split(query, "?")
+		predicate = parts[0]
+		for i, literal := range lits {
+			predicate += literal + parts[i+1]
+		}
+		actual = guard.Incarnation
+	}
+	cmd, err := plan()
+	if err == nil && cmd != nil && predicate != "" {
+		for i := range cmd.Body {
+			cmd.Body[i].SQL += ` AND ` + predicate
+		}
+	}
+	return actual, cmd, err
+}
+
+// PlanRefileStatementsGuarded appends guarded moves to the existing node op.
+// origin: hot-update S8 plan §6.2 / P34
+func PlanRefileStatementsGuarded(db *sql.DB, guard upgradeauthority.Guard, from, to string, pids []string) (string, []cluster.Statement, error) {
+	actual, cmd, err := guardProcessPlan(db, &guard, func() (*cluster.Command, error) {
+		return planRefile(guard.SID, from, to, pids)
+	})
 	if err != nil {
-		return false, err
+		return "", nil, err
 	}
-	n, aerr := res.RowsAffected()
-	if aerr != nil {
-		// Cannot tell. Report NOT moved: the caller's only use of a true is to
-		// unlock a kill, so an unknown must never read as evidence.
-		return false, fmt.Errorf("proc: refile rows affected: %w", aerr)
-	}
-	return n > 0, nil
+	return actual, cmd.Body, nil
 }

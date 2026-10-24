@@ -18,3 +18,12 @@ var applyFailHook func(index uint64) error
 // is incomplete). Used by the §13.4 fp3 fault point to SIGKILL the child mid-backup
 // and prove the live DB is untouched. Test-only (nil in production).
 var backupStepGate func()
+
+// setImageCloseHook injects receipt errors after actual object cleanup. The
+// object's phase remains unknown despite its already-closed kernel descriptor.
+// origin: hot-update S6 plan §3.2 / T10
+func setImageCloseHook(n *Node, hook func(string) error) {
+	n.image.shutdownMu.Lock()
+	defer n.image.shutdownMu.Unlock()
+	n.image.closeHook = hook
+}

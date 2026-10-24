@@ -241,7 +241,22 @@ type Policy struct {
 	hasHangable bool
 	fallback    []string // existence-checked local fallback PATH dirs
 	health      map[string]*mountHealth
-	wedged      int
+	wedged      int // abandoned operations, held until the reaper finishes
+	inFlight    int // operations still inside their bounded window
+	// A cut closes admission and drains under the same mutex as acquisition.
+	// Runtime closes its creation gate FIRST: an admitted startup must still
+	// be able to acquire here and finish adoption before the table freezes.
+	// origin: hot-update S4 plan §4.1 / SPAWN-INFLIGHT (drill 36.A).
+	spawnCut     chan struct{}
+	spawnChanged chan struct{}
+	// probesInFlight counts probe goroutines launched and not yet returned.
+	// It is deliberately NOT derived from the health map: applyMounts drops
+	// an entry whose mount signature changed while its probe is still in
+	// D-state, and a sticky-dead entry keeps its result channel after the
+	// timeout. Both hide a live goroutine from any map walk; the image fence
+	// must see every one of them (Export refuses while any is in flight).
+	// origin: hot-update S2 plan D9.
+	probesInFlight int
 }
 
 // Config carries the operator-tunable knobs from agent.yaml/Config.
@@ -379,7 +394,8 @@ func (p *Policy) validSafeDir(dir string) bool {
 // slot, so a healthy-classified-but-actually-dead path cannot hang startup
 // (external review F3). The abandoned goroutine releases its slot on recovery.
 func (p *Policy) boundedTouch(fn func() bool) bool {
-	if !p.TryAcquireSpawnSlot() {
+	slot := p.acquireSpawnSlot()
+	if slot == nil {
 		return false
 	}
 	done := make(chan bool, 1)
@@ -388,13 +404,14 @@ func (p *Policy) boundedTouch(fn func() bool) bool {
 		// Publish only after releasing the shared slot. Otherwise a caller woken
 		// by the result can immediately fail its next healthy operation when
 		// wedge_ceiling=1.
-		p.ReleaseSpawnSlot()
+		slot.release()
 		done <- ok
 	}()
 	select {
 	case ok := <-done:
 		return ok
 	case <-time.After(p.probeTimeout):
+		slot.abandon()
 		return false
 	}
 }
@@ -664,7 +681,10 @@ func (p *Policy) pathOnDeadMount(path string) bool {
 // Probes deliberately do NOT take a wedge slot: 64 stuck spawns must never be
 // able to starve the one probe that would teach the agent its mount died.
 func (p *Policy) mountHealthy(mp string) bool {
-	p.mu.Lock()
+	// Probe launch must share the slot fence, including after a mount-table
+	// change or TTL invalidation. An empty census alone is not a safe cut.
+	// origin: hot-update S4 plan §4.1 / SPAWN-INFLIGHT test 4.
+	p.lockSpawnAdmission()
 	h := p.health[mp]
 	if h == nil {
 		h = &mountHealth{}
@@ -713,7 +733,15 @@ func (p *Policy) mountHealthy(mp string) bool {
 		h.done = make(chan struct{})
 		ch := h.result
 		probe := p.probe
-		go func() { ch <- probe(mp) }()
+		p.probesInFlight++
+		go func() {
+			ok := probe(mp)
+			p.mu.Lock()
+			p.probesInFlight--
+			p.notifySpawnChangedLocked()
+			p.mu.Unlock()
+			ch <- ok
+		}()
 	}
 	ch := h.result
 	done := h.done
@@ -1032,7 +1060,8 @@ func appendFallback(dirs, fallback []string) []string {
 // handler unbounded (external review F1). On timeout it returns a fail-fast
 // remote_fs_spawn_timeout; the abandoned stat releases its slot on fs recovery.
 func (p *Policy) boundedResolveInDirs(name string, dirs []string) (string, error) {
-	if !p.TryAcquireSpawnSlot() {
+	slot := p.acquireSpawnSlot()
+	if slot == nil {
 		return "", &FSError{Code: ReasonTooManyWedged}
 	}
 	type res struct {
@@ -1046,7 +1075,7 @@ func (p *Policy) boundedResolveInDirs(name string, dirs []string) (string, error
 	ch := make(chan res, 1)
 	go func() {
 		r, ok := resolve(name, dirs)
-		p.ReleaseSpawnSlot()
+		slot.release()
 		ch <- res{r, ok}
 	}()
 	select {
@@ -1059,6 +1088,7 @@ func (p *Policy) boundedResolveInDirs(name string, dirs []string) (string, error
 		}
 		return r.path, nil
 	case <-time.After(p.probeTimeout):
+		slot.abandon()
 		// Evidence: resolution wedged, so some dir we walked is on a mount whose
 		// cached healthy verdict is stale. Expire them before returning, so the
 		// NEXT command re-probes and drops the dead dir instead of repeating this
@@ -1139,7 +1169,8 @@ func (p *Policy) RunStartWithCleanup(
 	onAbandon func(),
 	reapOnReturn func(error),
 ) error {
-	if !p.TryAcquireSpawnSlot() {
+	slot := p.acquireSpawnSlot()
+	if slot == nil {
 		return ErrTooManyWedged
 	}
 	done := make(chan error, 1)
@@ -1147,9 +1178,13 @@ func (p *Policy) RunStartWithCleanup(
 
 	select {
 	case err := <-done:
-		p.ReleaseSpawnSlot()
+		slot.release()
 		return err
 	case <-time.After(timeout):
+		// Publish the hazard before any cleanup callback: a stalled or late
+		// reaper remains unimageable until all of its child ownership is gone.
+		// origin: hot-update S4 plan §4.1 / SPAWN-INFLIGHT test 2.
+		slot.abandon()
 		// Evidence: the execve itself wedged (argv[0] or cwd is on a mount we still
 		// believe is healthy). Expire cached healthy verdicts BEFORE onAbandon so the
 		// next spawn re-probes — see invalidateHealthy.
@@ -1163,16 +1198,17 @@ func (p *Policy) RunStartWithCleanup(
 			if reapOnReturn != nil {
 				reapOnReturn(err)
 			}
-			p.ReleaseSpawnSlot()
+			slot.release()
 		}()
 		return ErrSpawnTimeout
 	}
 }
 
 // TryAcquireSpawnSlot reserves one of the bounded concurrent-spawn slots,
-// returning false at the wedge ceiling. Pair every true with exactly one
-// ReleaseSpawnSlot — immediately on an in-time start, or from the reaper when an
-// abandoned start finally returns (so a recovered mount frees the slot).
+// returning false at the wedge ceiling or while image admission is closed.
+// Pair every true with exactly one ReleaseSpawnSlot. Raw reservations remain
+// InFlight until released; the timed watchdogs own the transition to
+// Wedged and retain it until reaping finishes.
 //
 // Callers that must clean up resources on abandon (close exec pipes, Wait the
 // child) use RunStartWithCleanup, NOT these primitives directly. The older advice
@@ -1180,22 +1216,25 @@ func (p *Policy) RunStartWithCleanup(
 // StdoutPipe/StderrPipe" — predates RunStartWithCleanup and is what led the agent
 // to grow a second, line-for-line copy of the watchdog; that copy is exactly where
 // gotcha #81's invalidation hook would have been forgotten. These primitives are
-// now only for callers doing something neither watchdog models (boundedTouch).
+// now only for external accounting. The policy's watchdogs use per-operation
+// tokens so a late timeout cannot mark another caller's healthy slot abandoned.
+// origin: hot-update S4 plan §4.1 / SPAWN-INFLIGHT test 4.
 func (p *Policy) TryAcquireSpawnSlot() bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.wedged >= p.wedgeCeiling {
+	if p.spawnCut != nil || p.inFlight+p.wedged >= p.wedgeCeiling {
 		return false
 	}
-	p.wedged++
+	p.inFlight++
 	return true
 }
 
 // ReleaseSpawnSlot frees a slot acquired by TryAcquireSpawnSlot.
 func (p *Policy) ReleaseSpawnSlot() {
 	p.mu.Lock()
-	if p.wedged > 0 {
-		p.wedged--
+	if p.inFlight > 0 {
+		p.inFlight--
+		p.notifySpawnChangedLocked()
 	}
 	p.mu.Unlock()
 }

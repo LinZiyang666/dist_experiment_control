@@ -1,10 +1,14 @@
 package cluster
 
-import "strconv"
+import "github.com/LinZiyang666/tether/internal/cluster/state"
 
-// applied_index / applied_term are stored as decimal TEXT in cluster_meta
-// (key/value are both TEXT). These helpers are the single encode/decode point.
+// SQL planning stays below Raft; this facade preserves the cluster API.
+// origin: hot-update S6 plan §9.3 / CLUSTER-SLIM
 
-func formatUint(n uint64) string { return strconv.FormatUint(n, 10) }
+func formatUint(n uint64) string {
+	return state.FormatUint(n)
+}
 
-func parseUint(s string) (uint64, error) { return strconv.ParseUint(s, 10, 64) }
+func parseUint(s string) (uint64, error) {
+	return state.ParseUint(s)
+}
