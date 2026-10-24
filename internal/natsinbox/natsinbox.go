@@ -2,10 +2,10 @@ package natsinbox
 
 import (
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/auth"
+	"github.com/LinZiyang666/tether/internal/controlbudget"
 	"github.com/nats-io/nats.go"
 )
 
@@ -71,55 +71,24 @@ func InboxConnectOptions(pubKey string) []nats.Option {
 // connection) that is unmeasurable; for a one-shot ctl command it is a single extra RTT
 // on a connection that is about to make at least one request anyway.
 func Connect(url, pubKey string, opts []nats.Option) (nc *nats.Conn, fellBack bool, err error) {
-	// Discover the caller's async error handler and dial timeout WITHOUT connecting, so
-	// the wrapper below can chain to the handler rather than replace it. Options are
-	// plain functions over nats.Options; applying them to a throwaway value is the only
-	// way to read what a caller configured.
-	inspect := nats.GetDefaultOptions()
-	for _, o := range opts {
-		if o == nil {
-			continue
-		}
-		if e := o(&inspect); e != nil {
-			return nil, false, e
-		}
+	inspect, err := inspectConnectOptions(opts)
+	if err != nil {
+		return nil, false, err
 	}
-	prevErrCB := inspect.AsyncErrorCB
-
 	prefix := auth.InboxPrefixFor(pubKey)
-	var mu sync.Mutex
-	refused := false
-
-	deep := make([]nats.Option, 0, len(opts)+3)
-	deep = append(deep, opts...)
-	deep = append(deep, InboxConnectOptions(pubKey)...)
-	deep = append(deep, nats.ErrorHandler(func(c *nats.Conn, sub *nats.Subscription, aerr error) {
-		if aerr != nil && isInboxRefusal(aerr.Error(), prefix) {
-			mu.Lock()
-			refused = true
-			mu.Unlock()
-			// Deliberately NOT forwarded to the caller's handler: this connection is
-			// about to be replaced, and a "permissions violation" line the operator can
-			// do nothing about is exactly the noise that trains people to ignore the
-			// handler. The fallback is reported through the return value instead.
-			return
-		}
-		if prevErrCB != nil {
-			prevErrCB(c, sub, aerr)
-		}
-	}))
+	deep := privateConnectOptions(pubKey, opts, inspect.AsyncErrorCB)
 
 	nc, err = nats.Connect(url, deep...)
 	if err != nil {
 		return nil, false, err
 	}
-	if inboxUsable(nc, prefix, flushBudget(inspect.Timeout)) {
-		mu.Lock()
-		ok := !refused
-		mu.Unlock()
-		if ok {
-			return nc, false, nil
-		}
+	refused, _, probeErr := probeInbox(nc, prefix, flushBudget(inspect.Timeout))
+	// A flush that does not complete says nothing about the grant. Treat it as
+	// usable and let the caller's own request timeouts speak: falling back here
+	// would silently downgrade a healthy connection to the shared inbox on nothing
+	// more than a slow link. Within instead returns the failed admission.
+	if probeErr != nil || !refused {
+		return nc, false, nil //nolint:nilerr // The legacy API leaves probe failures to caller request timeouts; only a proved refusal authorizes fallback.
 	}
 	// The peer will not grant this identity its own inbox. Fall back to exactly the
 	// connection a pre-cutover client would have made: no prefix, no marker.
@@ -131,22 +100,132 @@ func Connect(url, pubKey string, opts []nats.Option) (nc *nats.Conn, fellBack bo
 	return nc, true, nil
 }
 
-// inboxUsable subscribes to this connection's own inbox and reports whether the server
-// accepted it. See Connect for why a single Flush is sufficient synchronisation.
-func inboxUsable(nc *nats.Conn, prefix string, budget time.Duration) bool {
+// ConnectWithin admits both the private inbox and its N-1 fallback under one
+// absolute deadline. The caller supplies proxydial.OptionsWithin with the same
+// deadline to bound DNS, multi-URL dialing and TLS/WSS below nats.Connect.
+// Admission does not install a timer on the returned, long-lived connection.
+// origin: hot-update S6 plan §8.2 / T34
+func ConnectWithin(url, pubKey string, opts []nats.Option, deadline controlbudget.Deadline,
+	observer controlbudget.Observer) (result *nats.Conn, fallback bool, resultErr error) {
+	// The composite owner ends admission after private negotiation, including a
+	// proved legacy re-dial. An asynchronous first-CONNECT callback is too early.
+	// origin: hot-update S6 internal review rv-ctl-14
+	defer func() {
+		inspect, err := inspectConnectOptions(opts)
+		if err == nil {
+			if dialer, ok := inspect.CustomDialer.(interface{ FinishConnect(error) error }); ok {
+				resultErr = dialer.FinishConnect(resultErr)
+			}
+		}
+		if resultErr != nil && result != nil {
+			result.Close()
+			result = nil
+		}
+	}()
+	if _, err := inboxRemaining(deadline); err != nil {
+		return nil, false, err
+	}
+	inspect, err := inspectConnectOptions(opts)
+	if err != nil {
+		return nil, false, err
+	}
+	deep := privateConnectOptions(pubKey, opts, inspect.AsyncErrorCB)
+	nc, err := connectInboxWithin(url, deep, inspect.Timeout, deadline, observer, controlbudget.PhaseConnect)
+	if err != nil {
+		return nil, false, err
+	}
+	attempt, err := beginInboxAttempt(observer, controlbudget.PhaseInboxProbe)
+	if err != nil {
+		nc.Close()
+		return nil, false, err
+	}
+	remaining, err := inboxRemaining(deadline)
+	refused := false
+	sent := false
+	if err == nil {
+		// Unlike the legacy probe, there is no 500ms floor: every round trip
+		// consumes only the operation's remaining admission time.
+		refused, sent, err = probeInbox(nc, auth.InboxPrefixFor(pubKey), min(remaining, flushBudget(inspect.Timeout)))
+		if err == nil {
+			_, err = inboxRemaining(deadline)
+		}
+	}
+	class := inboxAttemptClass(err)
+	if err == nil && refused {
+		class = "refused"
+	}
+	err = finishInboxAttempt(observer, attempt, sent, class, err)
+	if err != nil {
+		nc.Close()
+		return nil, false, err
+	}
+	if !refused {
+		return nc, false, nil
+	}
+	// A completed flush plus the exact subject refusal is the only downgrade
+	// proof. Timeout, disconnect and unrelated permissions cannot grant fallback.
+	nc.Close()
+	nc, err = connectInboxWithin(url, opts, inspect.Timeout, deadline, observer, controlbudget.PhaseInboxFallback)
+	if err != nil {
+		return nil, false, err
+	}
+	return nc, true, nil
+}
+
+// inspectConnectOptions discovers the caller's async error handler and dial timeout
+// WITHOUT connecting, so the wrapper can chain to the handler rather than replace it.
+// Options are plain functions over nats.Options; applying them to a throwaway value
+// is the only way to read what a caller configured.
+// Applying options to a fresh value also keeps our appended options out of the
+// caller's backing slice, which may be reused by later connection attempts.
+func inspectConnectOptions(opts []nats.Option) (nats.Options, error) {
+	inspect := nats.GetDefaultOptions()
+	for _, option := range opts {
+		if option != nil {
+			if err := option(&inspect); err != nil {
+				return nats.Options{}, err
+			}
+		}
+	}
+	return inspect, nil
+}
+
+func privateConnectOptions(pubKey string, opts []nats.Option, previous nats.ErrHandler) []nats.Option {
+	prefix := auth.InboxPrefixFor(pubKey)
+	deep := append([]nats.Option(nil), opts...)
+	deep = append(deep, InboxConnectOptions(pubKey)...)
+	return append(deep, nats.ErrorHandler(func(c *nats.Conn, sub *nats.Subscription, err error) {
+		if err != nil && isInboxRefusal(err.Error(), prefix) {
+			// Deliberately NOT forwarded to the caller's handler: this connection is
+			// about to be replaced, and a "permissions violation" line the operator can
+			// do nothing about is exactly the noise that trains people to ignore the
+			// handler. The fallback is reported through the return value instead.
+			return
+		}
+		if previous != nil {
+			previous(c, sub, err)
+		}
+	}))
+}
+
+// probeInbox separates a proved refusal from a failed round trip. LastError is
+// updated synchronously before the matching PONG; the async callback is not a
+// barrier and can run after the connection has already been replaced.
+// origin: hot-update S6 plan §8.2 / T34
+func probeInbox(nc *nats.Conn, prefix string, budget time.Duration) (refused, sent bool, err error) {
 	sub, err := nc.SubscribeSync(prefix + ".>")
 	if err != nil {
-		return false
+		return false, false, err
 	}
 	defer func() { _ = sub.Unsubscribe() }()
 	if err := nc.FlushTimeout(budget); err != nil {
-		// A flush that does not complete says nothing about the grant. Treat it as
-		// usable and let the caller's own request timeouts speak: falling back here
-		// would silently downgrade a healthy connection to the shared inbox on nothing
-		// more than a slow link.
-		return true
+		// A flush that does not complete says nothing about the grant. Falling
+		// back would silently downgrade a healthy connection to a shared inbox
+		// on nothing more than a slow link. The legacy API lets its caller's
+		// request timeouts speak; Within returns the failed admission instead.
+		return false, true, err
 	}
-	return !isInboxRefusal(lastErrText(nc), prefix)
+	return isInboxRefusal(lastErrText(nc), prefix), true, nil
 }
 
 // isInboxRefusal matches the one server message that means "you may not subscribe to

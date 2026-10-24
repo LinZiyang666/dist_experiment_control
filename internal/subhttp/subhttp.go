@@ -21,7 +21,9 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/LinZiyang666/tether/internal/controlbudget"
 	"github.com/LinZiyang666/tether/internal/httplisten"
+	"github.com/LinZiyang666/tether/internal/listenerimage"
 	"github.com/LinZiyang666/tether/internal/proxysub"
 	"github.com/LinZiyang666/tether/internal/session"
 )
@@ -31,6 +33,11 @@ const maxTokenLen = 256
 
 // Config wires the handler to its read-only dependencies.
 type Config struct {
+	// CurrentDB resolves the runtime slot once per request after admission. A
+	// thaw may reopen SQLite into a new handle; keeping the cold DB in a
+	// captured handler would query the closed old generation forever.
+	// origin: hot-update S6 plan §6.1 / T20
+	CurrentDB  func() *sql.DB
 	DB         *sql.DB
 	PublicHost string // host printed in node entries (broker's public DNS name; the per-node FALLBACK)
 	Logger     *slog.Logger
@@ -71,15 +78,28 @@ func serveSub(w http.ResponseWriter, r *http.Request, cfg Config) {
 		return
 	}
 
+	// Resolve once: the HTTP owner's join prevents replacement until this
+	// request leaves. Every SQL operation inherits request cancellation.
+	// origin: hot-update S6 plan §6.1 / T20
+	db := cfg.DB
+	if cfg.CurrentDB != nil {
+		db = cfg.CurrentDB()
+	}
+	if db == nil {
+		http.Error(w, "store unavailable", http.StatusServiceUnavailable)
+		return
+	}
 	tokenHash := proxysub.HashToken(token)
-	sid, err := proxysub.LookupSIDByTokenHash(cfg.DB, tokenHash)
+	var sid string
+	err := db.QueryRowContext(r.Context(), `SELECT sid FROM proxy_subscribers WHERE token_hash=? AND state='ACTIVE'`, tokenHash).Scan(&sid)
 	if err != nil {
 		// Unknown OR revoked → identical 404 (no existence oracle).
 		notFound(w)
 		return
 	}
 	// Session must be ACTIVE (a DELETING session yields the same 404).
-	if active, err := session.IsActive(cfg.DB, sid); err != nil || !active {
+	var state string
+	if err := db.QueryRowContext(r.Context(), `SELECT state FROM sessions WHERE sid=?`, sid).Scan(&state); err != nil || state != string(session.StateActive) {
 		notFound(w)
 		return
 	}
@@ -89,20 +109,21 @@ func serveSub(w http.ResponseWriter, r *http.Request, cfg Config) {
 		notFound(w)
 		return
 	}
-	sub, err := proxysub.LookupByTokenHash(cfg.DB, sid, tokenHash)
+	var cipher, psk string
+	err = db.QueryRowContext(r.Context(), `SELECT cipher, psk FROM proxy_subscribers WHERE sid=? AND token_hash=? AND state='ACTIVE'`, sid, tokenHash).Scan(&cipher, &psk)
 	if err != nil {
 		notFound(w)
 		return
 	}
 
-	nodes, err := liveProxyNodes(cfg.DB, sid, cfg.ClusterMode)
+	nodes, err := liveProxyNodesContext(r.Context(), db, sid, cfg.ClusterMode)
 	if err != nil {
 		cfg.Logger.Warn("subhttp: live nodes query", "err", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
 
-	body, err := renderClash(sid, cfg.PublicHost, sub.Cipher, sub.PSK, nodes)
+	body, err := renderClash(sid, cfg.PublicHost, cipher, psk, nodes)
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
@@ -146,8 +167,15 @@ func LiveProxyNodes(db *sql.DB, sid string) ([]ProxyNode, error) {
 // (the broker that terminates that node's tunnel), and a node whose home is NOT a VOTER is EXCLUDED
 // (un-vendable until it rehomes) — so /sub from any broker returns working exits.
 func liveProxyNodes(db *sql.DB, sid string, clusterMode bool) ([]ProxyNode, error) {
+	ctx := context.Background() // ctx-none: legacy exported read API has no caller context.
+	return liveProxyNodesContext(ctx, db, sid, clusterMode)
+}
+
+// Request queries use the owner's cancellable root, including rows iteration.
+// origin: hot-update S6 plan §6.1 / T20
+func liveProxyNodesContext(ctx context.Context, db *sql.DB, sid string, clusterMode bool) ([]ProxyNode, error) {
 	if !clusterMode {
-		rows, err := db.Query(`
+		rows, err := db.QueryContext(ctx, `
 			SELECT pa.nid, pa.port
 			FROM port_allocations pa
 			JOIN nodes n ON n.sid = pa.sid AND n.nid = pa.nid
@@ -176,7 +204,7 @@ func liveProxyNodes(db *sql.DB, sid string, clusterMode bool) ([]ProxyNode, erro
 		return out, rows.Err()
 	}
 	// Cluster mode: JOIN the home broker (must be a VOTER) and project its public_host per node.
-	rows, err := db.Query(`
+	rows, err := db.QueryContext(ctx, `
 		SELECT pa.nid, pa.port, cn.public_host
 		FROM port_allocations pa
 		JOIN nodes n ON n.sid = pa.sid AND n.nid = pa.nid
@@ -270,4 +298,12 @@ func Bind(addr string) (net.Listener, error) {
 // ServeListener serves /sub on an already-bound listener until ctx is canceled.
 func ServeListener(ctx context.Context, ln net.Listener, cfg Config) error {
 	return httplisten.Serve(ctx, ln, Handler(cfg), "subhttp")
+}
+
+// StartImage gives the broker a tracked owner for the inherited subscription
+// listener. CurrentDB should read the current runtime slot when thaw can reopen
+// the store; a new image supplies its freshly opened DB before admission.
+// origin: hot-update S6 plan §6.1 / §12.1 P09
+func StartImage(k listenerimage.Keeper, cfg Config, deadline controlbudget.Deadline) (httplisten.ImageOwner, error) {
+	return httplisten.StartImage(k, Handler(cfg), "subhttp", deadline)
 }

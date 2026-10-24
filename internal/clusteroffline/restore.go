@@ -69,9 +69,6 @@ type RestoreResult struct {
 
 // RestoreFromBackup installs a cluster backup bundle as a fresh single-voter cluster.
 func RestoreFromBackup(opts RestoreOptions) (*RestoreResult, error) {
-	if opts.Now == nil {
-		opts.Now = time.Now
-	}
 	if opts.Logger == nil {
 		opts.Logger = slog.Default()
 	}
@@ -80,6 +77,13 @@ func RestoreFromBackup(opts RestoreOptions) (*RestoreResult, error) {
 	}
 
 	// (1) flock + (2) live-daemon interlock.
+	// origin: hot-update S6 plan §3.1 / T05
+	// Bind DB and lock before offline surgery can touch either store.
+	identity, err := storage.CanonicalStoreIdentity(opts.DBPath, opts.DataDir)
+	if err != nil {
+		return nil, err
+	}
+	opts.DBPath, opts.DataDir = identity.Path, identity.DataDir
 	warnRootDataDirOwner(opts.DataDir, opts.Logger) // #6: nudge if run as root against a tether-owned data dir
 	release, err := cluster.AcquireDataDirLock(opts.DataDir)
 	if err != nil {
@@ -135,44 +139,9 @@ func RestoreFromBackup(opts RestoreOptions) (*RestoreResult, error) {
 		}
 	}()
 
-	// (6) verify pre-migration → forward-migrate → verify post-migration.
-	if err := cluster.VerifyIntegrity(stage); err != nil {
-		return nil, fmt.Errorf("clusteroffline: staging verify (pre-migration): %w", err)
-	}
-	mdb, oerr := storage.Open("file:" + stage)
-	if oerr != nil {
-		return nil, fmt.Errorf("clusteroffline: forward-migrate staging: %w", oerr)
-	}
-	_ = mdb.Close()
-	// Test-only seam (Stage-C BLOCKER-2): lets a test corrupt the migrated staging so the
-	// post-migration verify is actually exercised — proving the live DB is NEVER installed when a
-	// migration-introduced corruption is present (the verify-before-swap ordering).
-	if restoreAfterMigrateHook != nil {
-		restoreAfterMigrateHook(stage)
-	}
-	if err := cluster.VerifyIntegrity(stage); err != nil {
-		return nil, fmt.Errorf("clusteroffline: staging verify (post-migration): %w", err)
-	}
-
-	// External-review Q1: restore re-bootstraps raft at the bundle's RaftAddr, which is right for a
-	// same-host restore. For a FRESH-HOST restore (the box's IP changed), --raft-addr overrides it;
-	// the override is also re-stamped into the self roster row so the address is consistent everywhere.
-	effectiveRaftAddr := m.RaftAddr
-	if opts.RaftAddrOverride != "" {
-		if _, _, err := net.SplitHostPort(opts.RaftAddrOverride); err != nil {
-			return nil, fmt.Errorf("clusteroffline: --raft-addr %q must be host:port: %w", opts.RaftAddrOverride, err)
-		}
-		effectiveRaftAddr = opts.RaftAddrOverride
-	}
-
-	// (7) normalize staging: reset applied_index/term to 0 + prune non-self roster (+ re-stamp the
-	// self raft_addr when overridden).
-	pruned, err := normalizeRestoreStaging(stage, opts.ConfirmNodeID, effectiveRaftAddr)
+	pruned, effectiveRaftAddr, err := prepareRestoreStaging(opts, m, stage)
 	if err != nil {
 		return nil, err
-	}
-	if err := cluster.VerifyIntegrity(stage); err != nil {
-		return nil, fmt.Errorf("clusteroffline: staging verify (post-normalize): %w", err)
 	}
 
 	// (8) .bak the current live DB (preserve the pre-restore copy; skip if absent — a fresh DR box
@@ -206,7 +175,7 @@ func RestoreFromBackup(opts RestoreOptions) (*RestoreResult, error) {
 		return nil, fmt.Errorf("clusteroffline: wipe raft dir: %w", err)
 	}
 	if err := cluster.BootstrapSingleNode(opts.DataDir, m.SelfID, effectiveRaftAddr, opts.Logger); err != nil &&
-		!isAlreadyBootstrapped(err) {
+		!errors.Is(err, cluster.ErrAlreadyBootstrapped) {
 		return nil, fmt.Errorf("clusteroffline: bootstrap restored single voter: %w", err)
 	}
 
@@ -237,6 +206,52 @@ func RestoreFromBackup(opts RestoreOptions) (*RestoreResult, error) {
 		SelfID: m.SelfID, BundleAppliedIdx: m.AppliedIndex, PrunedPeers: pruned,
 		PreRestoreBackup: preBak, RaftAddr: effectiveRaftAddr, NatsRoute: m.NatsRoute,
 	}, nil
+}
+
+// prepareRestoreStaging verifies, migrates and normalizes the copy on the target
+// filesystem. The caller owns its sidecar cleanup even when verification fails.
+func prepareRestoreStaging(opts RestoreOptions, m *Manifest, stage string) (int64, string, error) {
+	// (6) verify pre-migration → forward-migrate → verify post-migration.
+	if err := cluster.VerifyIntegrity(stage); err != nil {
+		return 0, "", fmt.Errorf("clusteroffline: staging verify (pre-migration): %w", err)
+	}
+	mdb, oerr := storage.Open("file:" + stage)
+	if oerr != nil {
+		return 0, "", fmt.Errorf("clusteroffline: forward-migrate staging: %w", oerr)
+	}
+	_ = mdb.Close()
+	// Test-only seam (Stage-C BLOCKER-2): lets a test corrupt the migrated staging so the
+	// post-migration verify is actually exercised — proving the live DB is NEVER installed when a
+	// migration-introduced corruption is present (the verify-before-swap ordering).
+	if restoreAfterMigrateHook != nil {
+		restoreAfterMigrateHook(stage)
+	}
+	if err := cluster.VerifyIntegrity(stage); err != nil {
+		return 0, "", fmt.Errorf("clusteroffline: staging verify (post-migration): %w", err)
+	}
+
+	// External-review Q1: restore re-bootstraps raft at the bundle's RaftAddr, which is right for a
+	// same-host restore. For a FRESH-HOST restore (the box's IP changed), --raft-addr overrides it;
+	// the override is also re-stamped into the self roster row so the address is consistent everywhere.
+	effectiveRaftAddr := m.RaftAddr
+	if opts.RaftAddrOverride != "" {
+		if _, _, err := net.SplitHostPort(opts.RaftAddrOverride); err != nil {
+			return 0, "", fmt.Errorf("clusteroffline: --raft-addr %q must be host:port: %w", opts.RaftAddrOverride, err)
+		}
+		effectiveRaftAddr = opts.RaftAddrOverride
+	}
+
+	// (7) normalize staging: reset applied_index/term to 0 + prune non-self roster (+ re-stamp the
+	// self raft_addr when overridden).
+	pruned, err := normalizeRestoreStaging(stage, opts.ConfirmNodeID, effectiveRaftAddr)
+	if err != nil {
+		return 0, "", err
+	}
+	if err := cluster.VerifyIntegrity(stage); err != nil {
+		return 0, "", fmt.Errorf("clusteroffline: staging verify (post-normalize): %w", err)
+	}
+
+	return pruned, effectiveRaftAddr, nil
 }
 
 // restoreProvenanceGate enforces the 4-layer identity gate (all FATAL, pre-mutation).
@@ -428,8 +443,7 @@ func copyFileSync(src, dst string) error {
 	in, err := os.OpenFile(src, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
 	if err != nil {
 		if errors.Is(err, syscall.ELOOP) {
-			return fmt.Errorf("clusteroffline: %s is a SYMLINK — refusing to read through it; "+
-				"remove it and inspect why it is there", src)
+			return fmt.Errorf("clusteroffline: %s is a SYMLINK — refusing to read through it; remove it and inspect why it is there", src)
 		}
 		return err
 	}
@@ -451,10 +465,6 @@ func copyFileSync(src, dst string) error {
 		return err
 	}
 	return out.Close()
-}
-
-func isAlreadyBootstrapped(err error) bool {
-	return errors.Is(err, cluster.ErrAlreadyBootstrapped)
 }
 
 // clearRestoreInProgress removes the DI-MAJOR-2 marker from the installed DB after the raft bootstrap

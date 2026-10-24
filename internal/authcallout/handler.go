@@ -4,7 +4,7 @@
 // Flow on each NATS CONNECT:
 //
 //  1. THIS HANDLER verifies the client's nkey signature over the server nonce —
-//     see verifyClientNkey. Step 1 used to read "NATS server has already verified
+//     see xferauth.VerifyClientNkey. Step 1 used to read "NATS server has already verified
 //     the client's nkey signature", and that was false in the one mode tether runs.
 //  2. NATS publishes a signed AuthorizationRequestClaims JWT to
 //     `$SYS.REQ.USER.AUTH`.
@@ -18,18 +18,19 @@
 //   - "tether-cli"            — unactivated CLI
 //   - "tether-cli:<sid>"      — CLI activating session <sid>
 //   - "tether-agent:<sid>:<nid>" — agent in session <sid> as node <nid>
+//   - "transfer-settlement:<sid>:<nid>" — original receiver settling one entry
+//   - "session-removal:<sid>" — session owner retrying tombstone settlement
 //
-// Token (`nats.Token(...)`) optionally carries a PIN for first-time join.
+// Token (`nats.Token(...)`) carries a PIN for first-time join, or the signed
+// entry capsule for transfer settlement. Neither reconnect role restores joins.
 package authcallout
 
 import (
 	"database/sql"
-	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
-	"strings"
 	"sync"
 	"time"
 
@@ -37,12 +38,27 @@ import (
 	"github.com/LinZiyang666/tether/internal/auth"
 	"github.com/LinZiyang666/tether/internal/proto"
 	"github.com/LinZiyang666/tether/internal/session"
+	"github.com/LinZiyang666/tether/internal/xferauth"
+	"github.com/LinZiyang666/tether/internal/xfercontract"
 	"github.com/nats-io/jwt/v2"
 	"github.com/nats-io/nkeys"
 )
 
 // Handler is stateful: holds the DB + the account signer for issuing JWTs.
 type Handler struct {
+	// Settlement verifies the original receiver against the durable origin.
+	// Nil denies the role; it cannot fall back to ordinary membership.
+	// origin: hot-update S7 plan §6.4 / T31
+	Settlement xfercontract.SettlementVerifier
+
+	// SystemPrincipals returns the managed $SYS users of the NATS config this
+	// callout answers for. The server delegates those static users here (config
+	// mode, empty allowed_accounts), so a reload that adds them needs no change to
+	// the non-reloadable AuthCallout block. Nil or an absent key means the
+	// identity takes the ordinary role path; a name can never select it.
+	// origin: hot-update S9 plan §3.3 / P12 / T27
+	SystemPrincipals func() []SystemPrincipal
+
 	DB        *sql.DB
 	AccountKp nkeys.KeyPair // signs response JWT (Issuer in NATS auth_callout)
 	Now       func() time.Time
@@ -217,8 +233,19 @@ func (h *Handler) Handle(reqJWT string) (string, error) {
 	}
 	// PROVE THE NKEY BELONGS TO THIS CONNECTION. Everything below treats clientNkey as
 	// an identity; until this line it is a string the connecting party typed.
-	if err := verifyClientNkey(clientNkey, req.ClientInformation.Nonce, req.ConnectOptions.SignedNonce); err != nil {
+	if err := xferauth.VerifyClientNkey(clientNkey, req.ClientInformation.Nonce, req.ConnectOptions.SignedNonce); err != nil {
 		return h.deny(req, "nkey identity: "+err.Error())
+	}
+	// Only a PROVEN key can be a system principal; it is placed in $SYS with the
+	// managed lists verbatim and never falls through to an ordinary role.
+	// origin: hot-update S9 plan §3.3 / P12 / T27
+	if principal, ok, err := h.systemPrincipal(clientNkey); ok {
+		perms, permErr := systemPrincipalPermissions(principal)
+		if err != nil || permErr != nil {
+			h.Logger.Error("authcallout: system principal refused", "actor", clientNkey, "err", errors.Join(err, permErr))
+			return h.deny(req, "system principal authentication denied")
+		}
+		return h.allowInAccount(req, jwtSubject, perms, SystemAccount)
 	}
 
 	fp, err := auth.FingerprintFromActor(clientNkey)
@@ -248,7 +275,27 @@ func (h *Handler) Handle(reqJWT string) (string, error) {
 	legacyInbox := req.ConnectOptions.Username != auth.InboxCapableMarker
 
 	role, sid, nid := parseRole(req.ConnectOptions.Name)
+	// The additive intent marker preserves old-broker CONNECT compatibility;
+	// new brokers grant only removal even while the session is still ACTIVE.
+	// origin: S7 internal review rv-n1compat F4
+	if role == roleCtlActivated && req.ConnectOptions.Token == auth.SessionRemovalToken {
+		role = roleSessionRemoval
+	}
 	switch role {
+	case roleSessionRemoval:
+		if h.fenced() || xferauth.VerifyRemovalOwner(h.DB, sid, fp) != nil {
+			return h.deny(req, "session removal authentication denied")
+		}
+		return h.allow(req, jwtSubject, auth.PermissionsForSessionRemoval(clientNkey, sid))
+	case roleTransferSettlement:
+		if h.fenced() {
+			return h.deny(req, "transfer settlement authentication denied")
+		}
+		grant, err := xferauth.VerifyConnect(h.DB, h.Settlement, req, sid, nid)
+		if err != nil {
+			return h.deny(req, "transfer settlement authentication denied")
+		}
+		return h.allow(req, jwtSubject, auth.PermissionsForTransferSettlement(clientNkey, sid, nid, grant.Identity.TransferID))
 	case roleCtlUnactivated:
 		return h.allow(req, jwtSubject, auth.PermissionsForUnactivated(clientNkey, legacyInbox))
 	case roleCtlActivated:
@@ -290,38 +337,20 @@ func (h *Handler) Handle(reqJWT string) (string, error) {
 	}
 }
 
-// role tags the four valid client kinds.
-type role int
+// Keep the existing callout names while the authentication leaf owns parsing.
+// origin: hot-update S7 plan §6.4 / T31
+type role = xferauth.ConnectionRole
 
 const (
-	roleUnknown role = iota
-	roleCtlUnactivated
-	roleCtlActivated
-	roleAgent
+	roleUnknown            = xferauth.RoleUnknown
+	roleCtlUnactivated     = xferauth.RoleCtlUnactivated
+	roleCtlActivated       = xferauth.RoleCtlActivated
+	roleAgent              = xferauth.RoleAgent
+	roleTransferSettlement = xferauth.RoleTransferSettlement
+	roleSessionRemoval     = xferauth.RoleSessionRemoval
 )
 
-// parseRole classifies a connection name into (role, sid, nid). sid is
-// empty for unactivated CLIs; nid is non-empty only for agents.
-func parseRole(name string) (role, string, string) {
-	switch {
-	case name == "tether-cli":
-		return roleCtlUnactivated, "", ""
-	case strings.HasPrefix(name, "tether-cli:"):
-		sid := strings.TrimPrefix(name, "tether-cli:")
-		if sid == "" {
-			return roleUnknown, "", ""
-		}
-		return roleCtlActivated, sid, ""
-	case strings.HasPrefix(name, "tether-agent:"):
-		rest := strings.TrimPrefix(name, "tether-agent:")
-		parts := strings.SplitN(rest, ":", 2)
-		if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
-			return roleUnknown, "", ""
-		}
-		return roleAgent, parts[0], parts[1]
-	}
-	return roleUnknown, "", ""
-}
+func parseRole(name string) (role, string, string) { return xferauth.ParseConnectionName(name) }
 
 // ensureAgentProvisioned implements the two-phase agent auth flow:
 //
@@ -613,6 +642,13 @@ func (h *Handler) emit(kind string, fields map[string]any) {
 }
 
 func (h *Handler) allow(req *jwt.AuthorizationRequestClaims, userPub string, perms jwt.Permissions) (string, error) {
+	return h.allowInAccount(req, userPub, perms, h.TargetAccount)
+}
+
+// allowInAccount is allow with an explicit placement. Only the managed system
+// principals pass a target other than TargetAccount.
+// origin: hot-update S9 plan §3.3 / P12 / T27
+func (h *Handler) allowInAccount(req *jwt.AuthorizationRequestClaims, userPub string, perms jwt.Permissions, target string) (string, error) {
 	uc := jwt.NewUserClaims(userPub)
 	uc.Permissions = perms
 	if h.JWTTTL > 0 {
@@ -623,7 +659,6 @@ func (h *Handler) allow(req *jwt.AuthorizationRequestClaims, userPub string, per
 	// "if it is not a public key, set the audience"). NATS uses this to
 	// route the connection into the right account after auth. Default to
 	// "$G" (global) when caller didn't specify.
-	target := h.TargetAccount
 	if target == "" {
 		target = "$G"
 	}
@@ -645,66 +680,6 @@ func (h *Handler) allow(req *jwt.AuthorizationRequestClaims, userPub string, per
 		return "", fmt.Errorf("encode auth response: %w", err)
 	}
 	return out, nil
-}
-
-// verifyClientNkey proves that the connecting party holds the private half of the nkey
-// it presented, by checking its signature over the nonce the server issued.
-//
-// origin: prerelease audit increment 2 internal review, admission-enforcement/L9-F1 ≡
-// red-team/RED-TEAM-REFUTE-F1, found by two lanes and reproduced end to end against a
-// real nats-server + this handler.
-//
-// NOBODY ELSE DOES THIS. It is natural to assume the server has already checked the
-// signature by the time a callout runs — this package's own doc comment said so for
-// three releases — but in conf mode nats-server only verifies an nkey it has a STATIC
-// `users:` entry for. server/auth.go bails out at `nkey, ok = s.nkeys[c.opts.Nkey]; if
-// !ok { return false }` BEFORE reaching its Verify branch, and the deferred callout hop
-// then forwards `ConnectOptions.Nkey` exactly as the client typed it
-// (server/auth_callout.go fillConnectOpts). Every tether principal except the broker
-// itself is callout-authenticated, so the entire identity model rests on this function.
-//
-// WHAT WAS REACHABLE WITHOUT IT. `clientNkey` is the actor in every permission template:
-// it pins the `ctrl.by.<actor>` publish grants and it derives auth.InboxPrefixFor's
-// private subtree. And the fingerprint the session-create allow-list is keyed on is
-// computed from it. So knowing a victim's PUBLIC key — which sys.events hands to any
-// session member in session_created{actor} — was enough to connect as that victim, read
-// its private inbox (register replies carry the tunnel token and every subscriber PSK),
-// and pass the admission check as that victim. The signature was never checked, so any
-// bytes at all would do.
-//
-// NOT AN N-1 BREAK. All four production dial sites already sign: internal/cli's
-// ConnectNATSWithNkey, the completion transport, the agent, and the broker's own
-// connection. A client that signs has always sent `sig`, and nats-server fills
-// ClientInformation.Nonce whenever `sig` is present (verified on v2.10.22 and v2.14.0),
-// so the material has always been on the request — nothing here asks a client for
-// anything it does not already send.
-//
-// EMPTY IS A REFUSAL, NOT AN EXEMPTION. A missing nonce or signature means the client
-// did not authenticate as an nkey holder, which is exactly the case this exists to
-// reject. It must not fall through to a permissive template: an empty jwt.Permissions is
-// UNRESTRICTED in nats-server (c.perms stays nil), so failing open here would be worse
-// than the hole it closes.
-func verifyClientNkey(pubKey, nonce, signedNonce string) error {
-	if nonce == "" || signedNonce == "" {
-		return errors.New("no signature over the server nonce")
-	}
-	// Same decode order as nats-server's own check (server/auth.go): raw-url first,
-	// standard base64 as a fallback. A client library that picks the other encoding must
-	// not be rejected here when the server itself would have accepted it.
-	sig, err := base64.RawURLEncoding.DecodeString(signedNonce)
-	if err != nil {
-		if sig, err = base64.StdEncoding.DecodeString(signedNonce); err != nil {
-			return errors.New("signature is not valid base64")
-		}
-	}
-	kp, err := nkeys.FromPublicKey(pubKey)
-	if err != nil {
-		return fmt.Errorf("public key: %w", err)
-	}
-	if err := kp.Verify([]byte(nonce), sig); err != nil {
-		return errors.New("signature does not verify against the presented nkey")
-	}
-	return nil
 }
 
 func (h *Handler) deny(req *jwt.AuthorizationRequestClaims, reason string) (string, error) {

@@ -7,6 +7,7 @@ import (
 
 	"github.com/LinZiyang666/tether/internal/cluster"
 	"github.com/LinZiyang666/tether/internal/proto"
+	"github.com/LinZiyang666/tether/internal/upgradeauthority"
 )
 
 // Plan* are the D2 leader-side renderers for the session mutators (architecture
@@ -75,8 +76,28 @@ func PlanTombstone(db *sql.DB, sid string, now time.Time) (*cluster.Command, err
 // It is fenced to the DELETING state: a stale finalizer for a previously deleted
 // same-sid session must not delete a newly-created ACTIVE replacement.
 func PlanHardDelete(db *sql.DB, sid string) (*cluster.Command, error) {
-	var state string
-	switch err := db.QueryRow(`SELECT state FROM sessions WHERE sid=?`, sid).Scan(&state); err {
+	return planHardDelete(db, sid, "")
+}
+
+// PlanHardDeleteGuarded belongs inside the leader's existing applyMu planner.
+// Every DELETE carries the captured creation predicate through delayed Apply;
+// a replacement that is itself DELETING still belongs to a different cleanup.
+// origin: hot-update S8 plan §6.2 / §11.2 P36
+func PlanHardDeleteGuarded(db *sql.DB, guard upgradeauthority.Guard) (string, *cluster.Command, error) {
+	cmd, err := guardedHardDeletePlan(db, guard)
+	if err != nil {
+		return "", nil, err
+	}
+	return guard.Incarnation, cmd, nil
+}
+
+// The legacy signature also freezes the exact row for Apply, without requiring
+// a parseable legacy PIN hash. Absence produces a permanently inert command so
+// retrying it after recreation cannot remove even a DELETING replacement.
+// origin: hot-update S8 plan §6.2 / §11.2 P36
+func planHardDelete(reader upgradeauthority.RowReader, sid, predicate string) (*cluster.Command, error) {
+	var state, owner, created, pinHash string
+	switch err := reader.QueryRow(`SELECT state, owner_pubkey_fp, CAST(created_at AS TEXT), pin_hash FROM sessions WHERE sid=?`, sid).Scan(&state, &owner, &created, &pinHash); err {
 	case nil:
 		if state != string(StateDeleting) {
 			return nil, ErrDeleting
@@ -84,25 +105,25 @@ func PlanHardDelete(db *sql.DB, sid string) (*cluster.Command, error) {
 	case sql.ErrNoRows:
 		// Idempotent retry after another finalizer already removed the row. Still
 		// return a no-op command so the forward/propose path has a concrete op.
+		return cluster.NewCommand(cluster.OpSessionHardDelete, cluster.Stmt(`DELETE FROM sessions WHERE 0`)), nil
 	default:
 		return nil, fmt.Errorf("session: plan hard delete lookup: %w", err)
 	}
-	sidL, err := cluster.LitText(sid)
+	lits, err := cluster.LitTextAll(sid, owner, created, pinHash)
 	if err != nil {
-		return nil, fmt.Errorf("session: plan hard delete literal: %w", err)
+		return nil, fmt.Errorf("session: plan hard delete literal is invalid")
 	}
-	childTables := []string{
-		"port_allocations", "processes", "proxy_subscribers",
-		"agent_provisioning", "nodes", "members",
+	where := `sid=` + lits[0] + ` AND state='DELETING'`
+	if predicate == "" {
+		predicate = `(owner_pubkey_fp, CAST(created_at AS TEXT), pin_hash)=(` + lits[1] + `,` + lits[2] + `,` + lits[3] + `)`
 	}
+	where += ` AND ` + predicate
+	childTables := []string{"port_allocations", "processes", "proxy_subscribers", "agent_provisioning", "nodes", "members"}
 	stmts := make([]cluster.Statement, 0, len(childTables)+1)
 	for _, tbl := range childTables {
-		stmts = append(stmts, cluster.Stmt(
-			`DELETE FROM `+tbl+` WHERE sid IN (`+
-				`SELECT sid FROM sessions WHERE sid=`+sidL+` AND state=`+cluster.MustLitText(string(StateDeleting))+`)`))
+		stmts = append(stmts, cluster.Stmt(`DELETE FROM `+tbl+` WHERE sid IN (SELECT sid FROM sessions WHERE `+where+`)`))
 	}
-	stmts = append(stmts, cluster.Stmt(
-		`DELETE FROM sessions WHERE sid=`+sidL+` AND state=`+cluster.MustLitText(string(StateDeleting))))
+	stmts = append(stmts, cluster.Stmt(`DELETE FROM sessions WHERE `+where))
 	return cluster.NewCommand(cluster.OpSessionHardDelete, stmts...), nil
 }
 
@@ -116,19 +137,8 @@ func PlanJoinWithPIN(
 	verifyPIN func(pin, hash string) error,
 	now time.Time,
 ) (*cluster.Command, error) {
-	var pinHash, state string
-	switch err := db.QueryRow(`SELECT pin_hash, state FROM sessions WHERE sid=?`, sid).Scan(&pinHash, &state); err {
-	case nil:
-		if state != string(StateActive) {
-			return nil, ErrDeleting
-		}
-	case sql.ErrNoRows:
-		return nil, ErrNotFound
-	default:
-		return nil, fmt.Errorf("session: plan join lookup: %w", err)
-	}
-	if err := verifyPIN(pin, pinHash); err != nil {
-		return nil, ErrInvalidPIN
+	if err := checkJoinPIN(db, sid, pin, verifyPIN); err != nil {
+		return nil, err
 	}
 	lits, err := cluster.LitTextAll(sid, pubkeyFP)
 	if err != nil {

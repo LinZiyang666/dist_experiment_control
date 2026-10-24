@@ -39,7 +39,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/LinZiyang666/tether/internal/cluster"
 	"github.com/LinZiyang666/tether/internal/tokenhash"
+	"github.com/LinZiyang666/tether/internal/upgradeauthority"
 )
 
 // PortBandLow / PortBandHigh bound the public port range. Defaults
@@ -97,6 +99,11 @@ type Allocation struct {
 	// the zero value matches the default (a zero Allocation is rebuild-ON). Populated by
 	// the scanRowWithHome / scanOneWithHome paths (ps, expose-rm, offline reconciler).
 	RebuildOff bool
+
+	// Authority is captured by the caller, never learned again during cleanup.
+	// Its zero value preserves ordinary legacy allocation mutations.
+	// origin: hot-update S8 plan §6.2 / P35
+	Authority upgradeauthority.Guard
 }
 
 // Errors callers may need to distinguish. ErrNotFound is the lookup
@@ -199,21 +206,14 @@ func Allocate(db *sql.DB, sid, nid, name string, localPort, desiredPort int, cre
 	// pre-B4 — rebuild_on_failure is omitted so it takes its migration-0010 DEFAULT 1.
 	// Only --no-rebuild (rebuildOff) names the column and sets it 0. This keeps the
 	// default single-mode row byte-for-byte identical to a pre-B4 allocate.
+	cols := ` (port, sid, nid, name, local_port, token_hash, state, created_by_fp, created_at)`
+	vals := ` VALUES (?, ?, ?, ?, ?, ?, 'ALLOCATED', ?, ?)`
 	if rebuildOff {
-		if _, err := tx.Exec(
-			`INSERT INTO port_allocations
-			   (port, sid, nid, name, local_port, token_hash, state, created_by_fp, created_at, rebuild_on_failure)
-			 VALUES (?, ?, ?, ?, ?, ?, 'ALLOCATED', ?, ?, 0)`,
-			port, sid, nid, name, localPort, tokenHash, createdByFP, now.UTC(),
-		); err != nil {
-			return nil, translateInsertErr(err, desiredPort)
-		}
-	} else if _, err := tx.Exec(
-		`INSERT INTO port_allocations
-		   (port, sid, nid, name, local_port, token_hash, state, created_by_fp, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?, 'ALLOCATED', ?, ?)`,
-		port, sid, nid, name, localPort, tokenHash, createdByFP, now.UTC(),
-	); err != nil {
+		cols = strings.TrimSuffix(cols, `)`) + `, rebuild_on_failure)`
+		vals = strings.TrimSuffix(vals, `)`) + `, 0)`
+	}
+	if _, err := tx.Exec(`INSERT INTO port_allocations`+cols+vals,
+		port, sid, nid, name, localPort, tokenHash, createdByFP, now.UTC()); err != nil {
 		return nil, translateInsertErr(err, desiredPort)
 	}
 
@@ -327,17 +327,7 @@ func ListBySession(db *sql.DB, sid string) ([]Allocation, error) {
 	if err != nil {
 		return nil, fmt.Errorf("port: list: %w", err)
 	}
-	defer func() { _ = rows.Close() }()
-
-	var out []Allocation
-	for rows.Next() {
-		a, err := scanRowWithHome(rows)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, *a)
-	}
-	return out, rows.Err()
+	return scanAllocations(rows)
 }
 
 // ListBySessionOpts narrows ListBySessionFiltered (h1 A1), mirroring
@@ -380,17 +370,7 @@ func ListBySessionFiltered(db *sql.DB, sid string, opts ListBySessionOpts) ([]Al
 	if err != nil {
 		return nil, fmt.Errorf("port: list: %w", err)
 	}
-	defer func() { _ = rows.Close() }()
-
-	var out []Allocation
-	for rows.Next() {
-		a, err := scanRowWithHome(rows)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, *a)
-	}
-	return out, rows.Err()
+	return scanAllocations(rows)
 }
 
 // GCTerminated deletes FREED/REVOKED rows whose end-of-life timestamp is
@@ -435,8 +415,6 @@ func CountBySession(db *sql.DB, sid string, includeFreed bool) (int, error) {
 // ranges a comment edit could invalidate). Free and Revoke share a shape, and batch-A A4 deliberately
 // kept the two paths SEPARATE after finding that sharing them turns a revoke into a footgun. Merging
 // here would undo a decision taken with a defect in hand.
-//
-//nolint:dupl // paired with Revoke; argument above.
 func Free(db *sql.DB, port int, now time.Time) error {
 	res, err := db.Exec(
 		`UPDATE port_allocations
@@ -444,24 +422,7 @@ func Free(db *sql.DB, port int, now time.Time) error {
 		 WHERE port=? AND state='ALLOCATED'`,
 		now.UTC(), port,
 	)
-	if err != nil {
-		return fmt.Errorf("port: free: %w", err)
-	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("port: rows affected: %w", err)
-	}
-	if n == 0 {
-		// Either no such port, or it's already non-ALLOCATED. Distinguish.
-		var exists int
-		if err := db.QueryRow(`SELECT COUNT(*) FROM port_allocations WHERE port=?`, port).Scan(&exists); err != nil {
-			return err
-		}
-		if exists == 0 {
-			return ErrNotFound
-		}
-	}
-	return nil
+	return portStateResult(db, port, res, err, "free")
 }
 
 // FreeAllocation transitions exactly the selected ALLOCATED row to FREED.
@@ -479,11 +440,23 @@ func RevokeAllocation(db *sql.DB, a Allocation, now time.Time) error {
 }
 
 func updateAllocationState(db *sql.DB, a Allocation, next State, label string, now time.Time) error {
-	res, err := db.Exec(
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	// Read creation on this transaction's connection, then repeat its identity
+	// in the UPDATE. DELETING remains eligible for ordered session settlement.
+	// origin: hot-update S8 plan §6.2 / TestPortMutationRejectsRecreatedSession
+	predicate, args, err := allocationAuthorityPredicate(tx, a.Authority, a.SID, a.NID)
+	if err != nil {
+		return err
+	}
+	res, err := tx.Exec(
 		`UPDATE port_allocations
 		   SET state=?, revoked_at=?
-		 WHERE port=? AND sid=? AND nid=? AND name=? AND token_hash=? AND state='ALLOCATED'`,
-		string(next), now.UTC(), a.Port, a.SID, a.NID, a.Name, a.TokenHash,
+		 WHERE port=? AND sid=? AND nid=? AND name=? AND token_hash=? AND state='ALLOCATED' AND `+predicate,
+		append([]any{string(next), now.UTC(), a.Port, a.SID, a.NID, a.Name, a.TokenHash}, args...)...,
 	)
 	if err != nil {
 		return fmt.Errorf("port: %s: %w", label, err)
@@ -495,7 +468,7 @@ func updateAllocationState(db *sql.DB, a Allocation, next State, label string, n
 	if n == 0 {
 		return ErrNotFound
 	}
-	return nil
+	return tx.Commit()
 }
 
 // Revoke transitions ALLOCATED → REVOKED by PORT NUMBER ALONE, and is
@@ -519,8 +492,6 @@ func updateAllocationState(db *sql.DB, a Allocation, next State, label string, n
 // port_test.go:180/232/342/370, so it is NOT interchangeable with
 // RevokeAllocation, which returns ErrNotFound instead.
 // origin: line-2 review M14. Free above carries the argument for this pair.
-//
-//nolint:dupl // paired with Free; batch-A A4 kept these separate on purpose.
 func Revoke(db *sql.DB, port int, now time.Time) error {
 	res, err := db.Exec(
 		`UPDATE port_allocations
@@ -528,14 +499,23 @@ func Revoke(db *sql.DB, port int, now time.Time) error {
 		 WHERE port=? AND state='ALLOCATED'`,
 		now.UTC(), port,
 	)
+	return portStateResult(db, port, res, err, "revoke")
+}
+
+// Free and Revoke keep separate SQL state choices; only their result handling
+// is shared. This helper never chooses or issues a mutation, so a revoke cannot
+// accidentally become a free (batch-A A4).
+// origin: hot-update S8 plan §12.1 / P35
+func portStateResult(db *sql.DB, port int, res sql.Result, err error, label string) error {
 	if err != nil {
-		return fmt.Errorf("port: revoke: %w", err)
+		return fmt.Errorf("port: %s: %w", label, err)
 	}
 	n, err := res.RowsAffected()
 	if err != nil {
 		return fmt.Errorf("port: rows affected: %w", err)
 	}
 	if n == 0 {
+		// Either no such port, or it's already non-ALLOCATED. Distinguish.
 		var exists int
 		if err := db.QueryRow(`SELECT COUNT(*) FROM port_allocations WHERE port=?`, port).Scan(&exists); err != nil {
 			return err
@@ -570,16 +550,7 @@ func ListAllocatedForOfflineNodes(db *sql.DB, now time.Time, threshold time.Dura
 	if err != nil {
 		return nil, fmt.Errorf("port: scan offline: %w", err)
 	}
-	defer func() { _ = rows.Close() }()
-	var out []Allocation
-	for rows.Next() {
-		a, err := scanRowWithHome(rows)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, *a)
-	}
-	return out, rows.Err()
+	return scanAllocations(rows)
 }
 
 // HashToken returns SHA256(rawToken) hex-encoded. Public so callers
@@ -653,37 +624,43 @@ func cfgWithDefaults(cfg *Config) (low, high int, now time.Time) {
 	return low, high, now
 }
 
+// scanAllocations preserves each caller's query ordering and closes Rows on
+// both success and decode failure before the one-connection writer is reused.
+// origin: hot-update S8 plan §12.1 / P35
+func scanAllocations(rows *sql.Rows) ([]Allocation, error) {
+	defer func() { _ = rows.Close() }()
+	var out []Allocation
+	for rows.Next() {
+		a, err := scanRowWithHome(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *a)
+	}
+	return out, rows.Err()
+}
+
 func scanOneWithHome(row *sql.Row) (*Allocation, error) {
-	var a Allocation
-	var revokedAt sql.NullTime
-	var stateStr string
-	var rebuildOnFailure int
-	err := row.Scan(
-		&a.Port, &a.SID, &a.NID, &a.Name, &a.LocalPort,
-		&a.TokenHash, &stateStr, &a.CreatedByFP, &a.CreatedAt, &revokedAt,
-		&a.HomeBroker, &a.Epoch, &rebuildOnFailure,
-	)
+	a, err := scanAllocationWithHome(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
-	if err != nil {
-		return nil, err
-	}
-	a.State = State(stateStr)
-	a.RebuildOff = rebuildOnFailure == 0 // inverted: column 1=ON ⇒ RebuildOff=false
-	if revokedAt.Valid {
-		t := revokedAt.Time
-		a.RevokedAt = &t
-	}
-	return &a, nil
+	return a, err
 }
 
 func scanRowWithHome(rows *sql.Rows) (*Allocation, error) {
+	return scanAllocationWithHome(rows)
+}
+
+// Both row and rows readers retain the same home/epoch and rebuild projection.
+// Sharing the scanner leaves room for the guard without moving its writer.
+// origin: hot-update S8 plan §12.1 / P35
+func scanAllocationWithHome(row interface{ Scan(...any) error }) (*Allocation, error) {
 	var a Allocation
 	var revokedAt sql.NullTime
 	var stateStr string
 	var rebuildOnFailure int
-	if err := rows.Scan(
+	if err := row.Scan(
 		&a.Port, &a.SID, &a.NID, &a.Name, &a.LocalPort,
 		&a.TokenHash, &stateStr, &a.CreatedByFP, &a.CreatedAt, &revokedAt,
 		&a.HomeBroker, &a.Epoch, &rebuildOnFailure,
@@ -782,3 +759,52 @@ func AllocateProxy(db *sql.DB, sid, nid string, cfg *Config) (*Allocation, error
 		CreatedAt: now.UTC(), Token: token,
 	}, nil
 }
+
+// Creation comparison stays inside the single transaction or live leader
+// planner. An inherited digest cannot be replaced by learning a recreated SID;
+// no ACTIVE filter is added because DELETING cleanup must finish settlement.
+// origin: hot-update S8 plan §6.2 / TestPortMutationRejectsRecreatedSession
+func allocationAuthorityPredicate(reader upgradeauthority.RowReader, guard upgradeauthority.Guard, sid, nid string) (string, []any, error) {
+	if guard == (upgradeauthority.Guard{}) {
+		return "1", nil, nil
+	}
+	if !allocationAuthorityMatches(guard, sid, nid) {
+		return "", nil, ErrMutationGuard
+	}
+	creation, err := upgradeauthority.ReadCreation(reader, guard)
+	if err != nil {
+		return "", nil, err
+	}
+	return upgradeauthority.CreationPredicate(creation)
+}
+
+type PlanReassignHomeGuardedFunc = func(*sql.DB, MutationGuard, string, time.Time) (int64, *cluster.Command, error)
+type PlanAllocateGuardedFunc = func(*sql.DB, MutationGuard, AllocationIntent) (*Allocation, *cluster.Command, error)
+
+// Only the audited literal renderer turns SQL bindings into replicated bytes.
+// Split the template before rendering: '?' in an owner literal is data, never
+// another placeholder. No new Raft op or parameter format is introduced.
+// origin: hot-update S8 plan §6.2 / P35
+func allocationAuthoritySQL(reader upgradeauthority.RowReader, guard upgradeauthority.Guard, sid, nid string) (string, error) {
+	predicate, args, err := allocationAuthorityPredicate(reader, guard, sid, nid)
+	if err != nil {
+		return "", err
+	}
+	parts := strings.Split(predicate, "?")
+	var baked strings.Builder
+	for i, arg := range args {
+		// A future predicate operand must refuse rather than panic during planning.
+		// origin: hot-update S8 plan §6.2; S10 LINT-L4
+		text, ok := arg.(string)
+		literal, err := cluster.LitText(text)
+		if !ok || err != nil {
+			return "", ErrMutationGuard
+		}
+		baked.WriteString(parts[i] + literal)
+	}
+	baked.WriteString(parts[len(parts)-1])
+	return baked.String(), nil
+}
+
+type PlanRotateAllocationGuardedFunc = func(*sql.DB, MutationGuard, AllocationIntent, time.Time) (*Allocation, *cluster.Command, error)
+type PlanFreeAllocationGuardedFunc = func(*sql.DB, MutationGuard, time.Time) (*cluster.Command, error)

@@ -17,6 +17,10 @@ import (
 
 	"github.com/LinZiyang666/tether/internal/cluster"
 	"github.com/LinZiyang666/tether/internal/schema"
+	// A pure render/replay leaf must never reach NATS: import the
+	// transport-free half of xfercontract (identical identities).
+	// origin: hot-update S7 plan §11.1 / P00 — NATS-free value split
+	xfercontract "github.com/LinZiyang666/tether/internal/xfercontract/xfervalue"
 )
 
 // xferAuxV1 is the apply-inert Command.Aux payload for OpTransferAudit: the single
@@ -32,17 +36,15 @@ func TransferReqID(transferID, kind string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// TransferRecordReqID derives the cross-retry-STABLE idempotency key for one exact
-// transfer-audit record. The full normalized record is included so a later legitimate
-// transfer that reuses the same transfer_id/kind does not get dedup-skipped.
+// TransferRecordReqID preserves the content key used by existing Raft callers.
 func TransferRecordReqID(rec schema.AuditTransfer) (string, error) {
-	rec.Ts = rec.Ts.Round(0)
-	body, err := json.Marshal(rec)
-	if err != nil {
-		return "", err
-	}
-	sum := sha256.Sum256(append([]byte("xferaudit-record:"), body...))
-	return hex.EncodeToString(sum[:]), nil
+	return schema.TransferRecordReqID(rec)
+}
+
+// CanonicalTransferAudit shares the exact schema normalization with history.
+// origin: hot-update S7 plan §5.1–§5.2 / T23
+func CanonicalTransferAudit(rec schema.AuditTransfer) (xfercontract.CanonicalRecord, error) {
+	return schema.CanonicalTransferAudit(rec)
 }
 
 // PlanTransferAudit renders OpTransferAudit for one audit record: EMPTY Body (no DB
@@ -57,22 +59,9 @@ func TransferRecordReqID(rec schema.AuditTransfer) (string, error) {
 // start/complete/failed and rec.TransferID non-empty — a malformed record is a leader-side
 // programming error, rejected here so it never becomes a poison entry.
 func PlanTransferAudit(rec schema.AuditTransfer) (*cluster.Command, error) {
-	if rec.TransferID == "" {
-		return nil, fmt.Errorf("xferaudit: empty transfer_id")
-	}
-	switch rec.Kind {
-	case "start", "complete", "failed":
-	default:
-		return nil, fmt.Errorf("xferaudit: invalid kind %q (want start|complete|failed)", rec.Kind)
-	}
-	rec.Ts = rec.Ts.Round(0)
-	reqID, err := TransferRecordReqID(rec)
+	aux, reqID, err := schema.TransferAuditPayload(rec)
 	if err != nil {
-		return nil, fmt.Errorf("xferaudit: reqid: %w", err)
-	}
-	aux, err := json.Marshal(xferAuxV1{Rec: rec})
-	if err != nil {
-		return nil, fmt.Errorf("xferaudit: marshal aux: %w", err)
+		return nil, err
 	}
 	cmd := cluster.NewCommand(cluster.OpTransferAudit) // empty Body — apply is a deterministic no-op
 	cmd.Aux = aux
@@ -95,6 +84,18 @@ func ReplayTransferAudit(cmd *cluster.Command) (rec schema.AuditTransfer, ok boo
 	var aux xferAuxV1
 	if err := json.Unmarshal(cmd.Aux, &aux); err != nil {
 		return schema.AuditTransfer{}, false, fmt.Errorf("xferaudit: decode aux: %w", err)
+	}
+	// Retained outboxes re-submit these bytes after Aux truncation. Never
+	// acknowledge a splice under the old record's content-addressed ReqID.
+	// origin: hot-update S7 plan §5.2 / T23
+	if schema.TransferContinuation(aux.Rec) {
+		canonical, err := CanonicalTransferAudit(aux.Rec)
+		if err != nil {
+			return schema.AuditTransfer{}, false, err
+		}
+		if cmd.ReqID != canonical.ReqID {
+			return schema.AuditTransfer{}, false, fmt.Errorf("xferaudit: continuation request identity conflict")
+		}
 	}
 	return aux.Rec, true, nil
 }

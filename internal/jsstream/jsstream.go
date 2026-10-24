@@ -32,6 +32,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/LinZiyang666/tether/internal/infrarepair"
 	"github.com/LinZiyang666/tether/internal/proto"
 	"github.com/LinZiyang666/tether/internal/schema"
 	"github.com/nats-io/nats.go/jetstream"
@@ -167,15 +168,19 @@ func EnsureHistoryStream(ctx context.Context, js jetstream.JetStream, sid string
 // DeleteHistoryStream is step ② of H.3 (session rm 三阶段). Returns
 // nil if the stream is already gone (so callers can re-run after a
 // crash-mid-rm without erroring). Other JetStream errors propagate.
+// origin: hot-update S9 plan §3.2 / §4.3 / T40 / T41
 func DeleteHistoryStream(ctx context.Context, js jetstream.JetStream, sid string) error {
-	err := js.DeleteStream(ctx, HistoryStreamName(sid))
-	if err == nil {
-		return nil
-	}
-	if errors.Is(err, jetstream.ErrStreamNotFound) {
-		return nil
-	}
-	return fmt.Errorf("jsstream: delete %s: %w", HistoryStreamName(sid), err)
+	return infrarepair.RunLegacy(ctx, js, infrarepair.StreamDelete, func(ctx context.Context) error {
+		err := js.DeleteStream(ctx, HistoryStreamName(sid))
+		if err == nil {
+			return nil
+		}
+		if errors.Is(err, jetstream.ErrStreamNotFound) {
+			return nil
+		}
+		return fmt.Errorf("jsstream: delete %s: %w", HistoryStreamName(sid), err)
+
+	})
 }
 
 // DeleteXferBucket deletes the per-session tier-B transfer object store (bucket
@@ -184,17 +189,9 @@ func DeleteHistoryStream(ctx context.Context, js jetstream.JetStream, sid string
 // its purged session row forever; at N>=3 a lingering bucket below its target replica count
 // then PERMANENTLY fails the retire gate (AllAtTarget) and latches replication_degraded.
 // Returns nil if the bucket is already gone so a crash-mid-rm re-run is idempotent.
+// origin: hot-update S9 plan §3.2 / §4.3 / T40 / T41
 func DeleteXferBucket(ctx context.Context, js jetstream.JetStream, sid string) error {
-	err := js.DeleteObjectStore(ctx, proto.XferBucketName(sid))
-	if err == nil {
-		return nil
-	}
-	// DeleteObjectStore joins ErrBucketNotFound with the underlying ErrStreamNotFound; accept
-	// either as "already gone".
-	if errors.Is(err, jetstream.ErrBucketNotFound) || errors.Is(err, jetstream.ErrStreamNotFound) {
-		return nil
-	}
-	return fmt.Errorf("jsstream: delete xfer bucket %s: %w", proto.XferBucketName(sid), err)
+	return infrarepair.DeleteLegacyObjectStore(ctx, js, proto.XferBucketName(sid), sid)
 }
 
 // SIDFromXferStream reverses the OBJ_xfer-<sid> backing-stream name. Returns ("", false)
@@ -235,60 +232,10 @@ func historyFilterSubject(sid string) string {
 	return fmt.Sprintf("%s.s.%s.audit.>", proto.SubjectPrefix, sid)
 }
 
-// ensureStream is the create-OR-RAISE helper (D5 §6.4 / R-18). On first call it
-// creates the stream at cfg.Replicas. When the stream already exists it RECONCILES the
-// replica factor toward cfg.Replicas — RAISE-ONLY: it never shrinks (shrink is the D7
-// retire path, gated on AllAtTarget). Retention/limits are NOT auto-mutated (operators
-// pin those via `nats stream edit`); only Replicas is reconciled, because the HA
-// replica factor is owned by the cluster (replicasFor(nVoters)), not the operator.
+// ensureStream shares the joined recovery admission path for create and replica raise.
+// origin: hot-update S9 plan §3.2 / §4.3 / T40 / T41
 func ensureStream(ctx context.Context, js jetstream.JetStream, cfg jetstream.StreamConfig) error {
-	_, err := js.CreateStream(ctx, cfg)
-	if err == nil {
-		return nil
-	}
-	if !errors.Is(err, jetstream.ErrStreamNameAlreadyInUse) {
-		return fmt.Errorf("jsstream: create %s: %w", cfg.Name, err)
-	}
-	return reconcileReplicas(ctx, js, cfg)
-}
-
-// reconcileReplicas raises an existing stream's replica factor toward cfg.Replicas
-// (D5 §6.4 / R-17/R-18). It compares the stream's CONFIGURED replicas (the current
-// target) to cfg.Replicas: at-or-above => no-op (raise-only, never shrink). Below =>
-// UpdateStream toward the target, with the meta-group readiness GATE being the
-// UpdateStream rejection itself (classified to ErrMetaGroupNotReady) — an R1 stream's
-// StreamInfo.Cluster cannot reveal the meta-group size, so a Cluster-based pre-check
-// would falsely block the expansion (R-17).
-func reconcileReplicas(ctx context.Context, js jetstream.JetStream, cfg jetstream.StreamConfig) error {
-	s, err := js.Stream(ctx, cfg.Name)
-	if err != nil {
-		return fmt.Errorf("jsstream: lookup %s: %w", cfg.Name, err)
-	}
-	info, err := s.Info(ctx)
-	if err != nil {
-		return fmt.Errorf("jsstream: info %s: %w", cfg.Name, err)
-	}
-	current := info.Config.Replicas
-	if current < 1 {
-		current = 1 // JS normalizes 0 -> 1 at create; defensive
-	}
-	if current >= cfg.Replicas {
-		return nil // raise-only (R-18): already at/above target
-	}
-	// audit jsstream F2: raise ONLY the replica factor — start from the LIVE config and change
-	// just Replicas, so an operator's `nats stream edit` limits (MaxBytes/retention/…) survive.
-	// UpdateStream(cfg) with the full tether-default cfg would silently clobber those edits,
-	// contradicting this function's "only Replicas is reconciled" contract (the HA replica factor
-	// is cluster-owned; retention/limits are operator-owned).
-	target := info.Config
-	target.Replicas = cfg.Replicas
-	if _, err := js.UpdateStream(ctx, target); err != nil {
-		if IsMetaGroupNotReady(err) {
-			return ErrMetaGroupNotReady // R-17: retriable; meta-group not ready
-		}
-		return fmt.Errorf("jsstream: update %s replicas->%d: %w", cfg.Name, cfg.Replicas, err)
-	}
-	return nil
+	return infrarepair.EnsureLegacyStream(ctx, js, cfg)
 }
 
 // CollectStreamState reads a stream's live replica health for the §6.4 AllAtTarget
@@ -366,84 +313,88 @@ const placementCanarySubject = "$TETHER.placement.canary"
 // The optional logger is variadic so callers that do not have one (tests, and any caller that only cares
 // about the verdict) stay source-compatible; it is used solely to make a failed post-probe cleanup
 // observable, which is never fatal to the verdict.
+// origin: hot-update S9 plan §3.2 / §4.3 / T40 / T41
 func ProbeMetaCanPlace(ctx context.Context, js jetstream.JetStream, targetReplicas int, logger ...*slog.Logger) error {
-	if js == nil {
-		return fmt.Errorf("jsstream: placement canary: no JetStream client")
-	}
-	existing, gerr := js.Stream(ctx, PlacementCanaryStreamName)
-	if gerr == nil {
-		info, ierr := existing.Info(ctx)
+	return infrarepair.RunLegacy(ctx, js, infrarepair.PlacementProbe, func(ctx context.Context) error {
+		if js == nil {
+			return fmt.Errorf("jsstream: placement canary: no JetStream client")
+		}
+		existing, gerr := js.Stream(ctx, PlacementCanaryStreamName)
+		if gerr == nil {
+			info, ierr := existing.Info(ctx)
+			if ierr != nil {
+				return fmt.Errorf("jsstream: placement canary: %q already exists and could not be inspected: %w",
+					PlacementCanaryStreamName, ierr)
+			}
+			// ROUND-5 R5-F3: emptiness is about MESSAGES, and a stream with no messages can still carry durable
+			// consumers — deleting the stream would delete them too. Ownership is the marker; the message and
+			// consumer counts are a second, independent refusal to destroy anything that is in use.
+			if !isOwnPlacementCanary(info.Config) || info.State.Msgs > 0 || info.State.Consumers > 0 {
+				return fmt.Errorf("jsstream: placement canary: the stream name %q is held by a stream this probe "+
+					"does not own (%d msg(s), %d consumer(s)) — it will not be touched; remove or rename it to "+
+					"re-enable the placement probe",
+					PlacementCanaryStreamName, info.State.Msgs, info.State.Consumers)
+			}
+			// ROUND-5 R5-F4: a failed reclaim must NOT fall through to the create. CreateStream is idempotent
+			// for an identical config, so it would hand back this stale object and the probe would report a
+			// placement it never performed.
+			if derr := js.DeleteStream(ctx, PlacementCanaryStreamName); derr != nil {
+				return fmt.Errorf("jsstream: placement canary: could not reclaim this probe's own abandoned "+
+					"canary %q, so a fresh placement cannot be distinguished from the stale one: %w",
+					PlacementCanaryStreamName, derr)
+			}
+		} else if !errors.Is(gerr, jetstream.ErrStreamNotFound) {
+			// R6-F3: UNKNOWN is not ABSENT. Continuing after a lookup timeout/transport/permission error lets
+			// CreateStream's identical-config idempotency hand back an old marked stream, bypassing the state
+			// checks above and turning cleanup into deletion of an object we never proved was disposable.
+			return fmt.Errorf("jsstream: placement canary: could not determine whether %q already exists; "+
+				"refusing to create or delete anything while ownership/state is unknown: %w",
+				PlacementCanaryStreamName, gerr)
+		}
+		cfg := jetstream.StreamConfig{
+			Name:      PlacementCanaryStreamName,
+			Subjects:  []string{placementCanarySubject},
+			Retention: jetstream.LimitsPolicy,
+			MaxMsgs:   1,
+			MaxAge:    time.Minute,
+			Storage:   jetstream.MemoryStorage, // nothing is ever published to it; never touch the disk budget
+			Replicas:  targetReplicas,
+			Metadata:  map[string]string{placementCanaryOwnerKey: placementCanaryOwnerVal},
+		}
+		created, err := js.CreateStream(ctx, cfg)
+		if err != nil {
+			return fmt.Errorf("jsstream: the JetStream meta could not place a new R=%d asset: %w", targetReplicas, err)
+		}
+		// R5-F4: verify what came back is the object we asked for, at the factor we asked for. The gate's
+		// contract is "a new R=N asset was placeable JUST NOW", so a lookup that merely found something must
+		// never be reported as a placement.
+		info, ierr := created.Info(ctx)
 		if ierr != nil {
-			return fmt.Errorf("jsstream: placement canary: %q already exists and could not be inspected: %w",
-				PlacementCanaryStreamName, ierr)
+			return fmt.Errorf("jsstream: placement canary: created but could not be verified: %w", ierr)
 		}
-		// ROUND-5 R5-F3: emptiness is about MESSAGES, and a stream with no messages can still carry durable
-		// consumers — deleting the stream would delete them too. Ownership is the marker; the message and
-		// consumer counts are a second, independent refusal to destroy anything that is in use.
-		if !isOwnPlacementCanary(info.Config) || info.State.Msgs > 0 || info.State.Consumers > 0 {
-			return fmt.Errorf("jsstream: placement canary: the stream name %q is held by a stream this probe "+
-				"does not own (%d msg(s), %d consumer(s)) — it will not be touched; remove or rename it to "+
-				"re-enable the placement probe",
-				PlacementCanaryStreamName, info.State.Msgs, info.State.Consumers)
+		if !isOwnPlacementCanary(info.Config) || info.Config.Replicas != targetReplicas {
+			return fmt.Errorf("jsstream: placement canary: the stream that came back is not the R=%d canary this "+
+				"probe asked for (replicas=%d) — treating placement as UNPROVEN",
+				targetReplicas, info.Config.Replicas)
 		}
-		// ROUND-5 R5-F4: a failed reclaim must NOT fall through to the create. CreateStream is idempotent
-		// for an identical config, so it would hand back this stale object and the probe would report a
-		// placement it never performed.
-		if derr := js.DeleteStream(ctx, PlacementCanaryStreamName); derr != nil {
-			return fmt.Errorf("jsstream: placement canary: could not reclaim this probe's own abandoned "+
-				"canary %q, so a fresh placement cannot be distinguished from the stale one: %w",
-				PlacementCanaryStreamName, derr)
+		if info.State.Msgs > 0 || info.State.Consumers > 0 {
+			// CreateStream may have returned an existing identical config after a race, and external use may
+			// begin between create and verification. Message/consumer state is an independent destructive
+			// guard at BOTH deletion points, not a property implied by our marker.
+			return fmt.Errorf("jsstream: placement canary: the R=%d stream returned by create is already in use "+
+				"(%d msg(s), %d consumer(s)); refusing destructive cleanup and treating placement as UNPROVEN",
+				targetReplicas, info.State.Msgs, info.State.Consumers)
 		}
-	} else if !errors.Is(gerr, jetstream.ErrStreamNotFound) {
-		// R6-F3: UNKNOWN is not ABSENT. Continuing after a lookup timeout/transport/permission error lets
-		// CreateStream's identical-config idempotency hand back an old marked stream, bypassing the state
-		// checks above and turning cleanup into deletion of an object we never proved was disposable.
-		return fmt.Errorf("jsstream: placement canary: could not determine whether %q already exists; "+
-			"refusing to create or delete anything while ownership/state is unknown: %w",
-			PlacementCanaryStreamName, gerr)
-	}
-	cfg := jetstream.StreamConfig{
-		Name:      PlacementCanaryStreamName,
-		Subjects:  []string{placementCanarySubject},
-		Retention: jetstream.LimitsPolicy,
-		MaxMsgs:   1,
-		MaxAge:    time.Minute,
-		Storage:   jetstream.MemoryStorage, // nothing is ever published to it; never touch the disk budget
-		Replicas:  targetReplicas,
-		Metadata:  map[string]string{placementCanaryOwnerKey: placementCanaryOwnerVal},
-	}
-	created, err := js.CreateStream(ctx, cfg)
-	if err != nil {
-		return fmt.Errorf("jsstream: the JetStream meta could not place a new R=%d asset: %w", targetReplicas, err)
-	}
-	// R5-F4: verify what came back is the object we asked for, at the factor we asked for. The gate's
-	// contract is "a new R=N asset was placeable JUST NOW", so a lookup that merely found something must
-	// never be reported as a placement.
-	info, ierr := created.Info(ctx)
-	if ierr != nil {
-		return fmt.Errorf("jsstream: placement canary: created but could not be verified: %w", ierr)
-	}
-	if !isOwnPlacementCanary(info.Config) || info.Config.Replicas != targetReplicas {
-		return fmt.Errorf("jsstream: placement canary: the stream that came back is not the R=%d canary this "+
-			"probe asked for (replicas=%d) — treating placement as UNPROVEN",
-			targetReplicas, info.Config.Replicas)
-	}
-	if info.State.Msgs > 0 || info.State.Consumers > 0 {
-		// CreateStream may have returned an existing identical config after a race, and external use may
-		// begin between create and verification. Message/consumer state is an independent destructive
-		// guard at BOTH deletion points, not a property implied by our marker.
-		return fmt.Errorf("jsstream: placement canary: the R=%d stream returned by create is already in use "+
-			"(%d msg(s), %d consumer(s)); refusing destructive cleanup and treating placement as UNPROVEN",
-			targetReplicas, info.State.Msgs, info.State.Consumers)
-	}
-	if derr := js.DeleteStream(ctx, PlacementCanaryStreamName); derr != nil && len(logger) > 0 && logger[0] != nil {
-		// Not fatal: the placement WAS proven. But it must be observable, or a canary that keeps failing to
-		// clean up looks identical to one that never existed.
-		logger[0].Warn("jsstream: could not delete the placement canary after a successful probe — the next "+
-			"probe reclaims it, but a persistent failure here needs attention",
-			"err", derr, "stream", PlacementCanaryStreamName)
-	}
-	return nil
+		if derr := js.DeleteStream(ctx, PlacementCanaryStreamName); derr != nil && len(logger) > 0 && logger[0] != nil {
+			// Not fatal: the placement WAS proven. But it must be observable, or a canary that keeps failing to
+			// clean up looks identical to one that never existed.
+			logger[0].Warn("jsstream: could not delete the placement canary after a successful probe — the next "+
+				"probe reclaims it, but a persistent failure here needs attention",
+				"err", derr, "stream", PlacementCanaryStreamName)
+		}
+		return nil
+
+	})
 }
 
 // TransferTerminalCommitted answers, from the AUDIT STREAM ITSELF, whether a terminal for

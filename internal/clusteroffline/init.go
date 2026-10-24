@@ -151,6 +151,13 @@ func InitFromExisting(opts InitFromExistingOptions) error {
 	}
 
 	// (1) flock — bar two concurrent inits.
+	// origin: hot-update S6 plan §3.1 / T05
+	// Bind DB and lock before offline surgery can touch either store.
+	identity, err := storage.CanonicalStoreIdentity(opts.DBPath, opts.DataDir)
+	if err != nil {
+		return err
+	}
+	opts.DBPath, opts.DataDir = identity.Path, identity.DataDir
 	warnRootDataDirOwner(opts.DataDir, opts.Logger) // #6: nudge if run as root against a tether-owned data dir
 	release, err := cluster.AcquireDataDirLock(opts.DataDir)
 	if err != nil {
@@ -378,6 +385,14 @@ func backupToUnique(dbPath string) (string, error) {
 // backupOnce copies dbPath to dbPath+".bak" iff the .bak does not already exist (a prior
 // half-run's .bak is the pristine pre-migration copy). fsync'd.
 func backupOnce(dbPath string) error {
+	// Recover --emit-manifest intentionally removes the old DB. There is no
+	// pre-migration state to checkpoint or back up on that fresh init path.
+	// origin: hot-update S6 plan §3.1; internal review rv-writer-9
+	if _, err := os.Stat(dbPath); errors.Is(err, os.ErrNotExist) {
+		return nil
+	} else if err != nil {
+		return fmt.Errorf("clusteroffline: stat DB for backup: %w", err)
+	}
 	bak := dbPath + ".bak"
 	if _, err := os.Stat(bak); err == nil {
 		return nil // pristine pre-migration copy already preserved
@@ -407,14 +422,18 @@ func backupOnce(dbPath string) error {
 	return dst.Close()
 }
 
-func checkpointWALForBackup(dbPath string) error {
-	db, err := sql.Open("sqlite", "file:"+dbPath+"?_pragma=busy_timeout(5000)")
+func checkpointWALForBackup(dbPath string) (err error) {
+	// origin: hot-update S6 plan §3.2 / T08 / T11
+	// This temporary writer belongs in the same driver census as the offline
+	// migration pool. OpenExisting preserves the pre-migration schema/journal.
+	db, err := storage.OpenExisting(dbPath)
 	if err != nil {
 		return fmt.Errorf("clusteroffline: open DB for checkpoint: %w", err)
 	}
-	defer func() { _ = db.Close() }()
-	db.SetMaxOpenConns(1)
-	if _, err := db.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+	// A failed checkpoint-pool close must stop the caller before a subsequent
+	// migration pool can open over an unknown writer still in the census.
+	defer func() { err = errors.Join(err, db.Close()) }()
+	if _, _, _, err := storage.CheckpointForImage(db); err != nil {
 		return fmt.Errorf("clusteroffline: checkpoint WAL before backup: %w", err)
 	}
 	return nil

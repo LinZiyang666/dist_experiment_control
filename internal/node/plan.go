@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/cluster"
+	"github.com/LinZiyang666/tether/internal/upgradeauthority"
 )
 
 // Plan* are the D2 leader-side renderers for the node mutators (architecture
@@ -27,17 +28,24 @@ import (
 // and the equivalence/differential harnesses, where liveness columns are excluded
 // from the comparison.
 func PlanRegister(db *sql.DB, in RegisterInput, now time.Time) (*cluster.Command, error) {
-	var state string
-	switch err := db.QueryRow(`SELECT state FROM sessions WHERE sid=?`, in.SID).Scan(&state); err {
-	case nil:
-		if state != "ACTIVE" {
-			return nil, ErrSessionNotActive
-		}
-	case sql.ErrNoRows:
-		return nil, ErrSessionMissing
-	default:
-		return nil, fmt.Errorf("node: plan register session lookup: %w", err)
+	return planRegister(db, in, now)
+}
+
+// The same renderer is used inside Register's transaction and applyMu's planner.
+// Every INSERT and conflict UPDATE retains the creation predicate through Apply.
+// origin: hot-update S8 plan §6.2 / P16
+func planRegister(db upgradeauthority.RowReader, in RegisterInput, now time.Time) (*cluster.Command, error) {
+	predicate, err := registerAuthority(db, in)
+	if err != nil {
+		return nil, err
 	}
+	// A replacement can itself be DELETING; compare creation before treating
+	// its lifecycle state as an ordinary rejection or a removal retry.
+	// origin: hot-update S8 plan §6.2 / P16
+	if err := registerState(db, in.SID); err != nil {
+		return nil, err
+	}
+
 	capable := int64(0)
 	if in.ProxyCapable {
 		capable = 1
@@ -51,12 +59,12 @@ func PlanRegister(db *sql.DB, in RegisterInput, now time.Time) (*cluster.Command
 	// so the DIFF-1 equivalence stays consistent. Set on INSERT and refreshed on
 	// conflict (matching the live mutator's `nats_server = excluded.nats_server`).
 	sql := `INSERT INTO nodes(nid, sid, boot_id, release_version, proto_version, registered_at, proxy_capable, nats_server, status) ` +
-		`VALUES (` + nidL + `, ` + sidL + `, ` + bootL + `, ` + relL + `, ` +
-		cluster.LitInt(int64(in.ProtoVersion)) + `, ` + cluster.LitTime(now.UTC()) + `, ` + cluster.LitInt(capable) + `, ` + natsL + `, 'OFFLINE') ` +
+		`SELECT ` + nidL + `, ` + sidL + `, ` + bootL + `, ` + relL + `, ` +
+		cluster.LitInt(int64(in.ProtoVersion)) + `, ` + cluster.LitTime(now.UTC()) + `, ` + cluster.LitInt(capable) + `, ` + natsL + `, 'OFFLINE' WHERE ` + predicate + ` AND EXISTS (SELECT 1 FROM sessions WHERE sid=` + sidL + ` AND state='ACTIVE') ` +
 		`ON CONFLICT(sid, nid) DO UPDATE SET ` +
 		`boot_id = excluded.boot_id, release_version = excluded.release_version, ` +
 		`proto_version = excluded.proto_version, proxy_capable = excluded.proxy_capable, ` +
-		`nats_server = excluded.nats_server`
+		`nats_server = excluded.nats_server WHERE ` + predicate
 	return cluster.NewCommand(cluster.OpNodeRegister, cluster.Stmt(sql)), nil
 }
 

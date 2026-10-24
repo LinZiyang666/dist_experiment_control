@@ -7,7 +7,9 @@ package clustermanifest
 
 import (
 	"context"
+	"github.com/LinZiyang666/tether/internal/controlbudget"
 	"github.com/LinZiyang666/tether/internal/httplisten"
+	"github.com/LinZiyang666/tether/internal/listenerimage"
 	"net"
 	"net/http"
 )
@@ -51,4 +53,11 @@ func Handler(body func() ([]byte, bool)) http.Handler {
 		_, _ = w.Write(b)
 	})
 	return mux
+}
+
+// StartImage returns the same tracked HTTP owner used by the other broker
+// surfaces. Request-time callbacks must resolve the current runtime slot.
+// origin: hot-update S6 plan §6.1 / §12.1 P09
+func StartImage(k listenerimage.Keeper, body func() ([]byte, bool), deadline controlbudget.Deadline) (httplisten.ImageOwner, error) {
+	return httplisten.StartImage(k, Handler(body), "clustermanifest", deadline)
 }

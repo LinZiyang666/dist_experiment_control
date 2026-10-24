@@ -148,7 +148,8 @@ func BuildMergedConf(own *Ownership, cfg Config) (string, error) {
 		b.WriteString("\n")
 		b.WriteString(pt)
 	}
-	return b.String(), nil
+	// origin: hot-update S9 plan §3.3 / T27
+	return preserveSystemPrincipals(own, b.String())
 }
 
 // websocketBlock re-emits the preserved websocket{host,port,no_tls} from the parsed conf.

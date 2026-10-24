@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/proto"
+	"github.com/LinZiyang666/tether/internal/upgradeauthority"
 )
 
 // Lease allocation for cloned-credential instances — the DB-backed half. The
@@ -63,19 +64,15 @@ func LowestFreeSuffixExcept(db *sql.DB, sid, basename string, maxSuffix int, exc
 	if len(basename) > proto.MaxLeaseBasenameLen {
 		return "", ErrLeaseUnavailable
 	}
-	if maxSuffix > proto.MaxLeaseSuffix {
-		maxSuffix = proto.MaxLeaseSuffix
-	}
+	maxSuffix = min(maxSuffix, proto.MaxLeaseSuffix)
 	taken, err := claimedLeaseNames(db, sid, basename)
 	if err != nil {
 		return "", err
 	}
 	for n := proto.FirstLeaseSuffix; n <= maxSuffix; n++ {
 		name := proto.LeaseNameFor(basename, n)
-		if _, bad := taken[name]; bad {
-			continue
-		}
-		if excluded != nil && excluded(name) {
+		_, bad := taken[name]
+		if bad || (excluded != nil && excluded(name)) {
 			continue
 		}
 		return name, nil
@@ -100,25 +97,16 @@ func claimedLeaseNames(db *sql.DB, sid, basename string) (map[string]struct{}, e
 	// OFFLINE real device keeps its name across a reboot, while an OFFLINE lease
 	// — which by construction has no binding of its own — is reclaimable. No
 	// column, and therefore no migration, is needed to tell them apart.
-	nodeRows, err := db.Query(
-		`SELECT nid FROM nodes WHERE sid = ? AND nid LIKE ? AND status <> 'OFFLINE'`,
-		sid, pattern)
+
+	rows, err := db.Query(`SELECT nid FROM nodes WHERE sid=? AND nid LIKE ? AND status <> 'OFFLINE'
+  UNION SELECT nid FROM agent_provisioning WHERE sid=? AND nid LIKE ?`, sid, pattern, sid, pattern)
 	if err != nil {
-		return nil, fmt.Errorf("node: lease scan nodes: %w", err)
+		return nil, fmt.Errorf("node: lease scan: %w", err)
 	}
-	if err := collectLeaseNames(nodeRows, basename, taken); err != nil {
+	if err := collectLeaseNames(rows, basename, taken); err != nil {
 		return nil, err
 	}
 
-	provRows, err := db.Query(
-		`SELECT nid FROM agent_provisioning WHERE sid = ? AND nid LIKE ?`,
-		sid, pattern)
-	if err != nil {
-		return nil, fmt.Errorf("node: lease scan provisioning: %w", err)
-	}
-	if err := collectLeaseNames(provRows, basename, taken); err != nil {
-		return nil, err
-	}
 	return taken, nil
 }
 
@@ -135,10 +123,7 @@ func collectLeaseNames(rows *sql.Rows, basename string, into map[string]struct{}
 			into[nid] = struct{}{}
 		}
 	}
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("node: lease scan rows: %w", err)
-	}
-	return nil
+	return rows.Err()
 }
 
 // ProvisionedNIDs returns the set of nids in sid that own an agent_provisioning
@@ -233,6 +218,23 @@ func ReleaseLeaseRow(db *sql.DB, sid, nid string) error {
 		`UPDATE nodes SET status = ?, proxy_ready = 0 WHERE sid = ? AND nid = ?`,
 		string(StateOffline), sid, nid); err != nil {
 		return fmt.Errorf("node: release lease row %s/%s: %w", sid, nid, err)
+	}
+	return nil
+}
+
+// Lifecycle checks run in the caller's transaction or serialized planner.
+// origin: hot-update S8 plan §6.2 / P16
+func registerState(db upgradeauthority.RowReader, sid string) error {
+	var state string
+	switch err := db.QueryRow(`SELECT state FROM sessions WHERE sid=?`, sid).Scan(&state); err {
+	case nil:
+		if state != "ACTIVE" {
+			return ErrSessionNotActive
+		}
+	case sql.ErrNoRows:
+		return ErrSessionMissing
+	default:
+		return fmt.Errorf("node: plan register session lookup: %w", err)
 	}
 	return nil
 }

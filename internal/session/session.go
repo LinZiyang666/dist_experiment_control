@@ -13,7 +13,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/LinZiyang666/tether/internal/cluster"
 	"github.com/LinZiyang666/tether/internal/proto"
+	"github.com/LinZiyang666/tether/internal/upgradeauthority"
 )
 
 type State string
@@ -130,16 +132,9 @@ func Get(db *sql.DB, sid string) (*Session, error) {
 
 // IsActive returns true iff the session exists and is in ACTIVE state. Used
 // by the C.1 §6 precheck on every incoming command.
-func IsActive(db *sql.DB, sid string) (bool, error) {
-	var state string
-	err := db.QueryRow(`SELECT state FROM sessions WHERE sid=?`, sid).Scan(&state)
-	if errors.Is(err, sql.ErrNoRows) {
-		return false, nil
-	}
-	if err != nil {
-		return false, err
-	}
-	return state == string(StateActive), nil
+func IsActive(db *sql.DB, sid string) (active bool, err error) {
+	err = db.QueryRow(`SELECT EXISTS (SELECT 1 FROM sessions WHERE sid=? AND state='ACTIVE')`, sid).Scan(&active)
+	return active, err
 }
 
 // ListVisible returns sessions where pubkeyFP appears in members.
@@ -204,18 +199,9 @@ func Tombstone(db *sql.DB, sid string, now time.Time) error {
 
 // IsOwner returns true iff pubkeyFP is the owner of sid (per members.role).
 func IsOwner(db *sql.DB, sid, pubkeyFP string) (bool, error) {
-	var role string
-	err := db.QueryRow(
-		`SELECT role FROM members WHERE sid=? AND pubkey_fp=?`,
-		sid, pubkeyFP,
-	).Scan(&role)
-	if errors.Is(err, sql.ErrNoRows) {
-		return false, nil
-	}
-	if err != nil {
-		return false, err
-	}
-	return role == string(RoleOwner), nil
+	var owner bool
+	err := db.QueryRow(`SELECT EXISTS (SELECT 1 FROM members WHERE sid=? AND pubkey_fp=? AND role='owner')`, sid, pubkeyFP).Scan(&owner)
+	return owner, err
 }
 
 // GetProxyEnabled returns the session's P13 proxy master-switch state.
@@ -272,15 +258,11 @@ func SetProxyEnabled(db *sql.DB, sid string, enabled bool) (changed bool, err er
 		return true, nil
 	}
 	// No change: distinguish "already at value" from "no ACTIVE row".
-	var cur int
-	err = db.QueryRow(`SELECT proxy_enabled FROM sessions WHERE sid=? AND state='ACTIVE'`, sid).Scan(&cur)
-	if errors.Is(err, sql.ErrNoRows) {
+	active, err := IsActive(db, sid)
+	if err == nil && !active {
 		return false, ErrNotFound
 	}
-	if err != nil {
-		return false, err
-	}
-	return false, nil
+	return false, err
 }
 
 // GetProxyEpoch returns the session's current keyset epoch.
@@ -317,52 +299,23 @@ func BumpProxyEpoch(db *sql.DB, sid string) (int64, error) {
 // rolls back, so a failed enable never leaves the authorization switch ON (which
 // tunnelTokenLookup treats as the auth boundary). Returns the post-bump epoch.
 func SetProxyEnabledAndBumpEpoch(db *sql.DB, sid string, enabled bool) (epoch int64, err error) {
-	tx, err := db.Begin()
-	if err != nil {
-		return 0, err
-	}
-	defer func() { _ = tx.Rollback() }()
-
-	var cur int
-	if err := tx.QueryRow(`SELECT proxy_enabled FROM sessions WHERE sid=? AND state='ACTIVE'`, sid).Scan(&cur); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return 0, ErrNotFound
-		}
-		return 0, err
-	}
+	// One UPDATE keeps the switch and epoch atomic, including trigger failures.
 	v := 0
 	if enabled {
 		v = 1
 	}
-	if _, err := tx.Exec(`UPDATE sessions SET proxy_enabled=? WHERE sid=? AND state='ACTIVE'`, v, sid); err != nil {
-		return 0, fmt.Errorf("session: set proxy_enabled: %w", err)
+	err = db.QueryRow(`UPDATE sessions SET proxy_enabled=?, proxy_epoch=proxy_epoch+1 WHERE sid=? AND state='ACTIVE' RETURNING proxy_epoch`, v, sid).Scan(&epoch)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, ErrNotFound
 	}
-	if _, err := tx.Exec(`UPDATE sessions SET proxy_epoch=proxy_epoch+1 WHERE sid=?`, sid); err != nil {
-		return 0, fmt.Errorf("session: bump proxy_epoch: %w", err)
-	}
-	if err := tx.QueryRow(`SELECT proxy_epoch FROM sessions WHERE sid=?`, sid).Scan(&epoch); err != nil {
-		return 0, err
-	}
-	if err := tx.Commit(); err != nil {
-		return 0, err
-	}
-	return epoch, nil
+	return epoch, err
 }
 
 // IsMember returns true iff pubkeyFP appears in members for sid.
 func IsMember(db *sql.DB, sid, pubkeyFP string) (bool, error) {
-	var n int
-	err := db.QueryRow(
-		`SELECT 1 FROM members WHERE sid=? AND pubkey_fp=? LIMIT 1`,
-		sid, pubkeyFP,
-	).Scan(&n)
-	if errors.Is(err, sql.ErrNoRows) {
-		return false, nil
-	}
-	if err != nil {
-		return false, err
-	}
-	return true, nil
+	var member bool
+	err := db.QueryRow(`SELECT EXISTS (SELECT 1 FROM members WHERE sid=? AND pubkey_fp=?)`, sid, pubkeyFP).Scan(&member)
+	return member, err
 }
 
 // AddMember idempotently adds a row to members.
@@ -390,19 +343,8 @@ func JoinWithPIN(
 	verifyPIN func(pin, hash string) error,
 	now time.Time,
 ) error {
-	var pinHash, state string
-	err := db.QueryRow(`SELECT pin_hash, state FROM sessions WHERE sid=?`, sid).Scan(&pinHash, &state)
-	if errors.Is(err, sql.ErrNoRows) {
-		return ErrNotFound
-	}
-	if err != nil {
-		return fmt.Errorf("session: lookup: %w", err)
-	}
-	if state != string(StateActive) {
-		return ErrDeleting
-	}
-	if err := verifyPIN(pin, pinHash); err != nil {
-		return ErrInvalidPIN
+	if err := checkJoinPIN(db, sid, pin, verifyPIN); err != nil {
+		return err
 	}
 	return AddMember(db, sid, pubkeyFP, RoleMember, ViaPin, now)
 }
@@ -414,4 +356,75 @@ func isUniqueViolation(err error) bool {
 	msg := err.Error()
 	return strings.Contains(msg, "UNIQUE constraint failed") ||
 		strings.Contains(msg, "constraint failed: UNIQUE")
+}
+
+// checkJoinPIN shares the existing lookup and verification between the live and
+// replicated membership writers, preserving their state and PIN refusal order.
+func checkJoinPIN(reader upgradeauthority.RowReader, sid, pin string, verifyPIN func(string, string) error) error {
+	var pinHash, state string
+	if err := reader.QueryRow(`SELECT pin_hash, state FROM sessions WHERE sid=?`, sid).Scan(&pinHash, &state); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		return fmt.Errorf("session: lookup: %w", err)
+	}
+	if state != string(StateActive) {
+		return ErrDeleting
+	}
+	if err := verifyPIN(pin, pinHash); err != nil {
+		return ErrInvalidPIN
+	}
+	return nil
+}
+
+// HardDeleteGuarded is the final SQL cleanup atom, after transfer settlement and
+// stream teardown. The caller must retain the original guard through that work;
+// learning the current incarnation here would authorize a replacement session.
+// origin: hot-update S8 plan §6.2 / §11.2 P36
+func HardDeleteGuarded(db *sql.DB, guard upgradeauthority.Guard) (string, error) {
+	tx, err := db.Begin()
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = tx.Rollback() }()
+	cmd, err := guardedHardDeletePlan(tx, guard)
+	if err != nil {
+		return "", err
+	}
+	for _, stmt := range cmd.Body {
+		if _, err := tx.Exec(stmt.SQL); err != nil {
+			return "", errors.New("session: guarded cleanup failed")
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return "", err
+	}
+	return guard.Incarnation, nil
+}
+
+// guardedHardDeletePlan reads through the actual writer transaction or leader
+// planner. Rendering only the predicate placeholders keeps punctuation inside
+// literals from becoming a new SQL parameter; no PIN material reaches errors.
+// origin: hot-update S8 plan §6.2 / §11.2 P36
+func guardedHardDeletePlan(reader upgradeauthority.RowReader, guard upgradeauthority.Guard) (*cluster.Command, error) {
+	if guard.Incarnation == "" {
+		return nil, upgradeauthority.Match("", "")
+	}
+	creation, err := upgradeauthority.ReadCreation(reader, guard)
+	if err != nil {
+		return nil, err
+	}
+	predicate, _, err := upgradeauthority.CreationPredicate(creation)
+	if err != nil {
+		return nil, err
+	}
+	lits, err := cluster.LitTextAll(creation.SID, creation.Owner, creation.CreatedAtText, creation.EncodedPINHash)
+	if err != nil {
+		return nil, errors.New("session: cleanup identity cannot be rendered")
+	}
+	parts := strings.Split(predicate, "?")
+	for i, literal := range lits {
+		parts[i] += literal
+	}
+	return planHardDelete(reader, guard.SID, strings.Join(parts, ""))
 }

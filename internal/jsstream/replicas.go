@@ -1,10 +1,9 @@
 package jsstream
 
 import (
-	"errors"
-	"strings"
 	"time"
 
+	"github.com/LinZiyang666/tether/internal/infrarepair"
 	"github.com/nats-io/nats.go/jetstream"
 )
 
@@ -32,7 +31,7 @@ const AuditDedupWindow = 2 * time.Minute
 // R1 stream's StreamInfo.Cluster cannot reveal the meta-group size (it lists only this
 // stream's own placement) — so a pre-check on Cluster.Replicas would falsely block the
 // very expansion it gates (main-process correction to the synthesis's pre-gate).
-var ErrMetaGroupNotReady = errors.New("jsstream: JS meta-group cannot yet host target replicas (retriable)")
+var ErrMetaGroupNotReady = infrarepair.ErrMetaGroupNotReady
 
 // ReplicasFor maps the raft voter count to a JetStream replica factor (§6.4 D5 /
 // R-16). Capped at 3 (architecture pins R<=3; the N>=3 HA target is R3). N=2 -> R2 is
@@ -146,45 +145,8 @@ func ActualReplicas(info *jetstream.StreamInfo) int {
 	return actual
 }
 
-// IsMetaGroupNotReady classifies a JetStream UpdateStream/UpdateObjectStore error as a
-// TRANSIENT "the meta-group cannot host this replica count YET" condition (R-17) — i.e.
-// retry next tick. It must NOT match PERMANENT misconfigurations that merely mention
-// peers/replicas: JS code 10074 "replicas > 1 not supported in non-clustered mode" means
-// the node's JetStream never formed a cluster, so retrying spins the reconcile loop
-// forever masked by Degraded() (internal review M1). A bare "peers" substring is likewise
-// too broad (e.g. "lost connection to peers" is a real failure). Any non-matching error
-// propagates as a hard failure (E-B3 pins the live classification). Exported so the
-// broker object-store reconcile (transfer.go) shares the one classifier.
-func IsMetaGroupNotReady(err error) bool {
-	if err == nil {
-		return false
-	}
-	msg := strings.ToLower(err.Error())
-	// Permanent dead-ends that mention replicas/peers but are NOT retriable. Checked BEFORE the
-	// transient signals so an overlapping substring resolves to permanent. "insufficient storage"
-	// (a disk-full peer; JS "insufficient storage resources available") is PERMANENT — retrying
-	// the same placement spins the reconcile loop forever, masked by Degraded() (audit jsstream
-	// F3); it must propagate as a hard failure so the operator sees it, distinct from the
-	// transient "insufficient resources"/"no suitable peer" placement-capacity signals below.
-	for _, perm := range []string{"non-clustered", "not supported", "insufficient storage"} {
-		if strings.Contains(msg, perm) {
-			return false
-		}
-	}
-	// Genuinely transient placement-capacity signals (a newly-joined voter not yet in the
-	// JS meta-group, or resources momentarily unavailable).
-	for _, s := range []string{
-		"no suitable peer",
-		"no peers",
-		"insufficient",
-		"not enough",
-	} {
-		if strings.Contains(msg, s) {
-			return true
-		}
-	}
-	return false
-}
+// IsMetaGroupNotReady preserves the shared legacy placement classifier.
+func IsMetaGroupNotReady(err error) bool { return infrarepair.IsMetaGroupNotReady(err) }
 
 // CaughtUpPeersExcluding counts the CAUGHT-UP replicas of a stream that do NOT live on
 // the named NATS server — i.e. how many would survive that server being removed.

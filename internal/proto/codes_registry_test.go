@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/LinZiyang666/tether/internal/adminsock"
+	"github.com/LinZiyang666/tether/internal/brokerimage"
 	"github.com/LinZiyang666/tether/internal/proto"
 )
 
@@ -29,6 +31,7 @@ import (
 // that migration is real work with real risk (32 codes across broker, agent and
 // spawnsafe) and belongs in its own increment; pretending it already happened is
 // what got flagged.
+// origin: S7 internal review GATE-CONVERGE-contracts F2
 func TestEveryDeclaredCodeHasAProductionEmitter(t *testing.T) {
 	root, err := os.Getwd()
 	if err != nil {
@@ -74,6 +77,10 @@ func TestEveryDeclaredCodeHasAProductionEmitter(t *testing.T) {
 	// cmd/tether is now excluded from the emitter evidence: it is the CONSUMER
 	// side. Evidence must come from a package that actually replies.
 	//
+	// S8 keeps the neutral and adapter emitters in this same scanner, after
+	// moving behavior out of the broker; registry aliases are independently
+	// exercised by TestUpgradeErrorProjectionPreservesAcceptedOutcome.
+	// origin: hot-update S8 plan §7.1 / §12.2 / P13
 	// Collect two things: every string literal, and every reference to a
 	// proto.Code* / proto.Reason* constant.
 	//
@@ -83,7 +90,12 @@ func TestEveryDeclaredCodeHasAProductionEmitter(t *testing.T) {
 	// that as an orphan would punish exactly the direction this file wants.
 	emitted := map[string]bool{}
 	referenced := map[string]bool{}
-	for _, dir := range []string{"internal/broker", "internal/agent", "internal/spawnsafe", "internal/adminsock"} {
+	// Control replies moved out of broker; consumers still cannot vouch for emitters.
+	// origin: hot-update S6 plan §9.3 / HARDGATE-A
+	// The tier-B transfer watchdog (the transfer_budget_exceeded emitter) moved
+	// verbatim from broker into the xfertrack leaf; it is still the reply side.
+	// origin: hot-update S7 plan §5.1 / P11
+	for _, dir := range []string{"internal/broker", "internal/brokercontrol", "internal/xfertrack", "internal/agent", "internal/spawnsafe", "internal/adminsock", "internal/upgradewire", "internal/upgradetx", "internal/upgradestore", "internal/upgradeobserve", "internal/upgradelock", "internal/upgradeartifact", "internal/upgradecompat", "internal/upgradecut", "internal/upgradeauthority", "internal/agentupgrade", "internal/brokerupgrade", "internal/upgraderoll", "internal/upgradelegacy"} {
 		_ = filepath.Walk(filepath.Join(root, dir), func(p string, info os.FileInfo, err error) error {
 			if err != nil || info.IsDir() || !strings.HasSuffix(p, ".go") || strings.HasSuffix(p, "_test.go") {
 				return nil
@@ -111,6 +123,8 @@ func TestEveryDeclaredCodeHasAProductionEmitter(t *testing.T) {
 		})
 	}
 
+	addTransferEmissionEvidence(t, root, emitted)
+
 	var orphans []string
 	for name, val := range declared {
 		if emitted[val] || referenced[name] {
@@ -134,5 +148,37 @@ func TestSharedCodeConstantsAreReachable(t *testing.T) {
 	}
 	if proto.CodeDataplaneNotConverged != "dataplane_not_converged" {
 		t.Fatal("CodeDataplaneNotConverged drifted; it is aliased by both broker and cmd/tether")
+	}
+}
+
+// Keep details separate from codes: a lost result after send is terminal for
+// the admission owner, even though ordinary no-responders admits retry.
+// Producers and the CLI own that state-dependent classification.
+// origin: hot-update S6 plan §9.1 / T46
+func TestBrokerImageCodeNamespaces(t *testing.T) {
+	for _, pair := range []struct{ protoCode, adminCode, want string }{
+		{proto.CodeStoreError, adminsock.CodeStoreError, "store_error"},
+		{proto.CodeBadRequest, adminsock.CodeBadRequest, "bad_request"},
+		{proto.CodeUpgradeDeferred, adminsock.CodeUpgradeDeferred, "upgrade_deferred"},
+	} {
+		if pair.protoCode != pair.want || pair.adminCode != pair.want {
+			t.Errorf("wire namespaces disagree: proto=%q admin=%q want=%q", pair.protoCode, pair.adminCode, pair.want)
+		}
+	}
+	manifest := []struct{ detail, want, code string }{
+		{brokerimage.DetailMaintenanceObserverUnsupported, "maintenance_observer_unsupported", adminsock.CodeUpgradeDeferred},
+		{brokerimage.DetailMaintenanceExpired, "maintenance_expired", adminsock.CodeUpgradeDeferred},
+		{brokerimage.DetailStoreCloseUnknown, "store_close_unknown", adminsock.CodeStoreError},
+		{brokerimage.DetailControlResultUnknown, "control_result_unknown", proto.CodeAgentNoResponders},
+	}
+	seen := map[string]bool{}
+	for _, row := range manifest {
+		if row.detail != row.want || row.detail == row.code || seen[row.detail] {
+			t.Errorf("closed broker error manifest drift: %+v", row)
+		}
+		seen[row.detail] = true
+	}
+	if adminsock.CodeIsLeader != "is_leader" || len(seen) != 4 {
+		t.Fatal("broker refusal namespace or closed detail family changed")
 	}
 }

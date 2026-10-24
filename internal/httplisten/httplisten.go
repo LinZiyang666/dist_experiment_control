@@ -25,7 +25,6 @@ package httplisten
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -103,15 +102,5 @@ func isLoopbackHost(host string) bool {
 // runs, so nothing outlives Serve. The hand-rolled `go func(){ <-ctx.Done() }()`
 // this replaces stayed parked until cancellation even after Serve had returned.
 func Serve(ctx context.Context, ln net.Listener, handler http.Handler, name string) error {
-	srv := &http.Server{Handler: handler, ReadHeaderTimeout: 5 * time.Second}
-	stop := context.AfterFunc(ctx, func() {
-		shCtx, cancel := context.WithTimeout(context.Background(), shutdownGrace)
-		defer cancel()
-		_ = srv.Shutdown(shCtx)
-	})
-	defer stop()
-	if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		return fmt.Errorf("%s: serve: %w", name, err)
-	}
-	return nil
+	return serveTracked(ctx, ln, handler, name)
 }

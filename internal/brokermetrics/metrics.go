@@ -15,7 +15,9 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"github.com/LinZiyang666/tether/internal/controlbudget"
 	"github.com/LinZiyang666/tether/internal/httplisten"
+	"github.com/LinZiyang666/tether/internal/listenerimage"
 	"io"
 	"net"
 	"net/http"
@@ -249,4 +251,11 @@ func Handler(snap func() Snapshot, ready func() (bool, string)) http.Handler {
 		_, _ = io.WriteString(w, "ready: "+reason+"\n")
 	})
 	return mux
+}
+
+// StartImage returns the same tracked HTTP owner used by the other broker
+// surfaces. Request-time callbacks must resolve the current runtime slot.
+// origin: hot-update S6 plan §6.1 / §12.1 P09
+func StartImage(k listenerimage.Keeper, snap func() Snapshot, ready func() (bool, string), deadline controlbudget.Deadline) (httplisten.ImageOwner, error) {
+	return httplisten.StartImage(k, Handler(snap, ready), "brokermetrics", deadline)
 }

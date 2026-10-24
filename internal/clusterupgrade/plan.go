@@ -96,8 +96,10 @@ type Step struct {
 // Plan is the ordered roll + any fatal refusal + the N=2 honesty flag.
 type Plan struct {
 	Steps        []Step
-	Refused      []string // non-empty ⇒ the whole roll MUST NOT proceed (HALT, restore HA first)
-	N2WriteFence bool     // exactly 2 voters ⇒ a restart fences writes regardless of transfer-leader (inherent F=0)
+	Refused      []string  // non-empty ⇒ the whole roll MUST NOT proceed (HALT, restore HA first)
+	Scope        PlanScope // product scope; independent of the host agent-presence fact
+	N1WriteStall bool      // sole voter: a bounded write interruption while its runtime reopens
+	N2WriteFence bool      // exactly 2 voters ⇒ a restart fences writes regardless of transfer-leader (inherent F=0)
 }
 
 // Upgrades counts the non-skip steps (how many hosts the roll will actually touch).
@@ -116,16 +118,31 @@ func (p Plan) Upgrades() int {
 // already at target by the time the leader's turn comes). Deterministic (sort.SliceStable by ID). Refuses
 // if the leader must upgrade but no OTHER caught-up voter can take leadership (restart HA first).
 func Compute(nodes []Node, target string) Plan {
+	return ComputeWithScope(nodes, target, ScopeWholeHost)
+}
+
+// ComputeWithScope preserves the inventory of agents while selecting which daemon
+// participates in the at-target verdict. An unknown scope cannot silently upgrade
+// an agent that the operator intended to leave running.
+// origin: hot-update S6 plan §5 / T45
+func ComputeWithScope(nodes []Node, target string, scope PlanScope) Plan {
 	sorted := append([]Node(nil), nodes...)
 	sort.SliceStable(sorted, func(i, j int) bool { return sorted[i].ID < sorted[j].ID })
 
-	var p Plan
+	p := Plan{Scope: scope}
+	switch scope {
+	case ScopeWholeHost, ScopeBrokerDaemon:
+	default:
+		p.Refused = append(p.Refused, "unknown upgrade scope")
+		return p
+	}
 	voters := 0
 	for _, n := range sorted {
 		if n.Voter {
 			voters++
 		}
 	}
+	p.N1WriteStall = voters == 1
 	p.N2WriteFence = voters == 2
 
 	// External-review M2: a cluster-health broadcast can collect replies ACROSS a leadership transition,
@@ -146,7 +163,7 @@ func Compute(nodes []Node, target string) Plan {
 	var leader *Node
 	for i := range sorted {
 		n := sorted[i]
-		if n.AtTarget(target) {
+		if (scope == ScopeBrokerDaemon && target != "" && proto.SameRelease(n.BrokerVer, target)) || (scope == ScopeWholeHost && n.AtTarget(target)) {
 			p.Steps = append(p.Steps, Step{Kind: StepSkip, NodeID: n.ID})
 			continue
 		}

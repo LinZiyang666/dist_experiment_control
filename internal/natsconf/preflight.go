@@ -50,6 +50,8 @@ var bucketOf = map[string]Bucket{
 	"server_name":     TetherGen,
 	"cluster":         TetherGen,
 	"authorization":   OperatorAuth, // read for identity, regenerated
+	"accounts":        InstallSafe,  // only the exact managed $SYS principals survive the nested gate
+	"system_account":  InstallSafe,  // only the existing default $SYS name is accepted
 	"max_payload":     TetherPassthrough,
 	"write_deadline":  TetherPassthrough,
 	"max_pending":     TetherPassthrough,
@@ -141,31 +143,6 @@ var (
 	authCalloutSafeSubkeys   = map[string]bool{"issuer": true, "account": true, "auth_users": true}
 )
 
-// lowerKeys recursively lowercases every map key (nats keys are case-insensitive). Values
-// are preserved; nested maps + slices of maps are descended so the accessors that read
-// nested keys (auth_callout, users, store_dir) are also case-insensitive.
-func lowerKeys(m map[string]any) map[string]any {
-	out := make(map[string]any, len(m))
-	for k, v := range m {
-		out[strings.ToLower(k)] = lowerValue(v)
-	}
-	return out
-}
-
-func lowerValue(v any) any {
-	switch t := v.(type) {
-	case map[string]any:
-		return lowerKeys(t)
-	case []any:
-		for i := range t {
-			t[i] = lowerValue(t[i])
-		}
-		return t
-	default:
-		return v
-	}
-}
-
 // Owned is one classified top-level directive (the before/after ownership table row).
 type Owned struct {
 	Key    string
@@ -181,7 +158,7 @@ type Ownership struct {
 
 // Preflight parses the existing nats.conf, refuses if it contains an `include` (the parser
 // inlines/errors on includes — a split-file conf can't be safely round-tripped by
-// re-rendering) or ANY unrecognized top-level directive (accounts/leafnodes/mqtt/gateways/
+// re-rendering) or ANY unrecognized top-level directive (operator accounts/leafnodes/mqtt/gateways/
 // operators/…), and otherwise returns the ownership table. This is the fail-closed gate
 // that prevents the takeover from silently dropping a hand-tuned conf.
 func Preflight(confPath string) (*Ownership, error) {
@@ -203,6 +180,10 @@ func Preflight(confPath string) (*Ownership, error) {
 	// JSStoreDir miss. Normalize every key to lowercase recursively so the whole leaf is
 	// case-insensitive (install.sh already writes lowercase, so this is a no-op there).
 	parsed = lowerKeys(parsed)
+	// origin: hot-update S9 plan §3.3 / T27/T28
+	if _, err := systemPrincipalsFromParsed(parsed); err != nil {
+		return nil, err
+	}
 	own := &Ownership{Parsed: parsed}
 	var unknown []string
 	for key := range parsed {

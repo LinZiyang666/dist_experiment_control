@@ -16,6 +16,10 @@ import (
 	"errors"
 	"fmt"
 	"time"
+
+	"github.com/LinZiyang666/tether/internal/cluster"
+	"github.com/LinZiyang666/tether/internal/proto"
+	"github.com/LinZiyang666/tether/internal/upgradeauthority"
 )
 
 // State labels written to the SQLite `nodes.status` column. Mirrors the CHECK
@@ -64,6 +68,10 @@ type RegisterInput struct {
 	// IDENTITY column so any broker can resolve the agent's home at expose time.
 	// "" when not reported. Inert in production (only read when clustered).
 	NatsServer string
+	// Authority is captured before register/reconcile; forwarded writers retain it.
+	// A nil value is the ordinary legacy path, never an inherited image proof.
+	// origin: hot-update S8 plan §6.2 / P16
+	Authority *upgradeauthority.Guard `json:"authority,omitempty"`
 }
 
 // ErrSessionMissing is returned by Register when the agent's target sid
@@ -93,49 +101,23 @@ func Register(db *sql.DB, in RegisterInput, now time.Time) error {
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	var state string
-	switch err := tx.QueryRow(
-		`SELECT state FROM sessions WHERE sid = ?`, in.SID,
-	).Scan(&state); err {
-	case nil:
-		if state != "ACTIVE" {
-			return ErrSessionNotActive
-		}
-	case sql.ErrNoRows:
-		return ErrSessionMissing
-	default:
-		return fmt.Errorf("node: lookup session: %w", err)
+	// origin: hot-update S8 plan §6.2 / P16
+	cmd, err := planRegister(tx, in, now)
+	if err != nil {
+		return err
 	}
-
-	capable := 0
-	if in.ProxyCapable {
-		capable = 1
-	}
-	if _, err := tx.Exec(`
-		INSERT INTO nodes(nid, sid, last_heartbeat_at, status, boot_id,
-		                  release_version, proto_version, registered_at, proxy_capable, nats_server)
-		VALUES (?,?,?,?,?,?,?,?,?,?)
-		ON CONFLICT(sid, nid) DO UPDATE SET
-		    last_heartbeat_at = excluded.last_heartbeat_at,
-		    status            = 'ONLINE',
-		    boot_id           = excluded.boot_id,
-		    release_version   = excluded.release_version,
-		    proto_version     = excluded.proto_version,
-		    proxy_capable     = excluded.proxy_capable,
-		    -- D6 §6.5: refresh the server-id bridge binding on every (re)register so
-		    -- a reconnect to a different nats-server re-homes the agent. Identity
-		    -- column; written by both this live mutator and PlanRegister (DIFF-1).
-		    nats_server       = excluded.nats_server,
-		    -- round-6 F8: a (re)register means a NEW agent process that has NOT yet
-		    -- re-established its SS server + tunnel. Clear readiness so a restarted
-		    -- or downgraded agent is never rendered into /sub until its post-bind
-		    -- ACK sets proxy_ready=1 again.
-		    proxy_ready       = 0
-	`,
-		in.NID, in.SID, now, string(StateOnline),
-		in.BootID, in.ReleaseVersion, in.ProtoVersion, now, capable, in.NatsServer,
-	); err != nil {
+	if _, err := tx.Exec(cmd.Body[0].SQL); err != nil {
 		return fmt.Errorf("node: upsert: %w", err)
+	}
+	// D6 §6.5: refresh the server-id bridge binding on every (re)register so
+	// a reconnect to a different nats-server re-homes the agent. Identity
+	// column; written by both this live mutator and PlanRegister (DIFF-1).
+	// round-6 F8: a (re)register means a NEW agent process that has NOT yet
+	// re-established its SS server + tunnel. Clear readiness so a restarted
+	// or downgraded agent is never rendered into /sub until its post-bind
+	// ACK sets proxy_ready=1 again.
+	if _, err := tx.Exec(`UPDATE nodes SET last_heartbeat_at=?, status='ONLINE', proxy_ready=0 WHERE sid=? AND nid=?`, now, in.SID, in.NID); err != nil {
+		return fmt.Errorf("node: upsert liveness: %w", err)
 	}
 
 	return tx.Commit()
@@ -285,7 +267,7 @@ func SetProxyReady(db *sql.DB, sid, nid string, ready bool) error {
 // List returns every node row, sorted by (sid, nid) for stable display.
 func List(db *sql.DB) ([]Snapshot, error) {
 	rows, err := db.Query(`
-		SELECT sid, nid, status, last_heartbeat_at, boot_id, release_version, proto_version
+		SELECT sid, nid, status, last_heartbeat_at, COALESCE(boot_id,''), COALESCE(release_version,''), COALESCE(proto_version,0)
 		FROM nodes
 		ORDER BY sid, nid
 	`)
@@ -298,18 +280,27 @@ func List(db *sql.DB) ([]Snapshot, error) {
 	for rows.Next() {
 		var s Snapshot
 		var lastHb sql.NullTime
-		var boot, rel sql.NullString
-		var pv sql.NullInt64
-		if err := rows.Scan(&s.SID, &s.NID, &s.Status, &lastHb, &boot, &rel, &pv); err != nil {
+		if err := rows.Scan(&s.SID, &s.NID, &s.Status, &lastHb, &s.BootID, &s.ReleaseVersion, &s.ProtoVersion); err != nil {
 			return nil, err
 		}
 		if lastHb.Valid {
 			s.LastHeartbeatAt = lastHb.Time
 		}
-		s.BootID = boot.String
-		s.ReleaseVersion = rel.String
-		s.ProtoVersion = int(pv.Int64)
 		out = append(out, s)
 	}
 	return out, rows.Err()
+}
+
+// registerAuthority belongs to the actual transaction/planner, including the
+// local liveness writer. A lease can change a name, never its creation identity.
+// origin: hot-update S8 plan §6.2 / P16
+func registerAuthority(reader upgradeauthority.RowReader, in RegisterInput) (string, error) {
+	if in.Authority == nil {
+		return "1", nil
+	}
+	g := *in.Authority
+	if g.SID != in.SID || (g.ConfiguredNID != in.NID && g.ConfiguredNID != proto.BasenameOf(in.NID)) {
+		return "", upgradeauthority.Match("", "")
+	}
+	return upgradeauthority.GuardPredicate(reader, g, cluster.LitText)
 }

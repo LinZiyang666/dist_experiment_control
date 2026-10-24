@@ -8,14 +8,14 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/LinZiyang666/tether/internal/testharness"
 )
 
-// openDB delegates to internal/testharness (B9) — see the note in internal/session/session_test.go.
+// openDB retains isolated production schema/policies without replaying DDL for
+// every allocation/CAS case. The local fixture contract checks both properties.
+// origin: hot-update S6 plan §9.3 / T42 / TESTFIX
 func openDB(t *testing.T) *sql.DB {
 	t.Helper()
-	return testharness.OpenDB(t)
+	return openPortFixtureDB(t)
 }
 
 func seedSessionAndNode(t *testing.T, db *sql.DB, sid, nid string) {

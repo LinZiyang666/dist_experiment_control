@@ -1,29 +1,36 @@
 package adminsock
 
 import (
-	"bufio"
 	"context"
 	"database/sql"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"syscall"
 	"time"
 
 	"github.com/LinZiyang666/tether/internal/auth"
+	"github.com/LinZiyang666/tether/internal/listenerimage"
 	"github.com/LinZiyang666/tether/internal/proto"
 	"github.com/LinZiyang666/tether/internal/session"
+	"github.com/LinZiyang666/tether/internal/upgradewire"
 )
 
 // Backend is everything the server needs from the broker. Decoupled
 // so the broker can wire its own DB / JS / pub functions without
 // adminsock importing the broker package (which would cycle).
 type Backend struct {
+	Infra *InfraBindings
+	// UpgradeEndpoint is the daemon's sole transaction writer. A missing port
+	// defers before accepting work; it never falls through to legacy reload.
+	// origin: hot-update S8 plan §2.2 / §3.3 / P13
+	UpgradeEndpoint UpgradeEndpoint
+	UpgradeKey      UpgradeKey
 	// DB is the broker's SQLite handle. Used by sessions / nodes /
 	// evict.
 	DB *sql.DB
@@ -116,6 +123,23 @@ type Server struct {
 	mu       sync.Mutex
 	listener net.Listener
 	closed   bool
+
+	// Owner operations serialize keeper transfer with normal terminal cleanup.
+	// Accepted connections remain registered through reply completion, not just
+	// dispatch return: a store cut must not strand an admitted write's receipt.
+	// origin: hot-update S6 plan §6.1 / T19
+	ownerMu        sync.Mutex
+	keeper         listenerimage.Keeper
+	pathInfo       os.FileInfo
+	fenced         bool
+	handlers       map[net.Conn]*adminHandler
+	changed        chan struct{}
+	acceptDone     chan struct{}
+	watcherDone    chan struct{}
+	reloadReplyErr error
+	controlCtx     context.Context
+	readCtx        context.Context
+	cancelReads    context.CancelFunc
 }
 
 // New returns a Server ready to call Start. path is the absolute
@@ -131,6 +155,14 @@ func New(path string, backend Backend) *Server {
 // runs until ctx is canceled or the server is Closed. Concurrent
 // Start calls are not allowed.
 func (s *Server) Start(ctx context.Context) error {
+	s.ownerMu.Lock()
+	defer s.ownerMu.Unlock()
+	s.mu.Lock()
+	unavailable := s.closed || s.listener != nil || s.keeper != nil
+	s.mu.Unlock()
+	if unavailable {
+		return errors.New("adminsock: server already started or closed")
+	}
 	parent := filepath.Dir(s.path)
 	if err := os.MkdirAll(parent, 0o700); err != nil {
 		return fmt.Errorf("adminsock: mkdir parent: %w", err)
@@ -172,23 +204,38 @@ func (s *Server) Start(ctx context.Context) error {
 		}
 		_ = os.Remove(s.path)
 	}
-	ln, err := net.Listen("unix", s.path)
+	unixListener, err := net.ListenUnix("unix", &net.UnixAddr{Name: s.path, Net: "unix"})
 	if err != nil {
 		return fmt.Errorf("adminsock: listen: %w", err)
 	}
+	var ln net.Listener = unixListener
 	if err := os.Chmod(s.path, 0o600); err != nil {
 		_ = ln.Close()
 		return fmt.Errorf("adminsock: chmod 0600: %w", err)
 	}
-	s.mu.Lock()
-	s.listener = ln
-	s.mu.Unlock()
-
-	// Pass the listener as a parameter so acceptLoop never reads
-	// s.listener concurrently with Close (which sets it to nil). The
-	// loop owns its own reference; Close still triggers exit by
-	// closing the listener (Accept returns ErrClosed).
-	go s.acceptLoop(ctx, ln)
+	// Cold bind is the only path allowed to probe or remove a stale socket.
+	// Disable automatic unlink even on platforms without image support; normal
+	// cleanup compares the saved pathname identity before removing it.
+	unixListener.SetUnlinkOnClose(false)
+	info, err := os.Lstat(s.path)
+	if err != nil {
+		_ = ln.Close()
+		return err
+	}
+	var keeper listenerimage.Keeper
+	if runtime.GOOS == "linux" {
+		keeper, err = listenerimage.Capture(ln, "admin.listener")
+		if err != nil {
+			if keeper != nil {
+				_ = keeper.Close()
+			} else {
+				_ = ln.Close()
+			}
+			return err
+		}
+		ln = keeper.View()
+	}
+	s.startOwner(ctx, ln, keeper, info)
 	return nil
 }
 
@@ -209,87 +256,151 @@ func isAdminSocketAlive(path string) bool {
 // Close unbinds the listener and removes the socket file. Safe to
 // call multiple times.
 func (s *Server) Close() error {
+	s.ownerMu.Lock()
+	defer s.ownerMu.Unlock()
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.closed {
+		s.mu.Unlock()
 		return nil
 	}
-	s.closed = true
-	var err error
-	if s.listener != nil {
-		err = s.listener.Close()
-		s.listener = nil
+	s.closed, s.fenced = true, true
+	ln, keeper, info := s.listener, s.keeper, s.pathInfo
+	s.listener, s.keeper, s.pathInfo = nil, nil, nil
+	if s.cancelReads != nil {
+		s.cancelReads()
 	}
-	_ = os.Remove(s.path)
+	conns := make([]net.Conn, 0, len(s.handlers))
+	for conn := range s.handlers {
+		conns = append(conns, conn)
+	}
+	s.notifyLocked()
+	s.mu.Unlock()
+	// Never block socket Close under the admission mutex: handler completion
+	// must be able to remove its receipt while terminal cleanup wakes netpoll.
+	var err error
+	if keeper != nil {
+		err = keeper.Close()
+	} else if ln != nil {
+		err = ln.Close()
+		current, statErr := os.Lstat(s.path)
+		if statErr == nil && info != nil && os.SameFile(info, current) {
+			err = errors.Join(err, os.Remove(s.path))
+		}
+	}
+	for _, conn := range conns {
+		err = errors.Join(err, conn.Close())
+	}
 	return err
 }
 
-func (s *Server) acceptLoop(ctx context.Context, ln net.Listener) {
-	// Audit shard 01 F6: the inner ctx-watcher goroutine used to
-	// leak when shutdown was initiated by an explicit Close()
-	// (which the broker does via defer b.admin.Close()) — accept
-	// returns ErrClosed cleanly, but the watcher sat forever
-	// waiting on <-ctx.Done. Close a `done` channel on loop exit
-	// so the watcher exits via select too.
-	done := make(chan struct{})
-	go func() {
-		select {
-		case <-ctx.Done():
-			_ = s.Close()
-		case <-done:
-		}
-	}()
+func (s *Server) acceptLoop(ln net.Listener, done chan struct{}) {
 	defer close(done)
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
-			if errors.Is(err, net.ErrClosed) {
-				return
+			if !errors.Is(err, net.ErrClosed) {
+				s.warn("adminsock: accept", "err", err)
 			}
-			s.warn("adminsock: accept", "err", err)
 			return
 		}
+		// Register before spawning. A late Accept racing the fence cannot enter
+		// business dispatch, and Join cannot miss a goroutine about to use SQL.
+		// origin: hot-update S6 plan §6.1 / T19
+		s.mu.Lock()
+		if s.closed || s.fenced {
+			s.mu.Unlock()
+			_ = conn.Close()
+			continue
+		}
+		s.handlers[conn] = &adminHandler{}
+		s.notifyLocked()
+		s.mu.Unlock()
 		go s.handle(conn)
 	}
 }
 
 func (s *Server) handle(conn net.Conn) {
-	defer func() { _ = conn.Close() }()
-	_ = conn.SetReadDeadline(s.now().Add(5 * time.Second))
+	var replyErr error
+	defer func() {
+		_ = conn.Close()
+		s.mu.Lock()
+		if handler := s.handlers[conn]; handler != nil && handler.reload && replyErr != nil {
+			// A failed armed reply is not permission to report a drained reload.
+			// origin: hot-update S6 plan §6.1 / T19
+			s.reloadReplyErr = errors.Join(s.reloadReplyErr, replyErr)
+		}
+		delete(s.handlers, conn)
+		s.notifyLocked()
+		s.mu.Unlock()
+	}()
+	received := s.now()
+	_ = conn.SetReadDeadline(received.Add(5 * time.Second))
 
-	br := bufio.NewReader(conn)
-	line, err := br.ReadBytes('\n')
+	line, err := upgradewire.ReadLine(conn)
 	if err != nil {
 		s.warn("adminsock: read", "err", err)
 		return
 	}
-	var req Request
-	if err := json.Unmarshal(line, &req); err != nil {
-		s.writeErr(conn, "", fmt.Sprintf("json_parse: %v", err))
-		return
-	}
-	resp := s.dispatch(req)
-	body, err := json.Marshal(&resp)
+	req, err := decodeInfraAdminRequest(line)
 	if err != nil {
-		s.warn("adminsock: marshal resp", "err", err)
+		s.writeErr(conn, req.Op, "invalid admin request")
 		return
 	}
-	body = append(body, '\n')
+	req.infraReceived = received
+	// Decoding is not admission. The fence and this decision share a mutex,
+	// so accepted-but-idle clients cannot acquire a stale store after Join.
+	// Reload is the sole DB-free control path and must not join itself.
+	// origin: hot-update S6 plan §6.1 / T19
+	s.mu.Lock()
+	state := s.handlers[conn]
+	admitted := state != nil && !s.fenced && !s.closed
+	if admitted && reloadRequest(req) {
+		for _, other := range s.handlers {
+			if other.reload {
+				admitted = false
+				break
+			}
+		}
+	}
+	if admitted {
+		state.dispatched = true
+		state.reload = reloadRequest(req)
+	}
+	s.mu.Unlock()
+	resp := fencedInfraAdminResponse(req)
+	if admitted {
+		resp = s.dispatch(req)
+	}
 	_ = conn.SetWriteDeadline(s.now().Add(5 * time.Second))
-	if _, err := conn.Write(body); err != nil {
-		s.warn("adminsock: write", "err", err)
+	if replyErr = upgradewire.WriteLine(conn, resp); replyErr != nil {
+		s.warn("adminsock: write", "err", replyErr)
 	}
 }
 
 func (s *Server) writeErr(conn net.Conn, op, msg string) {
-	body, _ := json.Marshal(Response{Op: op, Error: msg})
-	body = append(body, '\n')
 	_ = conn.SetWriteDeadline(s.now().Add(5 * time.Second))
-	_, _ = conn.Write(body)
+	_ = upgradewire.WriteLine(conn, invalidInfraAdminResponse(op, msg))
 }
 
 func (s *Server) dispatch(req Request) Response {
+	if req.Infra != nil || infraOperation(req.Op) != "" {
+		return dispatchInfra(s, req)
+	}
+	// The raw transaction decoder is shared with forwarded agent requests.
+	// No transaction operation may fall through to a legacy cluster callback.
+	// origin: hot-update S8 plan §2.2 / §7.2 / P13
+	if req.Upgrade != nil || upgradewire.IsOperation(req.Op) {
+		return dispatchUpgrade(s, req)
+	}
 	switch req.Op {
+	// Reload uses the same backend adapter in single and cluster mode, but its
+	// admitted handler is explicitly DB-free once it fences the current owner.
+	// origin: hot-update S6 plan §5 / §6.1 / T19
+	case OpBrokerUpgradeReload:
+		if s.backend.Cluster == nil {
+			return Response{Op: req.Op, Code: CodeClusterNotEnabled, Error: "broker reload is not wired"}
+		}
+		return s.backend.Cluster.HandleCluster(req)
 	case OpSessions:
 		return s.handleSessions()
 	case OpNodes:
@@ -316,7 +427,7 @@ func (s *Server) dispatch(req Request) Response {
 }
 
 func (s *Server) handleSessions() Response {
-	rows, err := s.backend.DB.Query(`
+	rows, err := s.backend.DB.QueryContext(s.readContext(), `
 		SELECT sid, name, owner_pubkey_fp, state, created_at
 		FROM sessions
 		ORDER BY sid
@@ -340,7 +451,7 @@ func (s *Server) handleSessions() Response {
 }
 
 func (s *Server) handleNodes() Response {
-	rows, err := s.backend.DB.Query(`
+	rows, err := s.backend.DB.QueryContext(s.readContext(), `
 		SELECT sid, nid, status, last_heartbeat_at, boot_id, release_version, proto_version
 		FROM nodes
 		ORDER BY sid, nid
@@ -372,17 +483,6 @@ func (s *Server) handleNodes() Response {
 	return Response{Op: OpNodes, Nodes: out, OK: true}
 }
 
-func (s *Server) handleRuntime() Response {
-	if s.backend.RuntimeSnapshot == nil {
-		return Response{Op: OpRuntime, Error: "runtime introspection unavailable", Code: CodeBadRequest}
-	}
-	rep := s.backend.RuntimeSnapshot()
-	if rep == nil {
-		return Response{Op: OpRuntime, Error: "runtime introspection unavailable", Code: CodeBadRequest}
-	}
-	return Response{Op: OpRuntime, OK: true, Runtime: rep}
-}
-
 func (s *Server) handleAudit(req Request) Response {
 	if req.SID == "" {
 		return Response{Op: OpAudit, Error: "sid required"}
@@ -393,7 +493,7 @@ func (s *Server) handleAudit(req Request) Response {
 	if s.backend.AuditTail == nil {
 		return Response{Op: OpAudit, Error: "audit_unavailable: broker has no JetStream"}
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(s.readContext(), 5*time.Second)
 	defer cancel()
 	entries, err := s.backend.AuditTail(ctx, req.SID, req.N)
 	if err != nil {
@@ -420,7 +520,7 @@ func (s *Server) handleEvents(req Request) Response {
 	if s.backend.EventsTail == nil {
 		return Response{Op: OpEvents, Error: "events_unavailable: broker has no JetStream"}
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(s.readContext(), 5*time.Second)
 	defer cancel()
 	entries, truncated, err := s.backend.EventsTail(ctx, req.N, since, req.EventKind)
 	if err != nil {
@@ -579,10 +679,7 @@ func (s *Server) handleSessionCreators(req Request) Response {
 	if s.backend.DB == nil {
 		return Response{Op: req.Op, Error: "no database", Code: CodeBadRequest}
 	}
-	now := time.Now()
-	if s.backend.Now != nil {
-		now = s.backend.Now()
-	}
+	now := s.now()
 	switch req.Op {
 	case OpSessionCreators:
 		list, err := session.ListCreators(s.backend.DB)

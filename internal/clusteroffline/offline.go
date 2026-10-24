@@ -76,6 +76,13 @@ func ForceSingle(opts ForceSingleOptions) ([]Peer, error) {
 	if opts.Logger == nil {
 		opts.Logger = slog.Default()
 	}
+	// origin: hot-update S6 plan §3.1 / T05
+	// Bind DB and lock before offline surgery can touch either store.
+	identity, err := storage.CanonicalStoreIdentity(opts.DBPath, opts.DataDir)
+	if err != nil {
+		return nil, err
+	}
+	opts.DBPath, opts.DataDir = identity.Path, identity.DataDir
 	warnRootDataDirOwner(opts.DataDir, opts.Logger) // #6: nudge if run as root against a tether-owned data dir
 	release, err := cluster.AcquireDataDirLock(opts.DataDir)
 	if err != nil {
@@ -239,6 +246,13 @@ func Resnapshot(opts ResnapshotOptions) error {
 	if opts.SelfID == "" || opts.SelfRaftAddr == "" {
 		return errors.New("clusteroffline: Resnapshot requires SelfID and SelfRaftAddr")
 	}
+	// origin: hot-update S6 plan §3.1 / T05
+	// Bind DB and lock before offline surgery can touch either store.
+	identity, err := storage.CanonicalStoreIdentity(opts.DBPath, opts.DataDir)
+	if err != nil {
+		return err
+	}
+	opts.DBPath, opts.DataDir = identity.Path, identity.DataDir
 	warnRootDataDirOwner(opts.DataDir, opts.Logger) // #6: nudge if run as root against a tether-owned data dir
 	release, err := cluster.AcquireDataDirLock(opts.DataDir)
 	if err != nil {
@@ -790,6 +804,13 @@ func Recover(opts RecoverOptions) (int, error) {
 	if opts.Now == nil {
 		opts.Now = time.Now
 	}
+	// origin: hot-update S6 plan §3.1 / T05
+	// Bind DB and lock before offline surgery can touch either store.
+	identity, err := storage.CanonicalStoreIdentity(opts.DBPath, opts.DataDir)
+	if err != nil {
+		return 0, err
+	}
+	opts.DBPath, opts.DataDir = identity.Path, identity.DataDir
 	warnRootDataDirOwner(opts.DataDir, opts.Logger) // #6: nudge if run as root against a tether-owned data dir
 	release, err := cluster.AcquireDataDirLock(opts.DataDir)
 	if err != nil {

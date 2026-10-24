@@ -59,6 +59,13 @@ func OfflineBackup(opts BackupOptions) (result *BackupResult, err error) {
 	if opts.DBPath == "" || opts.OutDir == "" {
 		return nil, fmt.Errorf("clusteroffline: OfflineBackup requires DBPath and OutDir")
 	}
+	// origin: hot-update S6 plan §3.1 / T05
+	// Even the read-only backup must use the source DB's own lock domain.
+	identity, err := storage.CanonicalStoreIdentity(opts.DBPath, opts.DataDir)
+	if err != nil {
+		return nil, err
+	}
+	opts.DBPath, opts.DataDir = identity.Path, identity.DataDir
 	if _, statErr := os.Stat(opts.DBPath); statErr != nil {
 		return nil, fmt.Errorf("clusteroffline: source DB %q not found: %w", opts.DBPath, statErr)
 	}

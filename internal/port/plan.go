@@ -2,7 +2,9 @@ package port
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"time"
 
@@ -44,30 +46,28 @@ func PlanRevokeAllocation(db *sql.DB, a Allocation, now time.Time) (*cluster.Com
 }
 
 func planAllocationStateChange(db *sql.DB, op cluster.OpType, newState, label string, a Allocation, now time.Time) (*cluster.Command, error) {
+	where, err := allocationIdentitySQL(a, StateAllocated, false)
+	if err != nil {
+		return nil, err
+	}
+	authority, err := allocationAuthoritySQL(db, a.Authority, a.SID, a.NID)
+	if err != nil {
+		return nil, err
+	}
+	// Repeat creation identity in the actual replicated write, even after the
+	// leader's comparison succeeds: replay may follow session recreation.
+	// origin: hot-update S8 plan §6.2 / TestPortMutationRejectsRecreatedSession
+	where += ` AND ` + authority
 	var exists int
-	if err := db.QueryRow(
-		`SELECT COUNT(*) FROM port_allocations
-		  WHERE port=? AND sid=? AND nid=? AND name=? AND token_hash=? AND state='ALLOCATED'`,
-		a.Port, a.SID, a.NID, a.Name, a.TokenHash,
-	).Scan(&exists); err != nil {
+	if err := db.QueryRow(`SELECT COUNT(*) FROM port_allocations WHERE ` + where).Scan(&exists); err != nil {
 		return nil, fmt.Errorf("port: plan %s allocation lookup: %w", label, err)
 	}
 	if exists == 0 {
 		return nil, ErrNotFound
 	}
-	lits, err := cluster.LitTextAll(a.SID, a.NID, a.Name, a.TokenHash)
-	if err != nil {
-		return nil, fmt.Errorf("port: plan %s allocation literal: %w", label, err)
-	}
-	sidL, nidL, nameL, hashL := lits[0], lits[1], lits[2], lits[3]
 	sql := `UPDATE port_allocations SET state=` + cluster.MustLitText(newState) +
 		`, revoked_at=` + cluster.LitTime(now.UTC()) +
-		` WHERE port=` + cluster.LitInt(int64(a.Port)) +
-		` AND sid=` + sidL +
-		` AND nid=` + nidL +
-		` AND name=` + nameL +
-		` AND token_hash=` + hashL +
-		` AND state='ALLOCATED'`
+		` WHERE ` + where
 	return cluster.NewCommand(op, cluster.Stmt(sql)), nil
 }
 
@@ -98,13 +98,30 @@ func PlanRevoke(db *sql.DB, publicPort int, now time.Time) (*cluster.Command, er
 // IDENTICAL to pre-D6 (home_broker/epoch take their migration-0010 defaults
 // ” / 0). The live port.Allocate direct mutator is unchanged and always EMPTY.
 func PlanAllocate(db *sql.DB, sid, nid, name string, localPort, desiredPort int, createdByFP, homeBroker string, rebuildOff bool, cfg *Config) (*Allocation, *cluster.Command, error) {
+	return planAllocate(db, sid, nid, name, localPort, desiredPort, createdByFP, homeBroker, rebuildOff, cfg, nil, false, "")
+}
+
+// planAllocate shares token/port selection and literal rendering with the cold
+// API. Guarded callers supply their already-validated replacement and predicate;
+// the cold API retains its original name scope and byte-identical SQL.
+func planAllocate(db *sql.DB, sid, nid, name string, localPort, desiredPort int, createdByFP, homeBroker string, rebuildOff bool, cfg *Config, replacing *Allocation, proxyScope bool, insertWhere string) (*Allocation, *cluster.Command, error) {
 	low, high, now := cfgWithDefaults(cfg)
 
+	scope, err := allocationNameSQL(sid, nid, name, proxyScope)
+	if err != nil {
+		return nil, nil, err
+	}
+	replacementExclusion := ""
+	if replacing != nil {
+		identity, err := allocationIdentitySQL(*replacing, StateAllocated)
+		if err != nil {
+			return nil, nil, err
+		}
+		replacementExclusion = ` AND NOT (` + identity + `)`
+	}
+	scope += replacementExclusion
 	var existing int
-	if err := db.QueryRow(
-		`SELECT COUNT(*) FROM port_allocations WHERE sid=? AND name=? AND state='ALLOCATED'`,
-		sid, name,
-	).Scan(&existing); err != nil {
+	if err := db.QueryRow(`SELECT COUNT(*) FROM port_allocations WHERE ` + scope).Scan(&existing); err != nil {
 		return nil, nil, fmt.Errorf("port: plan allocate name check: %w", err)
 	}
 	if existing > 0 {
@@ -130,9 +147,8 @@ func PlanAllocate(db *sql.DB, sid, nid, name string, localPort, desiredPort int,
 		// Node.applyMu, so atomic vs a concurrent Propose) and return the SAME typed
 		// error BEFORE proposing. (Stage C blocker, 2 reviewers.)
 		var taken int
-		if err := db.QueryRow(
-			`SELECT COUNT(*) FROM port_allocations WHERE port=? AND state='ALLOCATED'`, desiredPort,
-		).Scan(&taken); err != nil {
+		portScope := `port=` + cluster.LitInt(int64(desiredPort)) + ` AND state='ALLOCATED'` + replacementExclusion
+		if err := db.QueryRow(`SELECT COUNT(*) FROM port_allocations WHERE ` + portScope).Scan(&taken); err != nil {
 			return nil, nil, fmt.Errorf("port: plan allocate desired-port check: %w", err)
 		}
 		if taken > 0 {
@@ -157,7 +173,6 @@ func PlanAllocate(db *sql.DB, sid, nid, name string, localPort, desiredPort int,
 	cols := ` (port, sid, nid, name, local_port, token_hash, state, created_by_fp, created_at)`
 	vals := ` VALUES (` + cluster.LitInt(int64(publicPort)) + `, ` + sidLit + `, ` + nidLit + `, ` + nameLit + `, ` +
 		cluster.LitInt(int64(localPort)) + `, ` + thLit + `, 'ALLOCATED', ` + fpLit + `, ` + cluster.LitTime(nowUTC) + `)`
-	var epoch int64
 	if homeBroker != "" {
 		// D6: clustered home assignment. Append home_broker + epoch=0. The "" case
 		// above stays byte-identical to pre-D6 (no extra columns).
@@ -165,10 +180,8 @@ func PlanAllocate(db *sql.DB, sid, nid, name string, localPort, desiredPort int,
 		if herr != nil {
 			return nil, nil, fmt.Errorf("port: plan allocate home literal: %w", herr)
 		}
-		cols = ` (port, sid, nid, name, local_port, token_hash, state, created_by_fp, created_at, home_broker, epoch)`
-		vals = ` VALUES (` + cluster.LitInt(int64(publicPort)) + `, ` + sidLit + `, ` + nidLit + `, ` + nameLit + `, ` +
-			cluster.LitInt(int64(localPort)) + `, ` + thLit + `, 'ALLOCATED', ` + fpLit + `, ` + cluster.LitTime(nowUTC) +
-			`, ` + homeLit + `, ` + cluster.LitInt(0) + `)`
+		cols = strings.TrimSuffix(cols, `)`) + `, home_broker, epoch)`
+		vals = strings.TrimSuffix(vals, `)`) + `, ` + homeLit + `, ` + cluster.LitInt(0) + `)`
 	}
 	// B4 conditional column (composes with the home conditional above into a 2×2): only
 	// --no-rebuild (rebuildOff) appends rebuild_on_failure=0; rebuild-ON (the default)
@@ -179,12 +192,19 @@ func PlanAllocate(db *sql.DB, sid, nid, name string, localPort, desiredPort int,
 		cols = cols[:len(cols)-1] + `, rebuild_on_failure)`
 		vals = vals[:len(vals)-1] + `, ` + cluster.LitInt(0) + `)`
 	}
+	if insertWhere != "" {
+		// origin: hot-update S6 plan §7.2 / T42
+		// INSERT SELECT turns a stale absence/maintenance decision into zero
+		// rows rather than a unique-constraint failure in the replicated FSM.
+		vals = ` SELECT ` + vals[len(` VALUES (`):len(vals)-1] + ` WHERE ` + insertWhere +
+			` AND NOT EXISTS (SELECT 1 FROM port_allocations WHERE port=` + cluster.LitInt(int64(publicPort)) + ` AND state='ALLOCATED')`
+	}
 	sql := `INSERT INTO port_allocations` + cols + vals
 
 	alloc := &Allocation{
 		Port: publicPort, SID: sid, NID: nid, Name: name, LocalPort: localPort,
 		TokenHash: tokenHash, State: StateAllocated, CreatedByFP: createdByFP,
-		CreatedAt: nowUTC, Token: token, HomeBroker: homeBroker, Epoch: epoch,
+		CreatedAt: nowUTC, Token: token, HomeBroker: homeBroker, Epoch: 0,
 		RebuildOff: rebuildOff,
 	}
 	return alloc, cluster.NewCommand(cluster.OpPortAllocate, cluster.Stmt(sql)), nil
@@ -266,22 +286,16 @@ func PlanReassignHome(db *sql.DB, publicPort int, newHome string, now time.Time)
 	if newHome == "" {
 		return 0, nil, fmt.Errorf("port: plan reassign-home requires a non-empty home")
 	}
-	var (
-		curEpoch int64
-		state    string
-	)
+	// Only a live (ALLOCATED) expose can be rehomed; a freed/revoked port has
+	// nothing to migrate. The lookup predicate enforces this before planning.
+	var curEpoch int64
 	switch err := db.QueryRow(
-		`SELECT epoch, state FROM port_allocations WHERE port=? AND state='ALLOCATED'`, publicPort,
-	).Scan(&curEpoch, &state); {
+		`SELECT epoch FROM port_allocations WHERE port=? AND state='ALLOCATED'`, publicPort,
+	).Scan(&curEpoch); {
 	case err == sql.ErrNoRows:
 		return 0, nil, ErrNotFound
 	case err != nil:
 		return 0, nil, fmt.Errorf("port: plan reassign-home lookup: %w", err)
-	}
-	if state != string(StateAllocated) {
-		// Only a live (ALLOCATED) expose can be rehomed; a freed/revoked port has
-		// nothing to migrate.
-		return 0, nil, ErrNotFound
 	}
 	newEpoch := curEpoch + 1
 	homeLit, err := cluster.LitText(newHome)
@@ -312,6 +326,126 @@ func planPortStateChange(db *sql.DB, op cluster.OpType, newState string, publicP
 		`, revoked_at=` + cluster.LitTime(now.UTC()) +
 		` WHERE port=` + cluster.LitInt(int64(publicPort)) + ` AND state='ALLOCATED'`
 	return cluster.NewCommand(op, cluster.Stmt(sql)), nil
+}
+
+// PlanReassignHomeGuarded plans only against the live writer DB passed by
+// Node.Propose. Its epoch is an expected projection, never a committed receipt;
+// the caller must read back the complete identity before publishing a directive.
+// origin: hot-update S6 plan §2.1 / §7.2 / T42
+func PlanReassignHomeGuarded(db *sql.DB, guard MutationGuard, newHome string, now time.Time) (int64, *cluster.Command, error) {
+	if guard.Expected == nil || guard.ExpectAbsent || newHome == "" || guard.ToHome != newHome ||
+		guard.Expected.Epoch == math.MaxInt64 {
+		return 0, nil, ErrMutationGuard
+	}
+	where, err := mutationPredicate(db, guard)
+	if err != nil {
+		return 0, nil, err
+	}
+	home, err := cluster.LitText(newHome)
+	if err != nil {
+		return 0, nil, err
+	}
+	epoch := guard.Expected.Epoch + 1
+	sql := `UPDATE port_allocations SET home_broker=` + home + `, epoch=` + cluster.LitInt(epoch) +
+		`, last_rehome_at=` + cluster.LitTime(now.UTC()) + ` WHERE ` + where
+	return epoch, cluster.NewCommand(cluster.OpPortReassignHome, cluster.Stmt(sql)), nil
+}
+
+// PlanAllocateGuarded requires explicit absence of the logical allocation and
+// explicit current maintenance expectations for the target home. Proxy names
+// use (SID,NID), preserving the existing proxy uniqueness contract.
+// origin: hot-update S6 plan §2.1 / §7.2 / T42
+func PlanAllocateGuarded(db *sql.DB, guard MutationGuard, intent AllocationIntent) (*Allocation, *cluster.Command, error) {
+	if guard.Expected != nil || !guard.ExpectAbsent || guard.FromHome != "" || guard.ToHome != intent.HomeBroker {
+		return nil, nil, ErrMutationGuard
+	}
+	// Absence alone cannot let an old grant create a port under a reused SID.
+	// origin: hot-update S8 plan §6.2 / TestPortMutationRejectsRecreatedSession
+	if !allocationAuthorityMatches(guard.Authority, intent.SID, intent.NID) {
+		return nil, nil, ErrMutationGuard
+	}
+	maintenance, err := mutationPredicate(db, guard)
+	if err != nil {
+		return nil, nil, err
+	}
+	absence, err := allocationAbsenceSQL(intent)
+	if err != nil {
+		return nil, nil, err
+	}
+	return planAllocateIntent(db, intent, nil, maintenance+` AND `+absence)
+}
+
+// PlanRotateAllocationGuarded keeps free and insert in ONE replicated
+// transaction. Both statements carry the same maintenance expectations and
+// full old identity. changes() belongs to the transaction's connection: it
+// proves that this command's immediately preceding free actually won its CAS.
+// origin: hot-update S6 plan §2.1 / §7.2 / T42
+func PlanRotateAllocationGuarded(db *sql.DB, guard MutationGuard, intent AllocationIntent, now time.Time) (*Allocation, *cluster.Command, error) {
+	old := guard.Expected
+	if old == nil || guard.ExpectAbsent || guard.ToHome != intent.HomeBroker ||
+		old.SID != intent.SID || old.NID != intent.NID || old.Name != intent.Name {
+		return nil, nil, ErrMutationGuard
+	}
+	where, err := mutationPredicate(db, guard)
+	if err != nil {
+		return nil, nil, err
+	}
+	freedIdentity, err := allocationIdentitySQL(*old, StateFreed)
+	if err != nil {
+		return nil, nil, err
+	}
+	maintenance, err := maintenancePredicate(db, guard)
+	if err != nil {
+		return nil, nil, err
+	}
+	absence, err := allocationAbsenceSQL(intent)
+	if err != nil {
+		return nil, nil, err
+	}
+	// Use one leader timestamp for both halves, including callers with Config.Now.
+	cfg := Config{}
+	if intent.Config != nil {
+		cfg = *intent.Config
+	}
+	cfg.Now = func() time.Time { return now }
+	intent.Config = &cfg
+	insertWhere := `changes()=1 AND EXISTS (SELECT 1 FROM port_allocations WHERE ` + freedIdentity +
+		` AND revoked_at=` + cluster.LitTime(now.UTC()) + `) AND ` + maintenance + ` AND ` + absence
+	allocation, insert, err := planAllocateIntent(db, intent, old, insertWhere)
+	if err != nil {
+		return nil, nil, err
+	}
+	// origin: hot-update S6 plan §7.2 / T42
+	// A stale target-port decision must suppress BOTH halves. Otherwise a
+	// guarded insert could lose to a new allocation after freeing the old one.
+	oldIdentity, err := allocationIdentitySQL(*old, StateAllocated)
+	if err != nil {
+		return nil, nil, err
+	}
+	where += ` AND NOT EXISTS (SELECT 1 FROM port_allocations WHERE port=` + cluster.LitInt(int64(allocation.Port)) +
+		` AND state='ALLOCATED' AND NOT (` + oldIdentity + `))`
+	free := `UPDATE port_allocations SET state='FREED', revoked_at=` + cluster.LitTime(now.UTC()) + ` WHERE ` + where
+	op := cluster.OpPortAllocate
+	if intent.Name == ProxyPortName {
+		op = cluster.OpProxyAllocate
+	}
+	return allocation, cluster.NewCommand(op, cluster.Stmt(free), insert.Body[0]), nil
+}
+
+// PlanFreeAllocationGuarded covers maintenance-sensitive rotation/cleanup.
+// The legacy permission path remains independent of maintenance; widening its
+// five-field forwarding payload requires a separate additive wire change.
+// origin: hot-update S6 plan §2.1 / §7.2 / T26 / T42
+func PlanFreeAllocationGuarded(db *sql.DB, guard MutationGuard, now time.Time) (*cluster.Command, error) {
+	if guard.Expected == nil || guard.ExpectAbsent || guard.ToHome != "" {
+		return nil, ErrMutationGuard
+	}
+	where, err := mutationPredicate(db, guard)
+	if err != nil {
+		return nil, err
+	}
+	sql := `UPDATE port_allocations SET state='FREED', revoked_at=` + cluster.LitTime(now.UTC()) + ` WHERE ` + where
+	return cluster.NewCommand(cluster.OpPortFree, cluster.Stmt(sql)), nil
 }
 
 // PlanGCTerminated renders one OpPortGC chunk (h1 B1): up to `limit`
@@ -364,3 +498,29 @@ func PlanGCTerminated(db *sql.DB, cutoff time.Time, limit int) (*cluster.Command
 		`) AND state IN ('FREED','REVOKED')`
 	return cluster.NewCommand(cluster.OpPortGC, cluster.Stmt(sql)), len(ids), nil
 }
+
+// allocationIdentitySQL fences the new guarded mutations. Home and
+// exact epoch must survive planning AND replay: epoch inequality alone can hit
+// an unrelated replacement with a freshly reset counter on the same port.
+// origin: hot-update S6 plan §7.2 / T26 / T42
+func allocationIdentitySQL(a Allocation, state State, full ...bool) (string, error) {
+	lits, err := cluster.LitTextAll(a.SID, a.NID, a.Name, a.TokenHash)
+	if err != nil {
+		return "", err
+	}
+	identity := `port=` + cluster.LitInt(int64(a.Port)) + ` AND sid=` + lits[0] + ` AND nid=` + lits[1] +
+		` AND name=` + lits[2] + ` AND token_hash=` + lits[3] + ` AND state=` + cluster.MustLitText(string(state))
+	// The ordinary free/revoke payload still carries its original five fields;
+	// maintenance writers additionally fence the exact home and epoch.
+	// origin: hot-update S8 plan §6.2 / TestPortMutationRejectsRecreatedSession
+	if len(full) == 0 || full[0] {
+		home, err := cluster.LitText(a.HomeBroker)
+		if err != nil {
+			return "", err
+		}
+		identity += ` AND home_broker=` + home + ` AND epoch=` + cluster.LitInt(a.Epoch)
+	}
+	return identity, nil
+}
+
+var ErrMaintenanceUnknown = errors.New("port: maintenance proof unavailable or invalid")

@@ -149,7 +149,10 @@ func DBPreflight(dbPath string) error {
 
 	db, err := storage.OpenReadOnly("file:" + dbPath)
 	if err != nil {
-		return fmt.Errorf("open %s read-only: %v", dbPath, err)
+		// OpenReadOnly now establishes its registered connection eagerly. Keep
+		// the same actionable diagnosis for failures formerly caught by Ping.
+		// origin: hot-update S6 plan §3.2 / T08; internal review rv-writer-11
+		return fmt.Errorf("open %s read-only: %v — the file is not a readable SQLite database (missing? permission denied? not a database?)", dbPath, err)
 	}
 	defer func() { _ = db.Close() }()
 
